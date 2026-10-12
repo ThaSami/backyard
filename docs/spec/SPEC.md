@@ -23,7 +23,9 @@
    Warehouse: bigquery | postgres(-compatible, incl. Redshift) | athena.
 6. **Agent-native.** `backyard init` drops `CLAUDE.md`, `AGENTS.md` and a Claude skill into the
    project; `backyard mcp` is an MCP server; the hub serves `/llms.txt`.
-7. **Enterprise-ready.** Terraform for AWS/GCP/Azure, Helm, docker-compose; OIDC/SSO; admin
+7. **Runs anywhere.** AWS, GCP, Azure (Terraform), any VM or Kubernetes without a bucket
+   (fs storage + rsync; docker-compose, Helm, systemd), or Cloudflare's free tier (§16).
+8. **Enterprise-ready.** Terraform for AWS/GCP/Azure/Cloudflare, Helm, docker-compose; OIDC/SSO; admin
    groups; optional site ownership; rate limits; audit logs; Prometheus metrics; stateless
    horizontally-scalable server when backed by postgres/dynamodb + redis/postgres pubsub.
 
@@ -63,7 +65,10 @@ Go packages (module `github.com/thasami/backyard`):
 | `internal/server` | HTTP: host routing, static serving, APIs, hub |
 | `internal/app` | wiring: config → components → `http.Handler` |
 | `internal/cli`, `internal/clientconfig`, `internal/mcpserver` | CLI commands, local CLI config, MCP server |
-| `web` | embedded client SDK (`backyard.js`, `backyard.mjs`, `backyard.d.ts`) and hub UI |
+| `web` | embedded client SDK (`web/sdk/backyard.{js,mjs,d.ts}`) and hub UI (`web/hub/`) |
+| `deploy/cloudflare` | Cloudflare Workers edition (TypeScript, §16) |
+| `deploy/terraform/{aws,gcp,azure,cloudflare}`, `deploy/helm`, `deploy/docker-compose`, `deploy/systemd` | infrastructure |
+| `conformance` | black-box API test-suite shared by both editions (§17) |
 | `skills` | embedded Claude skill (`skills/backyard/…`) |
 | `templates` | embedded `backyard init` templates |
 
@@ -111,6 +116,28 @@ Hub host:
 | `/__backyard/metrics` | Prometheus (only if `telemetry.metrics` and no `telemetry.metrics_listen`) |
 
 `/__backyard/healthz` and `/readyz` are served on any host without authentication.
+
+### 2.1 SDK context resolution
+
+The server prepends a one-line preamble to every SDK response
+(`backyard.js`/`backyard.mjs`), computed per request:
+
+```js
+globalThis.__BACKYARD__ = {"v":1,"mode":"host","site":"foo","prefix":"/s/","hub":"https://backyard.acme.com"};
+```
+
+`site` is the site the script was requested for (`null` on the hub, or in path mode when
+requested at the root `/__backyard/backyard.js`). The SDK computes its API base as:
+
+1. `globalThis.BACKYARD_CONFIG.apiBase` if a page set it explicitly (escape hatch);
+2. host mode → `<page origin>/__backyard`;
+3. path mode → site from the preamble, else from `location.pathname` matching
+   `^<prefix>([^/]+)/` → `<origin><prefix><site>/__backyard`; no site → `<origin>/__backyard` (hub).
+
+The websocket URL is derived from the API base (`ws(s)://…/__backyard/api/ws`). Pages should
+always include the SDK with the absolute path `/__backyard/backyard.js`; this works in both modes.
+The SDK files in `web/sdk/` are complete standalone files (no build step at serve time) so the
+Go server and the Cloudflare Worker serve byte-identical SDKs (plus the preamble).
 
 ## 3. Static serving
 
@@ -495,6 +522,7 @@ backyard token   create [--name n] [--ttl 720h] | token hash <token>
 backyard skill   install [--global|--project]  install the Claude skill
 backyard mcp                                   MCP server over stdio (for agents)
 backyard config  example | validate [file]
+backyard cloudflare setup [--dir deploy/cloudflare]   provision the Workers edition via wrangler (§16)
 backyard version
 ```
 
@@ -540,3 +568,48 @@ After a direct sync the CLI calls `POST G/sites/{site}/refresh` (best effort).
 `http_request_duration_seconds{area}`, `deploys_total{method,result}`, `db_ops_total{op,result}`,
 `ai_requests_total{model,result}`, `ai_tokens_total{model,direction}`, `ws_connections`,
 `ws_messages_total{dir}`, `warehouse_queries_total{source,result}`.
+
+## 16. Cloudflare edition (free tier)
+
+A TypeScript Cloudflare Worker in `deploy/cloudflare/` implements the **same public contract**
+(§2–§7 URLs, site API, websocket protocol, deploy gateway protocol, SDK preamble) so that the same
+`backyard.js`, CLI, skill and MCP server work unchanged. Inspired by OpenQuick
+(github.com/topmass/openquick). Runs on the Workers **free plan** (Durable Objects with SQLite
+storage are available on free); R2 and paid features are optional.
+
+* **Topology:** one Worker (router, auth, SDK/hub/docs serving, deploy gateway) + one
+  `SiteDO` Durable Object per site (SQLite: site files, manifest, documents, uploads, websocket
+  hub with hibernation) + one `RegistryDO` (site list/metadata, platform-wide counters/quotas).
+* **URLs:** default path mode on `https://<worker>.<account>.workers.dev/s/<site>/`; custom domain
+  in path mode; or host mode with a wildcard route `*.<base_domain>/*` (Universal SSL covers one
+  wildcard level; deeper needs Advanced Certificate Manager). Configured via `vars`.
+* **Storage:** files ≤ `FILE_INLINE_MAX` (default 5 MiB) stored chunked in DO SQLite (chunks <
+  2 MB); larger files go to the optional `R2` binding (`sites/<site>/…`, `uploads/<site>/…`);
+  without R2 the per-file cap is 25 MiB. Deploy uploads use self-hosted upload URLs (§7.3).
+* **Database:** documents in the site DO's SQLite with the exact query semantics of §5.2
+  (shared conformance tests). Realtime is local to the site DO (single instance per site).
+* **AI:** `workers-ai` provider via the `AI` binding (free daily allowance) with configurable
+  aliases (`AI_MODELS` JSON var); optional `anthropic`/`openai`(-compatible) providers via
+  secrets (optionally through Cloudflare AI Gateway). Image generation via Workers AI image
+  models. Embeddings via Workers AI.
+* **Warehouse:** not available on Cloudflare (`501 unsupported`) unless `WAREHOUSE_URL` points
+  to a Backyard Go server's warehouse API (proxy) — optional.
+* **Auth:** `AUTH_MODE` = `none` (anonymous cookie identity; deploys need `DEPLOY_TOKEN` unless
+  `ALLOW_ANONYMOUS_DEPLOY`) or `access` (Cloudflare Access: verify `Cf-Access-Jwt-Assertion`
+  against `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs` with `ACCESS_AUD`; Okta,
+  Entra ID, Google etc. are configured as Access identity providers). Backyard API tokens (§8.3,
+  HS256 with `BACKYARD_SECRET`) and the `/__backyard/auth/cli` browser flow work identically.
+  Access must bypass `/__backyard/api/deploy/*` (service tokens or a Bypass policy) — Terraform
+  in `deploy/terraform/cloudflare` sets this up.
+* **Guardrails (free tier):** per-user/IP daily caps for AI calls, deploys and uploads, and a
+  platform-wide site cap, stored in `RegistryDO`; configurable via `LIMITS` JSON var.
+* **Deploying the platform:** `cd deploy/cloudflare && npm ci && npm run setup` (wrangler login,
+  secrets, optional R2 bucket, deploy, prints the `backyard login` command), or
+  `backyard cloudflare setup` which runs the same script; GitHub Actions example included.
+
+## 17. Cross-edition API conformance
+
+`conformance/` is a black-box HTTP + websocket test-suite (Node 22, `node --test`, no
+dependencies beyond `ws` if needed) run against a base URL (`BACKYARD_URL`, `BACKYARD_TOKEN`). It
+deploys a test site via the gateway protocol and exercises §5–§7. CI runs it against the Go server
+(`backyard serve --dev`) and the Worker (`wrangler dev`).

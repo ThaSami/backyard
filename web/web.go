@@ -1,5 +1,7 @@
-// Package web embeds the browser assets: the client SDK served at
-// /__backyard/backyard.{js,mjs,d.ts} on every host and the hub UI.
+// Package web embeds the browser assets: the client SDK (web/sdk/) served at
+// /__backyard/backyard.{js,mjs,d.ts} on every host and the hub UI (web/hub/).
+// The files are complete and standalone so the Cloudflare Worker can serve
+// identical bytes; the server prepends the per-request preamble (SPEC §2.1).
 package web
 
 import "io/fs"
