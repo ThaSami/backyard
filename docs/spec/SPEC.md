@@ -319,6 +319,80 @@ Clients choose **aliases**, never raw provider model ids, unless `ai.allow_raw_m
   engine); named queries use `@name` placeholders.
 * `GET /warehouse` → `{"sources": [{name, type, description}], "queries": [{name, description, params: [..]}]}`.
 
+### 5.6 JavaScript SDK (`window.backyard`)
+
+Exact public surface (TypeScript notation; `web/sdk/backyard.d.ts` is normative once written).
+All methods return Promises unless noted; failures throw `BackyardError {name:"BackyardError",
+code, status, message, loginUrl?}` with `code` from §5. On `401` with `login_url` the SDK
+redirects the top-level page to it (disable with `backyard.configure({autoLogin:false})`).
+
+```ts
+backyard.ready: Promise<void>                    // resolves when context is resolved (immediate)
+backyard.site: { name: string|null, url: string, apiBase: string, mode: "host"|"path" }
+backyard.configure(opts: { apiBase?: string, autoLogin?: boolean }): void
+backyard.me(): Promise<User>                     // shorthand for backyard.id.me()
+
+// Identity
+backyard.id.me(): Promise<User>                  // cached after first call
+backyard.id.lookup(email: string): Promise<User|null>
+
+// Database
+const posts = backyard.db.collection("posts")   // sync, returns Collection
+await posts.create(data, { id? }) → Doc          // Doc = { id, ...data, _meta }
+await posts.get(id) → Doc|null
+await posts.set(id, data) → Doc                  // create or replace (PUT)
+await posts.update(id, patch) → Doc              // shallow merge; null deletes a key
+await posts.delete(id) → void
+await posts.list({ limit?, offset?, orderBy?: string, order?: "asc"|"desc" }) → Doc[]
+posts.where(field, op, value) → Query            // chainable; ops as in §5.2
+     .where(...).orderBy(field, "desc").limit(20).offset(0)
+await query.get() → Doc[]                        // also: await posts.find(queryObject) → Doc[]
+await query.first() → Doc|null
+const unsubscribe = posts.subscribe({ onCreate?(doc), onUpdate?(doc), onDelete?(id), onChange?(event) })
+const stop = posts.watch(callback: (docs: Doc[]) => void, query?: Query) // live query: calls back with
+                                                 // the full result now and after every change (debounced 50 ms)
+await backyard.db.collections() → string[]
+
+// Files
+await backyard.files.upload(file: File|Blob, { name? }) → FileInfo   // FileInfo = {id,name,url,size,content_type,created_at,created_by}
+await backyard.files.list({ limit?, offset? }) → FileInfo[]
+await backyard.files.get(id) → FileInfo|null
+await backyard.files.delete(id) → void
+
+// AI
+await backyard.ai.chat(input: string | Message[], { model?, system?, maxTokens?, temperature?, json? })
+      → { content: string, model, stop_reason, usage, json?: any }   // json parsed when opts.json
+for await (const chunk of backyard.ai.stream(input, opts)) { chunk.text }   // async iterable; also
+      backyard.ai.stream(input, { ...opts, onText(text) }) and `await stream.done` → final result
+await backyard.ai.image(prompt, { model?, size?, n? }) → { url, content_type, images: [{url,content_type}] }
+await backyard.ai.embed(input: string|string[], { model? }) → number[] | number[][]  // mirrors input shape
+await backyard.ai.models() → { default, models: ModelInfo[] }
+
+// Warehouse
+await backyard.warehouse.query(sql, params?: any[], { source? }) → { rows, columns, row_count, truncated }
+await backyard.warehouse.named(name, params?: object) → { rows, columns, row_count, truncated }
+await backyard.warehouse.sources() → { sources, queries }
+
+// Realtime rooms (websockets)
+const room = backyard.socket.room("lobby", { state?: object })   // sync; joins lazily/automatically
+room.on("message", (data, from) => {})          // from = { cid, user: UserSummary }
+room.on("join" | "leave" | "update", (member) => {})
+room.on("members", (members: Member[]) => {})   // full list (excluding self) after any presence change
+room.members: Member[]                           // current list (excluding self)
+room.self: Member|null
+room.send(data, { to?: cid, echo?: boolean }): void
+room.setState(state: object): void               // replace presence state
+room.updateState(partial: object): void          // shallow-merge presence state
+room.off(event, handler): void
+room.leave(): void
+backyard.socket.connected: boolean
+backyard.socket.on("open" | "close", handler)   // connection status
+```
+
+The SDK keeps one websocket per page, created on first use (subscribe/watch/room), reconnects
+with exponential backoff (0.5 s → 10 s, jitter) and transparently re-subscribes and re-joins rooms
+(with the latest presence state) after reconnecting.
+
 ## 6. Realtime websocket (`GET /__backyard/api/ws`)
 
 JSON text frames, max 64 KiB. Server → client first frame:
@@ -381,6 +455,7 @@ proxy identity is accepted as well (used by the hub's drag-and-drop deploy).
 
 ### 7.2 Sites
 
+* `GET G/me` → `User` (auth required; lets CLIs verify a token)
 * `GET G/sites` → `{"sites": [SiteMeta]}`
 * `GET G/sites/{site}` → `SiteMeta` | 404
 * `GET G/sites/{site}/files` → `{"files": [{"path","size","sha256"?,"updated_at"}]}`
