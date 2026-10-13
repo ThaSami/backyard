@@ -18,7 +18,8 @@ import { DurableObject } from "cloudflare:workers";
 import { getConfig, type Config } from "./config";
 import { randomHex } from "./crypto";
 import { buildQuery, DOC_COLUMNS, type Query } from "./db/query";
-import { formatMicros, MicroClock } from "./db/time";
+import { formatMicros, formatMillisFixed, MicroClock, toFixedMillis } from "./db/time";
+import { canonicalDoc } from "./db/values";
 import { newULID } from "./db/ulid";
 import type { Env } from "./env";
 import { HttpError, badRequest, conflict, fail, internal, notFound, ok, tooLarge, rateLimited, type Result, errorResponse } from "./http";
@@ -134,8 +135,12 @@ interface ConnState {
   summary: UserSummary;
   /** Subscription id (JSON text) → {id value, collection}. */
   subs: Record<string, { id: string | number; collection: string }>;
-  /** Room → presence. */
-  rooms: Record<string, { state: Record<string, unknown>; joined_at: string; joined_us: number }>;
+  /**
+   * Room → presence. joined_at is fixed-width RFC 3339 with milliseconds
+   * (formatMillisFixed), so it orders chronologically as a string; joined_us
+   * is kept for connection state saved by older versions and is not used.
+   */
+  rooms: Record<string, { state: Record<string, unknown>; joined_at: string; joined_us?: number }>;
 }
 
 interface Bucket {
@@ -927,8 +932,12 @@ export class SiteDO extends DurableObject<Env> {
     }
   }
 
-  private checkSize(data: Record<string, unknown>): string {
-    const text = JSON.stringify(data);
+  /**
+   * Validates a document body (canonicalDoc: nesting depth, U+0000, finite
+   * numbers; 400 otherwise) and the size limit; returns the stored JSON text.
+   */
+  private encodeDoc(data: Record<string, unknown>): string {
+    const text = JSON.stringify(canonicalDoc(data));
     const max = this.cfg.limits.max_doc_bytes;
     if (max > 0 && new TextEncoder().encode(text).length > max) {
       throw tooLarge(`document exceeds the maximum size of ${max} bytes`);
@@ -949,7 +958,7 @@ export class SiteDO extends DurableObject<Env> {
   /** POST /db/{c}: creates a document (409 if the id exists). */
   async dbCreate(collection: string, id: string, data: Record<string, unknown>, opts: WriteOptions): Promise<Result<DocWire>> {
     try {
-      const text = this.checkSize(data);
+      const text = this.encodeDoc(data);
       if (id && this.docRow(collection, id)) return fail(conflict("a document with this id already exists"));
       this.checkQuota();
       this.chargeWrite(opts.writer);
@@ -987,7 +996,7 @@ export class SiteDO extends DurableObject<Env> {
   /** PUT /db/{c}/{id}: creates or replaces (version + 1, creation kept). */
   async dbPut(collection: string, id: string, data: Record<string, unknown>, opts: WriteOptions): Promise<Result<{ doc: DocWire; created: boolean }>> {
     try {
-      const text = this.checkSize(data);
+      const text = this.encodeDoc(data);
       const cur = this.docRow(collection, id);
       if (!cur) this.checkQuota();
       this.chargeWrite(opts.writer);
@@ -1028,12 +1037,12 @@ export class SiteDO extends DurableObject<Env> {
       const cur = this.docRow(collection, id);
       if (!cur) return fail(notFound("document not found"));
       const merged = JSON.parse(cur.data) as Record<string, unknown>;
-      for (const [k, v] of Object.entries(patch)) {
+      for (const [k, v] of Object.entries(canonicalDoc(patch))) {
         if (v === null) delete merged[k];
         // Defined, not assigned: a "__proto__" key is data, not the prototype.
         else Object.defineProperty(merged, k, { value: v, enumerable: true, writable: true, configurable: true });
       }
-      const text = this.checkSize(merged);
+      const text = this.encodeDoc(merged);
       this.chargeWrite(opts.writer);
       const now = this.clock.now();
       this.sql.exec(
@@ -1233,6 +1242,10 @@ export class SiteDO extends DurableObject<Env> {
       if (!row) return null;
       st = JSON.parse(row.data) as ConnState;
     }
+    // State saved by an older version may carry a variable-width joined_at.
+    for (const r of Object.values(st.rooms ?? {})) {
+      if (r && typeof r.joined_at === "string") r.joined_at = toFixedMillis(r.joined_at);
+    }
     this.conns.set(ws, st);
     return st;
   }
@@ -1298,10 +1311,14 @@ export class SiteDO extends DurableObject<Env> {
     return { cid: st.cid, user: st.summary, state: r.state, joined_at: r.joined_at };
   }
 
+  /**
+   * The other members of room in the order of the Go edition: by joined_at
+   * (fixed-width, so the string order is chronological), then by cid.
+   */
   private others(room: string, cid: string) {
     return this.sockets()
       .filter((x) => x.st.cid !== cid && x.st.rooms[room])
-      .sort((a, b) => a.st.rooms[room]!.joined_us - b.st.rooms[room]!.joined_us || (a.st.cid < b.st.cid ? -1 : a.st.cid > b.st.cid ? 1 : 0))
+      .sort((a, b) => compareMembers(a.st.rooms[room]!.joined_at, a.st.cid, b.st.rooms[room]!.joined_at, b.st.cid))
       .map((x) => this.member(x.st, room));
   }
 
@@ -1454,8 +1471,7 @@ export class SiteDO extends DurableObject<Env> {
     if (Object.keys(st.rooms).length >= this.cfg.limits.ws_rooms_per_conn) {
       return this.sendError(ws, id, "rate_limited", `too many rooms on this connection (max ${this.cfg.limits.ws_rooms_per_conn})`);
     }
-    const nowMs = Date.now();
-    st.rooms[room] = { state, joined_at: formatMicros(nowMs * 1000), joined_us: this.clock.now() };
+    st.rooms[room] = { state, joined_at: formatMillisFixed(Date.now()) };
     this.save(ws, st);
     const me = this.member(st, room);
     this.send(ws, withID({ t: "joined" }, id, { room, self: me, members: this.others(room, st.cid) }));
@@ -1540,6 +1556,12 @@ export class SiteDO extends DurableObject<Env> {
   override async webSocketError(ws: WebSocket): Promise<void> {
     this.dropConnection(ws);
   }
+}
+
+/** Orders presence members by joined_at (fixed-width RFC 3339), then cid. */
+export function compareMembers(joinedA: string, cidA: string, joinedB: string, cidB: string): number {
+  if (joinedA !== joinedB) return joinedA < joinedB ? -1 : 1;
+  return cidA < cidB ? -1 : cidA > cidB ? 1 : 0;
 }
 
 function withID(base: Record<string, unknown>, id: string | number | undefined, rest: Record<string, unknown>): Record<string, unknown> {

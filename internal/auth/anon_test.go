@@ -59,6 +59,10 @@ func TestAnonymousCookie(t *testing.T) {
 				c.SameSite != http.SameSiteLaxMode || c.Path != "/" || c.MaxAge != int((365*24*time.Hour).Seconds()) {
 				t.Fatalf("cookie = %+v", c)
 			}
+			// The request now carries the cookie as a plain name=value pair.
+			if got, want := r.Header.Get("Cookie"), AnonCookie+"="+c.Value; got != want {
+				t.Fatalf("request Cookie header = %q, want %q", got, want)
+			}
 			// Same request again: same guest, no second cookie.
 			rec2 := httptest.NewRecorder()
 			u2, _ := a.Authenticate(rec2, r)

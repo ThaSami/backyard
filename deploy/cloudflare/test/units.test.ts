@@ -5,15 +5,19 @@ import { extractText } from "../src/ai/workersai";
 import { DEFAULT_LIMITS, normalizeTeam, parseConfig } from "../src/config";
 import { b64urlDecode, decodeAnyBase64 } from "../src/crypto";
 import { buildQuery, normalizeQuery, parseListParams } from "../src/db/query";
-import { formatMicros, MicroClock, parseRFC3339Micros } from "../src/db/time";
+import { formatMicros, formatMillisFixed, MicroClock, parseRFC3339Micros, toFixedMillis } from "../src/db/time";
+import { canonicalDoc, MAX_NESTING_DEPTH } from "../src/db/values";
 import { newULID } from "../src/db/ulid";
 import type { Env } from "../src/env";
+import { REFERENCES, SKILL_MD } from "../src/generated/skills";
+import { HttpError } from "../src/http";
+import { baseURL, docMarkdown, HUB_URL_PLACEHOLDER, localize } from "../src/llms";
 import { validateLoopbackRedirect } from "../src/hub";
 import { contentTypeFor, detectContentType, isActiveContent, normalizeContentType } from "../src/mime";
 import { checkPreconditions, parseRange, serveObject, type Servable } from "../src/object";
 import { sanitizeFileName, validatePath } from "../src/paths";
 import { cleanPath, siteNameError } from "../src/router";
-import { contentDisposition, secondsToMidnight } from "../src/site-do";
+import { compareMembers, contentDisposition, secondsToMidnight } from "../src/site-do";
 import { extractTitle } from "../src/title";
 
 describe("paths and names", () => {
@@ -83,6 +87,43 @@ describe("timestamps and ids", () => {
     expect(formatMicros(1_500_000)).toBe("1970-01-01T00:00:01.5Z");
     expect(formatMicros(1_791_842_930_123_456)).toBe("2026-10-12T22:08:50.123456Z");
     expect(formatMicros(1_791_842_930_120_000)).toBe("2026-10-12T22:08:50.12Z");
+  });
+
+  it("formats presence joined_at with exactly three fractional digits (Go joinedAtLayout)", () => {
+    expect(formatMillisFixed(0)).toBe("1970-01-01T00:00:00.000Z");
+    expect(formatMillisFixed(1_791_842_930_120)).toBe("2026-10-12T22:08:50.120Z");
+    expect(formatMillisFixed(1_791_842_930_100)).toBe("2026-10-12T22:08:50.100Z");
+    expect(formatMillisFixed(1_791_842_930_123.9)).toBe("2026-10-12T22:08:50.123Z");
+    // Fixed width: the string order is the chronological order.
+    const times = [0, 5, 50, 120, 999, 1000, 1001, 59_999, 1_791_842_930_000, 1_791_842_930_001, 1_791_842_930_120, 1_791_842_931_000];
+    const shuffled = [...times].reverse().map(formatMillisFixed);
+    expect(shuffled.sort()).toEqual(times.map(formatMillisFixed));
+    expect(new Set(times.map((t) => formatMillisFixed(t).length))).toEqual(new Set([24]));
+    // State saved by older versions (variable width, offsets) is converted.
+    expect(toFixedMillis("2026-10-12T22:08:50.12Z")).toBe("2026-10-12T22:08:50.120Z");
+    expect(toFixedMillis("2026-10-12T22:08:50Z")).toBe("2026-10-12T22:08:50.000Z");
+    expect(toFixedMillis("2026-10-13T03:38:50.123456+05:30")).toBe("2026-10-12T22:08:50.123Z");
+    expect(toFixedMillis("2026-10-12T22:08:50.120Z")).toBe("2026-10-12T22:08:50.120Z");
+    expect(toFixedMillis("garbage")).toBe("garbage");
+    // Members order by joined_at, then cid (internal/realtime sortMembers).
+    const t1 = formatMillisFixed(1000);
+    const t2 = formatMillisFixed(1001);
+    expect(compareMembers(t1, "c_b", t2, "c_a")).toBeLessThan(0);
+    expect(compareMembers(t1, "c_b", t1, "c_a")).toBeGreaterThan(0);
+    expect(compareMembers(t1, "c_a", t1, "c_a")).toBe(0);
+  });
+
+  it("orders and filters _meta timestamps as integers, not as their variable-width text", () => {
+    // "…50.12Z" sorts after "…50.123Z" as text although it is earlier.
+    expect(formatMicros(1_791_842_930_120_000) > formatMicros(1_791_842_930_123_000)).toBe(true);
+    const q = normalizeQuery(
+      { where: [{ field: "_meta.created_at", op: ">", value: "2026-10-12T22:08:50.12Z" }], orderBy: [{ field: "_meta.updated_at", dir: "desc" }] },
+      1000,
+    );
+    const { sql, params } = buildQuery("c", q);
+    expect(sql).toContain("created_at > ?");
+    expect(sql).toContain("ORDER BY updated_at DESC, id ASC");
+    expect(params).toContain(1_791_842_930_120_000);
   });
 
   it("parses RFC 3339 with offsets and fractions", () => {
@@ -299,5 +340,115 @@ describe("misc", () => {
 
   it("computes the time to the UTC midnight reset", () => {
     expect(secondsToMidnight(Date.UTC(2026, 0, 1, 23, 59, 0))).toBe(60);
+  });
+});
+
+describe("document values (docstore canonical form)", () => {
+  /** levels nested containers (alternating arrays and objects) around "leaf". */
+  const nest = (levels: number): unknown => {
+    let v: unknown = "leaf";
+    for (let i = 0; i < levels; i++) v = i % 2 === 0 ? [v] : { k: v };
+    return v;
+  };
+  const err = (f: () => unknown): HttpError => {
+    try {
+      f();
+    } catch (e) {
+      expect(e).toBeInstanceOf(HttpError);
+      return e as HttpError;
+    }
+    throw new Error("expected a 400");
+  };
+
+  it("allows exactly MAX_NESTING_DEPTH levels (the body is level 1)", () => {
+    expect(MAX_NESTING_DEPTH).toBe(100);
+    const ok = { d: nest(MAX_NESTING_DEPTH - 1), n: 1 };
+    expect(canonicalDoc(ok)).toEqual(ok);
+    const e = err(() => canonicalDoc({ d: nest(MAX_NESTING_DEPTH), n: 1 }));
+    expect(e.status).toBe(400);
+    expect(e.code).toBe("bad_request");
+    expect(e.message).toBe('field "d": nested deeper than 100 levels');
+    expect(canonicalDoc({ x: "[".repeat(1500) })).toEqual({ x: "[".repeat(1500) });
+  });
+
+  it("rejects U+0000 in strings and keys at any depth", () => {
+    expect(err(() => canonicalDoc({ a: "x\u0000y" })).message).toBe('field "a": strings must not contain the NUL character (U+0000)');
+    expect(err(() => canonicalDoc({ a: { b: ["ok", "\u0000"] } })).message).toContain('field "a"');
+    expect(err(() => canonicalDoc({ a: { "k\u0000": 1 } })).message).toContain("NUL");
+    expect(err(() => canonicalDoc({ "k\u0000": 1 })).message).toBe('field name "k\\u0000": strings must not contain the NUL character (U+0000)');
+  });
+
+  it("normalizes numbers and strings like the Go backends", () => {
+    expect(err(() => canonicalDoc({ n: Infinity })).message).toBe('field "n": number Infinity is not valid JSON');
+    expect(err(() => canonicalDoc({ n: [NaN] })).message).toContain("not valid JSON");
+    const out = canonicalDoc({ z: -0, s: "a\ud800b", "\udc00": [undefined, 1], u: undefined, id: "x", _meta: { version: 9 } });
+    expect(Object.is(out.z, 0)).toBe(true);
+    expect(out.s).toBe("a\ufffdb");
+    expect(out["\ufffd"]).toEqual([null, 1]);
+    expect(Object.keys(out)).toEqual(["z", "s", "\ufffd"]);
+    // "__proto__" is data, not the prototype.
+    const proto = canonicalDoc(JSON.parse('{"__proto__": {"x": 1}}') as Record<string, unknown>);
+    expect(Object.keys(proto)).toEqual(["__proto__"]);
+    expect(Object.getPrototypeOf(proto)).toBe(Object.prototype);
+  });
+
+  it("canonicalizes filter operands (PrepareQuery)", () => {
+    const where = (value: unknown, op = "==") => normalizeQuery({ where: [{ field: "s", op, value }] }, 1000).where[0]!.value;
+    expect(err(() => where("a\u0000")).message).toBe('filter on "s": strings must not contain the NUL character (U+0000)');
+    expect(err(() => where(["ok", "\u0000"], "in")).message).toContain("NUL");
+    expect(err(() => where(Infinity)).message).toBe('filter on "s": number Infinity is not valid JSON');
+    expect(err(() => where([1, -Infinity], "not-in")).message).toContain("not valid JSON");
+    expect(Object.is(where(-0), 0)).toBe(true);
+    expect(where("a\udfff")).toBe("a\ufffd");
+    expect(where([-0, "x"], "in")).toEqual([0, "x"]);
+    // Normalizing never changes the caller's query.
+    const raw = { where: [{ field: "s", op: "in", value: [-0] }] };
+    normalizeQuery(raw, 1000);
+    expect(Object.is((raw.where[0]!.value as number[])[0], -0)).toBe(true);
+  });
+});
+
+describe("agent docs", () => {
+  const HUB = "https://hub.acme.com";
+
+  it("localizes documents like skills.Localize", () => {
+    const md = [
+      `Hub: ${HUB_URL_PLACEHOLDER}/docs and ${HUB_URL_PLACEHOLDER}.`,
+      "Site: https://demo.backyard.example.com/ and https://<site>.backyard.example.com/x, wildcard *.backyard.example.com.",
+      "Kept: https://backyard.example.com.evil.org/ and https://x.backyard.example.com-y/.",
+    ].join("\n");
+    expect(localize(md, HUB + "/")).toBe(
+      [
+        `Hub: ${HUB}/docs and ${HUB}.`,
+        "Site: https://demo.hub.acme.com/ and https://<site>.hub.acme.com/x, wildcard *.hub.acme.com.",
+        "Kept: https://backyard.example.com.evil.org/ and https://x.backyard.example.com-y/.",
+      ].join("\n"),
+    );
+    expect(localize(md, "")).toBe(md);
+    // No site subdomains for a hub with a path or an IP address.
+    expect(localize("https://demo.backyard.example.com/", "https://acme.com/backyard")).toBe("https://demo.backyard.example.com/");
+    expect(localize(`${HUB_URL_PLACEHOLDER}/ https://demo.backyard.example.com/`, "http://127.0.0.1:8787")).toBe(
+      "http://127.0.0.1:8787/ https://demo.backyard.example.com/",
+    );
+    expect(localize("https://demo.backyard.example.com/", "http://hub.local:8787")).toBe("http://demo.hub.local:8787/");
+    expect(baseURL("  https://user:pw@hub.acme.com///?q=1#frag  ")).toBe(HUB);
+    expect(baseURL("")).toBe("");
+  });
+
+  it("serves SKILL.md and references by name, with an optional references/ prefix", () => {
+    expect(docMarkdown("skill", HUB)).toBe(localize(SKILL_MD, HUB));
+    expect(docMarkdown("SKILL", HUB)).toBe(localize(SKILL_MD, HUB));
+    expect(docMarkdown("references/skill", HUB)).toBe("");
+    for (const name of Object.keys(REFERENCES)) {
+      const want = localize(REFERENCES[name]!, HUB);
+      expect(docMarkdown(name, HUB), name).toBe(want);
+      expect(docMarkdown(`references/${name}`, HUB), name).toBe(want);
+      expect(docMarkdown(name.toUpperCase(), HUB), name).toBe(want);
+      expect(docMarkdown(name, ""), name).toBe(REFERENCES[name]);
+      if (REFERENCES[name]!.includes(HUB_URL_PLACEHOLDER + "/")) expect(want).not.toContain(HUB_URL_PLACEHOLDER + "/");
+    }
+    for (const bad of ["", "nope", "../api", "references/../api", "references/references/api", "api.md", "a/b", "constructor", "__proto__", "toString"]) {
+      expect(docMarkdown(bad, HUB), bad).toBe("");
+    }
   });
 });

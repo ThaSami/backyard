@@ -970,7 +970,7 @@ func stale(dir *os.Root, name string) bool {
 }
 
 // PresignPut is not supported by the fs backend.
-func (s *Store) PresignPut(_ context.Context, key, _ string, _ time.Duration) (*blob.PresignedRequest, error) {
+func (s *Store) PresignPut(_ context.Context, key string, _ blob.PresignPutOptions, _ time.Duration) (*blob.PresignedRequest, error) {
 	if err := checkKey(key); err != nil {
 		return nil, err
 	}

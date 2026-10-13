@@ -232,10 +232,11 @@ or `rate_limited`, and handle anonymous visitors (`me.anonymous`).
 
 Deploy from CI with a token in `BACKYARD_TOKEN`:
 
-- **Personal token** (acts as you): `backyard token create --name github-actions --ttl 2160h`.
-- **Static token** (acts as `token:<name>`, survives people leaving): generate a random string,
-  run `backyard token hash <token>` and give the admin the hash for `auth.tokens`
-  (`[{name: ci, sha256: <hash>}]`).
+- **Personal token** (acts as you): `backyard token create --name github-actions --ttl 720h`
+  (at most the server's `auth.token_ttl`, 30 days by default; renew it before it expires).
+- **Static token** (acts as `token:<name>`, never expires, survives people leaving): create one
+  with `openssl rand -hex 32 | tee ci-token.txt | backyard token hash --name ci` and give the
+  admin the printed snippet for `auth.tokens` (`[{name: ci, sha256: <hash>}]`).
 
 ```yaml
 # .github/workflows/deploy-site.yml

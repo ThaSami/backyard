@@ -61,7 +61,7 @@ func (a *authenticator) authenticateAnon(w http.ResponseWriter, r *http.Request)
 	if w != nil {
 		c := a.newCookie(AnonCookie, keys.Sign(a.anon.key, []byte(id)), a.cookieDomain, "/", anonCookieTTL)
 		http.SetCookie(w, c)
-		r.AddCookie(&http.Cookie{Name: c.Name, Value: c.Value})
+		r.AddCookie(c) // a request Cookie header carries only name=value
 	}
 	return a.finalize(r.Context(), anonUser(id), srcAnon)
 }

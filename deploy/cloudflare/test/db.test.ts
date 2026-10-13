@@ -160,6 +160,91 @@ describe("database HTTP API", () => {
   });
 });
 
+describe("document validation (docstore.ErrInvalid parity)", () => {
+  /** levels nested containers (alternating arrays and objects) around "leaf". */
+  const nest = (levels: number): unknown => {
+    let v: unknown = "leaf";
+    for (let i = 0; i < levels; i++) v = i % 2 === 0 ? [v] : { k: v };
+    return v;
+  };
+  const errorOf = async (res: Response) => ((await res.json()) as { error: { code: string; message: string } }).error;
+  const put = (site: string, id: string, body: string, method = "PUT") =>
+    call(api(site, `/db/deep/${id}`), { method, headers: apiHeaders(), body });
+
+  it("rejects bodies nested more than 100 levels on every write", async () => {
+    const site = uniqueSite("deep");
+    let res = await create(site, "deep", { id: "ok", d: nest(99), n: 1 });
+    expect(res.status).toBe(201);
+    expect(((await res.json()) as Doc).d).toEqual(nest(99));
+    res = await create(site, "deep", { d: nest(100), n: 1 });
+    expect(res.status).toBe(400);
+    expect(await errorOf(res)).toEqual({ code: "bad_request", message: 'field "d": nested deeper than 100 levels' });
+    expect((await put(site, "ok", JSON.stringify({ d: nest(100) }))).status).toBe(400);
+    expect((await put(site, "ok", JSON.stringify({ x: nest(100) }), "PATCH")).status).toBe(400);
+    // Far deeper than any engine can evaluate: still a clean 400.
+    expect((await put(site, "ok", `{"d":${"[".repeat(5000)}${"]".repeat(5000)}}`)).status).toBe(400);
+    // A string of brackets is not nesting.
+    expect((await create(site, "deep", { id: "brackets", x: "[".repeat(1500), n: 1 })).status).toBe(201);
+    // The stored documents keep the collection queryable.
+    res = await call(api(site, "/db/deep/query"), {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify({ where: [{ field: "n", op: "==", value: 1 }], order_by: [{ field: "d", dir: "desc" }] }),
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { docs: Doc[] }).docs.map((d) => d.id)).toEqual(["ok", "brackets"]);
+    expect(((await (await call(api(site, "/db/deep/ok"))).json()) as Doc)._meta.version).toBe(1);
+  });
+
+  it("rejects U+0000 in strings and keys, and numbers JSON cannot represent", async () => {
+    const site = uniqueSite("nul");
+    for (const body of ['{"a":"x\\u0000y"}', '{"a":{"b":["ok","\\u0000"]}}', '{"a\\u0000":1}', '{"a":{"k\\u0000":1}}', '{"n":1e400}', '{"n":[-1e999]}']) {
+      const res = await call(api(site, "/db/c"), { method: "POST", headers: apiHeaders(), body });
+      expect(res.status, body).toBe(400);
+      expect((await errorOf(res)).message, body).toMatch(/NUL character \(U\+0000\)|is not valid JSON/);
+    }
+    expect((await create(site, "c", { id: "d1", a: "fine" })).status).toBe(201);
+    expect((await put(site, "x", '{"a":"\\u0000"}')).status).toBe(400);
+    let res = await call(api(site, "/db/c/d1"), { method: "PATCH", headers: apiHeaders(), body: '{"a":"\\u0000"}' });
+    expect(res.status).toBe(400);
+    expect(((await (await call(api(site, "/db/c/d1"))).json()) as Doc).a).toBe("fine");
+    expect(((await (await call(api(site, "/db"))).json()) as { collections: string[] }).collections).toEqual(["c"]);
+
+    // Lone surrogates become U+FFFD (as encoding/json decodes them), -0 is 0.
+    res = await call(api(site, "/db/c"), { method: "POST", headers: apiHeaders(), body: '{"id":"d2","s":"a\\ud800b","z":-0}' });
+    expect(res.status).toBe(201);
+    const d2 = (await res.json()) as Doc;
+    expect(d2.s).toBe("a\ufffdb");
+    expect(Object.is(d2.z, 0)).toBe(true);
+
+    // Filter operands are checked like stored values.
+    const q = (body: string) => call(api(site, "/db/c/query"), { method: "POST", headers: apiHeaders(), body });
+    res = await q('{"where":[{"field":"a","op":"==","value":"\\u0000"}]}');
+    expect(res.status).toBe(400);
+    expect((await errorOf(res)).message).toBe('filter on "a": strings must not contain the NUL character (U+0000)');
+    expect((await q('{"where":[{"field":"a","op":"in","value":["x","\\u0000"]}]}')).status).toBe(400);
+    expect((await q('{"where":[{"field":"_meta.created_by","op":"==","value":"\\u0000"}]}')).status).toBe(400);
+    res = await q('{"where":[{"field":"z","op":"==","value":1e400}]}');
+    expect(res.status).toBe(400);
+    expect((await errorOf(res)).message).toBe('filter on "z": number Infinity is not valid JSON');
+    res = await q('{"where":[{"field":"s","op":"==","value":"a\\udfffb"}]}');
+    expect(((await res.json()) as { docs: Doc[] }).docs.map((d) => d.id)).toEqual(["d2"]);
+    res = await q('{"where":[{"field":"z","op":"==","value":-0}]}');
+    expect(((await res.json()) as { docs: Doc[] }).docs.map((d) => d.id)).toEqual(["d2"]);
+  });
+
+  it("validates inside the site object too", async () => {
+    const stub = siteStub(E, uniqueSite("dov"));
+    const r = await stub.dbCreate("c", "x", { a: "\u0000" }, { actor: "t", writer: "t" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatchObject({ status: 400, code: "bad_request" });
+    const deep = await stub.dbPut("c", "x", { d: nest(100) }, { actor: "t", writer: "t" });
+    expect(deep.ok).toBe(false);
+    const ok = unwrap(await stub.dbCreate("c", "y", { z: -0, s: "\udc00" }, { actor: "t", writer: "t" }));
+    expect(ok.s).toBe("\ufffd");
+  });
+});
+
 // --- semantics table (SPEC §5.2), via the site object -----------------------
 
 const FIXTURE: [string, string, Record<string, unknown>][] = [

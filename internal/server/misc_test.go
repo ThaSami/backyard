@@ -40,6 +40,59 @@ func TestWSHandoff(t *testing.T) {
 		{"cross-site wrong scheme", []option{withConfig(func(c *config.Config) { c.Realtime.AllowCrossSiteWS = true })},
 			"https://foo.backyard.test/__backyard/api/ws", "http://bar.backyard.test", "foo",
 			[]string{"https://foo.backyard.test"}},
+		{"cross-site hub", []option{crossSite()},
+			"https://foo.backyard.test/__backyard/api/ws", "https://backyard.test", "foo",
+			[]string{"https://foo.backyard.test", "https://backyard.test"}},
+		{"cross-site on the request's port", []option{crossSite()},
+			"https://foo.backyard.test:8443/__backyard/api/ws", "https://bar.backyard.test:8443", "foo",
+			[]string{"https://foo.backyard.test", "https://foo.backyard.test:8443", "https://bar.backyard.test:8443"}},
+		{"cross-site other port", []option{crossSite()},
+			"https://foo.backyard.test:8443/__backyard/api/ws", "https://bar.backyard.test:9443", "foo",
+			[]string{"https://foo.backyard.test", "https://foo.backyard.test:8443"}},
+		{"cross-site reserved name", []option{crossSite()},
+			"https://foo.backyard.test/__backyard/api/ws", "https://www.backyard.test", "foo",
+			[]string{"https://foo.backyard.test"}},
+		{"cross-site nested host", []option{crossSite()},
+			"https://foo.backyard.test/__backyard/api/ws", "https://a.bar.backyard.test", "foo",
+			[]string{"https://foo.backyard.test"}},
+		{"cross-site lookalike domain", []option{crossSite()},
+			"https://foo.backyard.test/__backyard/api/ws", "https://bar.backyard.test.evil.example", "foo",
+			[]string{"https://foo.backyard.test"}},
+		{"cross-site not an origin", []option{crossSite()},
+			"https://foo.backyard.test/__backyard/api/ws", "https://bar.backyard.test/page?x=1", "foo",
+			[]string{"https://foo.backyard.test"}},
+		{"cross-site user info", []option{crossSite()},
+			"https://foo.backyard.test/__backyard/api/ws", "https://x@bar.backyard.test", "foo",
+			[]string{"https://foo.backyard.test"}},
+		{"cross-site as sent", []option{crossSite()},
+			"https://foo.backyard.test/__backyard/api/ws", "https://Bar.backyard.test.", "foo",
+			[]string{"https://foo.backyard.test", "https://bar.backyard.test", "https://Bar.backyard.test."}},
+		{"public URL host is not base_domain", []option{withConfig(func(c *config.Config) { c.Server.PublicURL = "https://hub.acme.test" })},
+			"https://foo.backyard.test/__backyard/api/ws", "", "foo",
+			[]string{"https://foo.backyard.test"}},
+		{"public URL port", []option{withConfig(func(c *config.Config) { c.Server.PublicURL = "https://backyard.test:8443" })},
+			"https://foo.backyard.test:8443/__backyard/api/ws", "", "foo",
+			[]string{"https://foo.backyard.test:8443"}},
+		{"path mode cross-site hub", []option{pathMode(), crossSite()},
+			"https://backyard.test/s/foo/__backyard/api/ws", "https://backyard.test", "foo",
+			[]string{"https://backyard.test"}},
+		{"path mode cross-site host-mode origin", []option{pathMode(), crossSite()},
+			"https://backyard.test/s/foo/__backyard/api/ws", "https://bar.backyard.test", "foo",
+			[]string{"https://backyard.test"}},
+		{"path mode dev alias", []option{pathMode(), withConfig(func(c *config.Config) {
+			c.Server.Dev = true
+			c.Server.PublicURL = "http://localhost:8080"
+			c.Server.BaseDomain = "localhost"
+		})},
+			"http://127.0.0.1:8080/s/foo/__backyard/api/ws", "", "foo",
+			[]string{"http://localhost:8080", "http://127.0.0.1:8080"}},
+		{"dev host mode cross-site", []option{crossSite(), withConfig(func(c *config.Config) {
+			c.Server.Dev = true
+			c.Server.PublicURL = "http://localhost:8080"
+			c.Server.BaseDomain = "localhost"
+		})},
+			"http://foo.localhost:8080/__backyard/api/ws", "http://bar.localhost:8080", "foo",
+			[]string{"http://foo.localhost:8080", "http://bar.localhost:8080"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -71,6 +124,10 @@ func TestWSHandoff(t *testing.T) {
 	if len(h.hub.wsCalls()) != 0 {
 		t.Fatal("unauthenticated websocket handed off")
 	}
+}
+
+func crossSite() option {
+	return withConfig(func(c *config.Config) { c.Realtime.AllowCrossSiteWS = true })
 }
 
 func scrape(t *testing.T, h *harness) string {

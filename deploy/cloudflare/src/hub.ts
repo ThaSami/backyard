@@ -114,10 +114,11 @@ async function serveHubPage(ctx: RequestContext): Promise<Response> {
     throw notFound("The page you are looking for does not exist.");
   }
   if (p.startsWith("/docs/") && p.endsWith(".md")) {
-    const name = p.slice("/docs/".length, -".md".length);
-    const md = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name) ? docMarkdown(name) : "";
-    if (!md) throw notFound(`no such document: ${name.slice(0, 64)}`);
-    return serveText(ctx, name + ".md", "text/markdown; charset=utf-8", md);
+    // /docs/<name>.md and /docs/references/<name>.md, localized like /llms-full.txt.
+    const rel = p.slice("/docs/".length, -".md".length);
+    const md = docMarkdown(rel, ctx.publicURL);
+    if (!md) throw notFound(`no such document: ${rel.slice(0, 80)}`);
+    return serveText(ctx, rel.slice(rel.lastIndexOf("/") + 1) + ".md", "text/markdown; charset=utf-8", md);
   }
   let name = p.replace(/^\/+/, "");
   if (name === "" || name.endsWith("/")) name += "index.html";

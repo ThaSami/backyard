@@ -11,23 +11,45 @@ run:
 linters:
   default: none
   enable:
+    # Correctness and security.
     - govet
     - staticcheck
     - errcheck
     - ineffassign
     - unused
     - gosec
-    - misspell
-    - revive
     - bodyclose
-    - copyloopvar
-    - durationcheck
     - errorlint
     - rowserrcheck
     - sqlclosecheck
+    - durationcheck
+    - copyloopvar
+    # Low-noise bug finders: []any passed as variadic ...any, Trojan Source
+    # bidi characters, nil error returned after an error check, appends to
+    # slices made with a non-zero length, reassigned package variables of
+    # other packages, contexts re-wrapped inside loops, misspelled //go:
+    # directives, and host:port built with Sprintf (breaks IPv6).
+    - asasalint
+    - bidichk
+    - nilnesserr
+    - makezero
+    - reassign
+    - fatcontext
+    - gocheckcompilerdirectives
+    - nosprintfhostport
+    # Conventions.
+    - revive
+    - misspell
     - unconvert
+    # Every //nolint names its linter and says why.
+    - nolintlint
 
   settings:
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      # Unused directives are reported (allow-unused: false).
+
     govet:
       enable-all: true
       disable:
@@ -140,14 +162,18 @@ linters:
       - common-false-positives
       - std-error-handling
     rules:
-      # Tests may use simpler error handling, fixed test credentials and
-      # plain HTTP clients.
+      # Tests may use simpler error handling, fixed test credentials,
+      # self-signed certificates and short-lived HTTP responses, and need no
+      # doc comments.
       - path: _test\.go
         linters:
           - errcheck
           - gosec
           - bodyclose
           - revive
+      # Shared test helpers (blobtest, servertest, clitest, fakes, ...) are
+      # production-quality code otherwise, but run only against local test
+      # servers.
       - path: internal/.*/(.*test|testutil|fake.*)/
         linters:
           - gosec

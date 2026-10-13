@@ -709,12 +709,8 @@ func (p *Provider) Image(ctx context.Context, req ai.ImageRequest) (*ai.ImageRes
 		if req.User != "" && p.sendUser() {
 			body.User = req.User
 		}
-		resp, err := p.post(ctx, p.endpoint("images/generations", req.Model), body)
-		if err != nil {
-			return nil, err
-		}
 		var ir imagesResponse
-		if err := httpx.DecodeJSON(p.name, resp, &ir); err != nil {
+		if err := p.postJSON(ctx, p.endpoint("images/generations", req.Model), body, &ir); err != nil {
 			return nil, err
 		}
 		if len(ir.Data) == 0 {
@@ -899,12 +895,8 @@ func (p *Provider) Embed(ctx context.Context, req ai.EmbedRequest) (*ai.EmbedRes
 	if req.User != "" && p.sendUser() {
 		body.User = req.User
 	}
-	resp, err := p.post(ctx, p.endpoint("embeddings", req.Model), body)
-	if err != nil {
-		return nil, err
-	}
 	var er embedResponse
-	if err := httpx.DecodeJSON(p.name, resp, &er); err != nil {
+	if err := p.postJSON(ctx, p.endpoint("embeddings", req.Model), body, &er); err != nil {
 		return nil, err
 	}
 	if len(er.Data) != len(req.Input) {
@@ -960,7 +952,8 @@ func (p *Provider) endpoint(op, model string) string {
 		"?api-version=" + url.QueryEscape(p.apiVersion)
 }
 
-func (p *Provider) post(ctx context.Context, endpoint string, body any) (*http.Response, error) {
+// newRequest builds an authorized JSON POST request to endpoint.
+func (p *Provider) newRequest(ctx context.Context, endpoint string, body any) (*http.Request, error) {
 	req, err := httpx.NewJSONRequest(ctx, endpoint, body)
 	if err != nil {
 		return nil, err
@@ -971,7 +964,27 @@ func (p *Provider) post(ctx context.Context, endpoint string, body any) (*http.R
 	if b, ok := body.(chatRequest); ok && b.Stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
+	return req, nil
+}
+
+// post sends a request and returns the open response; the caller closes the
+// body. Non-2xx responses are returned as *ai.UpstreamError.
+func (p *Provider) post(ctx context.Context, endpoint string, body any) (*http.Response, error) {
+	req, err := p.newRequest(ctx, endpoint, body)
+	if err != nil {
+		return nil, err
+	}
 	return httpx.Do(p.client, p.name, req)
+}
+
+// postJSON sends a non-streaming request and decodes the JSON response into
+// out, always closing the response body.
+func (p *Provider) postJSON(ctx context.Context, endpoint string, body, out any) error {
+	req, err := p.newRequest(ctx, endpoint, body)
+	if err != nil {
+		return err
+	}
+	return httpx.DoJSON(p.client, p.name, req, out)
 }
 
 func (p *Provider) authorize(ctx context.Context, req *http.Request) error {

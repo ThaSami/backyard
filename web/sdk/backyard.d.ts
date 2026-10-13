@@ -134,7 +134,7 @@ declare namespace Backyard {
 
   /** The signed-in person (or an anonymous guest when the server runs with `auth.mode: none`). */
   interface User {
-    /** Stable id: lowercased email, else `"sub:<issuer-sub>"`, else `"anon:<hex>"` for guests. */
+    /** Stable id: lowercased email, else `"sub:<issuer-sub>"`, `"token:<name>"` for static tokens, or `"anon:<hex>"` for guests. */
     id: string;
     email?: string;
     /** Display name (`"Guest 1a2b"` for anonymous users). */
@@ -378,6 +378,9 @@ declare namespace Backyard {
     created_by: string;
   }
 
+  /** An array of files with a non-enumerable `hasMore` flag (more files exist past `limit`). */
+  type FileInfoList = FileInfo[] & { readonly hasMore: boolean };
+
   interface FilesAPI {
     /**
      * Uploads a file (multipart, default limit 100 MiB). `name` overrides the
@@ -387,8 +390,8 @@ declare namespace Backyard {
      * ```
      */
     upload(file: Blob | File, options?: { name?: string; signal?: AbortSignal }): Promise<FileInfo>;
-    /** Lists uploads, newest first. */
-    list(options?: { limit?: number; offset?: number }): Promise<FileInfo[]>;
+    /** Lists uploads, newest first (default 100 per page). */
+    list(options?: { limit?: number; offset?: number }): Promise<FileInfoList>;
     /** File metadata, or `null` if unknown. */
     get(id: string): Promise<FileInfo | null>;
     delete(id: string): Promise<void>;
@@ -463,19 +466,35 @@ declare namespace Backyard {
     abort(): void;
   }
 
+  /** A generated image, stored as a site file (see {@link FilesAPI}). */
+  interface GeneratedImage {
+    /** File id (usable with `backyard.files.get/delete`). */
+    id: string;
+    /** Site-relative URL serving the bytes, usable directly in `<img src>`. */
+    url: string;
+    content_type: string;
+  }
+
   interface ImageResult {
+    /** File id of the first image. */
+    id: string;
     /** URL of the first image (stored as a site file). */
     url: string;
     content_type: string;
+    /** The model alias that generated the images. */
+    model?: string;
     /** All generated images. */
-    images: Array<{ url: string; content_type: string }>;
+    images: GeneratedImage[];
   }
 
   interface ModelInfo {
     /** Alias to pass as `model`. */
     name: string;
-    kind: "chat" | "image" | "embed" | (string & {});
+    /** What the alias is for: `chat` (chat/stream), `image` (image) or `embedding` (embed). */
+    kind: "chat" | "image" | "embedding" | (string & {});
     provider: string;
+    /** Provider model id (only when the server exposes model ids). */
+    model?: string;
     description?: string;
   }
 
@@ -517,7 +536,7 @@ declare namespace Backyard {
 
   interface WarehouseInfo {
     sources: Array<{ name: string; type: string; description?: string }>;
-    queries: Array<{ name: string; description?: string; params: string[] }>;
+    queries: Array<{ name: string; description?: string; params: string[]; source?: string }>;
   }
 
   /**
@@ -585,7 +604,7 @@ declare namespace Backyard {
    */
   interface Room<S extends Data = Data> {
     readonly name: string;
-    /** The other members (excluding yourself), oldest first. Replaced (never mutated) on every change. */
+    /** The other members (excluding yourself), oldest first (by `joined_at`, then `cid`). Replaced (never mutated) on every change. */
     readonly members: Member<S>[];
     /** Your own membership once joined, else `null`. */
     readonly self: Member<S> | null;
@@ -603,7 +622,11 @@ declare namespace Backyard {
     on(event: "join" | "leave" | "update", handler: (member: Member<S>) => void): () => void;
     /** The full member list (excluding yourself) after any presence change. */
     on(event: "members", handler: (members: Member<S>[]) => void): () => void;
-    /** The server rejected joining (e.g. too many rooms, invalid state). */
+    /**
+     * The server rejected joining (e.g. too many rooms), a message (e.g. too
+     * large, unknown `to`) or a state update (e.g. state over 8 KiB). Without
+     * a handler these errors go to `socket.on("error")`, else to the console.
+     */
     on(event: "error", handler: (error: BackyardError) => void): () => void;
     off(event: "message" | "join" | "leave" | "update" | "members" | "error", handler: (...args: any[]) => void): void;
     /** Broadcasts `data` (any JSON) to the room; queued while (re)connecting. Synchronous. */
@@ -631,7 +654,7 @@ declare namespace Backyard {
     /** Connection status. `"open"` fires after every (re)connect, `"close"` after every disconnect. */
     on(event: "open", handler: (info: { cid: string; user: User }) => void): () => void;
     on(event: "close", handler: (info: { code?: number; reason?: string }) => void): () => void;
-    /** Realtime errors not tied to a subscription or room (e.g. rate limiting). */
+    /** Realtime errors not tied to a subscription or room (e.g. rate limiting), and room errors without a room `"error"` handler. */
     on(event: "error", handler: (error: BackyardError) => void): () => void;
     off(event: "open" | "close" | "error", handler: (...args: any[]) => void): void;
     /** Opens the shared websocket even without rooms or subscriptions (it is otherwise created on first use). */

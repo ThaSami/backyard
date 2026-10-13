@@ -62,6 +62,7 @@ Go packages (module `github.com/thasami/backyard`):
 | `internal/sites` | site names, metadata, manifests, registry |
 | `internal/deploy` | deploy gateway (server) + Go client + Lambda adapter |
 | `internal/ratelimit` | token buckets |
+| `internal/keys` | per-purpose keys derived from `server.secret` (§8.3) |
 | `internal/server` | HTTP: host routing, static serving, APIs, hub |
 | `internal/app` | wiring: config → components → `http.Handler` |
 | `internal/cli`, `internal/clientconfig`, `internal/mcpserver` | CLI commands, local CLI config, MCP server |
@@ -81,8 +82,15 @@ Go packages (module `github.com/thasami/backyard`):
 * **Path mode** (`server.url_mode: path`, for environments without wildcard DNS/TLS): site `foo`
   at `https://<base_domain>/s/foo/`. Sites then share an origin (documented trade-off).
 * Request host is taken from `Host` (or `X-Forwarded-Host` only when the peer is in
-  `server.trusted_proxies`). Port is ignored for matching.
+  `server.trusted_proxies`). Port is ignored for matching. Any other host → `404` ("unknown
+  host").
+* **Dev mode** (`server.dev`): additionally, a request without a `Host`, or whose host is an IP
+  literal, `localhost` or a `*.localhost` name that is not a site host, reaches the hub. Every
+  other unknown name stays a `404`, so a DNS-rebinding page (`evil.example → 127.0.0.1`) cannot
+  use a local dev server as its own origin.
 * Reserved path prefix on **every** host: `/__backyard/`. Site files can never shadow it.
+* Non-canonical paths (`//`, `/./`, `/../`) are redirected to the cleaned path (`301`, GET/HEAD)
+  or rejected (`400`) before routing.
 
 Site host (`foo.<base>` or `/s/foo` prefix):
 
@@ -103,19 +111,22 @@ Hub host:
 |---|---|
 | `/` | hub UI: site directory/search, drag-and-drop deploy, CLI setup instructions |
 | `/docs` | API docs (renders `skills/backyard/references/api.md`) |
+| `/docs/skill.md`, `/docs/<ref>.md`, `/docs/references/<ref>.md` | the skill documents as `text/markdown` |
 | `/llms.txt`, `/llms-full.txt` | agent-oriented docs (SKILL.md; SKILL.md + all references) |
 | `/__backyard/backyard.{js,mjs,d.ts}` | SDK (hub UI uses it too) |
 | `/__backyard/api/info` | server info (§7.1, same as deploy `info`) |
 | `/__backyard/api/me` | current user |
 | `/__backyard/api/sites` | site list (`{sites:[SiteMeta]}`) |
-| `/__backyard/api/tokens` | `POST` mint a personal API token (`{name, ttl_hours}` → `{token, expires_at}`) |
+| `/__backyard/api/tokens` | `POST` mint a personal API token (§8.3) |
 | `/__backyard/api/deploy/...` | embedded deploy gateway (§7) |
 | `/__backyard/auth/{login,callback,logout,cli}` | auth flows (§8) |
 | `/__backyard/healthz` | liveness `200 ok` (no auth) |
-| `/__backyard/readyz` | readiness: pings db + blob (no auth) |
-| `/__backyard/metrics` | Prometheus (only if `telemetry.metrics` and no `telemetry.metrics_listen`) |
+| `/__backyard/readyz` | readiness: pings db + blob; `503 not ready: <checks>` on failure (no auth) |
+| `/__backyard/metrics` | Prometheus, **authenticated** (only if `telemetry.metrics` and no `telemetry.metrics_listen`) |
 
-`/__backyard/healthz` and `/readyz` are served on any host without authentication.
+`/__backyard/healthz` and `/readyz` are served on any host without authentication. Hub pages and
+docs require authentication like sites; the SDK files, `/__backyard/auth/*`,
+`/__backyard/api/info` and the deploy gateway (which authenticates by itself) do not.
 
 ### 2.1 SDK context resolution
 
@@ -154,8 +165,15 @@ Blob keys: `sites/<site>/<path>` (see §9). For request path `p` (URL-decoded, c
 Headers: `Content-Type` from extension (fallback `application/octet-stream`; `text/*` get
 `; charset=utf-8`), `ETag` (blob etag or size+mtime hash), `Last-Modified`, conditional GET
 (304), `Cache-Control: no-cache` (sites are overwritten in place), `X-Content-Type-Options:
-nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`. **No** `X-Frame-Options` (embedding
-sites in sites is a feature). `HEAD` supported. Range requests supported.
+nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `X-Request-Id`. **No**
+`X-Frame-Options` (embedding sites in sites is a feature). `HEAD` supported. Range requests
+supported. Methods other than GET/HEAD → `405`.
+
+Uploaded files (`/__backyard/files/{id}/{name}`, §5.3) are authenticated like site files and
+served with `Content-Disposition: inline; filename=…` and `Cache-Control: private, no-cache`.
+Active content — `text/html`, `application/xhtml+xml`, `image/svg+xml`, `text/xml`,
+`application/xml`, `*+xml` — additionally gets `Content-Security-Policy: sandbox`, so an
+uploaded document can never run script with the site's origin.
 
 A small in-memory LRU cache (`storage.cache_bytes`, `storage.cache_ttl`) fronts blob reads for
 objects ≤ 1 MiB.
@@ -186,7 +204,8 @@ objects ≤ 1 MiB.
   per user per 10 min per instance) so `GET /users/{email}` can resolve people who have used
   Backyard.
 * `auth.mode: none`: anonymous user `{id: "anon:<16 hex>", name: "Guest <4 hex>", anonymous:
-  true}` keyed by the `backyard_anon` cookie (Domain `.<base_domain>`, 1 year).
+  true}` keyed by the signed `backyard_anon` cookie (1 year; `Domain` as in §8.3). Static-token
+  users are `{id: "token:<name>"}`; neither kind is recorded in the user cache.
 
 ## 5. Site API (`/__backyard/api`, site-scoped)
 
@@ -201,6 +220,14 @@ Common rules:
   Otherwise `403 forbidden`. The SDK always sends the header.
 * `401` responses include `"login_url"` inside `error` when a browser login is possible.
 * Rate limits (§11) return `429` with `Retry-After`.
+* Unknown endpoints → `404 not_found`; a known path with the wrong method → `405` with code
+  `bad_request` and an `Allow` header. A feature that is not configured (AI, warehouse,
+  realtime, tokens) → `501 unsupported`.
+* Timestamps are RFC 3339 strings in UTC, formatted like Go's `time.RFC3339Nano` (fractional
+  seconds without trailing zeros, e.g. `2026-01-02T03:04:05.12Z`). Document timestamps
+  (`_meta.created_at`/`updated_at`, `FileInfo.created_at`) have **microsecond** precision on
+  every backend; because the fraction has a variable width they do not sort as strings — the
+  server compares them chronologically (§5.2). Presence `joined_at` uses a fixed width (§6).
 
 ### 5.1 Identity
 
@@ -223,8 +250,10 @@ Wire shape of a document is **flattened**:
 ```
 
 On write, the body is the plain data object. Keys `id` and `_meta` in a write body are not
-stored as data (`id` is used as the document id on create / must match on put). Max document size
-`database.max_doc_bytes` (default 256 KiB) of JSON data.
+stored as data (`id` is used as the document id on create / must match on put). `_meta.version`
+starts at 1 and every write (PUT, PATCH) increments it. Max document size
+`database.max_doc_bytes` (default 256 KiB) of JSON data; a larger document, or a create that would
+exceed `database.max_docs_per_site`, fails with `413 too_large`.
 
 | Method & path | Body | Result |
 |---|---|---|
@@ -247,17 +276,29 @@ Query:
 ```
 
 * `field` is a dot path into user data (`author.name`); segments match
-  `^[A-Za-z_][A-Za-z0-9_-]{0,63}$`, max depth 8. System fields: `id`, `_meta.created_at`,
-  `_meta.updated_at`, `_meta.created_by`, `_meta.updated_by`.
+  `^[A-Za-z_][A-Za-z0-9_-]{0,63}$`, max depth 8. System fields: `id` (string),
+  `_meta.created_at`, `_meta.updated_at` (timestamps), `_meta.created_by`, `_meta.updated_by`
+  (strings) and `_meta.version` (number).
 * ops: `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`, `not-in` (value = array of ≤ 30 scalars),
   `contains` (field is an array containing the scalar value).
 * Values are JSON scalars (string, number, boolean, null). **Comparisons only match values of the
-  same JSON type** (`"3"` never equals `3`; `<` on a string field with a number value matches
-  nothing). A missing field never matches `==`, `!=`, `<`…`>=`, `in`, `not-in`, `contains`;
-  `== null` matches explicit `null` only. `!=`/`not-in` require the field to exist.
-* Ordering within a type: numbers numerically, strings by byte order, `false < true`. Missing /
-  `null` values sort **first** ascending and **last** descending. Mixed-type ordering is
-  unspecified. Ties are broken by `id` ascending. Default order: `_meta.created_at asc, id asc`.
+  same JSON type**, for every operator: `"3"` never equals `3`, `true` never equals `1`, `<` on a
+  string field with a number value matches nothing.
+  * `!=` matches when the field exists, has the value's type and differs from it — so
+    `!= null` matches **nothing**, and `!= 2` does not match `"2"` or a missing field.
+  * `not-in` matches when the field is `!=` every listed value (and hence has the same type as
+    each); `in` when it equals any of them.
+  * A missing field never matches any operator. `== null` matches an explicit `null` only;
+    `<= null` / `>= null` match an explicit `null`; `< null` / `> null` match nothing.
+  * `contains` matches an array field with an element of the value's type equal to it.
+  * The timestamp fields compare chronologically against RFC 3339 string values (truncated to
+    microseconds); any other value for them matches nothing.
+* Ordering: values are ranked across types as missing/null < boolean < number < string < array
+  < object, then within a type numbers numerically, strings by byte order, `false < true`
+  (arrays and objects tie). Descending order reverses the whole comparison, so missing/`null`
+  sort **first** ascending and **last** descending. Ties are broken by `id` ascending. Default
+  order: `_meta.created_at asc, id asc`. `GET /db/{c}` also accepts
+  `orderBy=field[,field2]&order=asc|desc`.
 * `limit` default 100, max `database.max_list` (default 1000). `has_more` true if more matched.
 * Every successful write publishes a realtime event (§6).
 
@@ -266,14 +307,17 @@ Query:
 | Method & path | Body | Result |
 |---|---|---|
 | `POST /files` | `multipart/form-data`, field `file` (+ optional `name`) | `201` FileInfo |
-| `GET /files?limit=&offset=` | | `{"files": [FileInfo]}` newest first |
+| `GET /files?limit=&offset=` | | `{"files": [FileInfo], "has_more": bool}` newest first |
 | `GET /files/{id}` | | FileInfo \| 404 |
 | `DELETE /files/{id}` | | `204` |
 
 `FileInfo = {id, name, url, size, content_type, created_at, created_by}`; `url` is the
 site-relative path `/__backyard/files/{id}/{urlescaped name}` (path mode: prefixed with
-`/s/{site}`). Max size `files.max_upload_bytes` (default 100 MiB). Bytes stored at blob key
-`uploads/<site>/<id>/<name>`; metadata in the system collection `_files`.
+`/s/{site}`). `name` is sanitized (base name only, no control or reserved characters). `limit`
+defaults to 100, max `database.max_list`. Max size `files.max_upload_bytes` (default 100 MiB;
+larger → `413 too_large`). Bytes stored at blob key `uploads/<site>/<id>/<name>`; metadata in the
+system collection `_files`. Uploads count against `ratelimit.uploads_per_minute`; deletes
+against `db_writes_per_minute`. Serving rules: §3.
 
 ### 5.4 AI
 
@@ -293,15 +337,32 @@ site-relative path `/__backyard/files/{id}/{urlescaped name}` (path mode: prefix
 * non-stream → `{"content": "…", "model": "smart", "stop_reason": "end_turn", "usage": {"input_tokens": 12, "output_tokens": 40}}`
 * `stream: true` → `text/event-stream`; each event is one `data: <json>\n\n` line:
   `{"type":"text","text":"…"}` (repeated), then `{"type":"done","model":…,"stop_reason":…,"usage":{…}}`,
-  or `{"type":"error","error":{"code":…,"message":…}}`.
+  or `{"type":"error","error":{"code":…,"message":…}}`. While the model is silent the server
+  sends SSE comment lines `: ping` (every 15 s) to keep proxies from timing out; clients must
+  ignore lines starting with `:`.
 * `stop_reason` normalized to: `end_turn`, `max_tokens`, `stop_sequence`, `refusal`, `other`.
+* Image parts: `data` (base64, or a `data:` URL) with `media_type`, or `url` — a `data:` URL or an
+  **absolute public** http(s) URL. URLs are passed to providers that fetch them (OpenAI, Azure
+  OpenAI, the first-party Claude API) or downloaded by an SSRF-guarded fetcher (public
+  addresses only); a site-relative `/__backyard/files/…` URL is rejected. Inline images ≤ 20 MiB
+  each, downloaded images ≤ 64 MiB per request.
+* `max_tokens` is capped by `ai.max_tokens` and a smaller per-alias `max_tokens`; without one
+  the request gets min(4096, cap). `model` in responses is always the alias. An unknown alias →
+  `404 not_found`; an alias of the wrong kind → `400 bad_request`; AI not configured → `501
+  unsupported`; provider failures → `502`/`504 upstream_error` (a provider throttling the
+  server → `429` with `Retry-After` when known, else `503`).
 
-`POST /ai/image` `{prompt, model?, size?: "1024x1024", n?: 1}` → `{"images": [{"url": "/__backyard/files/…", "content_type": "image/png"}]}` (images are stored as site files).
+`POST /ai/image` `{prompt, model?, size?: "1024x1024", n?: 1}` →
+`{"model": "image", "images": [{"id": "01J…", "url": "/__backyard/files/01J…/image-1.png", "content_type": "image/png"}]}`.
+Images are stored as site files (`id` is the file id; they appear in `GET /files`).
 
-`POST /ai/embed` `{input: string | string[], model?}` → `{"model": "embed", "embeddings": [[…], …]}`.
+`POST /ai/embed` `{input: string | string[], model?}` →
+`{"model": "embed", "embeddings": [[…], …], "usage": {"input_tokens": 8, "output_tokens": 0}}` —
+one vector per input string (a single string yields one vector).
 
-`GET /ai/models` → `{"default": "smart", "models": [{"name": "smart", "kind": "chat", "provider": "anthropic", "description": "…"}]}`
-(underlying provider model ids are exposed only if `ai.expose_model_ids`).
+`GET /ai/models` → `{"default": "smart", "models": [ModelInfo]}` with
+`ModelInfo = {name, kind: "chat"|"image"|"embedding", provider, model?, description?}`; `model`
+(the provider model id) is present only if `ai.expose_model_ids`.
 
 Clients choose **aliases**, never raw provider model ids, unless `ai.allow_raw_models` is true
 (then `"provider/model-id"` is accepted).
@@ -317,11 +378,18 @@ Clients choose **aliases**, never raw provider model ids, unless `ai.allow_raw_m
   (after comments/whitespace) unless `warehouse.allow_any_statement`. Postgres sources run in a
   `READ ONLY` transaction. Positional params use `?` placeholders in raw SQL (translated per
   engine); named queries use `@name` placeholders.
-* `GET /warehouse` → `{"sources": [{name, type, description}], "queries": [{name, description, params: [..]}]}`.
+* `GET /warehouse` → `{"sources": [{name, type, description}], "queries": [{name, description, params: [..], source}]}`.
+* Errors: no warehouse configured → `501 unsupported`; raw SQL disabled or statement rejected →
+  `403 forbidden`; unknown source or named query → `404 not_found`; missing/unknown named
+  parameters or a placeholder/param count mismatch → `400 bad_request`; engine failures and
+  timeouts → `502`/`504 upstream_error`. Results are capped at `warehouse.max_rows` (then
+  `truncated: true`) and bounded by `warehouse.timeout`.
 
 ### 5.6 JavaScript SDK (`window.backyard`)
 
-Exact public surface (TypeScript notation; `web/sdk/backyard.d.ts` is normative once written).
+Public surface (TypeScript notation; `web/sdk/backyard.d.ts` is normative and also declares the
+optional extras: `signal` options, `ChatStream.abort()`/`.text`, `room.on("error")`,
+`socket.cid`/`.user`/`.connect()`/`.disconnect()`/`.on("error")`, `onError` callbacks).
 All methods return Promises unless noted; failures throw `BackyardError {name:"BackyardError",
 code, status, message, loginUrl?}` with `code` from §5. On `401` with `login_url` the SDK
 redirects the top-level page to it (disable with `backyard.configure({autoLogin:false})`).
@@ -344,9 +412,10 @@ await posts.set(id, data) → Doc                  // create or replace (PUT)
 await posts.update(id, patch) → Doc              // shallow merge; null deletes a key
 await posts.delete(id) → void
 await posts.list({ limit?, offset?, orderBy?: string, order?: "asc"|"desc" }) → Doc[]
-posts.where(field, op, value) → Query            // chainable; ops as in §5.2
+posts.where(field, op, value) → Query            // chainable; ops as in §5.2 (SDK aliases: = === !== <> array-contains "not in")
      .where(...).orderBy(field, "desc").limit(20).offset(0)
 await query.get() → Doc[]                        // also: await posts.find(queryObject) → Doc[]
+                                                 // arrays from list/find/query.get carry a non-enumerable hasMore
 await query.first() → Doc|null
 const unsubscribe = posts.subscribe({ onCreate?(doc), onUpdate?(doc), onDelete?(id), onChange?(event) })
 const stop = posts.watch(callback: (docs: Doc[]) => void, query?: Query) // live query: calls back with
@@ -355,7 +424,7 @@ await backyard.db.collections() → string[]
 
 // Files
 await backyard.files.upload(file: File|Blob, { name? }) → FileInfo   // FileInfo = {id,name,url,size,content_type,created_at,created_by}
-await backyard.files.list({ limit?, offset? }) → FileInfo[]
+await backyard.files.list({ limit?, offset? }) → FileInfo[]                // + non-enumerable hasMore
 await backyard.files.get(id) → FileInfo|null
 await backyard.files.delete(id) → void
 
@@ -364,7 +433,7 @@ await backyard.ai.chat(input: string | Message[], { model?, system?, maxTokens?,
       → { content: string, model, stop_reason, usage, json?: any }   // json parsed when opts.json
 for await (const chunk of backyard.ai.stream(input, opts)) { chunk.text }   // async iterable; also
       backyard.ai.stream(input, { ...opts, onText(text) }) and `await stream.done` → final result
-await backyard.ai.image(prompt, { model?, size?, n? }) → { url, content_type, images: [{url,content_type}] }
+await backyard.ai.image(prompt, { model?, size?, n? }) → { id, url, content_type, model?, images: [{id,url,content_type}] }
 await backyard.ai.embed(input: string|string[], { model? }) → number[] | number[][]  // mirrors input shape
 await backyard.ai.models() → { default, models: ModelInfo[] }
 
@@ -398,7 +467,9 @@ with exponential backoff (0.5 s → 10 s, jitter) and transparently re-subscribe
 JSON text frames, max 64 KiB. Server → client first frame:
 `{"t":"hello","cid":"c_8f3a…","user":{User}}`.
 
-Client → server (`id` is an optional client correlation id echoed in `ack`/`joined`/`error`):
+Client → server (`id` is an optional client correlation id echoed in `ack`/`joined`/`error`;
+as a compatible extension, `leave`, `state` and `send` frames that carry an `id` are
+acknowledged with `{"t":"ack","id"}` on success):
 
 | Frame | Meaning |
 |---|---|
@@ -420,10 +491,22 @@ Server → client:
 | `{"t":"error","id"?:…,"error":{"code","message"}}` | error |
 
 `Member = {"cid","user":UserSummary,"state":{…},"joined_at":RFC3339}`;
-`UserSummary = {id, name, email, avatar_url}`. Room names `^[A-Za-z0-9_\-:.]{1,128}$`.
-Limits: 50 rooms & 100 subscriptions per connection; 60 msgs/s sustained (burst 120) per
-connection; presence state ≤ 8 KiB. Server pings every 25 s; idle connections without pong for
-60 s are closed.
+`UserSummary = {id, name, email, avatar_url}`. `joined_at` has a fixed width of exactly three
+fractional digits (`2026-01-02T03:04:05.120Z`) so members order correctly as strings; `members`
+lists are sorted by `joined_at`, then `cid`. Room names `^[A-Za-z0-9_\-:.]{1,128}$`.
+
+Errors never close the connection: invalid frames are answered with an `error` frame (§5 codes:
+`bad_request`, `forbidden`, `not_found` — e.g. `state`/`send` for a room not joined or `to` an
+unknown member —, `too_large`, `rate_limited`, `internal`). Frames far above the size limit close
+the connection (1009); clients that cannot keep up with their outbound queue are closed (1008).
+Limits (`realtime.*`): 50 rooms & 100 subscriptions per connection; 60 msgs/s sustained (burst
+120) per connection; frames ≤ 64 KiB; presence state ≤ 8 KiB; 50 connections per user (more are
+refused with HTTP `429` before the upgrade). Server pings every 25 s; idle connections without
+pong for 60 s are closed. `realtime.disabled` → `GET /ws` answers `501 unsupported`.
+
+Origin check: a browser `Origin` must be the site's own origin (host mode) or the hub origin
+(path mode); with `realtime.allow_cross_site_ws` the hub and any site of the same server are
+allowed too.
 
 Multi-instance: every instance publishes to the pub/sub broker on topics
 `rt.<site>.db` and `rt.<site>.room.<room>`; presence is gossiped (join/leave/update/heartbeat
@@ -444,18 +527,25 @@ proxy identity is accepted as well (used by the hub's drag-and-drop deploy).
   "public_url": "https://backyard.acme.com", "base_domain": "backyard.acme.com", "url_mode": "host",
   "gateway_url": "https://…/__backyard/api/deploy",
   "auth": { "mode": "oidc", "cli_login_url": "https://backyard.acme.com/__backyard/auth/cli",
-            "device": { "issuer": "https://acme.okta.com/oauth2/default", "client_id": "0oa…", "scopes": ["openid","profile","email","offline_access"] } },
+            "device": { "issuer": "https://acme.okta.com/oauth2/default", "client_id": "0oa…", "scopes": ["openid","profile","email","offline_access"] },
+            "anonymous_deploy": false },
   "storage": { "type": "s3", "bucket": "acme-backyard", "prefix": "", "region": "us-east-1" },
-  "methods": ["api", "s3"], "rsync_target": "",
+  "methods": ["api", "s3"],
   "limits": { "max_site_bytes": 524288000, "max_files": 10000, "max_file_bytes": 104857600 } }
 ```
 
 `storage` reveals only what direct-sync clients need (`type`, `bucket`/`container`, `account`,
-`prefix`, `region`), and only if `deploy.expose_storage` (default true).
+`prefix`, `region`), and only if `deploy.expose_storage` (default true). `auth.cli_login_url` is
+present in the `oidc`, `iap`, `alb` and `header` modes; `auth.device` whenever
+`auth.oidc.issuer` and `auth.oidc.device_client_id` are set (in any mode);
+`auth.anonymous_deploy` (bool) is true when deploys need no token (`auth.mode: none` +
+`deploy.allow_anonymous`). `gateway_url` is `deploy.gateway_url` when set. `rsync_target` is
+omitted when empty. The Cloudflare edition adds `"edition": "cloudflare"`.
 
 ### 7.2 Sites
 
-* `GET G/me` → `User` (auth required; lets CLIs verify a token)
+* `GET G/me` → `User` (auth required — anonymous when anonymous deploys are allowed; lets CLIs
+  verify a token)
 * `GET G/sites` → `{"sites": [SiteMeta]}`
 * `GET G/sites/{site}` → `SiteMeta` | 404
 * `GET G/sites/{site}/files` → `{"files": [{"path","size","sha256"?,"updated_at"}]}`
@@ -466,7 +556,8 @@ proxy identity is accepted as well (used by the hub's drag-and-drop deploy).
 
 `SiteMeta = {name, url, title, description, created_at, created_by, updated_at, updated_by,
 deploy_id, file_count, bytes, owners: []}`. `title` is extracted from `<title>` of the root
-`index.html` at commit/refresh; `description` from `<meta name="description">`.
+`index.html` at commit/refresh; `description` from `<meta name="description">`. `deploy_id` here
+is a short opaque id of the last deploy (`d_<hex>`), not the signed deploy token.
 
 ### 7.3 Deploy (diffed, rsync semantics)
 
@@ -483,18 +574,29 @@ deploy_id, file_count, bytes, owners: []}`. `title` is extracted from `<title>` 
    `deploy.presign: false`). The self-hosted upload endpoint verifies size + sha256.
 3. `POST G/sites/{site}/deploys/{deploy_id}/commit` `{"files": [... same list ...]}` → verifies
    every listed file exists with the right size, deletes objects under `sites/<site>/` not in the
-   list, writes manifest + SiteMeta → `{"site": SiteMeta, "url": "https://site.base/"}`.
+   list, writes manifest + SiteMeta → `{"site": SiteMeta, "url": "https://site.base/", "deleted": 3}`.
+   A listed file whose stored size differs (and is not the previously committed version) is
+   deleted and the commit fails with `409 conflict` naming the paths.
 
 `deploy_id` is an HMAC-signed, expiring (1 h) token binding site + actor; commit rejects a
 mismatched actor or site. Deploys are not atomic (same as rsync); the commit makes deletions last
-so a site is never empty mid-deploy.
+so a site is never empty mid-deploy. Presigned uploads bind what the backend can enforce: the
+size and SHA-256 on S3, the size on GCS (`x-goog-content-length-range`); Azure SAS URLs cannot
+restrict the body, which the commit-time size check covers. State-changing gateway requests
+need `X-Backyard: 1` unless they carry a bearer token without browser cross-site signals
+(`Origin`, `Sec-Fetch-Site`); upload URLs are exempt (the signed token is the capability).
+Creates and refreshes (not commits) count against `ratelimit.deploys_per_hour` per actor
+(anonymous: per client IP).
 
 ## 8. Authentication
 
-`auth.mode`: `none` | `oidc` | `iap` | `alb` | `header`. In all modes, `Authorization: Bearer`
-Backyard API tokens and static tokens are also accepted (API + deploy), and admins are
-`auth.admins` ∪ members of `auth.admin_groups`. Optional gates: `auth.allowed_domains`,
-`auth.allowed_groups` (403 otherwise).
+`auth.mode`: `none` | `oidc` | `iap` | `alb` | `header` (`okta`, `entra`, `azuread`, `azure-ad`,
+`google`, `auth0`, `keycloak`, `openid` are aliases of `oidc`; `off`/`disabled`/empty mean
+`none`). In all modes, `Authorization: Bearer` Backyard API tokens and static tokens are also
+accepted (API + deploy), and admins are `auth.admins` ∪ members of `auth.admin_groups`. Optional
+gates: `auth.allowed_domains`, `auth.allowed_groups` (403 otherwise). A bearer token is tried
+first; if it is invalid the mode's own credentials are tried, and the bearer error is reported
+only when those are absent (in mode `none` an invalid bearer token is always `401`).
 
 ### 8.1 `oidc` (Okta, Entra ID, Google, Auth0, Keycloak…)
 
@@ -510,8 +612,10 @@ Backyard API tokens and static tokens are also accepted (API + deploy), and admi
 * Unauthenticated browser `GET` of HTML on any host → `302` to login with `rd` = original URL.
   API requests → `401` JSON with `login_url`.
 * Device flow for CLIs (optional `auth.oidc.device_client_id`): advertised in `info.auth.device`;
-  the gateway accepts IdP JWTs whose `aud`/`azp`/`cid` matches `device_client_id` (or
-  `auth.oidc.api_audiences`) and issuer matches.
+  the API and gateway accept IdP JWTs whose `aud`/`azp`/`cid` matches `client_id`,
+  `device_client_id` or `auth.oidc.api_audiences` and whose issuer matches. This works in every
+  mode where `auth.oidc.issuer` is set (e.g. device flow behind IAP or an ALB); the CLI refreshes
+  such tokens with the `offline_access` refresh token.
 
 ### 8.2 `iap`, `alb`, `header`
 
@@ -522,26 +626,45 @@ Backyard API tokens and static tokens are also accepted (API + deploy), and admi
   `https://public-keys.auth.elb.<region>.amazonaws.com/<kid>`; header `signer` must equal
   `auth.alb.signer_arn` when set). Claims are the IdP userinfo claims.
 * `header`: trust `auth.header.email_header` (+ name/groups headers) **only** from peers in
-  `server.trusted_proxies`; optionally verify a JWT header against `jwks_url`/`issuer`/`audience`
-  (Cloudflare Access, Pomerium, oauth2-proxy…). Azure Easy Auth works with
-  `email_header: X-MS-CLIENT-PRINCIPAL-NAME`.
+  `server.trusted_proxies`; optionally verify a JWT header (`jwt_header`) against
+  `jwks_url`/`issuer`/`audiences` (Cloudflare Access, Pomerium, oauth2-proxy…) — the JWT is then
+  the trust anchor, and if `trusted_proxies` is also set the peer must be trusted too. An
+  identity header present more than once is rejected; an `accounts.google.com:` prefix is
+  stripped. Azure Easy Auth works with `email_header: X-MS-CLIENT-PRINCIPAL-NAME` (name and
+  roles are read from `X-MS-CLIENT-PRINCIPAL`).
 * Behind these proxies the CLI gets a token by opening `/__backyard/auth/cli` in the browser
   (the proxy authenticates the browser); deploy traffic goes to a gateway path that the proxy
   exempts (ALB rule / separate GCP backend service) or to the standalone gateway (Lambda).
 
 ### 8.3 Backyard API tokens
 
-HS256 JWTs signed with a key derived from `server.secret` (`HKDF(secret, "backyard/token")`):
-`{iss: "backyard", sub: user.id, email, name, groups, admin, scope: "api", jti, iat, exp}`.
-Default TTL `auth.token_ttl` (720h). Minted by `/__backyard/auth/cli` (browser → CLI loopback) and
-`POST /__backyard/api/tokens`. Revocation = rotate `server.secret`. Static tokens: `auth.tokens:
-[{name, sha256}]` (hex sha256 of the token string; `backyard token hash` prints it); they
-authenticate as `{id: "token:<name>", name, admin: <bool>}`.
+**Key derivation.** Every secret-keyed component uses its own key
+`keys.Derive(server.secret, label)` = HKDF-SHA256(ikm = secret, salt = `"backyard"`,
+info = label, 32 bytes) with the labels `backyard/session/v1`, `backyard/oauth-state/v1`,
+`backyard/api-token/v1`, `backyard/deploy/v1`, `backyard/upload/v1` and `backyard/anon/v1`.
+Both editions derive keys identically, so tokens interoperate given the same secret.
+
+HS256 JWTs signed with `keys.Derive(secret, "backyard/api-token/v1")`:
+`{iss: "backyard", sub: user.id, email, name, groups, admin, scope: "api", jti, iat, exp}`
+(≤ 16 KiB: an overlong name is shortened and trailing groups dropped, keeping admin and
+allowed groups; 30 s clock leeway). Default TTL `auth.token_ttl` (720h). Minted by
+`/__backyard/auth/cli` (browser → CLI loopback) and `POST /__backyard/api/tokens`
+`{name?, ttl_hours?}` → `200 {token, expires_at, name?}` (`ttl_hours` ≤ `auth.token_ttl`, default
+that TTL; anonymous users and static tokens get `403`; needs `X-Backyard: 1`). Revocation =
+rotate `server.secret`. Static tokens: `auth.tokens: [{name, sha256, admin?}]` (hex sha256 of the
+token string; `backyard token hash` prints it); they authenticate as
+`{id: "token:<name>", name, admin: <bool>}` and cannot mint API tokens.
 
 CLI login (`/__backyard/auth/cli?redirect_uri=http://127.0.0.1:PORT/callback&state=…`): requires an
-authenticated browser user; `redirect_uri` must be `http://127.0.0.1|localhost|[::1]:<port>/…`;
-redirects to `redirect_uri?token=…&expires_at=…&state=…`. With `?mode=display` the token is shown
-on a page for copy/paste (headless machines).
+authenticated browser user (session cookie or proxy identity — bearer tokens are not accepted,
+so a token cannot renew itself); `redirect_uri` must be
+`http://127.0.0.1|localhost|[::1]:<port>/…`; redirects to
+`redirect_uri?token=…&expires_at=…&state=…`. With `?mode=display` the token is shown on a page for
+copy/paste (headless machines).
+
+Cookies are `HttpOnly; SameSite=Lax; Path=/` and `Secure` when `server.public_url` is https. Their
+`Domain` is `.<base_domain>` in host mode, and host-only in path mode and for `localhost`, IP or
+single-label base domains (browsers reject those as cookie domains).
 
 ## 9. Storage layout (blob keys, after optional `storage.<type>.prefix`)
 
@@ -564,42 +687,58 @@ in the reserved site `_system` (`_users` user cache, `_audit` audit log). They a
 
 ## 11. Limits & rate limiting
 
-Token buckets per instance (`ratelimit`), keyed by user id (or client IP when anonymous):
-`api_per_minute` (all API, default 600), `db_writes_per_minute` (default 300), `ai_per_minute`
-(default 20), `ai_tokens_per_day` (default 2,000,000 output+input tokens, 0 = unlimited),
-`deploys_per_hour` (default 60), `uploads_per_minute` (default 60). Per-site storage limits:
-`database.max_docs_per_site` (default 100,000), `database.max_doc_bytes`.
+Token buckets per instance (`ratelimit`), keyed by user id (or client IP when anonymous); each
+bucket holds one period's worth and refills continuously: `api_per_minute` (all site and hub API
+calls, default 600), `db_writes_per_minute` (document writes and file deletes, default 300),
+`ai_per_minute` (default 20), `ai_tokens_per_day` (default 2,000,000 input+output tokens, reset
+at 00:00 UTC), `warehouse_per_minute` (default 30), `uploads_per_minute` (default 60) and
+`deploys_per_hour` (enforced by the deploy gateway, default 60). `ratelimit.disabled` turns them
+off; a negative value disables a single limit (0 selects the default). With N instances the
+effective limits are up to N times higher. Per-site storage limits: `database.max_docs_per_site`
+(default 100,000), `database.max_doc_bytes`; per-site deploy limits: `sites.max_site_bytes`,
+`sites.max_files`, `sites.max_file_bytes`.
 
 ## 12. Configuration
 
-YAML (`backyard.yaml`), path from `--config` or `BACKYARD_CONFIG`; or inline YAML in
-`BACKYARD_CONFIG_YAML`. `${VAR}` and `${VAR:-default}` are expanded from the environment before
-parsing. If `server.listen` is empty, `:$PORT` (Cloud Run / Container Apps) else `:8080`.
+YAML (`backyard.yaml`). Sources, first match wins: `--config <file>`, inline YAML in
+`BACKYARD_CONFIG_YAML`, the file named by `BACKYARD_CONFIG`, `./backyard.yaml`. `${VAR}` and
+`${VAR:-default}` are expanded from the environment before parsing (an unset or empty variable
+yields the default or `""`; `$${` escapes a literal `${`). Unknown keys are errors. Durations
+accept Go syntax (`12h`), a plain number of seconds, or days (`90d`). After parsing,
+`BACKYARD_SECRET`, `BACKYARD_BASE_DOMAIN` and `BACKYARD_PUBLIC_URL` fill `server.secret`,
+`server.base_domain` and `server.public_url` when those are empty, and `DATABASE_URL` fills
+`database.postgres.dsn` for `database.type: postgres`. If `server.listen` is empty, `:$PORT`
+(Cloud Run / Container Apps) else `:8080`.
 `backyard config example` prints a fully commented example; `backyard config validate` checks
 one. See `internal/config/config.go` for the authoritative schema; `--dev` (or `server.dev:
 true`) fills in: `base_domain: localhost`, `auth.mode: none`, fs storage + sqlite under
-`./.backyard-data`, memory pubsub, `deploy.allow_anonymous: true`, random secret.
+`./.backyard-data`, memory pubsub, `deploy.allow_anonymous: true` (with `auth.mode: none`), a
+random (ephemeral) secret unless one is configured, and text logs; it also enables the dev host
+rules of §2.
 
 ## 13. CLI
 
 ```
-backyard serve   [--config f] [--dev]          run the server
-backyard gateway [--config f]                  run only the deploy gateway (§7)
-backyard init    [site] [--dir d] [--agents claude,codex,cursor,copilot] [--template blank|app]
-backyard dev     [dir] [--port 4321] [--site s] local preview server with a local backend
-backyard deploy  [dir] [--site s] [--method auto|api|s3|gcs|azure|rsync] [--dry-run] [-y]
-backyard login   [--server url] [--gateway url] [--device] [--token t] [--profile p]
+backyard serve   [-c f] [--dev]                run the server
+backyard gateway [-c f]                        run only the deploy gateway (§7, bearer tokens only)
+backyard init    [site] [-d dir] [--agents claude,codex,cursor,copilot] [-t blank|app] [-f]
+backyard dev     [dir] [-p 4321] [--site s] [-c f] [--no-open]   local preview with a local backend
+backyard deploy  [dir] [-s site] [-m auto|api|s3|gcs|azure|rsync] [-n] [-y] [--message m] [--open] [--concurrency 8]
+backyard login   [--device] [--no-browser]     (plus the global --server/--gateway/--token/--profile)
 backyard logout | whoami
-backyard sites list [--json] | sites delete <site> [-y] | sites info <site>
+backyard sites   list [filter] | info <site> | delete <site> [-y]
 backyard open    [site]                        open site (or hub) in the browser
-backyard pull    <site> [dir]                  download a site's files
-backyard token   create [--name n] [--ttl 720h] | token hash <token>
-backyard skill   install [--global|--project]  install the Claude skill
+backyard pull    <site> [dir] [-f]             download a site's files
+backyard token   create [--name cli] [--ttl 720h|90d] | hash [token|-] [--name ci]
+backyard skill   install [--global|--project] [-y]
 backyard mcp                                   MCP server over stdio (for agents)
-backyard config  example | validate [file]
-backyard cloudflare setup [--dir deploy/cloudflare]   provision the Workers edition via wrangler (§16)
-backyard version
+backyard config  example | validate [file] [--dev]
+backyard cloudflare setup [--dir d] [--download] [--ref r] [--no-login] [--skip-install] [-- args]
+backyard version | completion <shell>
 ```
+
+Global flags: `--server`, `--gateway`, `--token`, `--profile`, `--json` (machine-readable
+output), `-v`/`--verbose`.
 
 Local CLI config: `$XDG_CONFIG_HOME/backyard/config.json` (`~/.config/backyard/config.json`):
 `{"current": "default", "profiles": {"default": {"server": "…", "gateway": "…", "token": "…",
@@ -607,10 +746,13 @@ Local CLI config: `$XDG_CONFIG_HOME/backyard/config.json` (`~/.config/backyard/c
 Env overrides: `BACKYARD_SERVER`, `BACKYARD_GATEWAY`, `BACKYARD_TOKEN`, `BACKYARD_PROFILE`,
 `BACKYARD_DEPLOY_METHOD`.
 
-Project file `.backyard.json`: `{"site": "lunch-vote", "dir": ".", "method": "auto", "ignore":
+Project file `.backyard.json` (searched in the current directory and its parents; `dir` is
+relative to the file): `{"site": "lunch-vote", "dir": ".", "method": "auto", "ignore":
 […]}`. Default deploy ignores: `.git/`, `.backyard.json`, `.backyardignore`, `node_modules/`,
 `.claude/`, `.cursor/`, `.github/`, `CLAUDE.md`, `AGENTS.md`, `.DS_Store`, any path segment
-starting with `.` except `.well-known/`; plus gitignore-style lines from `.backyardignore`.
+starting with `.` except `.well-known/`; plus gitignore-style lines from `.backyardignore` in
+the deployed folder's root (`#` comments, `!` negation, trailing `/`, leading or inner `/`
+anchors, `**`; as in git, a path inside an excluded directory cannot be re-included).
 
 Deploy methods:
 * `api` — §7 protocol via the gateway.
@@ -618,19 +760,27 @@ Deploy methods:
 * `gcs` — `gcloud storage rsync <dir> gs://<bucket>/<prefix>sites/<site> --recursive --delete-unmatched-destination-objects --exclude=<regex>` (falls back to `gsutil -m rsync -r -d -x`)
 * `azure` — `az storage blob sync --account-name <a> -c <container> -s <dir> -d <prefix>sites/<site> --delete-destination true --exclude-pattern …`
 * `rsync` — `rsync -az --delete --exclude … <dir>/ <rsync_target>/<site>/`
-* `auto` — `api` if a gateway is reachable and the user has a token; otherwise the first
-  advertised direct method whose tool is installed.
+* `auto` — `api` if a gateway is reachable and the user has a token (or anonymous deploys are
+  allowed); otherwise the first advertised direct method whose tool is installed.
 After a direct sync the CLI calls `POST G/sites/{site}/refresh` (best effort).
+
+Login flows (`backyard login`): `--token` (or `-` for stdin) stores a given token; `--device`
+runs the OAuth device grant against `info.auth.device`; a server with anonymous deploys needs
+nothing; `auth.mode: none` without them asks for a static deploy token; otherwise the browser
+loopback flow via `info.auth.cli_login_url` (`--no-browser`: `?mode=display` and paste). An
+external gateway advertised in `info.gateway_url` is adopted when reachable.
 
 ## 14. Agent integration
 
 * `skills/backyard/SKILL.md` (+ `references/api.md`, `references/recipes.md`,
   `references/deploy.md`) — canonical agent docs; embedded in the binary.
-* `backyard init` writes `index.html`, `.backyard.json`, `CLAUDE.md`, `AGENTS.md`,
-  `.claude/skills/backyard/**` (and `.cursor/rules/backyard.mdc`,
-  `.github/copilot-instructions.md` when selected).
+* `backyard init` writes `index.html`, `.backyard.json`, `.backyardignore`, and per
+  `--agents` (default `claude,codex`): `CLAUDE.md` + `.claude/skills/backyard/**` (claude),
+  `AGENTS.md` (codex), `.cursor/rules/backyard.mdc` (cursor),
+  `.github/copilot-instructions.md` (copilot). Existing files are kept unless `--force`.
 * Claude Code plugin: `.claude-plugin/marketplace.json` + `.claude-plugin/plugin.json` at the repo
-  root (skills, slash commands in `commands/`, MCP server `backyard mcp`).
+  root (skills, slash commands `/backyard:new`, `/backyard:deploy`, `/backyard:docs` in
+  `commands/`, MCP server `backyard mcp`).
 * MCP tools (`backyard mcp`): `backyard_docs`, `backyard_init`, `backyard_deploy`,
   `backyard_list_sites`, `backyard_site_files`, `backyard_read_site_file`, `backyard_whoami`,
   `backyard_open_url`.
@@ -638,11 +788,17 @@ After a direct sync the CLI calls `POST G/sites/{site}/refresh` (best effort).
 
 ## 15. Observability
 
-`log/slog` JSON (or text) logs; audit events logged with `"audit": true` and stored in
-`_system/_audit`. Prometheus metrics (prefix `backyard_`): `http_requests_total{area,code}`,
-`http_request_duration_seconds{area}`, `deploys_total{method,result}`, `db_ops_total{op,result}`,
-`ai_requests_total{model,result}`, `ai_tokens_total{model,direction}`, `ws_connections`,
-`ws_messages_total{dir}`, `warehouse_queries_total{source,result}`.
+`log/slog` JSON (or text) logs; `telemetry.access_log` adds one line per request (with
+`request_id`, also returned as `X-Request-Id`). Audit events (logins, CLI and API token issuance,
+deploy create/commit, refresh, site deletion, owner changes) are logged with `"audit": true`; the
+server also stores API token issuance records in `_system/_audit` (best effort). Prometheus
+metrics (prefix `backyard_`): `http_requests_total{area,code}`,
+`http_request_duration_seconds{area}`, `deploys_total{method=api|sync,result}`,
+`db_ops_total{op,result}`, `ai_requests_total{model,result}`, `ai_tokens_total{model,direction}`,
+`ws_connections`, `ws_messages_total{dir}`, `warehouse_queries_total{source,result}`,
+`rate_limited_total{category}`, `build_info{version}`, plus the Go runtime and process
+collectors. They are served at `/__backyard/metrics` on the hub (authenticated) or, with
+`telemetry.metrics_listen`, at `/metrics` on that separate listener (no authentication).
 
 ## 16. Cloudflare edition (free tier)
 
@@ -660,7 +816,8 @@ storage are available on free); R2 and paid features are optional.
   wildcard level; deeper needs Advanced Certificate Manager). Configured via `vars`.
 * **Storage:** files ≤ `FILE_INLINE_MAX` (default 5 MiB) stored chunked in DO SQLite (chunks <
   2 MB); larger files go to the optional `R2` binding (`sites/<site>/…`, `uploads/<site>/…`);
-  without R2 the per-file cap is 25 MiB. Deploy uploads use self-hosted upload URLs (§7.3).
+  the per-file cap is 25 MiB without R2 and 95 MiB with it (100 MB request limit). Deploy uploads
+  use self-hosted upload URLs (§7.3).
 * **Database:** documents in the site DO's SQLite with the exact query semantics of §5.2
   (shared conformance tests). Realtime is local to the site DO (single instance per site).
 * **AI:** `workers-ai` provider via the `AI` binding (free daily allowance) with configurable

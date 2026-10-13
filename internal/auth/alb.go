@@ -253,5 +253,5 @@ func (a *authenticator) authenticateALB(r *http.Request) (*identity.User, error)
 		a.log.Warn("auth: invalid ALB user claims", "remote", r.RemoteAddr, "error", err)
 		return nil, fmt.Errorf("%w: invalid ALB user claims: %w", ErrUnauthenticated, err)
 	}
-	return a.finalize(r.Context(), a.mapClaims(claims), srcIdP)
+	return a.finalize(r.Context(), a.mapClaims(claims), srcIDP)
 }

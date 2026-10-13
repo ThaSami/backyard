@@ -1,7 +1,9 @@
 /**
- * /llms.txt and /llms-full.txt built from the embedded skill documents
- * (port of skills/docs.go): the hub URL placeholder and example site hosts are
- * rewritten for this deployment, links between documents point at /docs/*.md.
+ * /llms.txt, /llms-full.txt and /docs/<name>.md built from the embedded skill
+ * documents (port of skills/docs.go and the Go hub's /docs handler): the hub
+ * URL placeholder and example site hosts are rewritten for this deployment
+ * (localize), and in /llms-full.txt links between documents point at
+ * /docs/*.md.
  */
 import { REFERENCES, SKILL_MD } from "./generated/skills";
 
@@ -40,12 +42,68 @@ export function referenceNames(): string[] {
   return names.sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0));
 }
 
-/** SKILL.md, or a reference document by name ("" when unknown). */
-export function docMarkdown(name: string): string {
-  const n = name.trim().toLowerCase().replace(/\.md$/, "");
-  if (n === "skill") return SKILL_MD;
-  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(n)) return "";
-  return REFERENCES[n] ?? "";
+/** Name of a document below /docs/ (one path segment, so no "/", "." or ".."). */
+const DOC_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
+/** Optional directory of /docs/references/<name>.md (how SKILL.md links to its references). */
+const REFERENCES_DIR = "references/";
+
+/**
+ * The document served at /docs/<rel>.md, localized for the hub at publicURL
+ * (like /llms-full.txt), or "" when there is none. rel is the path below
+ * /docs/ without ".md": "skill" (SKILL.md, front matter included), a
+ * reference name ("api"), or the same with a "references/" prefix
+ * ("references/api"), which is where SKILL.md's relative links
+ * ("references/api.md") resolve against /docs/skill.md. Names are
+ * case-insensitive; "references/skill" does not exist.
+ */
+export function docMarkdown(rel: string, publicURL = ""): string {
+  const isRef = rel.startsWith(REFERENCES_DIR);
+  const name = isRef ? rel.slice(REFERENCES_DIR.length) : rel;
+  if (!DOC_NAME_RE.test(name)) return "";
+  const n = name.toLowerCase();
+  let md: string;
+  if (n === "skill") md = isRef ? "" : SKILL_MD;
+  else md = Object.hasOwn(REFERENCES, n) ? (REFERENCES[n] ?? "") : "";
+  return md ? localize(md, publicURL) : "";
+}
+
+/**
+ * Normalizes a public URL like skills.baseURL: surrounding space, user info,
+ * a query, a fragment and trailing slashes are dropped ("" stays "", so links
+ * become server-relative).
+ */
+export function baseURL(publicURL: string): string {
+  let s = publicURL.trim();
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/?#]/.test(s)) {
+    try {
+      const u = new URL(s);
+      u.username = "";
+      u.password = "";
+      u.search = "";
+      u.hash = "";
+      s = u.toString();
+    } catch {
+      /* not a URL: used as given */
+    }
+  }
+  return s.replace(/\/+$/, "");
+}
+
+/**
+ * Adapts an embedded document to the hub at publicURL (skills.Localize): the
+ * placeholder hub URL becomes publicURL and, when publicURL has no path,
+ * example site hosts under the placeholder domain become subdomains of the hub
+ * host. Links between documents are left alone. An empty publicURL returns md
+ * unchanged.
+ */
+export function localize(md: string, publicURL: string): string {
+  const base = baseURL(publicURL);
+  if (!base) return md;
+  let out = replaceHubURL(md, base);
+  const hh = hubHost(base);
+  if (hh) out = replaceSiteHosts(out, hh.scheme, hh.host);
+  return out;
 }
 
 function docURL(base: string, name: string): string {
@@ -62,10 +120,20 @@ function docTitle(name: string): string {
     .join(" ");
 }
 
+/** Reports whether a URL hostname is an IP address (IPv6 hostnames keep their brackets). */
+function isIPHost(hostname: string): boolean {
+  return hostname.startsWith("[") || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname);
+}
+
+/**
+ * Splits an absolute hub URL without a path into scheme and host[:port]; null
+ * when site subdomains cannot be derived from it (a path, or an IP address).
+ */
 function hubHost(base: string): { scheme: string; host: string } | null {
   try {
     const u = new URL(base);
     if ((u.protocol !== "http:" && u.protocol !== "https:") || (u.pathname !== "" && u.pathname !== "/")) return null;
+    if (!u.hostname || isIPHost(u.hostname)) return null;
     return { scheme: u.protocol.slice(0, -1), host: u.host };
   } catch {
     return null;
@@ -78,7 +146,7 @@ function link(title: string, href: string, desc: string): string {
 
 /** /llms.txt for a hub at publicURL. */
 export function llmsTxt(publicURL: string): string {
-  const base = publicURL.trim().replace(/\/+$/, "");
+  const base = baseURL(publicURL);
   let b = "# Backyard\n\n";
   b +=
     "> Backyard turns a folder of static HTML/CSS/JS into an internal URL that only people in the company can open, " +
@@ -157,7 +225,7 @@ function replaceSiteHosts(s: string, scheme: string, host: string): string {
 
 /** /llms-full.txt: SKILL.md followed by every reference, links resolved. */
 export function llmsFullTxt(publicURL: string): string {
-  const base = publicURL.trim().replace(/\/+$/, "");
+  const base = baseURL(publicURL);
   const known = new Set(["skill", ...referenceNames()]);
   let b = `<!-- Backyard documentation for agents: the skill overview followed by every reference. Source: ${docURL(base, "skill")} -->\n\n`;
   b += stripFrontMatter(SKILL_MD).trim() + "\n";
@@ -165,14 +233,9 @@ export function llmsFullTxt(publicURL: string): string {
     b += `\n---\n\n<!-- Source: ${docURL(base, name)} -->\n\n`;
     b += (REFERENCES[name] ?? "").trim() + "\n";
   }
-  let out = b.replace(DOC_LINK_RE, (m: string, n: string, frag: string | undefined) => {
+  const out = b.replace(DOC_LINK_RE, (m: string, n: string, frag: string | undefined) => {
     const name = n.toLowerCase();
     return known.has(name) ? `](${docURL(base, name)}${frag ?? ""})` : m;
   });
-  if (base) {
-    out = replaceHubURL(out, base);
-    const hh = hubHost(base);
-    if (hh) out = replaceSiteHosts(out, hh.scheme, hh.host);
-  }
-  return out;
+  return localize(out, base);
 }

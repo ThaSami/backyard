@@ -101,6 +101,12 @@ test("SDK in a real browser: context, db, realtime, files, AI streaming, rooms, 
       const final = await s.done;
       out.ai = { chunks, iterated, content: final.content, usage: final.usage.output_tokens };
       out.chat = (await backyard.ai.chat("ping")).content;
+      const img = await backyard.ai.image("a dot", { n: 2 });
+      out.image = { id: img.id, url: img.url, type: img.content_type, model: img.model, n: img.images.length, ids: img.images.map((i) => i.id) };
+      out.embed = [await backyard.ai.embed("abc"), await backyard.ai.embed(["a", "bb"])];
+      out.kinds = (await backyard.ai.models()).models.map((m) => m.kind);
+      const files = await backyard.files.list({ limit: 2 });
+      out.files = { n: files.length, hasMore: files.hasMore, keys: Object.keys(files) };
       const mod = await import("/__backyard/backyard.mjs");
       out.esmShared = mod.default === window.backyard && mod.db === backyard.db;
       return out;
@@ -118,6 +124,12 @@ test("SDK in a real browser: context, db, realtime, files, AI streaming, rooms, 
     assert.deepEqual(r.warehouse, ["BackyardError", "unsupported", 501, true]);
     assert.deepEqual(r.ai, { chunks: ["Hello", " from", " the", " stub", " ✓"], iterated: ["Hello", " from", " the", " stub", " ✓"], content: "Hello from the stub ✓", usage: 5 });
     assert.equal(r.chat, "echo: ping");
+    assert.match(r.image.id, /^img\d+$/);
+    assert.equal(r.image.url, `/s/demo/__backyard/files/${r.image.id}/image-1.png`);
+    assert.deepEqual([r.image.type, r.image.model, r.image.n, r.image.ids[0]], ["image/png", "image", 2, r.image.id]);
+    assert.deepEqual(r.embed, [[3, 0.5], [[1, 0.5], [2, 0.5]]]);
+    assert.deepEqual(r.kinds, ["chat", "image", "embedding"]);
+    assert.deepEqual(r.files, { n: 2, hasMore: true, keys: ["0", "1"] });
     assert.equal(r.esmShared, true);
 
     // CSRF header on writes, multipart upload.
@@ -149,6 +161,18 @@ test("SDK in a real browser: context, db, realtime, files, AI streaming, rooms, 
     assert.deepEqual(log, ["members:", "join:bob@acme.com", "members:bob@acme.com", "msg:hi alice:bob@acme.com", "update:bob@acme.com:green", "members:bob@acme.com"]);
     const bobView = await second.page.evaluate(() => ({ self: room.self.user.id, members: room.members.map((m) => m.user.id + ":" + m.state.color) }));
     assert.deepEqual(bobView, { self: "bob@acme.com", members: ["alice@acme.com:red"] });
+    // Errors about this room's frames come back with the frame id and reach room.on("error").
+    const roomErrors = await second.page.evaluate(async () => {
+      const errs = [];
+      room.on("error", (e) => errs.push(e.code + ":" + e.message));
+      room.send("hello?", { to: "c_ffffffffff" });
+      room.setState({ blob: "x".repeat(2000) });
+      room.send({ big: "y".repeat(5000) });
+      await new Promise((r) => setTimeout(r, 300));
+      return errs;
+    });
+    assert.deepEqual(roomErrors, ['not_found:no member "c_ffffffffff" in room "lobby"', "too_large:presence state exceeds 1024 bytes", "too_large:message too large"]);
+    await second.page.evaluate(() => room.setState({ color: "green" }));
 
     // Network drop: both pages reconnect, resubscribe and rejoin with their latest state.
     await page.evaluate(() => {
@@ -390,6 +414,93 @@ test("hub on a phone-sized screen has no horizontal scroll", async (t) => {
       if (path === "/") assert.equal(await page.isHidden("#banner"), true, "no error banner");
       assert.deepEqual(problems, []);
     }
+  } finally {
+    await context.close();
+    await stub.close();
+  }
+});
+
+test("hub deploy to presigned storage URLs on another origin: headers verbatim; a CORS failure is explained", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  const { dir, site } = makeSiteDir({ "index.html": "<!doctype html><title>B</title>bucket", "img/a.svg": "<svg/>" });
+  try {
+    for (const cors of [true, false]) {
+      const stub = await startStub({ presign: { cors } });
+      const context = await browser.newContext();
+      try {
+        const { page, problems } = await open(context, stub.url + "/");
+        await page.waitForSelector("#site-list:not([aria-busy])", { state: "attached" });
+        await page.setInputFiles("#folder-input", site);
+        await page.waitForFunction(() => !document.getElementById("deploy-btn").disabled);
+        await page.click("#deploy-btn");
+        await page.waitForSelector("#result:not([hidden]), #deploy-error:not([hidden])", { timeout: 30_000 });
+        const puts = stub.state.bucket.filter((r) => r.method === "PUT");
+        if (cors) {
+          assert.equal(await page.isHidden("#deploy-error"), true, await page.textContent("#deploy-error"));
+          assert.equal(puts.length, 2);
+          for (const r of puts) {
+            assert.equal(r.headers["x-ms-blob-type"], "BlockBlob");
+            assert.match(r.headers["x-amz-meta-sha256"], /^[0-9a-f]{64}$/);
+            assert.equal(r.headers["content-type"], "application/octet-stream", "the signed Content-Type, not the file's");
+            assert.equal(r.headers.cookie, undefined, "no cookies to storage");
+          }
+          assert.equal(stub.state.stored.get("guest-site/img/a.svg").toString(), "<svg/>");
+          assert.equal(stub.state.deploys[0].committed, true);
+          assert.deepEqual(problems, []);
+        } else {
+          assert.equal(puts.length, 0, "the preflight was refused");
+          const msg = await page.textContent("#deploy-error");
+          assert.match(msg, /failed: network or CORS error/);
+          assert.ok(msg.includes(`the bucket CORS must allow PUT from ${stub.url} with the headers Content-Type, x-ms-blob-type, x-amz-meta-sha256`), msg);
+          assert.equal(stub.state.deploys[0].committed, false);
+          assert.equal(stub.state.bucket.filter((r) => r.method === "OPTIONS").length >= 1, true);
+          assert.deepEqual(problems.filter((p) => !/CORS policy|net::ERR_FAILED/.test(p)), []);
+        }
+      } finally {
+        await context.close();
+        await stub.close();
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hub with an expired session (API calls redirected by a proxy) goes to the login page and back", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  const stub = await startStub({ expiredSession: true });
+  const context = await browser.newContext();
+  try {
+    const page = await context.newPage();
+    await page.goto(stub.url + "/?q=poll");
+    await page.waitForURL((u) => u.pathname === "/__backyard/auth/login", { timeout: 10_000 });
+    assert.equal(new URL(page.url()).searchParams.get("rd"), stub.url + "/?q=poll");
+    assert.deepEqual(stub.state.logins, [stub.url + "/?q=poll"], "one navigation, although several API calls failed");
+  } finally {
+    await context.close();
+    await stub.close();
+  }
+});
+
+test("docs page with an expired session goes to the login page and comes back to the same document", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  const stub = await startStub({ expiredSession: true });
+  const context = await browser.newContext();
+  try {
+    const page = await context.newPage();
+    const docsURL = stub.url + "/docs?doc=recipes#live-lists";
+    await page.goto(docsURL);
+    await page.waitForURL((u) => u.pathname === "/__backyard/auth/login", { timeout: 10_000 });
+    assert.equal(new URL(page.url()).searchParams.get("rd"), docsURL);
+    assert.deepEqual(stub.state.logins, [docsURL]);
+    assert.equal(await page.textContent("h1"), "Sign in");
+
+    // Coming back still expired (a broken login) does not loop: the page offers a link instead.
+    await page.goto(docsURL);
+    await page.waitForSelector("#doc .docs-status a");
+    assert.equal(await page.textContent("#doc .docs-status"), "Your session has expired. Sign in again");
+    assert.equal(await page.getAttribute("#doc .docs-status a", "href"), "/__backyard/auth/login?rd=" + encodeURIComponent(docsURL));
+    assert.equal(stub.state.logins.length, 1);
   } finally {
     await context.close();
     await stub.close();

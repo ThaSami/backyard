@@ -20,14 +20,23 @@ func (s *Server) warehouseEnabled(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// warehouseError maps warehouse errors (SPEC §5.5).
-func warehouseError(err error) *apiError {
+// warehouseError maps warehouse errors (SPEC §5.5). Messages of 4xx
+// errors describe the caller's query (syntax errors, unknown columns,
+// missing parameters) and are passed on. Server-side failures get a generic
+// message naming requestID instead: engine and connection errors can reveal
+// host, user and database names. The cause is logged with the same request
+// id (see prepareError).
+func warehouseError(err error, requestID string) *apiError {
 	msg := func(sentinel error) string {
 		m := err.Error()
 		if i := strings.Index(m, sentinel.Error()+": "); i >= 0 {
 			return m[i+len(sentinel.Error())+2:]
 		}
 		return strings.TrimPrefix(m, "warehouse: ")
+	}
+	see := ""
+	if requestID != "" {
+		see = "; the details are in the server log (request id " + requestID + ")"
 	}
 	switch {
 	case errors.Is(err, warehouse.ErrDisabled):
@@ -45,11 +54,11 @@ func warehouseError(err error) *apiError {
 	case errors.Is(err, context.Canceled):
 		return errContext(err, "warehouse query")
 	case errors.Is(err, warehouse.ErrUpstream):
-		e := newError(http.StatusBadGateway, codeUpstream, "%s", truncate(msg(warehouse.ErrUpstream), 1000))
+		e := newError(http.StatusBadGateway, codeUpstream, "the warehouse could not run the query%s", see)
 		e.Err = err
 		return e
 	}
-	return errInternal(err, "warehouse query failed")
+	return errInternal(err, "warehouse query failed%s", see)
 }
 
 // sourceLabel bounds the cardinality of the source metric label.
@@ -78,7 +87,9 @@ func (s *Server) handleWarehouseQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	extendDeadlines(w, 0, max(s.cfg.Warehouse.Timeout.D(), time.Minute)+time.Minute)
 	var req warehouse.QueryRequest
-	if e := decodeJSON(w, r, smallBodyLimit, &req, false); e != nil {
+	// Parameters stay json.Number (which the warehouse service accepts), so
+	// integer ids beyond 2^53 reach the engine exactly.
+	if e := decodeJSONWith(w, r, smallBodyLimit, &req, jsonOptions{useNumber: true}); e != nil {
 		s.writeAPIError(w, r, e)
 		return
 	}
@@ -91,15 +102,13 @@ func (s *Server) handleWarehouseQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := s.deps.Warehouse.Query(r.Context(), req)
-	result := "ok"
 	if err != nil {
-		result = warehouseError(err).Code
-	}
-	s.metrics.warehouseQueries.WithLabelValues(s.sourceLabel(req), result).Inc()
-	if err != nil {
-		s.writeAPIError(w, r, warehouseError(err))
+		e := warehouseError(err, info(r).requestID)
+		s.metrics.warehouseQueries.WithLabelValues(s.sourceLabel(req), e.Code).Inc()
+		s.writeAPIError(w, r, e)
 		return
 	}
+	s.metrics.warehouseQueries.WithLabelValues(s.sourceLabel(req), "ok").Inc()
 	if res == nil {
 		res = &warehouse.Result{}
 	}

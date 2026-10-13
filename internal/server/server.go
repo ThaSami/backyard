@@ -30,6 +30,13 @@
 // No http.TimeoutHandler is used: streaming responses (AI server-sent events,
 // websockets, large downloads and uploads) extend or clear the connection
 // deadlines themselves, and backend calls are bounded by contexts.
+//
+// # Large responses on Cloud Run
+//
+// Cloud Run rejects HTTP/1 responses that declare a Content-Length above
+// 32 MiB. When K_SERVICE is set, static files and uploads above that size
+// are streamed without a Content-Length (chunked), and byte ranges above it
+// are shortened to 32 MiB (see serveObject).
 package server
 
 import (
@@ -40,6 +47,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -103,6 +111,7 @@ type Server struct {
 	hubHostname  string // hostname of server.public_url
 	hubOrigin    string // normalized origin of server.public_url
 	hubScheme    string // scheme of server.public_url
+	hubPort      string // port of server.public_url (explicit or the scheme's default)
 	publicURL    string // server.public_url without trailing slash
 	pathMode     bool
 	trusted      []*net.IPNet
@@ -110,6 +119,10 @@ type Server struct {
 	reserved     []string
 	metricsOnHub bool
 	gatewayOn    bool // deploy gateway mounted at /__backyard/api/deploy
+
+	// maxFixedLength, when positive, is the largest Content-Length an
+	// HTTP/1 response of serveObject may declare (see responseLengthCap).
+	maxFixedLength int64
 
 	bg *background // background work (user cache touches, audit writes)
 }
@@ -164,6 +177,7 @@ func New(d Deps) (*Server, error) {
 		hubHostname: strings.ToLower(strings.TrimSuffix(pub.Hostname(), ".")),
 		hubScheme:   scheme,
 		hubOrigin:   normalizeOrigin(scheme, pub.Host),
+		hubPort:     portOf(pub, scheme),
 		publicURL:   scheme + "://" + strings.ToLower(pub.Host),
 		pathMode:    cfg.Server.URLMode == "path",
 		reserved:    cfg.Sites.Reserved,
@@ -172,6 +186,7 @@ func New(d Deps) (*Server, error) {
 		gatewayOn:   d.Gateway != nil && (cfg.Deploy.EmbeddedGateway == nil || *cfg.Deploy.EmbeddedGateway),
 	}
 	s.metricsOnHub = cfg.Telemetry.Metrics && cfg.Telemetry.MetricsListen == ""
+	s.maxFixedLength = responseLengthCap()
 
 	for _, p := range cfg.Server.TrustedProxies {
 		n, err := config.ParseCIDROrIP(p)
@@ -222,6 +237,24 @@ func New(d Deps) (*Server, error) {
 	s.hubMux = s.hubRoutes()
 	s.handler = s.middleware(http.HandlerFunc(s.route))
 	return s, nil
+}
+
+// cloudRunMaxResponse is the largest response Cloud Run's HTTP/1 front end
+// accepts with a Content-Length (32 MiB); larger responses must be streamed
+// with chunked transfer encoding (or served over end-to-end HTTP/2).
+const cloudRunMaxResponse = 32 << 20
+
+// responseLengthCap returns the Content-Length limit of HTTP/1 responses
+// for the platform the process runs on: cloudRunMaxResponse on Cloud Run
+// (detected by K_SERVICE, which Cloud Run and Knative set for every
+// service), else 0 (no limit). Streaming without a Content-Length works on
+// every platform, so a false positive (plain Knative) costs nothing but the
+// length hint.
+func responseLengthCap() int64 {
+	if os.Getenv("K_SERVICE") != "" {
+		return cloudRunMaxResponse
+	}
+	return 0
 }
 
 // Handler returns the root http.Handler.

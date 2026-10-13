@@ -1,0 +1,20 @@
+{
+  "name": "@backyard/e2e",
+  "private": true,
+  "description": "Real-browser end-to-end tests for Backyard (Playwright + Chromium).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "playwright test",
+    "test:sites": "playwright test --project sites",
+    "test:auth": "playwright test --project auth",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
+    "@playwright/test": "1.56.1"
+  }
+}

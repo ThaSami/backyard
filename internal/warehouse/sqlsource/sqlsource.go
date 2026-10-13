@@ -437,7 +437,7 @@ func convertValue(tm *pgtype.Map, oid uint32, v any) any {
 		return int64(x)
 	case int32:
 		if oid == pgtype.QCharOID {
-			return string(rune(x))
+			return string(x) // "char" decodes as a rune (int32)
 		}
 		return int64(x)
 	case int8:

@@ -238,7 +238,7 @@ func (l *oidcLogin) callback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	base := a.mapClaims(claims)
-	u, err := a.finalize(r.Context(), base.Clone(), srcIdP)
+	u, err := a.finalize(r.Context(), base.Clone(), srcIDP)
 	if err != nil {
 		if errors.Is(err, ErrForbidden) {
 			detail := "Ask an administrator for access, or sign in with a different account."
@@ -293,7 +293,7 @@ func checkAuthorizedParty(aud []string, claims map[string]any, clientID string) 
 
 // readState returns the verified login state from the backyard_oauth cookie.
 func (l *oidcLogin) readState(r *http.Request) (*oauthState, error) {
-	var lastErr error = errors.New("no login state cookie")
+	lastErr := errors.New("no login state cookie")
 	for _, c := range r.Cookies() {
 		if c.Name != OAuthCookie {
 			continue

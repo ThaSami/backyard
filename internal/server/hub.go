@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/thasami/backyard/internal/identity"
 	"github.com/thasami/backyard/internal/sites"
+	"github.com/thasami/backyard/skills"
 )
 
 // auditTimeout bounds the write of one audit record.
@@ -85,7 +87,36 @@ func (s *Server) serveHubMetrics(w http.ResponseWriter, r *http.Request) {
 	s.metrics.handler.ServeHTTP(w, r)
 }
 
+// docNameRe matches the document name of /docs/<name>.md and
+// /docs/references/<name>.md: one path segment of word characters, so no
+// "/", "." or ".." can reach the document lookup.
 var docNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+
+// docReferencesDir is the optional directory of /docs/references/<name>.md.
+// SKILL.md links to its references as "references/<name>.md", which a
+// browser or agent resolves against /docs/skill.md to
+// /docs/references/<name>.md; the references link to each other by bare
+// name, which resolves within the same directory.
+const docReferencesDir = "references/"
+
+// hubDocument returns the embedded document for the path below /docs/
+// without its ".md" suffix ("skill", "api", "references/api"), or "" when
+// there is none. SKILL.md is not a reference, so "references/skill" does
+// not exist.
+func hubDocument(rel string) string {
+	name, isRef := strings.CutPrefix(rel, docReferencesDir)
+	switch {
+	case !docNameRe.MatchString(name):
+		return ""
+	case strings.EqualFold(name, "skill"):
+		if isRef {
+			return ""
+		}
+		return skillMarkdown()
+	default:
+		return skillReference(name)
+	}
+}
 
 // serveHubPage serves the hub UI, docs and llms.txt (authenticated).
 func (s *Server) serveHubPage(w http.ResponseWriter, r *http.Request) {
@@ -110,20 +141,15 @@ func (s *Server) serveHubPage(w http.ResponseWriter, r *http.Request) {
 		s.serveHubAsset(w, r, "docs.html")
 	case strings.HasPrefix(p, "/docs/") && strings.HasSuffix(p, ".md"):
 		info(r).area = "docs"
-		name := strings.TrimSuffix(strings.TrimPrefix(p, "/docs/"), ".md")
-		var md string
-		switch {
-		case !docNameRe.MatchString(name):
-		case strings.EqualFold(name, "skill"):
-			md = skillMarkdown()
-		default:
-			md = skillReference(name)
-		}
+		rel := strings.TrimSuffix(strings.TrimPrefix(p, "/docs/"), ".md")
+		md := hubDocument(rel)
 		if md == "" {
-			s.fail(w, r, errNotFound("no such document: %s", truncate(name, 64)))
+			s.fail(w, r, errNotFound("no such document: %s", truncate(rel, 80)))
 			return
 		}
-		s.serveText(w, r, name+".md", "text/markdown; charset=utf-8", md)
+		// Like /llms-full.txt: the documents use skills.HubURLPlaceholder
+		// for "this hub" and its example site hosts.
+		s.serveText(w, r, path.Base(rel)+".md", "text/markdown; charset=utf-8", skills.Localize(md, s.publicURL))
 	default:
 		name := strings.TrimPrefix(p, "/")
 		if name == "" || strings.HasSuffix(name, "/") {

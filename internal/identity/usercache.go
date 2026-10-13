@@ -205,7 +205,7 @@ func profileData(u *User, email string, now time.Time) map[string]any {
 		d["groups"] = g
 	}
 	if len(u.Extra) > 0 {
-		d["extra"] = cloneValue(map[string]any(u.Extra))
+		d["extra"] = cloneValue(u.Extra)
 	}
 	return d
 }

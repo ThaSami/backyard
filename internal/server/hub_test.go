@@ -3,6 +3,8 @@ package server
 import (
 	"io"
 	"net/http"
+	"net/url"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -11,6 +13,7 @@ import (
 	"github.com/thasami/backyard/internal/auth"
 	"github.com/thasami/backyard/internal/config"
 	"github.com/thasami/backyard/internal/identity"
+	"github.com/thasami/backyard/skills"
 )
 
 func TestHubPages(t *testing.T) {
@@ -205,4 +208,123 @@ func TestHubTokens(t *testing.T) {
 	n := newHarness(t, func(h *harness, d *Deps) { d.Tokens = nil })
 	n.srv.deps.Tokens = nil
 	expectError(t, n.api("POST", u, map[string]any{}), 501, "unsupported")
+}
+
+// useDocs substitutes the embedded skill documents for one test.
+func useDocs(t *testing.T, skill func() string, ref func(string) string) {
+	t.Helper()
+	oldSkill, oldRef := skillMarkdown, skillReference
+	skillMarkdown, skillReference = skill, ref
+	t.Cleanup(func() { skillMarkdown, skillReference = oldSkill, oldRef })
+}
+
+func TestHubDocsReferencesDirAndLocalize(t *testing.T) {
+	useDocs(t,
+		func() string {
+			return "# Skill\nHub: " + skills.HubURLPlaceholder + "/docs\nSite: https://my-app.backyard.example.com/\nSee [API](references/api.md).\n"
+		},
+		func(name string) string {
+			if name == "api" {
+				return "# API\nPOST " + skills.HubURLPlaceholder + "/__backyard/api/deploy\nSee [deploy](deploy.md).\n"
+			}
+			return ""
+		})
+	h := newHarness(t)
+	tests := []struct {
+		name   string
+		url    string
+		status int
+		want   []string
+	}{
+		{"skill localized", "https://backyard.test/docs/skill.md", 200,
+			[]string{"Hub: https://backyard.test/docs\n", "Site: https://my-app.backyard.test/\n", "(references/api.md)"}},
+		{"skill upper", "https://backyard.test/docs/SKILL.md", 200, []string{"Hub: https://backyard.test/docs\n"}},
+		{"reference", "https://backyard.test/docs/api.md", 200, []string{"POST https://backyard.test/__backyard/api/deploy\n"}},
+		{"reference dir", "https://backyard.test/docs/references/api.md", 200,
+			[]string{"POST https://backyard.test/__backyard/api/deploy\n", "(deploy.md)"}},
+		{"skill is no reference", "https://backyard.test/docs/references/skill.md", 404, []string{"no such document"}},
+		{"missing reference", "https://backyard.test/docs/references/nope.md", 404, []string{"no such document"}},
+		{"nested", "https://backyard.test/docs/references/x/api.md", 404, nil},
+		{"double prefix", "https://backyard.test/docs/references/references/api.md", 404, nil},
+		{"other dir", "https://backyard.test/docs/other/api.md", 404, nil},
+		{"dotted", "https://backyard.test/docs/references/a.b.md", 404, nil},
+		{"dot dot", "https://backyard.test/docs/references/...md", 404, nil},
+		{"encoded traversal", "https://backyard.test/docs/references/..%2fapi.md", 301, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := h.get(tc.url)
+			expectStatus(t, w, tc.status)
+			body := w.Body.String()
+			if tc.status == 200 {
+				if ct := w.Header().Get("Content-Type"); ct != "text/markdown; charset=utf-8" {
+					t.Fatalf("Content-Type = %q", ct)
+				}
+				if strings.Contains(body, skills.HubURLPlaceholder) || strings.Contains(body, "backyard.example.com") {
+					t.Fatalf("placeholder not localized: %q", body)
+				}
+			}
+			for _, s := range tc.want {
+				if !strings.Contains(body, s) {
+					t.Fatalf("body = %q, want %q", body, s)
+				}
+			}
+		})
+	}
+	// The traversal redirect never leaves /docs/references/ for a document.
+	if loc := h.get("https://backyard.test/docs/references/..%2fapi.md").Header().Get("Location"); loc != "/docs/api.md" {
+		t.Fatalf("traversal Location = %q", loc)
+	}
+}
+
+// docLinkTargetRe matches relative markdown links to sibling documents.
+var docLinkTargetRe = regexp.MustCompile(`\]\(((?:\./)?(?:references/)?[A-Za-z0-9_-]+\.md)(?:#[^)\s]*)?\)`)
+
+// TestHubDocsRelativeLinksResolve follows every relative link between the
+// real embedded documents as a browser or agent would (relative to the
+// document's URL) and expects each one to be served, localized.
+func TestHubDocsRelativeLinksResolve(t *testing.T) {
+	useDocs(t, skills.SkillMarkdown, skills.Reference)
+	h := newHarness(t)
+	start := []string{"/docs/skill.md"}
+	for _, name := range skills.References() {
+		start = append(start, "/docs/"+name+".md", "/docs/references/"+name+".md")
+	}
+	seen := map[string]bool{}
+	queue := slices.Clone(start)
+	links := 0
+	for len(queue) > 0 {
+		p := queue[0]
+		queue = queue[1:]
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		w := h.get("https://backyard.test" + p)
+		if w.Code != http.StatusOK {
+			t.Errorf("GET %s: status %d", p, w.Code)
+			continue
+		}
+		if strings.Contains(w.Body.String(), skills.HubURLPlaceholder) {
+			t.Errorf("GET %s: hub placeholder not localized", p)
+		}
+		base, err := url.Parse("https://backyard.test" + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range docLinkTargetRe.FindAllStringSubmatch(w.Body.String(), -1) {
+			ref, err := url.Parse(m[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			links++
+			queue = append(queue, base.ResolveReference(ref).Path)
+		}
+	}
+	if links == 0 {
+		t.Fatal("no relative links found in the embedded documents")
+	}
+	if !seen["/docs/references/api.md"] {
+		t.Fatalf("SKILL.md's references/api.md link was not followed: %v", seen)
+	}
 }

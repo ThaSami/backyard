@@ -138,16 +138,35 @@ func opCtx(r *http.Request) (context.Context, context.CancelFunc) {
 
 // decodeJSON reads one JSON value from the body (at most limit bytes).
 func decodeJSON(w http.ResponseWriter, r *http.Request, limit int64, v any, strict bool) *apiError {
+	return decodeJSONWith(w, r, limit, v, jsonOptions{strict: strict})
+}
+
+// jsonOptions tune decodeJSONWith.
+type jsonOptions struct {
+	// strict rejects unknown object fields.
+	strict bool
+	// useNumber decodes numbers held in interface values (any, []any,
+	// map[string]any) as json.Number instead of float64, so integers
+	// beyond 2^53 keep every digit.
+	useNumber bool
+}
+
+// decodeJSONWith reads exactly one JSON value from the body (at most limit
+// bytes) into v.
+func decodeJSONWith(w http.ResponseWriter, r *http.Request, limit int64, v any, opt jsonOptions) *apiError {
 	body := http.MaxBytesReader(w, r.Body, limit)
 	dec := json.NewDecoder(body)
-	if strict {
+	if opt.strict {
 		dec.DisallowUnknownFields()
+	}
+	if opt.useNumber {
+		dec.UseNumber()
 	}
 	if err := dec.Decode(v); err != nil {
 		return jsonError(err, limit)
 	}
 	// Exactly one value.
-	if err := dec.Decode(&json.RawMessage{}); err != io.EOF {
+	if err := dec.Decode(&json.RawMessage{}); !errors.Is(err, io.EOF) {
 		if err == nil {
 			return errBadRequest("request body must contain a single JSON value")
 		}

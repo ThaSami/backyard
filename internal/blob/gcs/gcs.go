@@ -15,6 +15,11 @@
 // the IAM Credentials SignBlob API as cfg.SignerEmail (or the detected
 // default service account), which needs roles/iam.serviceAccountTokenCreator
 // on that account.
+//
+// Presigned uploads sign Content-Type and, when the size is known,
+// x-goog-content-length-range: <size>,<size>, so GCS rejects a body of any
+// other size. GCS cannot verify a SHA-256 digest (it only checks MD5 and
+// CRC32C), so PresignPutOptions.SHA256 is not enforced.
 package gcs
 
 import (
@@ -445,7 +450,13 @@ func (s *Store) List(ctx context.Context, prefix, delimiter string) (*blob.ListR
 	return res, nil
 }
 
-func (s *Store) signedURL(key, method, contentType string, ttl time.Duration) (string, time.Time, error) {
+// contentLengthRangeHeader is the signed-URL header that makes GCS reject an
+// upload whose Content-Length is outside "<min>,<max>".
+const contentLengthRangeHeader = "x-goog-content-length-range"
+
+// signedURL returns a V4 signed URL. headers are extra "name:value" headers
+// the request must carry (names lowercase).
+func (s *Store) signedURL(key, method, contentType string, headers []string, ttl time.Duration) (string, time.Time, error) {
 	if !s.canSign {
 		return "", time.Time{}, fmt.Errorf("%w: GCS signed URLs are unavailable without credentials (emulator endpoint)", blob.ErrNotSupported)
 	}
@@ -455,6 +466,7 @@ func (s *Store) signedURL(key, method, contentType string, ttl time.Duration) (s
 		GoogleAccessID: s.signer,
 		Method:         method,
 		ContentType:    contentType,
+		Headers:        headers,
 		Expires:        expires,
 		Scheme:         storage.SigningSchemeV4,
 	})
@@ -465,13 +477,25 @@ func (s *Store) signedURL(key, method, contentType string, ttl time.Duration) (s
 }
 
 // PresignPut returns a V4 signed URL accepting a PUT of the object's bytes.
-// Headers carries the signed Content-Type, which must be sent verbatim.
-func (s *Store) PresignPut(_ context.Context, key, contentType string, ttl time.Duration) (*blob.PresignedRequest, error) {
+// Headers carries the signed headers, which must be sent verbatim:
+// Content-Type and, when opts.Size >= 0, x-goog-content-length-range pinning
+// the body to exactly that size. opts.SHA256 cannot be enforced by GCS.
+func (s *Store) PresignPut(_ context.Context, key string, opts blob.PresignPutOptions, ttl time.Duration) (*blob.PresignedRequest, error) {
 	if err := s.checkKey(key); err != nil {
 		return nil, err
 	}
-	ct := blobutil.PresignContentType(key, contentType)
-	u, exp, err := s.signedURL(key, http.MethodPut, ct, ttl)
+	spec, err := blobutil.CheckPresignPut(key, opts)
+	if err != nil {
+		return nil, fmt.Errorf("blob/gcs: presign put %q: %w", key, err)
+	}
+	headers := map[string]string{"Content-Type": spec.ContentType}
+	var signed []string
+	if spec.Size >= 0 {
+		n := strconv.FormatInt(spec.Size, 10)
+		headers[contentLengthRangeHeader] = n + "," + n
+		signed = append(signed, contentLengthRangeHeader+":"+n+","+n)
+	}
+	u, exp, err := s.signedURL(key, http.MethodPut, spec.ContentType, signed, ttl)
 	if err != nil {
 		if errors.Is(err, blob.ErrNotSupported) {
 			return nil, err
@@ -481,7 +505,7 @@ func (s *Store) PresignPut(_ context.Context, key, contentType string, ttl time.
 	return &blob.PresignedRequest{
 		Method:    http.MethodPut,
 		URL:       u,
-		Headers:   map[string]string{"Content-Type": ct},
+		Headers:   headers,
 		ExpiresAt: exp,
 	}, nil
 }
@@ -491,7 +515,7 @@ func (s *Store) PresignGet(_ context.Context, key string, ttl time.Duration) (*b
 	if err := s.checkKey(key); err != nil {
 		return nil, err
 	}
-	u, exp, err := s.signedURL(key, http.MethodGet, "", ttl)
+	u, exp, err := s.signedURL(key, http.MethodGet, "", nil, ttl)
 	if err != nil {
 		if errors.Is(err, blob.ErrNotSupported) {
 			return nil, err

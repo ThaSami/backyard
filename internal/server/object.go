@@ -207,6 +207,22 @@ type serveOptions struct {
 
 // serveObject writes obj with validators, conditional GET (304), HEAD and
 // single byte-range support (206/416).
+//
+// On platforms that limit the Content-Length of HTTP/1 responses
+// (Server.maxFixedLength; Cloud Run: 32 MiB), larger bodies are adapted
+// for HTTP/1 requests (HTTP/2 has no such limit):
+//
+//   - a full response (200, or a custom 404.html) is sent without a
+//     Content-Length, so net/http streams it with chunked transfer encoding
+//     (HTTP/1.0 clients read until the connection closes). A failure while
+//     streaming aborts the connection, so a truncated body never looks
+//     complete;
+//   - a range response (206) is shortened to the first maxFixedLength bytes
+//     of the requested range and keeps its Content-Length. Content-Range
+//     names the bytes actually sent, which RFC 9110 §15.3.7 obliges
+//     clients to inspect to "determine what parts are enclosed and whether
+//     additional requests are needed"; browsers' media elements and
+//     download managers request the rest.
 func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, obj *object, opt serveOptions) {
 	status := opt.status
 	if status == 0 {
@@ -256,9 +272,20 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, obj *object
 			case rangeOK:
 				offset, length = start, n
 				status = http.StatusPartialContent
-				h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+n-1, obj.size))
 			}
 		}
+	}
+
+	chunked := false
+	if limit := s.maxFixedLength; limit > 0 && length > limit && r.ProtoMajor < 2 {
+		if status == http.StatusPartialContent {
+			length = limit
+		} else {
+			chunked = true
+		}
+	}
+	if status == http.StatusPartialContent {
+		h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+length-1, obj.size))
 	}
 
 	var body io.Reader
@@ -285,13 +312,26 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, obj *object
 	}
 
 	h.Set("Content-Type", obj.contentType)
-	h.Set("Content-Length", strconv.FormatInt(length, 10))
+	if chunked {
+		h.Del("Content-Length")
+	} else {
+		h.Set("Content-Length", strconv.FormatInt(length, 10))
+	}
 	w.WriteHeader(status)
 	if body == nil {
 		return
 	}
-	if _, err := io.CopyN(w, body, length); err != nil && r.Context().Err() == nil {
-		s.log.WarnContext(r.Context(), "streaming object failed", "name", obj.name, "error", err)
+	if _, err := io.CopyN(w, body, length); err != nil {
+		if r.Context().Err() == nil {
+			s.log.WarnContext(r.Context(), "streaming object failed", "name", obj.name, "error", err)
+		}
+		if chunked {
+			// Returning normally would end the chunked body cleanly and
+			// the client would take the truncated file for the whole one.
+			// (With a Content-Length, net/http closes the connection after
+			// a short body by itself.)
+			panic(http.ErrAbortHandler)
+		}
 	}
 }
 

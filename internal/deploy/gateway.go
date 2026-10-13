@@ -190,7 +190,7 @@ func (g *Gateway) routes() {
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if v := recover(); v != nil {
-			if v == http.ErrAbortHandler {
+			if err, ok := v.(error); ok && errors.Is(err, http.ErrAbortHandler) {
 				panic(v)
 			}
 			g.log.ErrorContext(r.Context(), "deploy gateway panic", "panic", v, "stack", string(debug.Stack()))

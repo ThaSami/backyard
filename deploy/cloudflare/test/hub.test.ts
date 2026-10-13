@@ -2,8 +2,9 @@
 import { describe, expect, it } from "vitest";
 import { HUB_FILES } from "../src/generated/hub";
 import { SDK_DTS, SDK_JS, SDK_MJS } from "../src/generated/sdk";
-import { REFERENCES } from "../src/generated/skills";
-import { call } from "./helpers";
+import { REFERENCES, SKILL_MD } from "../src/generated/skills";
+import { HUB_URL_PLACEHOLDER, localize } from "../src/llms";
+import { call, ORIGIN } from "./helpers";
 
 describe("hub", () => {
   it("serves the SDK with the per-request preamble, byte-identical otherwise", async () => {
@@ -39,14 +40,30 @@ describe("hub", () => {
     }
     res = await call("/docs");
     expect(await res.text()).toBe(HUB_FILES["docs.html"]!.text);
+    // Documents are localized for this hub, like /llms-full.txt (and the Go hub).
     res = await call("/docs/skill.md");
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toBe("text/markdown; charset=utf-8");
+    const skill = await res.text();
+    expect(skill).toBe(localize(SKILL_MD, ORIGIN));
+    expect(skill).not.toContain(HUB_URL_PLACEHOLDER + "/");
+    if (SKILL_MD.includes(HUB_URL_PLACEHOLDER)) expect(skill).toContain(ORIGIN);
     for (const name of Object.keys(REFERENCES)) {
       res = await call(`/docs/${name}.md`);
       expect(res.status, name).toBe(200);
-      expect(await res.text()).toBe(REFERENCES[name]);
+      const body = await res.text();
+      expect(body).toBe(localize(REFERENCES[name]!, ORIGIN));
+      expect(body).not.toContain(HUB_URL_PLACEHOLDER + "/");
+      // SKILL.md links to "references/<name>.md", relative to /docs/skill.md.
+      res = await call(`/docs/references/${name}.md`);
+      expect(res.status, `references/${name}`).toBe(200);
+      expect(res.headers.get("Content-Type")).toBe("text/markdown; charset=utf-8");
+      expect(await res.text()).toBe(body);
     }
+    expect((await call("/docs/references/skill.md")).status).toBe(404);
+    expect((await call("/docs/references/nope.md")).status).toBe(404);
+    expect((await call("/docs/references/references/api.md")).status).toBe(404);
+    expect((await call("/docs/constructor.md")).status).toBe(404);
     expect((await call("/docs/../etc.md")).status).toBe(404);
     expect((await call("/docs/nope.md")).status).toBe(404);
     expect((await call("/nope.html")).status).toBe(404);

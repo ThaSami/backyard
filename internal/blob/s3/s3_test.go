@@ -3,14 +3,20 @@ package s3
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -94,13 +100,128 @@ func strictCompat(t *testing.T) func(http.Handler) http.Handler {
 	}
 }
 
+// presignedS3 makes gofakes3 (which ignores authentication) check presigned
+// requests the way S3 does: the SigV4 query signature over the signed
+// headers as received, so a body whose Content-Length differs from a signed
+// one fails with 403 SignatureDoesNotMatch; the expiry; and a signed
+// x-amz-checksum-sha256 against the body (400 BadDigest). gofakes3 itself
+// verifies Content-MD5.
+func presignedS3(secret string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Has("X-Amz-Signature") {
+				if err := verifyPresignedSigV4(r, secret, time.Now()); err != nil {
+					writeS3Error(w, http.StatusForbidden, "SignatureDoesNotMatch", err.Error())
+					return
+				}
+			}
+			if want := r.Header.Get("X-Amz-Checksum-Sha256"); want != "" {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					writeS3Error(w, http.StatusBadRequest, "IncompleteBody", err.Error())
+					return
+				}
+				sum := sha256.Sum256(body)
+				if got := base64.StdEncoding.EncodeToString(sum[:]); got != want {
+					writeS3Error(w, http.StatusBadRequest, "BadDigest", "The SHA256 you specified did not match the calculated checksum.")
+					return
+				}
+				r.Body = io.NopCloser(bytes.NewReader(body))
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func writeS3Error(w http.ResponseWriter, status int, code, msg string) {
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(status)
+	fmt.Fprintf(w, "<Error><Code>%s</Code><Message>%s</Message></Error>", code, msg)
+}
+
+// verifyPresignedSigV4 recomputes a presigned (query-string) SigV4 signature
+// from the request as received, independently of the SDK's signer.
+func verifyPresignedSigV4(r *http.Request, secret string, now time.Time) error {
+	q := r.URL.Query()
+	if q.Get("X-Amz-Algorithm") != "AWS4-HMAC-SHA256" {
+		return fmt.Errorf("unsupported algorithm %q", q.Get("X-Amz-Algorithm"))
+	}
+	cred := strings.Split(q.Get("X-Amz-Credential"), "/")
+	if len(cred) != 5 || cred[4] != "aws4_request" {
+		return fmt.Errorf("malformed credential %q", q.Get("X-Amz-Credential"))
+	}
+	amzDate := q.Get("X-Amz-Date")
+	signedAt, err := time.Parse("20060102T150405Z", amzDate)
+	if err != nil {
+		return fmt.Errorf("malformed X-Amz-Date: %w", err)
+	}
+	expires, err := strconv.Atoi(q.Get("X-Amz-Expires"))
+	if err != nil || expires <= 0 || expires > 7*24*3600 {
+		return fmt.Errorf("malformed X-Amz-Expires %q", q.Get("X-Amz-Expires"))
+	}
+	if now.After(signedAt.Add(time.Duration(expires) * time.Second)) {
+		return errors.New("request has expired")
+	}
+	signedHeaders := q.Get("X-Amz-SignedHeaders")
+	var canonHeaders strings.Builder
+	for _, name := range strings.Split(signedHeaders, ";") {
+		var v string
+		switch name {
+		case "host":
+			v = r.Host
+		case "content-length":
+			if r.ContentLength < 0 {
+				return errors.New("signed content-length missing (chunked body)")
+			}
+			v = strconv.FormatInt(r.ContentLength, 10)
+		default:
+			v = strings.Join(r.Header.Values(name), ",")
+		}
+		canonHeaders.WriteString(name + ":" + strings.Join(strings.Fields(v), " ") + "\n")
+	}
+	sig := q.Get("X-Amz-Signature")
+	q.Del("X-Amz-Signature")
+	path, _, _ := strings.Cut(r.RequestURI, "?")
+	creq := strings.Join([]string{
+		r.Method, path, strings.ReplaceAll(q.Encode(), "+", "%20"),
+		canonHeaders.String(), signedHeaders, "UNSIGNED-PAYLOAD",
+	}, "\n")
+	creqSum := sha256.Sum256([]byte(creq))
+	scope := strings.Join(cred[1:], "/")
+	sts := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + hex.EncodeToString(creqSum[:])
+	mac := func(key []byte, data string) []byte {
+		h := hmac.New(sha256.New, key)
+		h.Write([]byte(data))
+		return h.Sum(nil)
+	}
+	key := []byte("AWS4" + secret)
+	for _, part := range cred[1:] {
+		key = mac(key, part)
+	}
+	if want := hex.EncodeToString(mac(key, sts)); !hmac.Equal([]byte(want), []byte(sig)) {
+		return errors.New("the request signature does not match the signed headers")
+	}
+	return nil
+}
+
+// chain applies wrappers outermost first.
+func chain(wraps ...func(http.Handler) http.Handler) func(http.Handler) http.Handler {
+	return func(h http.Handler) http.Handler {
+		for i := len(wraps) - 1; i >= 0; i-- {
+			h = wraps[i](h)
+		}
+		return h
+	}
+}
+
 // S3-compatible endpoints (MinIO, R2, Ceph...) get only headers such stores
-// understand.
+// understand; presigned uploads still pin the size (signed Content-Length or
+// Content-MD5), but not the SHA-256 (no flexible checksums).
 func TestConformanceStrictCompatible(t *testing.T) {
 	t.Setenv("AWS_REQUEST_CHECKSUM_CALCULATION", "")
 	t.Setenv("AWS_RESPONSE_CHECKSUM_VALIDATION", "")
-	f := newFakeWith(t, strictCompat(t))
-	blobtest.Run(t, func(t *testing.T) blob.Store { return newTestStore(t, f, "r2") })
+	f := newFakeWith(t, chain(strictCompat(t), presignedS3(testSecret)))
+	blobtest.Run(t, func(t *testing.T) blob.Store { return newTestStore(t, f, "r2") }, blobtest.PresignEnforcesSize())
 }
 
 // Stores (or caches) that ignore Range still yield the requested bytes.
@@ -143,7 +264,7 @@ func TestPrefixedKeyLength(t *testing.T) {
 	if _, err := s.Stat(ctx, long); !errors.Is(err, blob.ErrInvalidKey) {
 		t.Errorf("Stat(long) err = %v, want ErrInvalidKey", err)
 	}
-	if _, err := s.PresignPut(ctx, long, "", time.Minute); !errors.Is(err, blob.ErrInvalidKey) {
+	if _, err := s.PresignPut(ctx, long, blob.PresignPutOptions{Size: -1}, time.Minute); !errors.Is(err, blob.ErrInvalidKey) {
 		t.Errorf("PresignPut(long) err = %v, want ErrInvalidKey", err)
 	}
 	if _, err := s.Put(ctx, strings.Repeat("k", 1012), strings.NewReader("x"), 1, ""); err != nil {
@@ -167,9 +288,11 @@ func (f *fakeS3) cfg(bucket, prefix string) config.S3Config {
 		Prefix:          prefix,
 		Endpoint:        f.url,
 		AccessKeyID:     "test-key",
-		SecretAccessKey: "test-secret",
+		SecretAccessKey: testSecret,
 	}
 }
+
+const testSecret = "test-secret"
 
 func newTestStore(t *testing.T, f *fakeS3, prefix string, opts ...Option) *Store {
 	t.Helper()
@@ -181,28 +304,28 @@ func newTestStore(t *testing.T, f *fakeS3, prefix string, opts ...Option) *Store
 }
 
 func TestConformance(t *testing.T) {
-	f := newFake(t)
-	blobtest.Run(t, func(t *testing.T) blob.Store { return newTestStore(t, f, "") })
+	f := newFakeWith(t, presignedS3(testSecret))
+	blobtest.Run(t, func(t *testing.T) blob.Store { return newTestStore(t, f, "") }, blobtest.PresignEnforcesSize())
 }
 
 func TestConformanceWithPrefix(t *testing.T) {
-	f := newFake(t)
-	blobtest.Run(t, func(t *testing.T) blob.Store { return newTestStore(t, f, "/tenant/a") })
+	f := newFakeWith(t, presignedS3(testSecret))
+	blobtest.Run(t, func(t *testing.T) blob.Store { return newTestStore(t, f, "/tenant/a") }, blobtest.PresignEnforcesSize())
 }
 
 // The default AWS checksum mode (CRC32 on uploads and multipart parts) must
-// also work end to end.
+// also work end to end; presigned uploads then also pin the SHA-256.
 func TestConformanceWithFlexibleChecksums(t *testing.T) {
 	t.Setenv("AWS_REQUEST_CHECKSUM_CALCULATION", "when_supported")
 	t.Setenv("AWS_RESPONSE_CHECKSUM_VALIDATION", "when_supported")
-	f := newFake(t)
+	f := newFakeWith(t, presignedS3(testSecret))
 	blobtest.Run(t, func(t *testing.T) blob.Store {
 		s := newTestStore(t, f, "")
-		if !s.partChecksums {
-			t.Fatal("expected part checksums to be enabled")
+		if !s.checksums {
+			t.Fatal("expected flexible checksums to be enabled")
 		}
 		return s
-	})
+	}, blobtest.PresignEnforcesSize(), blobtest.PresignEnforcesSHA256())
 }
 
 func TestNewValidation(t *testing.T) {
@@ -239,8 +362,8 @@ func TestDescribeAndDefaults(t *testing.T) {
 	if d := s.Describe(); d != want {
 		t.Errorf("Describe = %+v, want %+v", d, want)
 	}
-	if !s.partChecksums || s.client.Options().UsePathStyle {
-		t.Errorf("AWS defaults not kept: checksums=%v pathStyle=%v", s.partChecksums, s.client.Options().UsePathStyle)
+	if !s.checksums || s.client.Options().UsePathStyle {
+		t.Errorf("AWS defaults not kept: checksums=%v pathStyle=%v", s.checksums, s.client.Options().UsePathStyle)
 	}
 	r2, err := New(ctx, config.S3Config{
 		Bucket: "site", Endpoint: "https://0123abcd.r2.cloudflarestorage.com",
@@ -253,7 +376,7 @@ func TestDescribeAndDefaults(t *testing.T) {
 		t.Errorf("endpoint not described: %+v", r2.Describe())
 	}
 	o := r2.client.Options()
-	if !o.UsePathStyle || o.RequestChecksumCalculation != aws.RequestChecksumCalculationWhenRequired || r2.partChecksums {
+	if !o.UsePathStyle || o.RequestChecksumCalculation != aws.RequestChecksumCalculationWhenRequired || r2.checksums {
 		t.Errorf("custom endpoint options: pathStyle=%v checksum=%v", o.UsePathStyle, o.RequestChecksumCalculation)
 	}
 	// R2 always signs for "auto" unless a region is configured, even when
@@ -456,7 +579,7 @@ func TestPresignDetails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req, err := s.PresignPut(ctx, "sites/foo/index.html", "", time.Hour)
+	req, err := s.PresignPut(ctx, "sites/foo/index.html", blob.PresignPutOptions{Size: -1}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -500,6 +623,168 @@ func TestPresignDetails(t *testing.T) {
 	lu, _ := url.Parse(long.URL)
 	if lu.Query().Get("X-Amz-Expires") != "604800" {
 		t.Errorf("clamped X-Amz-Expires = %q", lu.Query().Get("X-Amz-Expires"))
+	}
+}
+
+// Presigned uploads sign the declared size (and on AWS the SHA-256), and
+// return exactly the headers the client must send.
+func TestPresignBindsSizeAndChecksum(t *testing.T) {
+	ctx := context.Background()
+	const sha = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" // "hello"
+	const shaB64 = "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ="
+	aws, err := New(ctx, config.S3Config{Bucket: "acme", Region: "us-east-1", AccessKeyID: "AKIDEXAMPLE", SecretAccessKey: "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_REQUEST_CHECKSUM_CALCULATION", "")
+	compat, err := New(ctx, config.S3Config{Bucket: "acme", Endpoint: "https://acct.r2.cloudflarestorage.com", AccessKeyID: "AKIDEXAMPLE", SecretAccessKey: "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name        string
+		s           *Store
+		opts        blob.PresignPutOptions
+		wantSigned  []string
+		wantHeaders map[string]string
+		notSigned   []string
+	}{
+		{
+			name:        "aws with sha256",
+			s:           aws,
+			opts:        blob.PresignPutOptions{ContentType: "text/plain", Size: 5, SHA256: sha},
+			wantSigned:  []string{"content-length", "content-type", "host", "x-amz-checksum-sha256"},
+			wantHeaders: map[string]string{"Content-Length": "5", "Content-Type": "text/plain", "X-Amz-Checksum-Sha256": shaB64},
+		},
+		{
+			name:        "aws without sha256",
+			s:           aws,
+			opts:        blob.PresignPutOptions{ContentType: "text/plain", Size: 5},
+			wantSigned:  []string{"content-length", "content-type", "host"},
+			wantHeaders: map[string]string{"Content-Length": "5", "Content-Type": "text/plain"},
+			notSigned:   []string{"x-amz-checksum-sha256"},
+		},
+		{
+			name:        "compatible endpoint: size only",
+			s:           compat,
+			opts:        blob.PresignPutOptions{ContentType: "text/plain", Size: 5, SHA256: strings.ToUpper(sha)},
+			wantSigned:  []string{"content-length", "content-type", "host"},
+			wantHeaders: map[string]string{"Content-Length": "5", "Content-Type": "text/plain"},
+			notSigned:   []string{"x-amz-checksum-sha256"},
+		},
+		{
+			name:        "empty body",
+			s:           compat,
+			opts:        blob.PresignPutOptions{ContentType: "text/plain", Size: 0},
+			wantSigned:  []string{"content-md5", "content-type", "host"},
+			wantHeaders: map[string]string{"Content-Md5": emptyMD5, "Content-Type": "text/plain"},
+			notSigned:   []string{"content-length"},
+		},
+		{
+			name:        "unknown size",
+			s:           aws,
+			opts:        blob.PresignPutOptions{ContentType: "text/plain", Size: -1},
+			wantSigned:  []string{"content-type", "host"},
+			wantHeaders: map[string]string{"Content-Type": "text/plain"},
+			notSigned:   []string{"content-length", "content-md5"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := tc.s.PresignPut(ctx, "sites/foo/a.txt", tc.opts, time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			u, err := url.Parse(req.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			signed := strings.Split(u.Query().Get("X-Amz-SignedHeaders"), ";")
+			for _, h := range tc.wantSigned {
+				if !slices.Contains(signed, h) {
+					t.Errorf("X-Amz-SignedHeaders = %q, missing %s", signed, h)
+				}
+			}
+			for _, h := range tc.notSigned {
+				if slices.Contains(signed, h) {
+					t.Errorf("X-Amz-SignedHeaders = %q, must not contain %s", signed, h)
+				}
+			}
+			if !maps.Equal(req.Headers, tc.wantHeaders) {
+				t.Errorf("Headers = %v, want %v", req.Headers, tc.wantHeaders)
+			}
+		})
+	}
+	for name, opts := range map[string]blob.PresignPutOptions{
+		"negative size": {Size: -5},
+		"bad sha256":    {Size: 5, SHA256: "xyz"},
+	} {
+		if _, err := aws.PresignPut(ctx, "a.txt", opts, time.Minute); err == nil {
+			t.Errorf("%s: PresignPut succeeded", name)
+		}
+	}
+}
+
+// The presigned-URL verifier used by the conformance tests rejects what S3
+// rejects: a different body size, an altered signed header, a dropped
+// checksum header and an expired URL.
+func TestPresignedUploadRejections(t *testing.T) {
+	t.Setenv("AWS_REQUEST_CHECKSUM_CALCULATION", "when_supported")
+	f := newFakeWith(t, presignedS3(testSecret))
+	s := newTestStore(t, f, "p")
+	ctx := context.Background()
+	data := []byte("twelve bytes")
+	sum := sha256.Sum256(data)
+	req, err := s.PresignPut(ctx, "k.txt", blob.PresignPutOptions{Size: int64(len(data)), SHA256: hex.EncodeToString(sum[:])}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send := func(body []byte, mutate func(*http.Request)) (int, string) {
+		t.Helper()
+		r, err := http.NewRequestWithContext(ctx, req.Method, req.URL, bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range req.Headers {
+			r.Header.Set(k, v)
+		}
+		if mutate != nil {
+			mutate(r)
+		}
+		resp, err := http.DefaultClient.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b)
+	}
+	for _, tc := range []struct {
+		name   string
+		body   []byte
+		mutate func(*http.Request)
+		status int
+		code   string
+	}{
+		{"larger body", []byte("thirteen byte"), nil, 403, "SignatureDoesNotMatch"},
+		{"smaller body", []byte("eleven byte"), nil, 403, "SignatureDoesNotMatch"},
+		{"chunked body", data, func(r *http.Request) { r.ContentLength = -1; r.Body = io.NopCloser(bytes.NewReader(data)) }, 403, "SignatureDoesNotMatch"},
+		{"other content type", data, func(r *http.Request) { r.Header.Set("Content-Type", "text/html") }, 403, "SignatureDoesNotMatch"},
+		{"checksum header dropped", data, func(r *http.Request) { r.Header.Del("X-Amz-Checksum-Sha256") }, 403, "SignatureDoesNotMatch"},
+		{"same size, other bytes", []byte("TWELVE BYTES"), nil, 400, "BadDigest"},
+	} {
+		code, body := send(tc.body, tc.mutate)
+		if code != tc.status || !strings.Contains(body, tc.code) {
+			t.Errorf("%s: status %d %s, want %d %s", tc.name, code, body, tc.status, tc.code)
+		}
+	}
+	if _, err := s.Stat(ctx, "k.txt"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("object stored by a rejected upload: %v", err)
+	}
+	if code, body := send(data, nil); code != http.StatusOK {
+		t.Fatalf("exact upload: %d %s", code, body)
+	}
+	if err := verifyPresignedSigV4(httptest.NewRequest(http.MethodPut, req.URL, nil), testSecret, time.Now().Add(2*time.Minute)); err == nil {
+		t.Error("expired URL verified")
 	}
 }
 

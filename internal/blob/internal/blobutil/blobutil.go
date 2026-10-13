@@ -210,6 +210,41 @@ func PresignContentType(key, contentType string) string {
 	return blob.DetectContentType(key, nil)
 }
 
+// PresignSpec is a validated blob.PresignPutOptions.
+type PresignSpec struct {
+	// ContentType is the content type to sign (see PresignContentType).
+	ContentType string
+	// Size is the exact body size, or -1 when unknown.
+	Size int64
+	// SHA256 is the raw SHA-256 digest of the body, nil when unknown.
+	SHA256 []byte
+}
+
+// emptySHA256 is the SHA-256 digest of the empty body.
+var emptySHA256 = sha256.Sum256(nil)
+
+// CheckPresignPut validates the options of a presigned upload to key: the
+// size must be >= 0 or -1 (unknown), the SHA-256 (optional) 64 hex digits,
+// and a 0-byte upload's SHA-256 that of the empty body.
+func CheckPresignPut(key string, opts blob.PresignPutOptions) (PresignSpec, error) {
+	spec := PresignSpec{ContentType: PresignContentType(key, opts.ContentType), Size: opts.Size}
+	if opts.Size < -1 {
+		return spec, fmt.Errorf("invalid upload size %d (want >= 0, or -1 when unknown)", opts.Size)
+	}
+	if opts.SHA256 == "" {
+		return spec, nil
+	}
+	sum, err := hex.DecodeString(opts.SHA256)
+	if err != nil || len(sum) != sha256.Size {
+		return spec, fmt.Errorf("invalid upload sha256 %q (want 64 hex digits)", truncate(opts.SHA256))
+	}
+	if opts.Size == 0 && !bytes.Equal(sum, emptySHA256[:]) {
+		return spec, fmt.Errorf("upload sha256 %s cannot be the digest of a 0-byte body", opts.SHA256)
+	}
+	spec.SHA256 = sum
+	return spec, nil
+}
+
 // SyntheticETag derives a stable opaque ETag from size and modification time
 // (nanoseconds). It is used by the fs backend and as a fallback when a remote
 // store returns no ETag.
@@ -408,7 +443,7 @@ func (b *Body) NextChunk(max int64, hint int64) (chunk []byte, last bool, err er
 		b.buf.Grow(int(hint))
 	}
 	n, err := io.CopyN(&b.buf, b.br, max)
-	if err == io.EOF {
+	if errors.Is(err, io.EOF) {
 		return b.buf.Bytes(), true, nil
 	}
 	if err != nil {

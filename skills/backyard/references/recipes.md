@@ -536,7 +536,7 @@ the db) and appears in a shared gallery for everyone.
       status.textContent = "Painting… (this can take a few seconds)";
       try {
         const img = await backyard.ai.image(prompt, { size: "1024x1024" });
-        await images.create({ prompt, url: img.url, by: me.name });
+        await images.create({ prompt, url: img.url, file_id: img.id, by: me.name });  // file_id: backyard.files.delete later
         status.textContent = "";
         document.querySelector("#prompt").value = "";
       } catch (err) {

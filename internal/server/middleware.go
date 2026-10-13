@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -117,7 +118,7 @@ func (s *Server) serveRecover(w *statusRecorder, r *http.Request, next http.Hand
 		if v == nil {
 			return
 		}
-		if v == http.ErrAbortHandler {
+		if err, ok := v.(error); ok && errors.Is(err, http.ErrAbortHandler) {
 			panic(v)
 		}
 		ri := info(r)

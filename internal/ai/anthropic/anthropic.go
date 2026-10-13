@@ -384,7 +384,7 @@ func (p *Provider) params(ctx context.Context, req ai.ChatRequest) (sdk.BetaMess
 		maxTokens = defaultMaxTokens
 	}
 	params := sdk.BetaMessageNewParams{
-		Model:     sdk.Model(req.Model),
+		Model:     req.Model, // sdk.Model is an alias of string
 		MaxTokens: int64(maxTokens),
 		Messages:  msgs,
 	}
@@ -477,7 +477,7 @@ func (p *Provider) response(msg *sdk.BetaMessage, req ai.ChatRequest) *ai.ChatRe
 	}
 	out := &ai.ChatResponse{
 		Content:    content,
-		Model:      string(msg.Model),
+		Model:      msg.Model,
 		StopReason: mapStopReason(msg.StopReason),
 		Usage:      usageOf(msg.Usage),
 	}

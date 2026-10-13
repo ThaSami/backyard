@@ -110,12 +110,17 @@ func (g *Gateway) handleCreateDeploy(w http.ResponseWriter, r *http.Request) {
 	resp := CreateDeployResponse{DeployID: deployID, Unchanged: []string{}, ExpiresAt: exp.UTC()}
 	var changed []FileEntry
 	var uploadBytes int64
+	newFiles := 0 // uploads that would be orphans if never committed
 	for _, f := range req.Files {
-		if mf, ok := recorded[f.Path]; ok && mf.SHA256 == f.SHA256 && mf.Size == f.Size {
+		mf, ok := recorded[f.Path]
+		if ok && mf.SHA256 == f.SHA256 && mf.Size == f.Size {
 			if o, ok := stored[f.Path]; ok && o.ETag == mf.ETag && o.Size == mf.Size {
 				resp.Unchanged = append(resp.Unchanged, f.Path)
 				continue
 			}
+		}
+		if !ok {
+			newFiles++
 		}
 		changed = append(changed, f)
 		uploadBytes += f.Size
@@ -127,7 +132,8 @@ func (g *Gateway) handleCreateDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 	g.audit(r, u, "deploy.create", site,
 		"deploy_id", shortDeployID(claims.Nonce), "files", len(req.Files), "bytes", total,
-		"uploads", len(resp.Uploads), "upload_bytes", uploadBytes, "message", truncate(req.Message, maxMessageBytes))
+		"uploads", len(resp.Uploads), "upload_bytes", uploadBytes, "new_files", newFiles,
+		"message", truncate(req.Message, maxMessageBytes))
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -237,10 +243,16 @@ func (g *Gateway) uploadsFor(ctx context.Context, base, site string, changed []F
 	return ups, nil
 }
 
-// presignUpload asks the store for a presigned PUT. It returns (nil, false)
-// when the store cannot presign, so the caller stops trying for this deploy.
+// presignUpload asks the store for a presigned PUT bound to the file's
+// declared size and SHA-256 (as far as the backend can enforce them; see
+// blob.PresignPutOptions). It returns (nil, false) when the store cannot
+// presign, so the caller stops trying for this deploy.
 func (g *Gateway) presignUpload(ctx context.Context, site string, f FileEntry, ttl time.Duration) (*Upload, bool) {
-	pr, err := g.store.PresignPut(ctx, sites.SiteKey(site, f.Path), f.ContentType, ttl)
+	pr, err := g.store.PresignPut(ctx, sites.SiteKey(site, f.Path), blob.PresignPutOptions{
+		ContentType: f.ContentType,
+		Size:        f.Size,
+		SHA256:      f.SHA256,
+	}, ttl)
 	if err != nil {
 		if !errors.Is(err, blob.ErrNotSupported) {
 			g.log.WarnContext(ctx, "deploy: presign failed; using gateway uploads", "site", site, "error", err)
@@ -346,7 +358,7 @@ func (g *Gateway) handleCommit(w http.ResponseWriter, r *http.Request) {
 		stored[o.Key] = o
 	}
 
-	var problems []string
+	var problems []commitProblem
 	man := &sites.Manifest{Site: site, UpdatedAt: g.now().UTC(), Files: make([]sites.ManifestFile, 0, len(req.Files))}
 	listed := make(map[string]bool, len(req.Files))
 	for _, f := range req.Files {
@@ -354,9 +366,19 @@ func (g *Gateway) handleCommit(w http.ResponseWriter, r *http.Request) {
 		o, ok := stored[f.Path]
 		switch {
 		case !ok:
-			problems = append(problems, fmt.Sprintf("%s (missing)", truncate(f.Path, 200)))
+			problems = append(problems, commitProblem{path: f.Path, detail: "missing"})
 		case o.Size != f.Size:
-			problems = append(problems, fmt.Sprintf("%s (%d bytes in storage, expected %d)", truncate(f.Path, 200), o.Size, f.Size))
+			// Unless storage still holds the version the previous manifest
+			// verified (this deploy just did not replace it), the object
+			// came from an upload that bypassed the declared size (Azure
+			// SAS URLs cannot bind it, a URL from another deploy, ...):
+			// delete it rather than leave unverified bytes in the site.
+			prev, known := recorded[f.Path]
+			problems = append(problems, commitProblem{
+				path:      f.Path,
+				detail:    fmt.Sprintf("%d bytes in storage, expected %d", o.Size, f.Size),
+				untrusted: !known || prev.ETag != o.ETag || prev.Size != o.Size,
+			})
 		}
 		sha := f.SHA256
 		if prev, ok := recorded[f.Path]; ok && prev.ETag == o.ETag && prev.Size == o.Size {
@@ -371,11 +393,7 @@ func (g *Gateway) handleCommit(w http.ResponseWriter, r *http.Request) {
 		man.Files = append(man.Files, sites.ManifestFile{Path: f.Path, Size: f.Size, SHA256: sha, ETag: o.ETag})
 	}
 	if len(problems) > 0 {
-		n := len(problems)
-		if n > 10 {
-			problems = append(problems[:10], fmt.Sprintf("… and %d more", n-10))
-		}
-		writeError(w, r, g.log, errf(http.StatusConflict, CodeConflict, "%d file(s) were not uploaded correctly: %s", n, strings.Join(problems, ", ")))
+		g.rejectCommit(w, r, u, site, claims, problems)
 		return
 	}
 
@@ -431,6 +449,70 @@ func (g *Gateway) handleCommit(w http.ResponseWriter, r *http.Request) {
 		meta.Owners = []string{}
 	}
 	writeJSON(w, http.StatusOK, CommitResponse{Site: *meta, URL: meta.URL, Deleted: deleted})
+}
+
+// commitProblem is a listed file that storage does not hold as declared.
+type commitProblem struct {
+	path   string
+	detail string
+	// untrusted marks a stored object of the wrong size that is not the
+	// version the previous manifest recorded: it must not stay live.
+	untrusted bool
+	deleted   bool
+}
+
+// maxReportedProblems bounds the paths named in a failed commit's message.
+const maxReportedProblems = 10
+
+// rejectCommit fails a commit whose files are missing or of the wrong size
+// with 409, naming the paths. Untrusted objects of the wrong size are
+// deleted first, so a commit never leaves partially-trusted state behind
+// (objects not listed are only removed by a successful commit, see the
+// package doc).
+func (g *Gateway) rejectCommit(w http.ResponseWriter, r *http.Request, u *identity.User, site string, claims *deployClaims, problems []commitProblem) {
+	ctx := r.Context()
+	var untrusted []int
+	for i, p := range problems {
+		if p.untrusted {
+			untrusted = append(untrusted, i)
+		}
+	}
+	// Deletion must happen even if the client gives up waiting.
+	_ = parallel(context.WithoutCancel(ctx), len(untrusted), deleteParallelism, func(ctx context.Context, i int) error {
+		p := &problems[untrusted[i]]
+		if err := g.store.Delete(ctx, sites.SiteKey(site, p.path)); err != nil {
+			g.log.ErrorContext(ctx, "deploy: delete object of the wrong size", "site", site, "path", p.path, "error", err)
+			return nil // keep deleting the others
+		}
+		p.deleted = true
+		return nil
+	})
+	if len(untrusted) > 0 {
+		deleted := 0
+		for _, i := range untrusted {
+			if problems[i].deleted {
+				deleted++
+			}
+		}
+		g.audit(r, u, "deploy.reject_uploads", site,
+			"deploy_id", shortDeployID(claims.Nonce), "wrong_size", len(untrusted), "deleted", deleted)
+	}
+	msgs := make([]string, 0, min(len(problems), maxReportedProblems+1))
+	for i, p := range problems {
+		if i == maxReportedProblems {
+			msgs = append(msgs, fmt.Sprintf("… and %d more", len(problems)-maxReportedProblems))
+			break
+		}
+		detail := p.detail
+		switch {
+		case p.deleted:
+			detail += "; deleted"
+		case p.untrusted:
+			detail += "; could not be deleted"
+		}
+		msgs = append(msgs, fmt.Sprintf("%s (%s)", truncate(p.path, 200), detail))
+	}
+	writeError(w, r, g.log, errf(http.StatusConflict, CodeConflict, "%d file(s) were not uploaded correctly: %s", len(problems), strings.Join(msgs, ", ")))
 }
 
 // readTitle extracts the title/description of a site's index.html.

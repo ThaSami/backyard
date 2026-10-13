@@ -7,6 +7,9 @@ import { createEnv, plain, flush } from "./helpers/harness.mjs";
 const user = (id) => ({ id, name: id.split("@")[0], email: id, avatar_url: "" });
 const member = (cid, id, state = {}, joined_at = "2026-01-01T00:00:0" + cid.slice(-1) + "Z") => ({ cid, user: user(id), state, joined_at });
 const doc = (id, data = {}) => ({ id, ...data, _meta: { version: 1 } });
+/** Room frames carry ids "<room key>.<n>"; returns the frames without them. */
+const noID = (frames) => frames.map(({ id, ...f }) => f);
+const keyOf = (id) => String(id).slice(0, String(id).indexOf("."));
 
 test("no socket until first use; one shared socket per page", () => {
   const env = createEnv();
@@ -271,7 +274,7 @@ test("rooms: messages, send options, state updates, off, leave", () => {
   room.send({ move: "e5" });
   room.send("hi", { to: "c_2" });
   room.send(null, { echo: true });
-  assert.deepEqual(ws.frames("send"), [
+  assert.deepEqual(noID(ws.frames("send")), [
     { t: "send", room: "game", data: { move: "e5" } },
     { t: "send", room: "game", data: "hi", to: "c_2" },
     { t: "send", room: "game", data: null, echo: true },
@@ -279,10 +282,17 @@ test("rooms: messages, send options, state updates, off, leave", () => {
 
   room.setState({ cursor: [1, 2] });
   room.updateState({ name: "A" });
-  assert.deepEqual(ws.frames("state"), [
+  assert.deepEqual(noID(ws.frames("state")), [
     { t: "state", room: "game", state: { cursor: [1, 2] } },
     { t: "state", room: "game", state: { cursor: [1, 2], name: "A" } },
   ]);
+  // Every frame of the room carries a unique id with the room's key (server
+  // errors about it reach room.on("error"); the server acks it).
+  const ids = ws.frames("send").concat(ws.frames("state")).map((f) => f.id);
+  assert.equal(new Set(ids).size, 5);
+  for (const id of ids) assert.equal(keyOf(id), keyOf(joinID), id);
+  for (const id of ids) ws.push({ t: "ack", id }); // acks are ignored
+  assert.deepEqual(env.warnings, []);
   assert.deepEqual(plain(room.self.state), { cursor: [1, 2], name: "A" });
   assert.deepEqual(plain(room.state), { cursor: [1, 2], name: "A" });
   assert.throws(() => room.setState("nope"), { code: "bad_request" });
@@ -299,6 +309,9 @@ test("rooms: messages, send options, state updates, off, leave", () => {
   room.leave();
   room.leave();
   assert.deepEqual(ws.frames("leave"), [{ t: "leave", room: "game" }]);
+  // A late answer about a frame of the left room is reported generically.
+  ws.push({ t: "error", id: ids[0], error: { code: "not_found", message: "not a member of room \"game\"" } });
+  assert.match(env.warnings.join("\n"), /realtime error: not_found/);
   assert.equal(room.self, null);
   assert.deepEqual(plain(room.members), []);
   room.send("ignored");
@@ -388,7 +401,8 @@ test("reconnect: close event, exponential backoff with jitter, resubscribe and r
   assert.deepEqual(ws.frames("sub"), [{ t: "sub", id: subID, collection: "posts" }], "same subscription id is restored");
   const rejoin = ws.frames("join")[0];
   assert.deepEqual(rejoin.state, { v: 2 }, "rejoined with the latest presence state");
-  assert.deepEqual(ws.frames("send"), [{ t: "send", room: "lobby", data: "queued while offline" }]);
+  assert.deepEqual(noID(ws.frames("send")), [{ t: "send", room: "lobby", data: "queued while offline" }]);
+  assert.equal(keyOf(ws.frames("send")[0].id), keyOf(rejoin.id));
   assert.ok(ws.sent.indexOf(rejoin) < ws.sent.findIndex((f) => f.t === "send"), "join precedes queued sends");
   assert.deepEqual(status, ["open", "close:1006", "open"]);
 
@@ -570,4 +584,90 @@ test("without WebSocket support the SDK warns instead of throwing", () => {
   const env = createEnv({ noWebSocket: true });
   env.backyard.socket.room("r");
   assert.match(env.warnings.join("\n"), /WebSocket is not available/);
+});
+
+test("errors answering a room's send/state/join reach room.on('error'), else socket 'error', else the console", () => {
+  const env = createEnv();
+  const a = env.backyard.socket.room("a");
+  const b = env.backyard.socket.room("b");
+  const ws = env.ws();
+  ws.hello("c_1");
+  for (const j of ws.frames("join")) ws.push({ t: "joined", id: j.id, room: j.room, self: member("c_1", "a@x"), members: [] });
+  const aErrs = [];
+  a.on("error", (e) => aErrs.push([e.name, e.code, e.message, e instanceof env.backyard.BackyardError]));
+  const sockErrs = [];
+  const offSock = env.backyard.socket.on("error", (e) => sockErrs.push(e.code));
+
+  // The Go server and the Worker answer frames that carry an id with an ack
+  // on success (ignored) or an error frame with the same id.
+  a.send("x".repeat(10), { to: "c_404" });
+  const send = ws.frames("send")[0];
+  ws.push({ t: "error", id: send.id, error: { code: "not_found", message: 'no member "c_404" in room "a"' } });
+  a.setState({ big: true });
+  const state = ws.frames("state")[0];
+  ws.push({ t: "error", id: state.id, error: { code: "too_large", message: "presence state exceeds 8192 bytes" } });
+  a.send("ok");
+  ws.push({ t: "ack", id: ws.frames("send")[1].id });
+  assert.deepEqual(aErrs, [
+    ["BackyardError", "not_found", 'no member "c_404" in room "a"', true],
+    ["BackyardError", "too_large", "presence state exceeds 8192 bytes", true],
+  ]);
+
+  // Room b has no error handler: socket listeners get it, then the console.
+  b.send("hi");
+  const bID = ws.frames("send").find((f) => f.room === "b").id;
+  ws.push({ t: "error", id: bID, error: { code: "too_large", message: "message too large" } });
+  assert.deepEqual(sockErrs, ["too_large"]);
+  offSock();
+  ws.push({ t: "error", id: bID, error: { code: "internal", message: "realtime backend unavailable" } });
+  assert.match(env.warnings.join("\n"), /realtime error: internal realtime backend unavailable/);
+  // Errors without an id (e.g. rate limiting) never reach a room.
+  ws.push({ t: "error", error: { code: "rate_limited", message: "too many messages" } });
+  assert.equal(aErrs.length, 2);
+  assert.match(env.warnings.join("\n"), /realtime error: rate_limited/);
+});
+
+test("join errors of a room without an error handler are not swallowed", () => {
+  const env = createEnv();
+  env.backyard.socket.room("full");
+  const sockErrs = [];
+  env.backyard.socket.on("error", (e) => sockErrs.push(e.code));
+  const ws = env.ws();
+  ws.hello();
+  ws.push({ t: "error", id: ws.frames("join")[0].id, error: { code: "rate_limited", message: "too many rooms on this connection (max 50)" } });
+  assert.deepEqual(sockErrs, ["rate_limited"]);
+});
+
+test("members are ordered by join time whatever the timestamp precision, then by cid", () => {
+  const env = createEnv();
+  const room = env.backyard.socket.room("t");
+  const ws = env.ws();
+  ws.hello("c_self");
+  const at = (cid, joined_at) => ({ cid, user: user(cid + "@x"), state: {}, joined_at });
+  ws.push({
+    t: "joined",
+    id: ws.frames("join")[0].id,
+    room: "t",
+    self: at("c_self", "2026-01-01T00:00:00.000Z"),
+    members: [
+      at("c_nofrac", "2026-01-01T00:00:01Z"), // 1.000 s: before 1.5 s (a string compare gets this wrong)
+      at("c_half", "2026-01-01T00:00:01.5Z"),
+      at("c_go", "2026-01-01T00:00:01.120Z"), // Go: fixed 3 digits
+      at("c_short", "2026-01-01T00:00:01.12Z"), // same instant as c_go: tie broken by cid
+      at("c_micro2", "2026-01-01T00:00:01.123457Z"), // Cloudflare edition: 6 digits
+      at("c_micro1", "2026-01-01T00:00:01.123456Z"),
+      at("c_nano", "2026-01-01T00:00:01.1234565Z"),
+      at("c_offset", "2026-01-01T01:00:00.900+01:00"), // = 00:00:00.900Z
+      at("c_lower", "2026-01-01t00:00:00.950z"),
+      at("c_bad", "yesterday"),
+      at("c_missing", undefined),
+    ],
+  });
+  assert.deepEqual(
+    plain(room.members).map((m) => m.cid),
+    ["c_offset", "c_lower", "c_nofrac", "c_go", "c_short", "c_micro1", "c_nano", "c_micro2", "c_half", "c_bad", "c_missing"],
+  );
+  // Presence updates keep the order (a late joiner goes last, ties by cid).
+  ws.push({ t: "presence", room: "t", op: "join", member: at("c_aaa", "2026-01-01T00:00:01.5Z") });
+  assert.deepEqual(plain(room.members).map((m) => m.cid).slice(7, 10), ["c_micro2", "c_aaa", "c_half"]);
 });

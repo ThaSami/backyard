@@ -128,7 +128,7 @@ func (a *authenticator) authenticateHeader(r *http.Request) (*identity.User, err
 			}
 			u.Groups = identity.ParseList(headerValue(r, h.groupsHeader))
 		}
-		return a.finalize(r.Context(), u, srcIdP)
+		return a.finalize(r.Context(), u, srcIDP)
 	}
 
 	if !trusted {
@@ -174,7 +174,7 @@ func (a *authenticator) authenticateHeader(r *http.Request) (*identity.User, err
 			u.Name = u.ID
 		}
 	}
-	return a.finalize(r.Context(), u, srcIdP)
+	return a.finalize(r.Context(), u, srcIDP)
 }
 
 // singleValued rejects a request carrying an identity header more than once.

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -636,5 +637,84 @@ func TestVertexLocationValidation(t *testing.T) {
 		if _, err := New("g", config.ProviderConfig{ProjectID: "p", Location: loc}, Options{}); err != nil {
 			t.Errorf("location %q rejected: %v", loc, err)
 		}
+	}
+}
+
+// closeCounter is a transport that counts response bodies opened and closed.
+type closeCounter struct {
+	opened, closed atomic.Int32
+}
+
+type countedBody struct {
+	io.ReadCloser
+	once sync.Once
+	c    *closeCounter
+}
+
+func (b *countedBody) Close() error {
+	b.once.Do(func() { b.c.closed.Add(1) })
+	return b.ReadCloser.Close()
+}
+
+func (c *closeCounter) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := http.DefaultTransport.RoundTrip(r)
+	if err != nil {
+		return nil, err
+	}
+	c.opened.Add(1)
+	resp.Body = &countedBody{ReadCloser: resp.Body, c: c}
+	return resp, nil
+}
+
+// TestResponseBodiesClosed checks that every non-streaming call closes the
+// upstream response body, on success, on upstream errors and on invalid
+// responses.
+func TestResponseBodiesClosed(t *testing.T) {
+	b64 := base64.StdEncoding.EncodeToString(pngBytes)
+	f := newFake(t, func(w http.ResponseWriter, r *http.Request, body map[string]any) {
+		switch {
+		case strings.Contains(r.URL.Path, "fail"):
+			writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": map[string]any{"code": 429, "message": "slow down"}})
+		case strings.Contains(r.URL.Path, "garbage"):
+			_, _ = io.WriteString(w, "{not json")
+		case strings.HasSuffix(r.URL.Path, ":generateContent") && strings.Contains(r.URL.Path, "image"):
+			writeJSON(w, http.StatusOK, map[string]any{"candidates": []any{map[string]any{"content": map[string]any{
+				"parts": []any{map[string]any{"inlineData": map[string]any{"mimeType": "image/png", "data": b64}}}}}}})
+		case strings.HasSuffix(r.URL.Path, ":generateContent"):
+			writeJSON(w, http.StatusOK, genResponse("hi", "STOP"))
+		case strings.HasSuffix(r.URL.Path, ":predict"):
+			writeJSON(w, http.StatusOK, map[string]any{"predictions": []any{map[string]any{"bytesBase64Encoded": b64, "mimeType": "image/png"}}})
+		case strings.HasSuffix(r.URL.Path, ":batchEmbedContents"):
+			writeJSON(w, http.StatusOK, map[string]any{"embeddings": []any{map[string]any{"values": []float64{1}}}})
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	cc := &closeCounter{}
+	p, err := New("gem", config.ProviderConfig{Type: "gemini", APIKey: "AIza-test", BaseURL: f.srv.URL + "/v1beta"},
+		Options{HTTPClient: &http.Client{Transport: cc}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, model := range []string{"gemini-2.5-flash", "fail", "garbage"} {
+		_, err := p.Chat(ctx, ai.ChatRequest{Model: model, Messages: []ai.Message{{Role: "user", Content: []ai.Part{{Type: "text", Text: "hi"}}}}})
+		if (err != nil) != (model != "gemini-2.5-flash") {
+			t.Errorf("Chat(%s): err = %v", model, err)
+		}
+		_, err = p.Embed(ctx, ai.EmbedRequest{Model: model, Input: []string{"a"}})
+		if (err != nil) != (model != "gemini-2.5-flash") {
+			t.Errorf("Embed(%s): err = %v", model, err)
+		}
+	}
+	for _, model := range []string{"imagen-4.0-generate-001", "gemini-2.5-flash-image", "imagen-fail", "gemini-image-garbage"} {
+		_, err := p.Image(ctx, ai.ImageRequest{Model: model, Prompt: "a fox"})
+		wantErr := strings.Contains(model, "fail") || strings.Contains(model, "garbage")
+		if (err != nil) != wantErr {
+			t.Errorf("Image(%s): err = %v", model, err)
+		}
+	}
+	if o, c := cc.opened.Load(), cc.closed.Load(); o == 0 || o != c {
+		t.Fatalf("response bodies: %d opened, %d closed", o, c)
 	}
 }

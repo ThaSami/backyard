@@ -13,7 +13,8 @@ if (!window.backyard) {
 }
 
 const ROOM = "cursors";
-const COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#6250d6", "#e87ba4", "#008300", "#e34948", "#c98500"];
+// Every color keeps white text at ≥ 4.5:1 contrast (WCAG AA).
+const COLORS = ["#2266c8", "#c4501d", "#0f7f57", "#6250d6", "#b8467a", "#007a00", "#c62f2e", "#9a6500"];
 const EMOJIS = ["👋", "🎉", "❤️", "🔥", "👀", "🚀"];
 const THROTTLE_MS = 50;
 

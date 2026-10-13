@@ -11,6 +11,10 @@ import { fileURLToPath } from "node:url";
 const WEB = fileURLToPath(new URL("../", import.meta.url));
 const read = (p) => readFileSync(WEB + p);
 
+/** Realtime limits (smaller than the real server's, to keep test frames small). */
+const MAX_PRESENCE = 1024;
+const MAX_MESSAGE = 4096;
+
 const TYPES = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml" };
 
 const DOCS = {
@@ -105,7 +109,9 @@ function wsAccept(req, socket, handlers) {
 // --- server -------------------------------------------------------------------
 
 /**
- * Starts the stub. opts: { info, requireToken, guest, sites, pages: {"/s/demo/": html} }.
+ * Starts the stub. opts: { info, requireToken, guest, sites, pages: {"/s/demo/": html},
+ * presign: { cors } (deploy uploads go to a cross-origin "bucket"), expiredSession
+ * (docs requests redirect to /__backyard/auth/login) }.
  * guest: visitors are anonymous guests (like AUTH_MODE=none on the Cloudflare
  * edition): deleting sites then needs the deploy token.
  * Returns { url, state, close() }.
@@ -120,6 +126,9 @@ export async function startStub(opts = {}) {
     stored: new Map(), // "site/path" → Buffer
     conns: new Set(),
     rooms: new Map(), // room → Map(cid → member)
+    files: [], // FileInfo, newest first
+    logins: [], // rd parameters of /__backyard/auth/login visits
+    bucket: [], // requests the presigned "bucket" received: { method, path, headers }
     requireToken: opts.requireToken || "",
     seq: 0,
   };
@@ -159,6 +168,11 @@ export async function startStub(opts = {}) {
     conn.rooms.clear();
   };
 
+  const ack = (conn, f) => {
+    if (f.id !== undefined && f.id !== null) conn.send({ t: "ack", id: f.id });
+  };
+  const wsError = (conn, f, code, message) => conn.send({ t: "error", ...(f.id !== undefined && f.id !== null ? { id: f.id } : {}), error: { code, message } });
+
   const wsHandlers = (user) => ({
     open(conn) {
       conn.cid = "c_" + randomBytes(5).toString("hex");
@@ -197,20 +211,28 @@ export async function startStub(opts = {}) {
           conn.send({ t: "joined", id: f.id, room: f.room, self: me, members: membersExcept(f.room, conn.cid) });
           return presence(f.room, "join", me, conn.cid);
         }
+        // Like the Go server and the Worker: leave/state/send frames that
+        // carry an id are acknowledged ({"t":"ack","id"}) or answered with an
+        // error frame with the same id.
         case "leave": {
           const m = state.rooms.get(f.room)?.get(conn.cid);
           state.rooms.get(f.room)?.delete(conn.cid);
           conn.rooms.delete(f.room);
           if (m) presence(f.room, "leave", m, conn.cid);
-          return;
+          return ack(conn, f);
         }
         case "state": {
           const m = state.rooms.get(f.room)?.get(conn.cid);
-          if (!m) return conn.send({ t: "error", id: f.id, error: { code: "not_found", message: "not a member" } });
+          if (!m) return wsError(conn, f, "not_found", `not a member of room ${JSON.stringify(f.room)}`);
+          if (JSON.stringify(f.state || {}).length > MAX_PRESENCE) return wsError(conn, f, "too_large", `presence state exceeds ${MAX_PRESENCE} bytes`);
           m.state = f.state || {};
-          return presence(f.room, "update", m, conn.cid);
+          presence(f.room, "update", m, conn.cid);
+          return ack(conn, f);
         }
         case "send": {
+          if (!conn.rooms.has(f.room)) return wsError(conn, f, "not_found", `not a member of room ${JSON.stringify(f.room)}`);
+          if (f.to && !state.rooms.get(f.room)?.has(f.to)) return wsError(conn, f, "not_found", `no member ${JSON.stringify(f.to)} in room ${JSON.stringify(f.room)}`);
+          if (JSON.stringify(f.data ?? null).length > MAX_MESSAGE) return wsError(conn, f, "too_large", "message too large");
           const from = { cid: conn.cid, user: summary(conn.user) };
           for (const other of state.conns) {
             if (!other.rooms.has(f.room)) continue;
@@ -218,7 +240,7 @@ export async function startStub(opts = {}) {
             if (other === conn && !f.echo) continue;
             other.send({ t: "msg", room: f.room, from, data: f.data === undefined ? null : f.data });
           }
-          return;
+          return ack(conn, f);
         }
         default:
           return conn.send({ t: "error", id: f.id, error: { code: "bad_request", message: "unknown frame" } });
@@ -271,7 +293,15 @@ export async function startStub(opts = {}) {
         }
         const tok = randomBytes(6).toString("hex");
         state.uploads.set(tok, { site: m[1], dep, ...f });
-        uploads.push({ path: f.path, url: base + "/__backyard/api/deploy/uploads/" + tok, method: "PUT", headers: { "Content-Type": "application/octet-stream" } });
+        if (bucketBase) {
+          // A presigned storage URL on another origin; the signed headers
+          // must be sent verbatim (Azure x-ms-blob-type, S3 x-amz-*).
+          const headers = { "Content-Type": "application/octet-stream", "x-ms-blob-type": "BlockBlob", "x-amz-meta-sha256": f.sha256 };
+          state.uploads.get(tok).headers = headers;
+          uploads.push({ path: f.path, url: bucketBase + "/bucket/" + tok + "?sig=stub", method: "PUT", headers });
+        } else {
+          uploads.push({ path: f.path, url: base + "/__backyard/api/deploy/uploads/" + tok, method: "PUT", headers: { "Content-Type": "application/octet-stream" } });
+        }
       }
       return json(res, 200, { deploy_id: deployID, uploads, unchanged, expires_at: new Date(Date.now() + 3600e3).toISOString() });
     }
@@ -355,13 +385,26 @@ export async function startStub(opts = {}) {
       const name = /name="name"\r\n\r\n([^\r]*)/.exec(text)?.[1] || /filename="([^"]*)"/.exec(text)?.[1] || "file";
       const content = /filename="[^"]*"\r\nContent-Type: [^\r]*\r\n\r\n([\s\S]*?)\r\n--/.exec(text)?.[1] || "";
       const id = "f" + state.seq++;
-      return json(res, 201, { id, name, url: `/s/${site}/__backyard/files/${id}/${encodeURIComponent(name)}`, size: content.length, content_type: "text/plain", created_at: now(), created_by: user.id });
+      const info = { id, name, url: `/s/${site}/__backyard/files/${id}/${encodeURIComponent(name)}`, size: content.length, content_type: "text/plain", created_at: now(), created_by: user.id };
+      state.files.unshift(info);
+      return json(res, 201, info);
+    }
+    if (path === "/files" && method === "GET") {
+      // Server shape: {"files": [FileInfo], "has_more": bool}, newest first.
+      const q = new URL(req.url, base).searchParams;
+      const limit = Number(q.get("limit") || 100);
+      const offset = Number(q.get("offset") || 0);
+      return json(res, 200, { files: state.files.slice(offset, offset + limit), has_more: state.files.length > offset + limit });
     }
     if (path === "/ai/chat" && method === "POST") {
       const b = jsonBody();
       const prompt = typeof b.messages[0].content === "string" ? b.messages[0].content : "";
       if (!b.stream) return json(res, 200, { content: "echo: " + prompt, model: "smart", stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 2 } });
-      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+      // Like the Go server: headers are flushed at once, keep-alive comments
+      // (": ping") come while the model is silent.
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no" });
+      res.flushHeaders();
+      res.write(": ping\n\n");
       const words = ["Hello", " from", " the", " stub", " ✓"];
       let i = 0;
       const tick = () => {
@@ -381,7 +424,33 @@ export async function startStub(opts = {}) {
       };
       return tick();
     }
-    if (path === "/ai/models") return json(res, 200, { default: "smart", models: [{ name: "smart", kind: "chat", provider: "stub" }] });
+    if (path === "/ai/image" && method === "POST") {
+      // Server shape: {"model", "images": [{"id", "url", "content_type"}]} (stored as site files).
+      const b = jsonBody();
+      const images = [];
+      for (let i = 0; i < (b.n || 1); i++) {
+        const id = "img" + state.seq++;
+        const info = { id, name: `image-${i + 1}.png`, url: `/s/${site}/__backyard/files/${id}/image-${i + 1}.png`, size: 68, content_type: "image/png", created_at: now(), created_by: user.id };
+        state.files.unshift(info);
+        images.push({ id, url: info.url, content_type: info.content_type });
+      }
+      return json(res, 200, { model: b.model || "image", images });
+    }
+    if (path === "/ai/embed" && method === "POST") {
+      const b = jsonBody();
+      const inputs = Array.isArray(b.input) ? b.input : [b.input];
+      return json(res, 200, { model: b.model || "embedding", embeddings: inputs.map((t) => [String(t).length, 0.5]), usage: { input_tokens: inputs.length, output_tokens: 0 } });
+    }
+    if (path === "/ai/models") {
+      return json(res, 200, {
+        default: "smart",
+        models: [
+          { name: "smart", kind: "chat", provider: "stub" },
+          { name: "image", kind: "image", provider: "stub" },
+          { name: "embedding", kind: "embedding", provider: "stub" },
+        ],
+      });
+    }
     if (path === "/warehouse/query") return apiError(res, 501, "unsupported", "the warehouse is not available on this edition");
     return apiError(res, 404, "not_found", "no route " + method + " " + path);
   }
@@ -398,6 +467,11 @@ export async function startStub(opts = {}) {
         res.writeHead(200, { "Content-Type": m[2] === "d.ts" ? "text/plain; charset=utf-8" : "text/javascript; charset=utf-8" });
         return res.end(Buffer.concat([Buffer.from(pre), read(file)]));
       }
+      if (opts.expiredSession && /^\/__backyard\/api\/(info|me|sites)$/.test(p)) {
+        // An identity-aware proxy whose session expired redirects to its login.
+        res.writeHead(302, { Location: "/__backyard/auth/login?rd=" + encodeURIComponent(base + p) });
+        return res.end();
+      }
       if ((m = /^(?:\/s\/([a-z0-9-]+))?\/__backyard\/api(\/.*)$/.exec(p))) return await api(req, res, m[2], m[1] || null);
       if ((m = /^\/s\/([a-z0-9-]+)\/(.*)$/.exec(p))) {
         const page = (opts.pages || {})[m[2] || "index.html"];
@@ -410,6 +484,16 @@ export async function startStub(opts = {}) {
           res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
           return res.end(stored);
         }
+      }
+      if (p === "/__backyard/auth/login") {
+        state.logins.push(u.searchParams.get("rd"));
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        return res.end("<!doctype html><title>Sign in</title><h1>Sign in</h1>");
+      }
+      if (opts.expiredSession && /^\/docs\/[a-z]+\.md$/.test(p)) {
+        // An expired session: the server sends the browser to log in.
+        res.writeHead(302, { Location: "/__backyard/auth/login?rd=" + encodeURIComponent(base + p) });
+        return res.end();
       }
       if ((m = /^\/docs\/([a-z]+)\.md$/.exec(p)) && DOCS[m[1]]) {
         res.writeHead(200, { "Content-Type": "text/markdown; charset=utf-8" });
@@ -446,6 +530,46 @@ export async function startStub(opts = {}) {
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   base = "http://127.0.0.1:" + server.address().port;
+
+  // opts.presign: { cors: boolean } serves uploads from a separate "bucket"
+  // origin, with (or without) a CORS configuration allowing the hub.
+  let bucket = null;
+  let bucketBase = "";
+  if (opts.presign) {
+    bucket = http.createServer(async (req, res) => {
+      const cors = opts.presign.cors
+        ? { "Access-Control-Allow-Origin": base, "Access-Control-Allow-Methods": "PUT", "Access-Control-Allow-Headers": req.headers["access-control-request-headers"] || "", "Access-Control-Max-Age": "60" }
+        : {};
+      const body = await readBody(req);
+      const path = new URL(req.url, bucketBase).pathname;
+      state.bucket.push({ method: req.method, path, headers: req.headers });
+      if (req.method === "OPTIONS") {
+        res.writeHead(opts.presign.cors ? 204 : 403, cors);
+        return res.end();
+      }
+      const up = req.method === "PUT" && state.uploads.get(path.replace(/^\/bucket\//, ""));
+      if (!up) {
+        res.writeHead(404, { ...cors, "Content-Type": "application/xml" });
+        return res.end("<Error><Code>NoSuchUpload</Code><Message>unknown upload</Message></Error>");
+      }
+      for (const [k, v] of Object.entries(up.headers)) {
+        if (req.headers[k.toLowerCase()] !== v) {
+          res.writeHead(403, { ...cors, "Content-Type": "application/xml" });
+          return res.end(`<Error><Code>SignatureDoesNotMatch</Code><Message>header ${k} differs from the signed value</Message></Error>`);
+        }
+      }
+      if (body.length !== up.size || createHash("sha256").update(body).digest("hex") !== up.sha256) {
+        res.writeHead(400, { ...cors, "Content-Type": "application/xml" });
+        return res.end("<Error><Code>BadDigest</Code><Message>size or sha256 mismatch</Message></Error>");
+      }
+      state.stored.set(up.site + "/" + up.path, body);
+      up.done = true;
+      res.writeHead(201, cors);
+      res.end();
+    });
+    await new Promise((resolve) => bucket.listen(0, "127.0.0.1", resolve));
+    bucketBase = "http://127.0.0.1:" + bucket.address().port;
+  }
   return {
     url: base,
     state,
@@ -455,7 +579,9 @@ export async function startStub(opts = {}) {
     },
     close() {
       for (const c of state.conns) c.kill();
-      return new Promise((resolve) => server.close(() => resolve()));
+      const closing = [new Promise((resolve) => server.close(() => resolve()))];
+      if (bucket) closing.push(new Promise((resolve) => bucket.close(() => resolve())));
+      return Promise.all(closing);
     },
   };
 }

@@ -10,11 +10,12 @@
     :root {
       color-scheme: light dark;
       --bg: #f6f5f1; --surface: #ffffff; --ink: #1d1c1a; --ink-2: #5f5d58; --line: #e4e2dc;
-      --accent: #2a78d6; --accent-ink: #ffffff; --danger: #d03b3b; --radius: 16px;
+      --accent: #2266c8; --accent-ink: #ffffff; --danger: #bf3434; --radius: 16px;
       font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     }
     @media (prefers-color-scheme: dark) {
-      :root { --bg: #121211; --surface: #1c1c1a; --ink: #f0efec; --ink-2: #a9a79f; --line: #2e2d2a; --accent: #4b93ea; }
+      :root { --bg: #121211; --surface: #1c1c1a; --ink: #f0efec; --ink-2: #a9a79f; --line: #2e2d2a; --accent: #4b93ea;
+              --accent-ink: #0b1b30; --danger: #e5605f; }
     }
     * { box-sizing: border-box; }
     body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink); padding: 7vh 16px 4rem; }

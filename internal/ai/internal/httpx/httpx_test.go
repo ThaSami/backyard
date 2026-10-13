@@ -135,3 +135,58 @@ func TestErrorTextStripsURL(t *testing.T) {
 		t.Fatalf("transport error leaks URL: %v", err)
 	}
 }
+
+// closeTracker is a response body that records Close.
+type closeTracker struct {
+	*strings.Reader
+	closed bool
+}
+
+func (c *closeTracker) Close() error { c.closed = true; return nil }
+
+type stubTransport struct {
+	status int
+	body   *closeTracker
+}
+
+func (s *stubTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: s.status, Body: s.body, Header: http.Header{}, Request: r}, nil
+}
+
+func TestDoJSONClosesBody(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  int
+		body    string
+		wantErr bool
+		wantX   int
+	}{
+		{"ok", http.StatusOK, `{"x":7}`, false, 7},
+		{"upstream error", http.StatusBadGateway, `{"error":{"message":"down"}}`, true, 0},
+		{"invalid json", http.StatusOK, `{`, true, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tr := &stubTransport{status: tt.status, body: &closeTracker{Reader: strings.NewReader(tt.body)}}
+			req, err := NewJSONRequest(context.Background(), "http://upstream.invalid/x", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out struct{ X int }
+			err = DoJSON(&http.Client{Transport: tr}, "p", req, &out)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			var ue *ai.UpstreamError
+			if tt.wantErr && !errors.As(err, &ue) {
+				t.Fatalf("want *ai.UpstreamError, got %T %v", err, err)
+			}
+			if out.X != tt.wantX {
+				t.Errorf("X = %d, want %d", out.X, tt.wantX)
+			}
+			if !tr.body.closed {
+				t.Error("response body was not closed")
+			}
+		})
+	}
+}

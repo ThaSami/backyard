@@ -112,5 +112,5 @@ func (a *authenticator) authenticateIAP(r *http.Request) (*identity.User, error)
 		a.log.Warn("auth: invalid IAP assertion", "remote", r.RemoteAddr, "error", err)
 		return nil, fmt.Errorf("%w: invalid IAP assertion: %w", ErrUnauthenticated, err)
 	}
-	return a.finalize(r.Context(), a.mapClaims(claims), srcIdP)
+	return a.finalize(r.Context(), a.mapClaims(claims), srcIDP)
 }

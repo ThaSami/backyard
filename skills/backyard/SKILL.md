@@ -137,11 +137,12 @@ const stop = todos.watch(docs => render(docs), todos.where("done", "==", false))
 const unsub = todos.subscribe({ onCreate(doc){}, onUpdate(doc){}, onDelete(id){}, onChange(ev){} })
 await backyard.db.collections()           // string[]
 // ops: == != < <= > >= in not-in (array ≤ 30) contains (array field has value)
+// type-strict: "3" never matches 3, a missing field never matches, `!= null` matches nothing
 
 // Files
 const f = await backyard.files.upload(fileOrBlob, { name: "photo.png" })  // {id, name, url, size, content_type, created_at, created_by}
 img.src = f.url                           // site-relative URL, works in <img>/<a>/<video>
-await backyard.files.list({ limit: 50 })  // FileInfo[] newest first
+await backyard.files.list({ limit: 50 })  // FileInfo[] newest first (.hasMore: more exist)
 await backyard.files.get(id)              // FileInfo | null
 await backyard.files.delete(id)
 
@@ -149,18 +150,19 @@ await backyard.files.delete(id)
 const r = await backyard.ai.chat("Summarize: " + text, { system: "Be brief", model: "smart", maxTokens: 800, temperature: 0.2 })
 r.content; r.model; r.stop_reason; r.usage   // stop_reason: end_turn|max_tokens|stop_sequence|refusal|other
 const { json } = await backyard.ai.chat("Extract {name, date} as JSON from: " + text, { json: true })
-await backyard.ai.chat([{ role: "user", content: [{ type: "text", text: "What is this?" }, { type: "image", url: f.url }] }])
+const dataUrl = await new Promise((ok) => { const r = new FileReader(); r.onload = () => ok(r.result); r.readAsDataURL(fileOrBlob); })
+await backyard.ai.chat([{ role: "user", content: [{ type: "text", text: "What is this?" }, { type: "image", url: dataUrl }] }])  // data: URL or public https URL, ≤ 20 MiB
 const s = backyard.ai.stream(messages, { onText: t => (out.textContent += t) })
 for await (const chunk of s) { /* chunk.text */ }   // either iterate or use onText
 const final = await s.done                // {content, model, stop_reason, usage}
-await backyard.ai.image("a watercolor fox", { size: "1024x1024", n: 1 })  // {url, content_type, images:[{url, content_type}]}
+await backyard.ai.image("a watercolor fox", { size: "1024x1024", n: 1 })  // {id, url, content_type, model, images:[{id, url, content_type}]} — stored as site files
 await backyard.ai.embed("text")           // number[]   (string[] → number[][])
-await backyard.ai.models()                // {default, models:[{name, kind, provider, description}]}
+await backyard.ai.models()                // {default, models:[{name, kind: "chat"|"image"|"embedding", provider, description}]}
 
 // Warehouse (read-only analytics; may be unavailable → "unsupported")
 await backyard.warehouse.named("weekly_active_users", { team: "growth" })  // {columns, rows, row_count, truncated}
 await backyard.warehouse.query("SELECT day, n FROM dau WHERE team = ?", ["growth"], { source: "default" })
-await backyard.warehouse.sources()        // {sources:[{name,type,description}], queries:[{name,description,params}]}
+await backyard.warehouse.sources()        // {sources:[{name,type,description}], queries:[{name,description,params,source}]}
 
 // Realtime rooms (one websocket per page, auto-reconnect, auto-rejoin)
 const room = backyard.socket.room("lobby", { state: { status: "here" } })  // sync, joins automatically
@@ -279,7 +281,7 @@ guest (`me.anonymous === true`): never rely on names or emails being real there 
 | `rate_limited` (429) | Too many calls; wait `err.retryAfter` seconds. Debounce writes; use rooms for high-frequency data. |
 | `conflict` on `create` | That id exists — use `set()` (replace) or `update()` (merge). |
 | `too_large` | Doc > 256 KiB, upload > limit or websocket message > 64 KiB — split data or use `files`. |
-| Query matches nothing | Types must match exactly (`"3"` ≠ `3`); missing fields never match; check field paths. |
+| Query matches nothing | Types must match exactly (`"3"` ≠ `3`, also for `!=` and `not-in`); missing fields never match; `!= null` matches nothing; check field paths. |
 | Other tabs don't update | Use `watch` (or `subscribe`) — `list`/`get` are one-shot reads. |
 | AI/warehouse fail in `backyard dev` | Start with `backyard dev --config backyard.yaml` containing providers/sources. |
 

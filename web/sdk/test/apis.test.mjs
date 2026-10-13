@@ -1,7 +1,8 @@
 // backyard.files, backyard.id, backyard.warehouse and non-streaming backyard.ai.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createEnv, json, apiError, rejects, plain } from "./helpers/harness.mjs";
+import { readFileSync } from "node:fs";
+import { createEnv, json, apiError, rejects, plain, TYPES_PATH } from "./helpers/harness.mjs";
 
 const fileInfo = (id, name) => ({
   id,
@@ -42,7 +43,8 @@ test("files.upload sends multipart FormData with the file (and optional name)", 
 
 test("files.list/get/delete", async () => {
   const env = createEnv();
-  env.on("GET", "/__backyard/api/files", { files: [fileInfo("f2", "b"), fileInfo("f1", "a")] });
+  // Server shape: {"files": [FileInfo], "has_more": bool}.
+  env.on("GET", "/__backyard/api/files", { files: [fileInfo("f2", "b"), fileInfo("f1", "a")], has_more: true });
   env.on("GET", "/__backyard/api/files/f1", fileInfo("f1", "a"));
   env.on("GET", "/__backyard/api/files/nope", apiError(404, "not_found", "no such file"));
   env.on("DELETE", "/__backyard/api/files/f1", json(204));
@@ -50,8 +52,13 @@ test("files.list/get/delete", async () => {
   const list = await env.backyard.files.list({ limit: 10, offset: 5 });
   assert.deepEqual(env.last().query, { limit: "10", offset: "5" });
   assert.deepEqual(plain(list.map((f) => f.id)), ["f2", "f1"]);
-  await env.backyard.files.list();
+  assert.equal(list.hasMore, true);
+  assert.deepEqual(Object.keys(list), ["0", "1"], "hasMore is not enumerable");
+  env.once("GET", "/__backyard/api/files", { files: [], has_more: false });
+  const empty = await env.backyard.files.list();
   assert.equal(env.last().search, "");
+  assert.equal(empty.length, 0);
+  assert.equal(empty.hasMore, false);
 
   assert.equal((await env.backyard.files.get("f1")).name, "a");
   assert.equal(await env.backyard.files.get("nope"), null);
@@ -155,28 +162,38 @@ test("ai.chat json parsing tolerates prose and returns undefined for non-JSON", 
   assert.equal((await env.backyard.ai.chat("x", { json: true })).json, undefined);
 });
 
-test("ai.image returns the first image plus the full list", async () => {
+test("ai.image returns the first image (id, url, content_type) plus the full list", async () => {
   const env = createEnv();
-  env.on("POST", "/__backyard/api/ai/image", {
-    images: [
-      { url: "/__backyard/files/i1/image.png", content_type: "image/png" },
-      { url: "/__backyard/files/i2/image.png", content_type: "image/png" },
-    ],
-  });
+  // Server shape: {"model": alias, "images": [{"id", "url", "content_type"}]}.
+  const images = [
+    { id: "01JIMG1", url: "/__backyard/files/01JIMG1/image-1.png", content_type: "image/png" },
+    { id: "01JIMG2", url: "/__backyard/files/01JIMG2/image-2.png", content_type: "image/png" },
+  ];
+  env.on("POST", "/__backyard/api/ai/image", { model: "img", images });
   const r = await env.backyard.ai.image("a watercolor fox", { model: "img", size: "512x512", n: 2 });
   assert.deepEqual(env.last().json, { prompt: "a watercolor fox", model: "img", size: "512x512", n: 2 });
-  assert.equal(r.url, "/__backyard/files/i1/image.png");
-  assert.equal(r.content_type, "image/png");
-  assert.equal(r.images.length, 2);
+  assert.deepEqual(plain(r), { id: "01JIMG1", url: "/__backyard/files/01JIMG1/image-1.png", content_type: "image/png", model: "img", images });
   await env.backyard.ai.image("x");
   assert.deepEqual(env.last().json, { prompt: "x" });
   assert.equal((await rejects(env.backyard.ai.image(""))).code, "bad_request");
+
+  // A 200 without images is not a usable answer.
+  for (const body of [{ model: "img", images: [] }, { model: "img" }, { images: [{ id: "x" }] }]) {
+    env.once("POST", "/__backyard/api/ai/image", body);
+    const err = await rejects(env.backyard.ai.image("x"));
+    assert.equal(err.code, "bad_response", JSON.stringify(body));
+  }
 });
 
 test("ai.embed mirrors the input shape", async () => {
   const env = createEnv();
+  // Server shape: {"model", "embeddings": [[…], …], "usage"}.
   env.on("POST", "/__backyard/api/ai/embed", (req) =>
-    json(200, { model: "embed", embeddings: (Array.isArray(req.json.input) ? req.json.input : [req.json.input]).map((_, i) => [i, 0.5]) }),
+    json(200, {
+      model: "embedding",
+      embeddings: (Array.isArray(req.json.input) ? req.json.input : [req.json.input]).map((_, i) => [i, 0.5]),
+      usage: { input_tokens: 3, output_tokens: 0 },
+    }),
   );
   assert.deepEqual(plain(await env.backyard.ai.embed("one")), [0, 0.5]);
   assert.deepEqual(env.last().json, { input: "one" });
@@ -185,13 +202,39 @@ test("ai.embed mirrors the input shape", async () => {
     [1, 0.5],
   ]);
   assert.deepEqual(env.last().json, { input: ["a", "b"], model: "embed-large" });
+  const before = env.requests.length;
   assert.equal((await rejects(env.backyard.ai.embed(3))).code, "bad_request");
+  assert.equal((await rejects(env.backyard.ai.embed(["a", 2]))).code, "bad_request");
+  assert.equal(env.requests.length, before, "invalid input is rejected without a request");
+
+  // One vector per input, or the answer is unusable.
+  env.once("POST", "/__backyard/api/ai/embed", { model: "embedding", embeddings: [[1]] });
+  assert.equal((await rejects(env.backyard.ai.embed(["a", "b"]))).code, "bad_response");
+  env.once("POST", "/__backyard/api/ai/embed", { model: "embedding", embeddings: [] });
+  assert.equal((await rejects(env.backyard.ai.embed("a"))).code, "bad_response");
 });
 
 test("ai.models", async () => {
   const env = createEnv();
-  env.on("GET", "/__backyard/api/ai/models", { default: "smart", models: [{ name: "smart", kind: "chat", provider: "anthropic" }] });
+  const models = [
+    { name: "smart", kind: "chat", provider: "anthropic", description: "Best quality" },
+    { name: "image", kind: "image", provider: "openai" },
+    { name: "embedding", kind: "embedding", provider: "openai", model: "text-embedding-3-small" },
+  ];
+  env.on("GET", "/__backyard/api/ai/models", { default: "smart", models });
   const m = await env.backyard.ai.models();
   assert.equal(m.default, "smart");
+  assert.deepEqual(plain(m.models), models);
   assert.equal(env.last().method, "GET");
+});
+
+test("the typings use the server's model kinds and response shapes", () => {
+  const types = readFileSync(TYPES_PATH, "utf8");
+  const kind = /interface ModelInfo \{[\s\S]*?kind: ([^;]+);/.exec(types);
+  assert.ok(kind, "ModelInfo.kind");
+  assert.match(kind[1], /"chat" \| "image" \| "embedding"/);
+  assert.doesNotMatch(kind[1], /"embed"/);
+  assert.match(/interface ImageResult \{([\s\S]*?)\n  \}/.exec(types)[1], /\bid: string;[\s\S]*\burl: string;[\s\S]*\bimages: GeneratedImage\[\]/);
+  assert.match(/interface GeneratedImage \{([\s\S]*?)\n  \}/.exec(types)[1], /\bid: string;[\s\S]*\burl: string;[\s\S]*\bcontent_type: string;/);
+  assert.match(types, /list\(options\?: \{ limit\?: number; offset\?: number \}\): Promise<FileInfoList>;/);
 });

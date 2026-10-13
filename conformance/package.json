@@ -1,0 +1,17 @@
+{
+  "name": "backyard-conformance",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cross-edition black-box API conformance suite for Backyard (SPEC §17).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"tests/*.test.mjs\"",
+    "test:go": "./run-go.sh",
+    "test:worker": "./run-worker.sh",
+    "mock-ai": "node mock/openai.mjs"
+  }
+}

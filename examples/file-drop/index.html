@@ -28,12 +28,12 @@
     <ul class="queue" id="queue" aria-live="polite"></ul>
 
     <div class="toolbar">
-      <div class="chips" role="tablist" aria-label="Filter by type">
-        <button class="chip active" data-kind="all">All</button>
-        <button class="chip" data-kind="image">Images</button>
-        <button class="chip" data-kind="video">Video</button>
-        <button class="chip" data-kind="doc">Documents</button>
-        <button class="chip" data-kind="other">Other</button>
+      <div class="chips" role="group" aria-label="Filter by type">
+        <button class="chip active" data-kind="all" aria-pressed="true">All</button>
+        <button class="chip" data-kind="image" aria-pressed="false">Images</button>
+        <button class="chip" data-kind="video" aria-pressed="false">Video</button>
+        <button class="chip" data-kind="doc" aria-pressed="false">Documents</button>
+        <button class="chip" data-kind="other" aria-pressed="false">Other</button>
       </div>
       <input type="search" id="search" placeholder="Search by name…" aria-label="Search files">
     </div>

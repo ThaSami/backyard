@@ -133,7 +133,10 @@ async function main() {
   document.querySelectorAll("[data-filter]").forEach((chip) => {
     chip.addEventListener("click", () => {
       state.filter = chip.dataset.filter;
-      document.querySelectorAll("[data-filter]").forEach((c) => c.classList.toggle("active", c === chip));
+      document.querySelectorAll("[data-filter]").forEach((c) => {
+        c.classList.toggle("active", c === chip);
+        c.setAttribute("aria-pressed", String(c === chip));
+      });
       render();
     });
   });

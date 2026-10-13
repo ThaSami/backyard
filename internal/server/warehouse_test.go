@@ -2,8 +2,11 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
@@ -91,4 +94,77 @@ func TestWarehouseDisabledAndRateLimited(t *testing.T) {
 	g := newHarness(t, withConfig(func(c *config.Config) { c.RateLimit.WarehousePerMinute = 1 }))
 	expectStatus(t, g.api("POST", whURL+"/query", map[string]any{"sql": "x"}), 200)
 	expectError(t, g.api("POST", whURL+"/query", map[string]any{"sql": "x"}), http.StatusTooManyRequests, "rate_limited")
+}
+
+func TestWarehouseServerErrorsDoNotLeak(t *testing.T) {
+	h := newHarness(t)
+	const rid = "req-warehouse-0001"
+	pgErr := errors.New(`failed to connect to ` + "`" + `host=db.internal.acme user=analytics database=prod_dw` + "`" + `: dial error (dial tcp 10.1.2.3:5432: connect: connection refused)`)
+	tests := []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"upstream", fmt.Errorf("%w: source %q: %w", warehouse.ErrUpstream, "default", pgErr), 502, "upstream_error"},
+		{"unclassified", fmt.Errorf("source %q: %w", "default", pgErr), 500, "internal"},
+		{"timeout", fmt.Errorf("%w: %w", warehouse.ErrTimeout, pgErr), 504, "upstream_error"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h.wh.err = tc.err
+			w := h.api("POST", whURL+"/query", map[string]any{"sql": "SELECT 1"}, "X-Request-Id", rid)
+			e := expectError(t, w, tc.status, tc.code)
+			for _, secret := range []string{"db.internal.acme", "analytics", "prod_dw", "10.1.2.3", "5432", "connection refused"} {
+				if strings.Contains(e.Error.Message, secret) {
+					t.Fatalf("message %q leaks %q", e.Error.Message, secret)
+				}
+			}
+			if tc.status != 504 && !strings.Contains(e.Error.Message, rid) {
+				t.Fatalf("message %q does not name the request id", e.Error.Message)
+			}
+			if w.Header().Get("X-Request-Id") != rid {
+				t.Fatalf("X-Request-Id = %q", w.Header().Get("X-Request-Id"))
+			}
+		})
+	}
+	// The detail is logged with the request id.
+	logs := h.logText()
+	if !strings.Contains(logs, "db.internal.acme") || !strings.Contains(logs, "request_id="+rid) {
+		t.Fatalf("detail not logged: %s", logs)
+	}
+	// Client errors keep their (useful, caller-caused) message.
+	h.wh.err = fmt.Errorf("%w: column \"nope\" does not exist", warehouse.ErrBadRequest)
+	e := expectError(t, h.api("POST", whURL+"/query", map[string]any{"sql": "SELECT nope"}), 400, "bad_request")
+	if e.Error.Message != `column "nope" does not exist` {
+		t.Fatalf("message = %q", e.Error.Message)
+	}
+}
+
+func TestWarehouseLargeIntegerParamsStayExact(t *testing.T) {
+	h := newHarness(t)
+	w := h.api("POST", whURL+"/query", `{"sql":"SELECT * FROM t WHERE id = ? AND x = ? AND y = ?","params":[9007199254740993,1.5,-12]}`)
+	expectStatus(t, w, 200)
+	w = h.api("POST", whURL+"/query", `{"query":"wau","params":{"id":18446744073709551615,"n":3}}`)
+	expectStatus(t, w, 200)
+	h.wh.mu.Lock()
+	reqs := slices.Clone(h.wh.reqs)
+	h.wh.mu.Unlock()
+	if len(reqs) != 2 {
+		t.Fatalf("requests = %d", len(reqs))
+	}
+	pos, ok := reqs[0].Params.([]any)
+	if !ok || len(pos) != 3 {
+		t.Fatalf("positional params = %#v", reqs[0].Params)
+	}
+	for i, want := range []string{"9007199254740993", "1.5", "-12"} {
+		n, ok := pos[i].(json.Number)
+		if !ok || n.String() != want {
+			t.Fatalf("param %d = %#v, want json.Number %s", i, pos[i], want)
+		}
+	}
+	named, ok := reqs[1].Params.(map[string]any)
+	if !ok || named["id"] != json.Number("18446744073709551615") || named["n"] != json.Number("3") {
+		t.Fatalf("named params = %#v", reqs[1].Params)
+	}
 }

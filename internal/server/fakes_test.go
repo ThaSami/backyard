@@ -215,7 +215,7 @@ func (m *memBlob) List(ctx context.Context, prefix, delimiter string) (*blob.Lis
 	return res, nil
 }
 
-func (m *memBlob) PresignPut(context.Context, string, string, time.Duration) (*blob.PresignedRequest, error) {
+func (m *memBlob) PresignPut(context.Context, string, blob.PresignPutOptions, time.Duration) (*blob.PresignedRequest, error) {
 	return nil, blob.ErrNotSupported
 }
 

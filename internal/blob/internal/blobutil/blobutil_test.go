@@ -3,6 +3,7 @@ package blobutil
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"slices"
@@ -119,6 +120,36 @@ func TestNormPrefixAndTTL(t *testing.T) {
 	}
 	if got := PresignContentType("noext", ""); got != "application/octet-stream" {
 		t.Errorf("PresignContentType noext = %q", got)
+	}
+}
+
+func TestCheckPresignPut(t *testing.T) {
+	const helloSHA = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+	const emptySHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	spec, err := CheckPresignPut("a.css", blob.PresignPutOptions{Size: 5, SHA256: strings.ToUpper(helloSHA)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.ContentType != "text/css; charset=utf-8" || spec.Size != 5 || hex.EncodeToString(spec.SHA256) != helloSHA {
+		t.Errorf("spec = %+v", spec)
+	}
+	spec, err = CheckPresignPut("a.bin", blob.PresignPutOptions{ContentType: "x/y", Size: -1})
+	if err != nil || spec.SHA256 != nil || spec.Size != -1 || spec.ContentType != "x/y" {
+		t.Errorf("unknown size = %+v, %v", spec, err)
+	}
+	if _, err := CheckPresignPut("e", blob.PresignPutOptions{Size: 0, SHA256: emptySHA}); err != nil {
+		t.Errorf("empty body: %v", err)
+	}
+	for name, opts := range map[string]blob.PresignPutOptions{
+		"negative size":         {Size: -2},
+		"short sha":             {Size: 1, SHA256: "abcd"},
+		"non-hex sha":           {Size: 1, SHA256: strings.Repeat("z", 64)},
+		"long sha":              {Size: 1, SHA256: helloSHA + "00"},
+		"non-empty sha, size 0": {Size: 0, SHA256: helloSHA},
+	} {
+		if _, err := CheckPresignPut("k", opts); err == nil {
+			t.Errorf("%s: no error", name)
+		}
 	}
 }
 

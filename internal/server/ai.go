@@ -7,9 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/thasami/backyard/internal/ai"
 	"github.com/thasami/backyard/internal/docstore"
@@ -91,9 +95,7 @@ func aiError(err error) *apiError {
 	case errors.Is(err, ai.ErrDisabled):
 		return errUnsupported("AI is not configured on this server")
 	case errors.As(err, &ue):
-		e := newError(http.StatusBadGateway, codeUpstream, "AI provider error: %s", truncate(ue.Message, 500))
-		e.Err = err
-		return e
+		return aiUpstreamError(err, ue)
 	case errors.Is(err, context.DeadlineExceeded):
 		return errContext(err, "AI request")
 	case errors.Is(err, context.Canceled):
@@ -102,6 +104,143 @@ func aiError(err error) *apiError {
 	e := newError(http.StatusBadGateway, codeUpstream, "AI request failed")
 	e.Err = err
 	return e
+}
+
+// aiUpstreamError maps a provider failure by the provider's HTTP status:
+//
+//   - 504 (the router's own timeout, or the provider's) and 408 → 504;
+//   - 429 (the provider throttles this server's account, which all users
+//     share) → 429 with Retry-After when the provider said when to retry,
+//     else 503: a 429 without a retry time would read as the caller's own
+//     rate limit;
+//   - 400 and 422 (the provider rejected the request: an assistant prefill
+//     the model does not support, an image it cannot read, …) → 400
+//     bad_request, and 413 → 413 too_large;
+//   - anything else (bad credentials, provider outages, malformed
+//     responses) → 502.
+//
+// Provider messages are sanitized before they reach the client (see
+// safeUpstreamMessage); err itself is logged for 5xx responses.
+func aiUpstreamError(err error, ue *ai.UpstreamError) *apiError {
+	var e *apiError
+	switch ue.Status {
+	case http.StatusGatewayTimeout, http.StatusRequestTimeout:
+		e = newError(http.StatusGatewayTimeout, codeUpstream, "the AI provider did not respond in time")
+	case http.StatusTooManyRequests:
+		if d := upstreamRetryAfter(err, ue.Message); d > 0 {
+			e = newError(http.StatusTooManyRequests, codeRateLimited, "the AI provider is rate limiting requests; retry later")
+			e.RetryAfter = d
+		} else {
+			e = newError(http.StatusServiceUnavailable, codeUpstream, "the AI provider is rate limiting requests; retry later")
+		}
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		e = errBadRequest("the AI provider rejected the request: %s", safeUpstreamMessage(ue.Message, ue.Status))
+	case http.StatusRequestEntityTooLarge:
+		e = newError(http.StatusRequestEntityTooLarge, codeTooLarge, "the AI provider rejected the request as too large: %s",
+			safeUpstreamMessage(ue.Message, ue.Status))
+	default:
+		e = newError(http.StatusBadGateway, codeUpstream, "AI provider error: %s", safeUpstreamMessage(ue.Message, ue.Status))
+	}
+	e.Err = err
+	return e
+}
+
+// retryAfterer is implemented by errors that carry a provider's
+// Retry-After. ai.UpstreamError has no such field; a provider or the router
+// may put such an error in the chain.
+type retryAfterer interface {
+	RetryAfter() time.Duration
+}
+
+// maxUpstreamRetryAfter bounds a provider's Retry-After passed on to
+// clients.
+const maxUpstreamRetryAfter = time.Hour
+
+// retryHintRe finds the retry delay providers put into rate-limit messages
+// ("Please try again in 1.5s" (OpenAI), "Please retry after 6 seconds"
+// (Azure OpenAI)).
+var retryHintRe = regexp.MustCompile(`(?i)\b(?:retry after|try again in)\s+(\d{1,6}(?:\.\d{1,3})?)\s*(ms|milliseconds?|s|secs?|seconds?|m|mins?|minutes?)?\b`)
+
+// upstreamRetryAfter returns when a throttled provider accepts requests
+// again, or 0 when unknown: from an error in err's chain that implements
+// retryAfterer, else from a hint in the provider message.
+func upstreamRetryAfter(err error, msg string) time.Duration {
+	var d time.Duration
+	var ra retryAfterer
+	if errors.As(err, &ra) {
+		d = ra.RetryAfter()
+	}
+	if d <= 0 {
+		d = retryHint(msg)
+	}
+	if d <= 0 {
+		return 0
+	}
+	return min(d, maxUpstreamRetryAfter)
+}
+
+// retryHint parses the retry delay of a provider message (0 if none).
+func retryHint(msg string) time.Duration {
+	m := retryHintRe.FindStringSubmatch(msg)
+	if m == nil {
+		return 0
+	}
+	v, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0
+	}
+	unit := time.Second
+	switch u := strings.ToLower(m[2]); {
+	case strings.HasPrefix(u, "ms") || strings.HasPrefix(u, "milli"):
+		unit = time.Millisecond
+	case strings.HasPrefix(u, "m"):
+		unit = time.Minute
+	}
+	return time.Duration(v * float64(unit))
+}
+
+// maxUpstreamMessage bounds provider messages relayed to clients (bytes).
+const maxUpstreamMessage = 300
+
+var (
+	// upstreamURLRe matches URLs in provider messages: endpoint URLs can
+	// reveal internal hosts, Azure resource names or Vertex project ids.
+	upstreamURLRe = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]{1,15}://[^\s"'<>()]+`)
+	// upstreamSecretRe matches account identifiers and key-like tokens
+	// providers echo in messages ("organization org-…", "sk-…****abcd",
+	// AWS access key ids, bearer tokens).
+	upstreamSecretRe = regexp.MustCompile(`\b(?:(?:sk|pk|rk|org|proj|key|sess)[-_][A-Za-z0-9*_-]{6,}|A(?:KIA|SIA)[A-Z0-9]{12,}|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{8,})`)
+)
+
+// safeUpstreamMessage prepares a provider error message for clients: one
+// line of printable text without URLs, account ids or key-like tokens,
+// at most maxUpstreamMessage bytes (cut at a rune boundary). An empty
+// result falls back to the HTTP status text.
+func safeUpstreamMessage(msg string, status int) string {
+	msg = strings.ToValidUTF8(msg, "")
+	msg = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Bidi_Control, r) {
+			return ' '
+		}
+		return r
+	}, msg)
+	msg = upstreamURLRe.ReplaceAllString(msg, "[url]")
+	msg = upstreamSecretRe.ReplaceAllString(msg, "[redacted]")
+	msg = strings.Join(strings.Fields(msg), " ")
+	if len(msg) > maxUpstreamMessage {
+		cut := maxUpstreamMessage
+		for cut > 0 && !utf8.RuneStart(msg[cut]) {
+			cut--
+		}
+		msg = strings.TrimSpace(msg[:cut]) + "…"
+	}
+	if msg == "" {
+		msg = strings.ToLower(http.StatusText(status))
+	}
+	if msg == "" {
+		msg = "request failed"
+	}
+	return msg
 }
 
 // aiResult is the metrics label of an AI outcome.

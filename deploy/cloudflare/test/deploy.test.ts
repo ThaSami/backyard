@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { call, deploy, DEPLOY_TOKEN, sha256Hex, tokenHeaders, uniqueSite } from "./helpers";
+import { issueAPIToken } from "../src/jwt";
+import { call, deploy, DEPLOY_TOKEN, SECRET, sha256Hex, tokenHeaders, uniqueSite } from "./helpers";
 
 const INDEX = `<!doctype html><html><head><title>Lunch &amp; Vote</title>
 <meta name="description" content="Pick   lunch together"></head><body>hi</body></html>`;
@@ -235,6 +236,59 @@ describe("deploy gateway protocol", () => {
     // Deleting still needs a real identity.
     res = await call(`/__backyard/api/deploy/sites/${site}`, { method: "DELETE", headers: { "X-Backyard": "1" } }, { ALLOW_ANONYMOUS_DEPLOY: "true" });
     expect(res.status).toBe(401);
+  });
+
+  it("treats a token minted for a guest as that guest, like the Go gateway", async () => {
+    // AUTH_MODE=none lets guests mint API tokens (the CLI browser login).
+    const guest = { id: "anon:0123456789abcdef", name: "Guest 0123", anonymous: true, admin: false };
+    const { token } = await issueAPIToken(SECRET, guest, 3600);
+    const site = uniqueSite("guest");
+    const body = JSON.stringify({ files: [{ path: "index.html", size: 1, sha256: await sha256Hex("x") }] });
+    const anonymous = { ALLOW_ANONYMOUS_DEPLOY: "true" };
+    const errorOf = async (res: Response) => ((await res.json()) as { error: { code: string; message: string } }).error;
+
+    // It reads as that guest.
+    let res = await call("/__backyard/api/deploy/me", { headers: tokenHeaders(token) });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ id: guest.id, anonymous: true, admin: false });
+    expect((await call("/__backyard/api/deploy/sites", { headers: tokenHeaders(token) })).status).toBe(200);
+
+    // Without ALLOW_ANONYMOUS_DEPLOY it cannot deploy, and is told why.
+    res = await call(`/__backyard/api/deploy/sites/${site}/deploys`, { method: "POST", headers: tokenHeaders(token), body });
+    expect(res.status).toBe(401);
+    let e = await errorOf(res);
+    expect(e.code).toBe("unauthenticated");
+    expect(e.message).toContain("anonymous guest, which cannot deploy");
+
+    // With it, the guest deploys and refreshes as itself (never as an owner)...
+    const out = await deploy(site, { "index.html": "guest" }, { token, envOverrides: { ...anonymous, OWNERSHIP: "owner" } });
+    expect(out.commit.site).toMatchObject({ name: site, created_by: guest.id, updated_by: guest.id, owners: [] });
+    res = await call(`/__backyard/api/deploy/sites/${site}/refresh`, { method: "POST", headers: tokenHeaders(token) }, anonymous);
+    expect(res.status).toBe(200);
+
+    // ...but never deletes sites or changes owners.
+    res = await call(`/__backyard/api/deploy/sites/${site}`, { method: "DELETE", headers: tokenHeaders(token) }, anonymous);
+    expect(res.status).toBe(401);
+    e = await errorOf(res);
+    expect(e.message).toContain("anonymous guest, which cannot delete sites or change owners");
+    res = await call(
+      `/__backyard/api/deploy/sites/${site}/owners`,
+      { method: "POST", headers: tokenHeaders(token), body: JSON.stringify({ add: ["me@example.com"] }) },
+      { ...anonymous, OWNERSHIP: "owner" },
+    );
+    expect(res.status).toBe(401);
+
+    // Guest tokens are only valid in AUTH_MODE=none; an invalid token is never a guest.
+    const access = { AUTH_MODE: "access", ACCESS_TEAM_DOMAIN: "acme", ACCESS_AUD: "aud" };
+    res = await call("/__backyard/api/deploy/me", { headers: tokenHeaders(token) }, access);
+    expect(res.status).toBe(401);
+    res = await call(`/__backyard/api/deploy/sites/${site}/deploys`, { method: "POST", headers: tokenHeaders(token.slice(0, -2) + "xx"), body }, anonymous);
+    expect(res.status).toBe(401);
+    expect((await errorOf(res)).message).toContain("invalid or expired token");
+
+    // A real identity can still delete the site.
+    res = await call(`/__backyard/api/deploy/sites/${site}`, { method: "DELETE", headers: tokenHeaders() });
+    expect(res.status).toBe(204);
   });
 
   it("validates deploy requests", async () => {

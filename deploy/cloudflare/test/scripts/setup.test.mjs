@@ -4,12 +4,14 @@
 // without a Cloudflare account.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+
+import { isCI, isMissingWorker, maskSecret, parseSecretList, revealSecrets } from "../../scripts/setup.mjs";
 
 const pkgDir = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -48,12 +50,21 @@ switch (args[0]) {
     console.log("Uploaded backyard\nDeployed backyard triggers\n  https://" + args[args.indexOf("--name") + 1] + ".me.workers.dev");
     break;
   }
-  case "secret":
-    if (args[1] === "list" && process.env.FAKE_LIST_ERROR) { console.error("✘ [ERROR] Authentication error [code: 10000]"); code = 1; break; }
+  case "secret": {
+    // FAKE_LIST_MODE plays the ways "secret list" can go wrong.
+    const mode = process.env.FAKE_LIST_MODE || (process.env.FAKE_LIST_ERROR ? "auth" : "");
+    if (args[1] === "list" && mode === "auth") { console.error("✘ [ERROR] Authentication error [code: 10000]"); code = 1; break; }
+    if (args[1] === "list" && mode === "network") { console.error("✘ [ERROR] fetch failed: getaddrinfo ENOTFOUND api.cloudflare.com (route not found)"); code = 1; break; }
     if (args[1] === "list" && !existsSync(secretsFile + ".deployed")) { console.error('✘ [ERROR] Worker "' + args[args.indexOf("--name") + 1] + '" not found. [code: 10007]'); code = 1; break; }
+    // Exit 0 without the list on stdout (an empty "[]" only on stderr).
+    if (args[1] === "list" && mode === "stderr-json") { console.log("Listing secrets…"); console.error("[]"); break; }
+    if (args[1] === "list" && mode === "garbage") { console.log("Something unexpected happened"); break; }
+    // A warning on stderr that starts with "[" (what a proxy warning can look like without colors).
+    if (args[1] === "list" && mode === "stderr-warning") console.error("[WARNING] Proxy environment variables detected. We'll use your proxy for fetch requests.");
     if (args[1] === "list") console.log("▲ [WARNING] noise [x]\n" + JSON.stringify(Object.keys(secrets).map((name) => ({ name, type: "secret_text" }))));
     if (args[1] === "put") { secrets[args[2]] = readStdin().replace(/\n$/, ""); writeFileSync(secretsFile, JSON.stringify(secrets)); entry.secret = args[2]; }
     break;
+  }
   default:
     code = 2;
 }
@@ -103,7 +114,9 @@ function calls(dir) {
   return all;
 }
 
-const state = (dir, worker = "backyard") => JSON.parse(readFileSync(join(dir, "config", "backyard", "cloudflare", `${worker}.json`), "utf8"));
+const statePath = (dir, worker = "backyard") => join(dir, "config", "backyard", "cloudflare", `${worker}.json`);
+const state = (dir, worker = "backyard") => JSON.parse(readFileSync(statePath(dir, worker), "utf8"));
+const fileMode = (p) => (statSync(p).mode & 0o777).toString(8);
 
 describe("scripts/setup.mjs", () => {
   let server;
@@ -154,7 +167,13 @@ describe("scripts/setup.mjs", () => {
     assert.equal(st.deployToken, secrets.DEPLOY_TOKEN);
     assert.equal(st.accountId, "acc1");
     assert.equal(st.r2Bucket, "backyard-files");
-    assert.match(r.out, new RegExp(`backyard login --server ${hub.replace(/[.]/g, "\\.")} --token byd_`));
+    if (process.platform !== "win32") assert.equal(fileMode(statePath(dir)), "600");
+    // Not a terminal: the generated secrets are never printed, the token is
+    // masked and lives in the state file.
+    assert.ok(!r.out.includes(secrets.DEPLOY_TOKEN), "the deploy token is not printed");
+    assert.ok(!r.out.includes(secrets.BACKYARD_SECRET), "BACKYARD_SECRET is not printed");
+    assert.ok(r.out.includes(`backyard login --server ${hub} --token <"deployToken" in ${statePath(dir)}>`), r.out);
+    assert.ok(r.out.includes(maskSecret(secrets.DEPLOY_TOKEN)), r.out);
 
     // A re-run keeps secrets, bucket and overrides.
     r = await run(dir, [], { FAKE_ACCOUNTS: accounts });
@@ -183,14 +202,32 @@ describe("scripts/setup.mjs", () => {
     assert.equal(r.code, 0, r.out);
     const before = readFileSync(join(dir, "secrets.json"), "utf8");
     calls(dir);
-    r = await run(dir, [], { FAKE_ACCOUNTS: accounts, FAKE_LIST_ERROR: "1" });
-    assert.notEqual(r.code, 0);
-    assert.match(r.out, /could not list the secrets/);
-    assert.ok(!calls(dir).some((x) => x.args[0] === "deploy"));
+    // Authentication or network errors, exit 0 without the list on stdout (an
+    // empty list only on stderr), or garbage: stop, change nothing.
+    for (const [mode, msg] of [
+      ["auth", /could not list the secrets/],
+      ["network", /could not list the secrets/],
+      ["stderr-json", /unexpected output of wrangler secret list/],
+      ["garbage", /unexpected output of wrangler secret list/],
+    ]) {
+      r = await run(dir, [], { FAKE_ACCOUNTS: accounts, FAKE_LIST_MODE: mode });
+      assert.notEqual(r.code, 0, mode);
+      assert.match(r.out, msg, mode);
+      assert.ok(!calls(dir).some((x) => x.args[0] === "deploy" || x.secret), mode);
+      assert.equal(readFileSync(join(dir, "secrets.json"), "utf8"), before, mode);
+    }
+    // A "[…]" warning on stderr is not the list: the secrets are kept.
+    r = await run(dir, [], { FAKE_ACCOUNTS: accounts, FAKE_LIST_MODE: "stderr-warning", CI: "true" });
+    assert.equal(r.code, 0, r.out);
+    let c = calls(dir);
+    assert.ok(c.some((x) => x.args[0] === "deploy"));
+    assert.equal(c.filter((x) => x.secret || x.secretsFile).length, 0, "no secret is rewritten");
     assert.equal(readFileSync(join(dir, "secrets.json"), "utf8"), before);
+    assert.match(r.out, /not printed: CI/);
+    assert.ok(!r.out.includes(JSON.parse(before).DEPLOY_TOKEN));
     r = await run(dir, ["--skip-deploy", "--rotate-token"], { FAKE_ACCOUNTS: accounts });
     assert.equal(r.code, 0, r.out);
-    const c = calls(dir);
+    c = calls(dir);
     assert.ok(!c.some((x) => x.args[0] === "deploy"));
     assert.deepEqual(c.filter((x) => x.secret).map((x) => x.secret), ["DEPLOY_TOKEN"]);
     assert.equal(state(dir).deployToken, JSON.parse(readFileSync(join(dir, "secrets.json"), "utf8")).DEPLOY_TOKEN);
@@ -237,6 +274,9 @@ describe("scripts/setup.mjs", () => {
     assert.equal(JSON.parse(readFileSync(join(dir, "secrets.json"), "utf8")).DEPLOY_TOKEN, "my-token");
     assert.ok(c.find((x) => x.args[0] === "deploy").secretsFile.includes("DEPLOY_TOKEN"));
     assert.equal(state(dir, "team-yard").deployToken, "my-token");
+    // A token from the environment is referred to, never echoed.
+    assert.ok(!r.out.includes("my-token"), r.out);
+    assert.match(r.out, /--token \$DEPLOY_TOKEN/);
 
     r = await run(newSandbox(), [], { FAKE_LOGGED_OUT: "1" });
     assert.notEqual(r.code, 0);
@@ -244,5 +284,83 @@ describe("scripts/setup.mjs", () => {
     r = await run(dir, ["--bogus"]);
     assert.notEqual(r.code, 0);
     assert.match(r.out, /unknown option --bogus/);
+  });
+  it("keeps a broken state file and an unknown Worker from rotating anything", async () => {
+    const dir = newSandbox();
+    const accounts = '[{"id":"a","name":"A"}]';
+    // --skip-deploy cannot set secrets on a Worker that does not exist yet.
+    let r = await run(dir, ["--skip-deploy"], { FAKE_ACCOUNTS: accounts });
+    assert.notEqual(r.code, 0);
+    assert.match(r.out, /does not exist yet/);
+    assert.ok(!calls(dir).some((x) => x.secret || x.args[0] === "deploy"));
+
+    r = await run(dir, ["--var", `PUBLIC_URL:${hub}`], { FAKE_ACCOUNTS: accounts });
+    assert.equal(r.code, 0, r.out);
+    calls(dir);
+    const token = state(dir).deployToken;
+    // An older version may have left the state readable by others: fixed on save.
+    chmodSync(statePath(dir), 0o644);
+    r = await run(dir, [], { FAKE_ACCOUNTS: accounts });
+    assert.equal(r.code, 0, r.out);
+    calls(dir);
+    if (process.platform !== "win32") assert.equal(fileMode(statePath(dir)), "600");
+    assert.equal(state(dir).deployToken, token);
+
+    // A corrupt state file stops the setup instead of issuing a new token.
+    writeFileSync(statePath(dir), "{ not json");
+    r = await run(dir, [], { FAKE_ACCOUNTS: accounts });
+    assert.notEqual(r.code, 0);
+    assert.match(r.out, /is not a valid state file/);
+    writeFileSync(statePath(dir), "[]");
+    r = await run(dir, [], { FAKE_ACCOUNTS: accounts });
+    assert.notEqual(r.code, 0);
+    assert.match(r.out, /is not a valid state file/);
+    assert.ok(!calls(dir).some((x) => x.args[0] === "deploy" || x.secret));
+  });
+});
+
+describe("scripts/setup.mjs helpers", () => {
+  it("parses the secret list from stdout only, never guessing", () => {
+    const list = JSON.stringify([{ name: "BACKYARD_SECRET", type: "secret_text" }, { name: "DEPLOY_TOKEN", type: "secret_text" }]);
+    const names = (s) => [...parseSecretList(s)].sort();
+    assert.deepEqual(names(list), ["BACKYARD_SECRET", "DEPLOY_TOKEN"]);
+    assert.deepEqual(names("[]"), []);
+    assert.deepEqual(names(`▲ [WARNING] Proxy environment variables detected\n${list}\n`), ["BACKYARD_SECRET", "DEPLOY_TOKEN"]);
+    assert.deepEqual(names(`[WARNING] a notice [x]\n${list}\n`), ["BACKYARD_SECRET", "DEPLOY_TOKEN"]);
+    assert.deepEqual(names(`${list}\n▲ [WARNING] after the list [x]\n`), ["BACKYARD_SECRET", "DEPLOY_TOKEN"]);
+    assert.deepEqual(names('[\n  {\n    "name": "A",\n    "type": "secret_text"\n  }\n]\n'), ["A"]);
+    for (const bad of ["", "garbage", "Listing secrets…", "x []", "[1, 2]", '[{"type":"secret_text"}]', "[] trailing", "{}"]) {
+      assert.throws(() => parseSecretList(bad), /no JSON list/, JSON.stringify(bad));
+    }
+  });
+
+  it("recognizes only wrangler's explicit missing-Worker errors", () => {
+    assert.ok(isMissingWorker('✘ [ERROR] Worker "backyard" not found. [code: 10007]'));
+    assert.ok(isMissingWorker('Worker "backyard" (env: production) not found'));
+    assert.ok(isMissingWorker("This Worker does not exist on your account. [code: 10007]"));
+    for (const other of [
+      "✘ [ERROR] Authentication error [code: 10000]",
+      "fetch failed: getaddrinfo ENOTFOUND api.cloudflare.com",
+      "404 Not Found",
+      "",
+    ]) {
+      assert.ok(!isMissingWorker(other), other);
+    }
+  });
+
+  it("reveals secrets only on an interactive terminal outside CI", () => {
+    assert.equal(revealSecrets({}, true), true);
+    assert.equal(revealSecrets({}, false), false);
+    assert.equal(revealSecrets({ CI: "true" }, true), false);
+    assert.equal(revealSecrets({ CI: "1" }, true), false);
+    assert.equal(revealSecrets({ CI: "false" }, true), true);
+    assert.equal(isCI({ CI: "0" }), false);
+    assert.equal(isCI({ CI: "" }), false);
+    assert.equal(isCI({ CI: "woodpecker" }), true);
+    const tok = "byd_abcdefghijklmnopqrstuvwxyz012345";
+    assert.equal(maskSecret(tok), "byd_…2345");
+    assert.ok(!maskSecret(tok).includes("abcdefgh"));
+    assert.equal(maskSecret("short"), "…");
+    assert.equal(maskSecret("0123456789abcdef0123456789abcdef"), "…cdef");
   });
 });

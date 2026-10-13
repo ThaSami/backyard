@@ -7,14 +7,22 @@
 //   web/hub/**                      → src/generated/hub.ts
 //   skills/backyard/**              → src/generated/skills.ts
 //
+// It also copies the shared query-semantics cases of SPEC §5.2 for the test
+// suite (not bundled into the Worker):
+//
+//   internal/docstore/conformance/querycases.json → test/generated/querycases.json
+//
 // Missing sources (e.g. while they are being written) become placeholders with
 // a warning, so `npm test` and `wrangler dev` keep working. The repository root
 // defaults to ../.. and can be overridden with BACKYARD_REPO_ROOT.
 //
 // Usage: node scripts/sync-assets.mjs [--check] [--strict]
 //   --check   exit 1 if a generated file is out of date (no writes)
-//   --strict  exit 1 instead of using placeholders (used for real deploys, so a
-//             broken checkout never ships a Worker without its SDK)
+//   --strict  exit 1 instead of using placeholders (npm run build / deploy /
+//             setup), so a partial checkout never ships a Worker without its
+//             SDK, hub or docs. Implied when wrangler runs this script as the
+//             build step of anything but `wrangler dev` / `wrangler types`
+//             (WRANGLER_COMMAND), e.g. a plain `npx wrangler deploy`.
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
@@ -25,8 +33,12 @@ const here = dirname(fileURLToPath(import.meta.url));
 const pkgDir = resolve(here, "..");
 const repoRoot = resolve(process.env.BACKYARD_REPO_ROOT || join(pkgDir, "..", ".."));
 const outDir = join(pkgDir, "src", "generated");
+const testOutDir = join(pkgDir, "test", "generated");
 const check = process.argv.includes("--check");
-const strict = process.argv.includes("--strict");
+// wrangler sets WRANGLER_COMMAND for its custom build step ("dev", "deploy",
+// "versions upload", "types", …): anything that uploads must be complete.
+const wranglerCommand = (process.env.WRANGLER_COMMAND ?? "").trim();
+const strict = process.argv.includes("--strict") || (wranglerCommand !== "" && !/^(dev|types)\b/.test(wranglerCommand));
 
 const TEXT_EXT = new Set([".html", ".css", ".js", ".mjs", ".ts", ".json", ".svg", ".txt", ".md", ".map", ".xml", ".webmanifest"]);
 const warnings = [];
@@ -134,6 +146,24 @@ const skillsTS =
   `/** skills/backyard/SKILL.md (with YAML front matter). */\nexport const SKILL_MD: string = ${lit(skillMD)};\n\n` +
   `/** skills/backyard/references/<name>.md keyed by name. */\nexport const REFERENCES: Record<string, string> = {\n${refEntries.join("\n")}\n};\n`;
 
+// --- Test fixtures (not part of the Worker) ---------------------------------
+
+// The shared, language-neutral query cases (SPEC §5.2) that every Backyard
+// document store runs; test/querycases.test.ts runs them against SiteDO. A
+// missing file becomes a marked placeholder, which that test reports as a
+// failure (it never passes vacuously). Never needed for a deploy.
+const queryCasesRel = "internal/docstore/conformance/querycases.json";
+const testWarnings = [];
+let queryCasesJSON;
+try {
+  const raw = readFileSync(join(repoRoot, queryCasesRel), "utf8");
+  JSON.parse(raw); // a broken file becomes the marked placeholder too
+  queryCasesJSON = raw.replace(/\r\n/g, "\n");
+} catch (e) {
+  testWarnings.push(`cannot read ${queryCasesRel} (${e.code ?? e.message}): the shared query cases will fail`);
+  queryCasesJSON = JSON.stringify({ version: 0, missing: queryCasesRel, collections: {}, cases: [] }, null, 2) + "\n";
+}
+
 // --- Write -----------------------------------------------------------------
 
 const outputs = { "sdk.ts": sdkTS, "hub.ts": hubTS, "skills.ts": skillsTS };
@@ -146,32 +176,47 @@ outputs["index.ts"] =
   )};\n`;
 
 if (strict && warnings.length) {
-  for (const w of warnings) console.error(`sync-assets: ${w.replace(/: using a placeholder.*$/, "")}`);
-  console.error(`sync-assets: refusing to build with placeholders (--strict); is ${repoRoot} a complete Backyard checkout?`);
+  const missing = warnings.map((w) => w.replace(/: (?:using a placeholder|no reference docs bundled).*$/, ""));
+  console.error(
+    [
+      `sync-assets: cannot build the Worker: it bundles the browser SDK (web/sdk), the hub UI (web/hub) and the`,
+      `agent docs (skills/backyard) of the Backyard repository, and these are missing under ${repoRoot}:`,
+      ...missing.map((m) => `  - ${m.replace(/^missing /, "")}`),
+      `Build from a complete checkout (git clone https://github.com/thasami/backyard.git, then`,
+      `cd backyard/deploy/cloudflare), or point BACKYARD_REPO_ROOT at one. Placeholders are only`,
+      `used for local development and tests (npm run sync without --strict).`,
+    ].join("\n"),
+  );
   process.exit(1);
 }
 
 let stale = false;
-if (!check) mkdirSync(outDir, { recursive: true });
-for (const [name, content] of Object.entries(outputs)) {
-  const p = join(outDir, name);
+/** Writes (or, with --check, compares) one generated file. */
+function emit(dir, name, content) {
+  const p = join(dir, name);
   let current = null;
   try {
     current = readFileSync(p, "utf8");
   } catch {
     /* missing */
   }
-  if (current === content) continue;
+  if (current === content) return;
   stale = true;
-  if (!check) writeFileSync(p, content);
+  if (!check) {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(p, content);
+  }
 }
+for (const [name, content] of Object.entries(outputs)) emit(outDir, name, content);
+emit(testOutDir, "querycases.json", queryCasesJSON);
 for (const w of warnings) console.warn(`sync-assets: warning: ${w}`);
+for (const w of testWarnings) console.warn(`sync-assets: warning: ${w}`);
 if (check && stale) {
-  console.error("sync-assets: src/generated is out of date; run npm run sync");
+  console.error("sync-assets: src/generated or test/generated is out of date; run npm run sync");
   process.exit(1);
 }
 if (!check) {
   console.log(
-    `sync-assets: ${stale ? "updated" : "up to date"} src/generated (sdk, ${hubFiles.length} hub files, ${refs.length} references)`,
+    `sync-assets: ${stale ? "updated" : "up to date"} src/generated (sdk, ${hubFiles.length} hub files, ${refs.length} references) and test/generated`,
   );
 }

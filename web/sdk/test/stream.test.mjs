@@ -183,3 +183,43 @@ test("stream validates its input synchronously", () => {
   const env = createEnv();
   assert.throws(() => env.backyard.ai.stream(null), { code: "bad_request" });
 });
+
+test("the Go server's stream shape: flushed headers, ': ping' keep-alives while the model is silent, then events", async () => {
+  const env = createEnv();
+  const sse = sseResponse();
+  env.on("POST", "/__backyard/api/ai/chat", () => sse.response);
+  const s = env.backyard.ai.stream("think hard");
+  const iter = s[Symbol.asyncIterator]();
+  const first = iter.next();
+  await flush();
+  // Headers arrived (fetch resolved) but nothing else yet; keep-alive comments follow.
+  sse.push(": ping\n\n");
+  sse.push(":ping\n\n");
+  sse.push("\n\n");
+  await flush();
+  assert.equal(s.text, "");
+  let settled = false;
+  first.then(() => (settled = true));
+  await flush();
+  assert.equal(settled, false, "comments and blank lines yield no chunks");
+  sse.push(ev({ type: "text", text: "Done" }) + ": ping\n\n" + ev(DONE));
+  assert.deepEqual(plain(await first), { value: { text: "Done" }, done: false });
+  // The server may keep the connection open briefly after "done": the result does not wait for EOF.
+  const final = await s.done;
+  assert.deepEqual(plain(final), { content: "Done", model: "smart", stop_reason: "end_turn", usage: { input_tokens: 3, output_tokens: 4 } });
+  assert.deepEqual(plain(await iter.next()), { done: true });
+});
+
+test("an error event after keep-alives (the model failed mid-stream) rejects with the server's code", async () => {
+  const env = createEnv();
+  const sse = sseResponse();
+  env.on("POST", "/__backyard/api/ai/chat", () => sse.response);
+  const s = env.backyard.ai.stream("x");
+  await flush();
+  sse.push(": ping\n\n");
+  sse.push(ev({ type: "error", error: { code: "upstream_error", message: "AI provider error: overloaded" } }));
+  const err = await rejects(s.done);
+  assert.equal(err.code, "upstream_error");
+  assert.equal(err.message, "AI provider error: overloaded");
+  assert.equal(err.status, 200);
+});

@@ -203,7 +203,7 @@ func (a *authenticator) authenticateSession(r *http.Request) (*identity.User, er
 			a.log.Debug("auth: session cookie rejected", "error", err)
 			continue
 		}
-		return a.finalize(r.Context(), u, srcIdP)
+		return a.finalize(r.Context(), u, srcIDP)
 	}
 	if found {
 		return nil, fmt.Errorf("%w: invalid or expired session", ErrUnauthenticated)

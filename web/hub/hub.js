@@ -460,6 +460,24 @@
     return !!url && safeHref(url) !== "#";
   }
 
+  /** The hub's login URL that returns to href after signing in (SPEC §8). */
+  function loginURLFor(href) {
+    return "/__backyard/auth/login?rd=" + encodeURIComponent(String(href));
+  }
+
+  /**
+   * Whether a same-origin JSON fetch (made with redirect: "manual") was
+   * answered by a login flow rather than the API: an identity-aware proxy or
+   * the server redirected (opaqueredirect; followed, it would end at the IdP
+   * as a CORS failure) or served an HTML login page in place of JSON.
+   */
+  function isLoginResponse(res) {
+    if (!res) return false;
+    if (res.type === "opaqueredirect") return true;
+    const ct = String((res.headers && res.headers.get && res.headers.get("Content-Type")) || "").toLowerCase();
+    return !!res.ok && ct.indexOf("text/html") >= 0;
+  }
+
   /**
    * Whether the deploy token should be persisted by default: only in host
    * mode. In path mode every site shares the hub's origin and could read
@@ -821,6 +839,166 @@
     return out;
   }
 
+  /**
+   * Request headers a page may not set (Fetch "forbidden request-header"):
+   * the browser computes them itself (e.g. Content-Length from the body), and
+   * trying to set them only logs a console error.
+   */
+  const FORBIDDEN_HEADER_RE =
+    /^(accept-charset|accept-encoding|access-control-request-headers|access-control-request-method|connection|content-length|cookie|cookie2|date|dnt|expect|host|keep-alive|origin|referer|set-cookie|te|trailer|transfer-encoding|upgrade|via|proxy-.*|sec-.*)$/i;
+
+  /**
+   * The headers of an upload instruction as [name, value] pairs, exactly as
+   * the gateway gave them (presigned URLs sign some of them, e.g. S3
+   * x-amz-*, Azure x-ms-blob-type, Content-Type): names keep their case,
+   * values are not altered. Names differing only in case collapse to the last
+   * one (a browser would join them into one invalid value); forbidden headers
+   * are left to the browser.
+   */
+  function uploadHeaders(headers) {
+    const out = new Map();
+    for (const [name, value] of Object.entries(headers || {})) {
+      if (value === undefined || value === null || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) || FORBIDDEN_HEADER_RE.test(name)) continue;
+      out.set(name.toLowerCase(), [name, Array.isArray(value) ? value.join(",") : String(value)]);
+    }
+    return Array.from(out.values());
+  }
+
+  /** The origin of url resolved against base ("" when it cannot be parsed). */
+  function originOf(url, base) {
+    try {
+      return new URL(url, base || undefined).origin;
+    } catch (_) {
+      return "";
+    }
+  }
+
+  /**
+   * Explains a failed upload PUT that never got an HTTP response. To a
+   * presigned storage URL on another origin that is almost always the
+   * bucket's CORS configuration (the browser hides the actual reason).
+   */
+  function uploadNetworkError(fileName, url, pageOrigin, headerNames) {
+    const target = originOf(url, pageOrigin);
+    const name = fileName || "a file";
+    if (target && pageOrigin && target !== pageOrigin) {
+      let host = target;
+      try {
+        host = new URL(target).host;
+      } catch (_) {
+        /* keep the origin */
+      }
+      const allowed = (headerNames || []).filter((h) => !/^content-length$/i.test(h));
+      return new HubError(
+        `Uploading ${name} to ${host} failed: network or CORS error. ` +
+          `If it keeps failing, the bucket CORS must allow PUT from ${pageOrigin}` +
+          (allowed.length ? ` with the headers ${allowed.join(", ")}` : "") +
+          ": ask your Backyard admin (deploying with the backyard CLI is not affected).",
+        { status: 0, code: "cors", retryable: true },
+      );
+    }
+    return new HubError(`Network error while uploading ${name}`, { status: 0, code: "network_error", retryable: true });
+  }
+
+  /** Extracts a readable reason from an upload error body (Backyard JSON or S3/GCS/Azure XML). */
+  function uploadErrorDetail(text) {
+    const body = String(text || "");
+    try {
+      const j = JSON.parse(body);
+      if (j && j.error && typeof j.error.message === "string" && j.error.message) return j.error.message;
+    } catch (_) {
+      /* not JSON */
+    }
+    const tag = (t) => {
+      const m = new RegExp("<" + t + ">([^<]{1,500})</" + t + ">").exec(body);
+      return m ? m[1].trim() : "";
+    };
+    const message = tag("Message");
+    const code = tag("Code");
+    if (message && code) return `${message} (${code})`;
+    return message || code;
+  }
+
+  /**
+   * Creates the upload function used by deploySite: an XMLHttpRequest PUT
+   * (for upload progress) with exactly the given headers and the raw bytes.
+   * The body is sent as a type-less Blob, so the browser never adds a
+   * Content-Type the presigned signature did not include; no cookies are sent
+   * to cross-origin URLs (withCredentials stays false).
+   * env: { XMLHttpRequest, origin (the hub origin), stallMs, setTimeout, clearTimeout }.
+   */
+  function createUploader(env) {
+    const XHR = env.XMLHttpRequest;
+    const stallMs = env.stallMs || 120000;
+    const setT = env.setTimeout || setTimeout;
+    const clearT = env.clearTimeout || clearTimeout;
+    return function upload({ url, method, headers, file, onProgress }) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XHR();
+        const name = (file && file.name) || "";
+        const label = name || "a file";
+        const pairs = uploadHeaders(headers);
+        let stall = null;
+        let done = false;
+        const settle = (fn, arg) => {
+          if (done) return;
+          done = true;
+          clearT(stall);
+          fn(arg);
+        };
+        const watchdog = () => {
+          clearT(stall);
+          stall = setT(() => {
+            xhr.onload = xhr.onerror = xhr.ontimeout = xhr.onabort = null;
+            try {
+              xhr.abort();
+            } catch (_) {
+              /* ignore */
+            }
+            settle(reject, new HubError(`Uploading ${label} stalled`, { status: 0, retryable: true }));
+          }, stallMs);
+        };
+        xhr.open(method || "PUT", url);
+        for (const [k, v] of pairs) {
+          try {
+            xhr.setRequestHeader(k, v);
+          } catch (_) {
+            /* refused by the browser: it sets this header itself */
+          }
+        }
+        xhr.upload.onprogress = (e) => {
+          watchdog();
+          if (onProgress) onProgress(e.loaded);
+        };
+        xhr.upload.onload = watchdog; // body sent: now waiting for the response
+        xhr.onabort = () => settle(reject, new HubError("The upload was aborted", { status: 0, retryable: true }));
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) return settle(resolve);
+          if (xhr.status === 0) return settle(reject, uploadNetworkError(name, url, env.origin, pairs.map((p) => p[0])));
+          let detail = "";
+          try {
+            detail = uploadErrorDetail(xhr.responseText);
+          } catch (_) {
+            detail = "";
+          }
+          const ra = xhr.getResponseHeader("Retry-After");
+          settle(
+            reject,
+            new HubError(detail ? `Uploading ${label} failed: ${detail} (HTTP ${xhr.status})` : `Uploading ${label} failed (HTTP ${xhr.status})`, {
+              status: xhr.status,
+              retryAfter: ra && /^\d+$/.test(ra) ? +ra : undefined,
+            }),
+          );
+        };
+        xhr.onerror = () => settle(reject, uploadNetworkError(name, url, env.origin, pairs.map((p) => p[0])));
+        xhr.ontimeout = xhr.onerror;
+        watchdog();
+        const body = file && typeof file.slice === "function" ? file.slice(0, file.size) : file;
+        xhr.send(body);
+      });
+    };
+  }
+
   /** Deletes a site through the gateway. */
   function deleteSite(opts) {
     const fetchImpl = opts.fetch || ((...a) => globalThis.fetch(...a));
@@ -865,6 +1043,8 @@
     tokenFromHash,
     safeHref,
     isSafeRedirect,
+    loginURLFor,
+    isLoginResponse,
     rememberByDefault,
     initialsOf,
     treeFromPaths,
@@ -872,6 +1052,9 @@
     collectTree,
     hashFiles,
     deploySite,
+    uploadHeaders,
+    uploadErrorDetail,
+    createUploader,
     deleteSite,
     filterSites,
     HubError,
@@ -955,25 +1138,52 @@
   }
 
   async function copyText(text) {
+    let copied = false;
     try {
       await navigator.clipboard.writeText(text);
+      copied = true;
     } catch (_) {
+      // No clipboard permission (or an insecure context): the legacy way.
       const ta = el("textarea", { readonly: true, class: "visually-hidden" });
       ta.value = text;
       document.body.append(ta);
       ta.select();
       try {
-        document.execCommand("copy");
+        copied = document.execCommand("copy") === true;
       } catch (__) {
-        /* ignore */
+        copied = false;
       }
       ta.remove();
     }
-    toast("Copied to clipboard");
+    // Never claim success when nothing reached the clipboard.
+    toast(copied ? "Copied to clipboard" : "Could not copy: select the text and copy it yourself");
+  }
+
+  /** Same key and window as the docs page: one automatic re-login per 30 s (no loops). */
+  const RELOGIN_KEY = "backyard.reloginAt";
+
+  /** Sends the browser to url to sign in again, unless that was just tried. */
+  function relogin(url) {
+    let last = 0;
+    try {
+      last = Number(sessionStorage.getItem(RELOGIN_KEY)) || 0;
+      if (last && Date.now() - last >= 0 && Date.now() - last < 30000) return false;
+      sessionStorage.setItem(RELOGIN_KEY, String(Date.now()));
+    } catch (_) {
+      /* storage unavailable: redirect anyway */
+    }
+    location.href = url;
+    return true;
   }
 
   async function getJSON(path) {
-    const res = await fetch(path, { credentials: "same-origin", headers: { Accept: "application/json" } });
+    const res = await fetch(path, { credentials: "same-origin", redirect: "manual", headers: { Accept: "application/json" } });
+    if (isLoginResponse(res)) {
+      // The session expired behind a proxy (or the server sent us to log in).
+      const loginUrl = loginURLFor(location.href);
+      relogin(loginUrl);
+      throw new HubError("Your session has expired; sign in again.", { status: 401, code: "unauthenticated", loginUrl });
+    }
     if (!res.ok) {
       const err = await errorFromResponse(res, "GET " + path);
       if (res.status === 401 && isSafeRedirect(err.loginUrl)) location.href = err.loginUrl;
@@ -1250,62 +1460,8 @@
     $("progress-text").textContent = text;
   }
 
-  /** An upload with no progress for this long is aborted (and retried). */
-  const UPLOAD_STALL_MS = 120000;
-
-  /**
-   * PUTs a file with exactly the given headers (no cookies are added to
-   * cross-origin presigned URLs: withCredentials stays false).
-   */
-  function xhrUpload({ url, method, headers, file, onProgress }) {
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      let stall = null;
-      const settle = (fn, arg) => {
-        clearTimeout(stall);
-        fn(arg);
-      };
-      const watchdog = () => {
-        clearTimeout(stall);
-        stall = setTimeout(() => {
-          xhr.onload = xhr.onerror = xhr.ontimeout = xhr.onabort = null;
-          xhr.abort();
-          settle(reject, new HubError(`Uploading ${file.name || "a file"} stalled`, { status: 0, retryable: true }));
-        }, UPLOAD_STALL_MS);
-      };
-      xhr.open(method, url);
-      for (const [k, v] of Object.entries(headers || {})) {
-        try {
-          xhr.setRequestHeader(k, v);
-        } catch (_) {
-          /* forbidden header (e.g. Content-Length): the browser sets it */
-        }
-      }
-      xhr.upload.onprogress = (e) => {
-        watchdog();
-        onProgress(e.loaded);
-      };
-      xhr.upload.onload = watchdog; // body sent: now waiting for the response
-      xhr.onabort = () => settle(reject, new HubError("The upload was aborted", { status: 0, retryable: true }));
-      xhr.onload = () => {
-        clearTimeout(stall);
-        if (xhr.status >= 200 && xhr.status < 300) return resolve();
-        let msg = "";
-        try {
-          const body = JSON.parse(xhr.responseText);
-          msg = body && body.error && body.error.message;
-        } catch (_) {
-          msg = "";
-        }
-        const ra = xhr.getResponseHeader("Retry-After");
-        reject(new HubError(msg || `Uploading ${file.name || "a file"} failed (HTTP ${xhr.status})`, { status: xhr.status, retryAfter: ra && /^\d+$/.test(ra) ? +ra : undefined }));
-      };
-      xhr.onerror = () => settle(reject, new HubError("Network error while uploading", { status: 0, retryable: true }));
-      xhr.ontimeout = xhr.onerror;
-      watchdog();
-      xhr.send(file);
-    });
-  }
+  /** PUTs deploy uploads with exactly the given headers (see createUploader). */
+  const xhrUpload = createUploader({ XMLHttpRequest, origin: location.origin, stallMs: 120000 });
 
   async function onDeploy(ev) {
     ev.preventDefault();

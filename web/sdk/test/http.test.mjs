@@ -181,3 +181,14 @@ test("BackyardError is constructible by apps", () => {
   assert.equal(e.message, "taken");
   assert.deepEqual(plain({ name: e.name }), { name: "BackyardError" });
 });
+
+test("quota and size limits: 413 too_large keeps the server's message", async () => {
+  const env = createEnv();
+  env.on("POST", "/__backyard/api/db/posts", apiError(413, "too_large", "this site has reached its document quota (10000 documents)"));
+  env.on("POST", "/__backyard/api/files", apiError(413, "too_large", "file exceeds the maximum upload size of 104857600 bytes"));
+  let err = await rejects(env.backyard.db.collection("posts").create({ a: 1 }));
+  assert.deepEqual([err.code, err.status, err.message], ["too_large", 413, "this site has reached its document quota (10000 documents)"]);
+  err = await rejects(env.backyard.files.upload(new Blob(["x"]), { name: "x.bin" }));
+  assert.deepEqual([err.code, err.status], ["too_large", 413]);
+  assert.match(err.message, /maximum upload size/);
+});

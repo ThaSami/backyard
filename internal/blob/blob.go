@@ -39,6 +39,34 @@ type ListResult struct {
 	Prefixes []string
 }
 
+// PresignPutOptions describes the object a presigned upload URL accepts.
+//
+// What a backend can bind into the URL differs (see each implementation):
+//
+//   - s3: Content-Type and the size are signed (Content-Length, or
+//     Content-MD5 of the empty body for Size 0), so S3 rejects any other
+//     size; SHA256 is signed as x-amz-checksum-sha256, which S3 verifies
+//     against the body, wherever flexible checksums are enabled (AWS S3 by
+//     default; custom endpoints only with AWS_REQUEST_CHECKSUM_CALCULATION).
+//   - gcs: Content-Type and x-goog-content-length-range: Size,Size are
+//     signed (V4), so GCS rejects any other size; GCS cannot verify SHA-256.
+//   - azure: a SAS cannot restrict the size or content of an upload; only
+//     the blob is fixed. Callers must verify uploads afterwards (the deploy
+//     gateway compares sizes at commit and deletes mismatching objects).
+//
+// The zero value is not "anything goes": Size 0 means an empty body. Use
+// Size -1 when the size is unknown.
+type PresignPutOptions struct {
+	// ContentType is signed into the URL and stored with the object; ""
+	// derives it from the key's extension.
+	ContentType string
+	// Size is the exact body size in bytes, or -1 when unknown.
+	Size int64
+	// SHA256 is the lowercase or uppercase hex SHA-256 of the body; "" when
+	// unknown. Ignored by backends that cannot enforce it.
+	SHA256 string
+}
+
 // PresignedRequest is an upload/download URL usable without credentials.
 type PresignedRequest struct {
 	Method    string            `json:"method"`
@@ -65,9 +93,11 @@ type Store interface {
 	// objects in "sub-directories" are folded into Prefixes; with "" the
 	// listing is recursive. Results are sorted by key.
 	List(ctx context.Context, prefix, delimiter string) (*ListResult, error)
-	// PresignPut returns a URL that accepts a PUT of the object's bytes with the
-	// given content type. Returns ErrNotSupported when the backend cannot presign.
-	PresignPut(ctx context.Context, key, contentType string, ttl time.Duration) (*PresignedRequest, error)
+	// PresignPut returns a URL that accepts a PUT of the object's bytes as
+	// described by opts (content type, and as far as the backend can enforce
+	// them, size and SHA-256). The returned Headers must be sent verbatim.
+	// Returns ErrNotSupported when the backend cannot presign.
+	PresignPut(ctx context.Context, key string, opts PresignPutOptions, ttl time.Duration) (*PresignedRequest, error)
 	// PresignGet returns a time-limited download URL or ErrNotSupported.
 	PresignGet(ctx context.Context, key string, ttl time.Duration) (*PresignedRequest, error)
 	// Ping checks connectivity/permissions cheaply (used by /readyz).

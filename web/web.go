@@ -13,10 +13,12 @@
 // npm test (Node 22, no dependencies) checks that the builds are in sync and
 // runs the SDK, hub and docs unit tests. With playwright-core and Chromium
 // (PLAYWRIGHT_CORE=…/playwright-core/index.mjs) it also runs the real-browser
-// tests against web/test/stubserver.mjs, and with BACKYARD_E2E_URL (plus
-// BACKYARD_E2E_TOKEN when deploys need a token) web/test/e2e.test.mjs deploys
-// a site through the hub of a real server (Go or the Cloudflare Worker) and
-// exercises the SDK end to end.
+// tests against web/test/stubserver.mjs, and web/test/e2e.test.mjs deploys a
+// site through the hub of a real server and exercises the SDK end to end:
+// with BACKYARD_E2E_SERVE=go it builds and starts this checkout's Go server
+// itself (npm run test:e2e:go), with BACKYARD_E2E_URL (plus
+// BACKYARD_E2E_TOKEN when deploys need a token) it uses a running server (Go
+// or the Cloudflare Worker).
 package web
 
 import (

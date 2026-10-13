@@ -588,6 +588,13 @@ func TestDeployIDs(t *testing.T) {
 		e.store.Put(context.Background(), sites.SiteKey("ids", "index.html"), strings.NewReader("hello"), 5, "")
 		resp, body := commit("alice", "ids", cr.DeployID)
 		wantStatus(t, resp, body, 409, CodeConflict)
+		// Never committed before: the unverified object is deleted.
+		if !strings.Contains(string(body), "index.html (5 bytes in storage, expected 2; deleted)") {
+			t.Errorf("body = %s", body)
+		}
+		if b := e.object("ids", "index.html"); b != nil {
+			t.Errorf("object of the wrong size kept: %q", b)
+		}
 	})
 	t.Run("file list revalidated", func(t *testing.T) {
 		resp, body := e.do("POST", "/sites/ids/deploys/"+cr.DeployID+"/commit", "alice", CommitRequest{Files: []FileEntry{{Path: "../x", Size: 1, SHA256: sha256Hex([]byte("x"))}}})

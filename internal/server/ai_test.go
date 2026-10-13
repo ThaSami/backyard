@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/thasami/backyard/internal/ai"
 	"github.com/thasami/backyard/internal/config"
@@ -333,4 +334,125 @@ func TestAIRateLimits(t *testing.T) {
 	expectStatus(t, g.api("GET", aiURL+"/models", nil), 200) // models is not an AI call
 	expectStatus(t, g.api("POST", aiURL+"/chat", body), 200)
 	expectError(t, g.api("POST", aiURL+"/chat", body), http.StatusTooManyRequests, "rate_limited")
+}
+
+// retryAfterErr is an upstream error that knows the provider's Retry-After.
+type retryAfterErr struct {
+	*ai.UpstreamError
+	after time.Duration
+}
+
+func (e retryAfterErr) RetryAfter() time.Duration { return e.after }
+func (e retryAfterErr) Unwrap() error             { return e.UpstreamError }
+
+func TestAIUpstreamStatusMapping(t *testing.T) {
+	h := newHarness(t, withConfig(func(c *config.Config) { c.RateLimit.AIPerMinute = 1000 }))
+	msgs := []any{map[string]any{"role": "user", "content": "hi"}}
+	up := func(status int, msg string) *ai.UpstreamError {
+		return &ai.UpstreamError{Provider: "anthropic", Status: status, Message: msg}
+	}
+	tests := []struct {
+		name       string
+		err        error
+		status     int
+		code       string
+		retryAfter string // expected Retry-After header ("" = none)
+		contains   []string
+		excludes   []string
+	}{
+		{"router timeout", up(504, "no response within 5m0s"), 504, "upstream_error", "", []string{"did not respond in time"}, nil},
+		{"provider request timeout", up(408, "timeout"), 504, "upstream_error", "", nil, nil},
+		{"throttled with retry-after", retryAfterErr{up(429, "slow down"), 20 * time.Second}, 429, "rate_limited", "20", nil, nil},
+		{"throttled wrapped", fmt.Errorf("router: %w", retryAfterErr{up(429, "slow down"), 1500 * time.Millisecond}), 429, "rate_limited", "2", nil, nil},
+		{"throttled zero retry-after with hint", retryAfterErr{up(429, "try again in 7s"), 0}, 429, "rate_limited", "7", nil, nil},
+		{"throttled hint milliseconds", up(429, "Please try again in 350ms."), 429, "rate_limited", "1", nil, nil},
+		{"throttled hint seconds", up(429, "Rate limit reached for gpt-4o in organization org-AbCdEf123456 on tokens per min. Please try again in 1.5s."),
+			429, "rate_limited", "2", nil, []string{"org-AbCdEf123456"}},
+		{"throttled azure hint", up(429, "Requests have exceeded token rate limit. Please retry after 6 seconds."), 429, "rate_limited", "6", nil, nil},
+		{"throttled hint minutes", up(429, "Quota exceeded; try again in 2 minutes"), 429, "rate_limited", "120", nil, nil},
+		{"throttled unknown", up(429, "Too many requests, please wait before trying again."), 503, "upstream_error", "", []string{"rate limiting"}, nil},
+		{"throttled absurd hint", up(429, "retry after 999999 seconds"), 429, "rate_limited", "3600", nil, nil},
+		{"prefill rejected", up(400, "This model does not support assistant message prefill. The conversation must end with a user message."),
+			400, "bad_request", "", []string{"rejected the request", "does not support assistant message prefill"}, nil},
+		{"unprocessable", up(422, "invalid image"), 400, "bad_request", "", []string{"invalid image"}, nil},
+		{"too large", up(413, "request too large"), 413, "too_large", "", []string{"too large"}, nil},
+		{"bad request leaks", up(400, "see https://internal.example:8443/v1/deploy/secret-deployment?api-version=1 for key sk-proj-abcdefghijklmnop\x00\nnext"),
+			400, "bad_request", "", []string{"[url]", "[redacted]", "next"}, []string{"internal.example", "secret-deployment", "abcdefghijklmnop", "\x00", "\n"}},
+		{"empty 400 message", up(400, ""), 400, "bad_request", "", []string{"bad request"}, nil},
+		{"credentials", up(401, "invalid x-api-key"), 502, "upstream_error", "", []string{"invalid x-api-key"}, nil},
+		{"model missing upstream", up(404, "model not found"), 502, "upstream_error", "", nil, nil},
+		{"overloaded", up(529, "Overloaded"), 502, "upstream_error", "", []string{"Overloaded"}, nil},
+		{"no status", up(0, "stream ended unexpectedly"), 502, "upstream_error", "", nil, nil},
+		{"long message", up(500, strings.Repeat("é", 400)), 502, "upstream_error", "", []string{"…"}, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h.ai.chatErr = tc.err
+			w := h.api("POST", aiURL+"/chat", map[string]any{"messages": msgs})
+			e := expectError(t, w, tc.status, tc.code)
+			if got := w.Header().Get("Retry-After"); got != tc.retryAfter {
+				t.Fatalf("Retry-After = %q, want %q", got, tc.retryAfter)
+			}
+			for _, s := range tc.contains {
+				if !strings.Contains(e.Error.Message, s) {
+					t.Fatalf("message %q does not contain %q", e.Error.Message, s)
+				}
+			}
+			for _, s := range tc.excludes {
+				if strings.Contains(e.Error.Message, s) {
+					t.Fatalf("message %q contains %q", e.Error.Message, s)
+				}
+			}
+			if len(e.Error.Message) > 400 || !utf8.ValidString(e.Error.Message) {
+				t.Fatalf("message not bounded/valid: %d bytes", len(e.Error.Message))
+			}
+		})
+	}
+
+	// The same mapping applies to images and embeddings.
+	h.ai.chatErr = nil
+	h.ai.imageErr = up(400, "prompt rejected by safety system")
+	expectError(t, h.api("POST", aiURL+"/image", map[string]any{"prompt": "x"}), 400, "bad_request")
+	h.ai.embedErr = up(504, "no response within 1m0s")
+	expectError(t, h.api("POST", aiURL+"/embed", map[string]any{"input": "x"}), 504, "upstream_error")
+}
+
+func TestAIUpstreamStatusInStream(t *testing.T) {
+	h := newHarness(t)
+	srv := httptest.NewServer(h.h)
+	defer srv.Close()
+	for _, tc := range []struct {
+		err  error
+		code string
+		msg  string
+	}{
+		{&ai.UpstreamError{Provider: "anthropic", Status: 400, Message: "prefill not supported"}, "bad_request", "prefill not supported"},
+		{&ai.UpstreamError{Provider: "anthropic", Status: 429, Message: "slow down"}, "upstream_error", "rate limiting"},
+		{&ai.UpstreamError{Provider: "anthropic", Status: 504, Message: "no response within 10m0s"}, "upstream_error", "did not respond in time"},
+	} {
+		h.ai.streamErr = tc.err
+		r, err := http.NewRequest("POST", srv.URL+"/__backyard/api/ai/chat",
+			strings.NewReader(`{"messages":[{"role":"user","content":"hi"}],"stream":true}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Host = "foo.backyard.test"
+		r.Header.Set("X-Backyard", "1")
+		r.Header.Set("Content-Type", "application/json")
+		resp, err := srv.Client().Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		evs := readSSE(t, string(body))
+		if len(evs) == 0 {
+			t.Fatalf("no events: %s", body)
+		}
+		last := evs[len(evs)-1]
+		e, _ := last["error"].(map[string]any)
+		if last["type"] != "error" || e["code"] != tc.code || !strings.Contains(fmt.Sprint(e["message"]), tc.msg) {
+			t.Fatalf("last event = %v, want code %s with %q", last, tc.code, tc.msg)
+		}
+	}
 }

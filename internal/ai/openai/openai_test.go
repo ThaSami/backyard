@@ -1013,3 +1013,78 @@ func TestAzureEndpointForms(t *testing.T) {
 		}
 	}
 }
+
+// closeCounter is a transport that counts response bodies opened and closed.
+type closeCounter struct {
+	opened, closed atomic.Int32
+}
+
+type countedBody struct {
+	io.ReadCloser
+	once sync.Once
+	c    *closeCounter
+}
+
+func (b *countedBody) Close() error {
+	b.once.Do(func() { b.c.closed.Add(1) })
+	return b.ReadCloser.Close()
+}
+
+func (c *closeCounter) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := http.DefaultTransport.RoundTrip(r)
+	if err != nil {
+		return nil, err
+	}
+	c.opened.Add(1)
+	resp.Body = &countedBody{ReadCloser: resp.Body, c: c}
+	return resp, nil
+}
+
+// TestResponseBodiesClosed checks that every call closes the upstream
+// response body, on success, on upstream errors and on invalid responses.
+func TestResponseBodiesClosed(t *testing.T) {
+	b64 := base64.StdEncoding.EncodeToString(pngBytes)
+	_, srv := newServer(t, func(w http.ResponseWriter, r *http.Request, body map[string]any) {
+		model, _ := body["model"].(string)
+		switch {
+		case model == "fail":
+			writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": map[string]any{"message": "slow down"}})
+		case model == "garbage":
+			_, _ = io.WriteString(w, "{not json")
+		case body["stream"] == true:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n")
+		case r.URL.Path == "/chat/completions":
+			writeJSON(w, http.StatusOK, map[string]any{"model": model, "choices": []any{
+				map[string]any{"message": map[string]any{"role": "assistant", "content": "hi"}, "finish_reason": "stop"}}})
+		case r.URL.Path == "/images/generations":
+			writeJSON(w, http.StatusOK, map[string]any{"data": []any{map[string]any{"b64_json": b64}}})
+		case r.URL.Path == "/embeddings":
+			writeJSON(w, http.StatusOK, map[string]any{"data": []any{map[string]any{"index": 0, "embedding": []float64{1}}}})
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	cc := &closeCounter{}
+	p := mustNew(t, config.ProviderConfig{BaseURL: srv.URL, APIKey: "k"}, Options{HTTPClient: &http.Client{Transport: cc}})
+	ctx := context.Background()
+	msgs := []ai.Message{{Role: "user", Content: []ai.Part{{Type: "text", Text: "hi"}}}}
+	for _, model := range []string{"gpt-4o", "fail", "garbage"} {
+		wantErr := model != "gpt-4o"
+		if _, err := p.Chat(ctx, ai.ChatRequest{Model: model, Messages: msgs}); (err != nil) != wantErr {
+			t.Errorf("Chat(%s): err = %v", model, err)
+		}
+		if _, err := p.ChatStream(ctx, ai.ChatRequest{Model: model, Messages: msgs}, func(string) error { return nil }); (err != nil) != wantErr {
+			t.Errorf("ChatStream(%s): err = %v", model, err)
+		}
+		if _, err := p.Image(ctx, ai.ImageRequest{Model: model, Prompt: "a cat"}); (err != nil) != wantErr {
+			t.Errorf("Image(%s): err = %v", model, err)
+		}
+		if _, err := p.Embed(ctx, ai.EmbedRequest{Model: model, Input: []string{"a"}}); (err != nil) != wantErr {
+			t.Errorf("Embed(%s): err = %v", model, err)
+		}
+	}
+	if o, c := cc.opened.Load(), cc.closed.Load(); o == 0 || o != c {
+		t.Fatalf("response bodies: %d opened, %d closed", o, c)
+	}
+}

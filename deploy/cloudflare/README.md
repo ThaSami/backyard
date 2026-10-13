@@ -100,20 +100,26 @@ You can re-run it at any time to upgrade. Each run:
    opt-in in the dashboard; 10 GB are free), it says so and continues without it; the next run
    tries again. `--no-r2` turns this off for good.
 5. Works out the secrets: what the Worker already has is kept, what is missing is generated
-   - `BACKYARD_SECRET`: 32 random bytes, created once.
+   - `BACKYARD_SECRET`: 32 random bytes, created once. Never printed.
    - `DEPLOY_TOKEN`: `byd_…`, created once and remembered.
 
-   If the secrets can't be listed (an API or permission problem), setup stops instead of
-   replacing them.
+   Only wrangler's explicit "Worker not found" counts as a first deploy. If the secrets can't
+   be listed (an authentication, permission or network problem, or output that isn't the
+   JSON list), setup stops and changes nothing: a new `BACKYARD_SECRET` would revoke every
+   API token.
 6. Runs `wrangler deploy` with the new secrets attached (`--secrets-file`, a private 0600
    temporary file removed right after), so the first version never runs without
    `BACKYARD_SECRET`. On the first deploy this creates the Durable Object classes (SQLite
    storage, migration `v1`).
 7. Waits for `/__backyard/readyz` and prints the hub URL and the `backyard login` command.
+   The token is shown only on an interactive terminal. In CI (`CI=true`) or when the output
+   is redirected, it is masked (`byd_…wxyz`) and the command refers to the state file (or
+   to `$DEPLOY_TOKEN` when you passed one).
 
 State (the deploy token, URL, account, R2 choice and `--var` overrides) is saved to
 `~/.config/backyard/cloudflare/<worker>.json` (mode 0600, honors `XDG_CONFIG_HOME`), so a plain
-`npm run setup` keeps every earlier choice.
+`npm run setup` keeps every earlier choice. A state file that isn't valid JSON stops the setup
+rather than silently issuing a new deploy token.
 
 | Option | Effect |
 | --- | --- |
@@ -431,6 +437,17 @@ npm run dev          # wrangler dev with the real Workers AI binding (needs `wra
 npm run build        # bundle check (wrangler deploy --dry-run)
 ```
 
+The Worker bundles the SDK, hub UI and agent docs from `../../web` and `../../skills`, so build
+and deploy from a complete checkout of the repository. `npm run build`, `npm run deploy`,
+`npm run setup` and wrangler's own build step for `wrangler deploy` / `versions upload` (also a
+plain `npx wrangler deploy`) stop with a list of what is missing instead of shipping
+placeholders; `npm run sync`, `npm test` and `wrangler dev` use placeholders with a warning.
+`BACKYARD_REPO_ROOT` points the sync at another checkout.
+
+`npm test` also runs the shared query-semantics cases of SPEC §5.2
+(`internal/docstore/conformance/querycases.json`, the same file the Go backends run, copied to
+`test/generated/` by `npm run sync`) against the Worker over HTTP.
+
 `wrangler dev` reads `.dev.vars` for secrets, for example:
 
 ```sh
@@ -439,8 +456,8 @@ npm run dev:local -- --port 8787
 backyard login --server http://localhost:8787 --token dev-token
 ```
 
-`src/generated/` is produced by `npm run sync` (it runs automatically before `dev`, `test`,
-`typecheck`, `deploy`, and as wrangler's build step). Don't edit it.
+`src/generated/` and `test/generated/` are produced by `npm run sync` (it runs automatically
+before `dev`, `test`, `typecheck`, `deploy`, and as wrangler's build step). Don't edit them.
 
 Layout: `src/index.ts` (entry), `router.ts` (URLs), `hub.ts` (hub, CLI login, tokens), `site-api.ts`
 (site API), `gateway.ts` (deploy protocol), `site-do.ts` / `registry-do.ts` (Durable Objects),

@@ -49,7 +49,11 @@ Contents: [Loading the SDK](#loading-the-sdk) · [Conventions](#conventions) ·
   `err.code === "unauthenticated"` / `err.loginUrl` yourself.
 - The SDK sends the CSRF header `X-Backyard: 1` on every request and uses the browser session
   cookie (or the identity-aware proxy in front of Backyard).
-- Timestamps are RFC 3339 strings in UTC (`"2026-03-02T17:04:05.123Z"`).
+- Timestamps are RFC 3339 strings in UTC. Document timestamps (`_meta.created_at`,
+  `_meta.updated_at`, `FileInfo.created_at`) have microsecond precision with trailing zeros
+  dropped (`"2026-03-02T17:04:05.1234Z"`), so compare them with `new Date(…)` or let queries
+  order them — not with string comparison. Presence `joined_at` always has exactly three
+  fractional digits (`"2026-03-02T17:04:05.120Z"`).
 
 ```js
 try {
@@ -120,7 +124,8 @@ implicitly by the first write.
 ```
 
 - On writes, `id` and `_meta` keys in the data are ignored (not stored). Data must be a JSON
-  object of at most 256 KiB. `version` starts at 1 and increments on every write.
+  object of at most 256 KiB (`too_large` otherwise, also when the site reached its document
+  quota). `_meta.version` starts at 1 and increments on every write.
 
 ### Collection
 
@@ -169,28 +174,32 @@ reused. The same query as a wire object (for `find`, and the HTTP API):
 
 **Fields** are dot paths into your data (`"author.name"`); each segment matches
 `^[A-Za-z_][A-Za-z0-9_-]{0,63}$`, at most 8 levels. System fields: `id`, `_meta.created_at`,
-`_meta.updated_at`, `_meta.created_by`, `_meta.updated_by`.
+`_meta.updated_at` (compared as times: pass RFC 3339 strings), `_meta.created_by`,
+`_meta.updated_by` and `_meta.version` (a number).
 
 **Operators**
 
 | Op | Matches when |
 |---|---|
 | `==` | field equals value (`== null` matches an explicit `null` only) |
-| `!=` | field exists and differs from value |
+| `!=` | field exists, has the **same type** as value and differs from it — `!= null` matches nothing, `!= 2` skips `"2"` |
 | `<` `<=` `>` `>=` | field and value have the same type and compare accordingly |
 | `in` | field equals one of the values (value = array of ≤ 30 scalars) |
-| `not-in` | field exists and equals none of the values (≤ 30 scalars) |
+| `not-in` | field exists and is `!=` every value (so it has their type; ≤ 30 scalars) |
 | `contains` | field is an array that contains the scalar value |
 
 **Semantics**
 
 - Values are JSON scalars: string, number, boolean or null.
-- Comparisons only match values of the **same JSON type**: `"3"` never equals `3`; `<` on a
-  string field with a number value matches nothing.
-- A **missing field never matches** any operator (including `!=` and `not-in`).
+- Comparisons only match values of the **same JSON type**, for every operator: `"3"` never
+  equals `3`, `true` never equals `1`, `<` on a string field with a number value matches
+  nothing, and `!=` / `not-in` skip values of another type.
+- A **missing field never matches** any operator (including `!=` and `not-in`). To find
+  documents without a field, store an explicit `null` (or `false`) and query `== null`.
 - Ordering within a type: numbers numerically, strings by byte order (case-sensitive),
-  `false < true`. Missing and `null` values sort **first ascending, last descending**.
-  Mixed-type ordering is unspecified. Ties are broken by `id` ascending.
+  `false < true`. Across types: missing/`null` < booleans < numbers < strings < arrays <
+  objects, reversed for descending order — so missing and `null` values sort **first
+  ascending, last descending**. Ties are broken by `id` ascending.
 - Default order: `_meta.created_at` ascending, then `id`.
 - `limit` defaults to 100, max 1000. Page with `offset` while `hasMore` is true.
 - There are no aggregates, joins or full-text search — compute them in JavaScript.
@@ -220,7 +229,10 @@ const unsubscribe = posts.subscribe({
 });
 ```
 
-Passing a function instead of an object is shorthand for `{ onChange }`.
+Passing a function instead of an object is shorthand for `{ onChange }`. Errors: `subscribe`
+accepts `onError(err)` (e.g. an invalid collection name), and `watch(callback, query, { onError })`
+reports failed re-fetches (default: a console warning). A `Query` has its own
+`query.watch(callback)`.
 
 ### Recipes for common data shapes
 
@@ -236,7 +248,7 @@ Passing a function instead of an object is shorthand for `{ onChange }`.
 | Method | Returns |
 |---|---|
 | `backyard.files.upload(file, { name? })` | `FileInfo` — `file` is a `File` or `Blob`; `name` overrides the file name (give Blobs a name). Max 100 MiB by default. |
-| `backyard.files.list({ limit?, offset? })` | `FileInfo[]`, newest first. |
+| `backyard.files.list({ limit?, offset? })` | `FileInfo[]`, newest first (100 per page by default); the array's non-enumerable `hasMore` is `true` when more exist. |
 | `backyard.files.get(id)` | `FileInfo \| null` |
 | `backyard.files.delete(id)` | `void` |
 
@@ -254,8 +266,10 @@ interface FileInfo {
 
 `url` is site-relative and works directly in `<img src>`, `<video src>` (Range requests are
 supported) and `<a href download>`. Uploaded files are visible to everyone who can open the
-site. Files have no realtime feed: to show other people's uploads live, also create a db
-document per upload and `watch` that collection.
+site. Uploaded HTML, SVG and XML files are served with `Content-Security-Policy: sandbox`, so
+they display but never run scripts as your site — host pages as site files instead. Files have
+no realtime feed: to show other people's uploads live, also create a db document per upload
+and `watch` that collection.
 
 ```js
 input.onchange = async () => {
@@ -290,7 +304,23 @@ const res = await backyard.ai.chat(input, {
   `{ role: "user" | "assistant" | "system", content: string | ContentBlock[] }`. System
   messages are hoisted into the system prompt.
 - Content blocks: `{ type: "text", text }`, `{ type: "image", data: "<base64 without data: prefix>", media_type: "image/png" }`,
-  `{ type: "image", url: "https://…" }` (an uploaded file's URL works too).
+  `{ type: "image", url: "data:image/png;base64,…" }` or `{ type: "image", url: "https://…" }`.
+  A URL must be absolute and **publicly reachable** (the provider or Backyard's guarded fetcher
+  downloads it; private and internal addresses are refused) — so a site-relative upload URL
+  such as `f.url` does **not** work. Send images you have in the browser (a `File`, a canvas, an
+  upload) as a data URL instead; images are limited to 20 MiB each.
+
+```js
+const toDataURL = (blob) => new Promise((ok, fail) => {
+  const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = () => fail(r.error); r.readAsDataURL(blob);
+});
+const photo = await (await fetch(f.url)).blob();            // e.g. a file uploaded earlier
+const { content } = await backyard.ai.chat([{ role: "user", content: [
+  { type: "text", text: "Describe this photo in one sentence." },
+  { type: "image", url: await toDataURL(photo) },
+] }]);
+```
+
 - `stop_reason` is normalized to `end_turn`, `max_tokens`, `stop_sequence`, `refusal` or `other`.
 - With `json: true`, `res.json` is the parsed object (`undefined` if the model did not return
   valid JSON — validate it). Describe the exact shape you want in the prompt.
@@ -317,7 +347,10 @@ async function ask(q) {
 
 `backyard.ai.stream(input, opts)` starts a streaming completion immediately (same options as
 `chat`, plus `onText(text)`). The returned object is an async iterable of `{ text }` chunks and
-has a `done` promise resolving to the final result (`{ content, model, stop_reason, usage }`).
+has a `done` promise resolving to the final result (`{ content, model, stop_reason, usage }`),
+a `text` property with everything received so far and `abort()` (then `done` rejects with
+`aborted`; breaking out of a `for await` loop does not cancel the request). Every AI method also
+accepts an `AbortSignal` as `signal`.
 
 ```js
 const s = backyard.ai.stream(history, { system: "Be concise.", onText: (t) => (out.textContent += t) });
@@ -332,10 +365,12 @@ for await (const chunk of backyard.ai.stream("Write a haiku about Mondays")) tex
 
 ```js
 const img = await backyard.ai.image("isometric illustration of a tiny office garden", { size: "1024x1024", n: 1, model: "image" });
-// img = { url: "/__backyard/files/…/image.png", content_type: "image/png", images: [{ url, content_type }] }
+// img = { id: "01JNV…", url: "/__backyard/files/01JNV…/image-1.png", content_type: "image/png",
+//         model: "image", images: [{ id, url, content_type }] }   // id/url/content_type = first image
 ```
 
-Generated images are stored as site files (they appear in `files.list()`).
+Generated images are stored as site files: they appear in `files.list()`, and `id` works with
+`backyard.files.get(id)` / `backyard.files.delete(id)`.
 
 ### embed
 
@@ -353,8 +388,8 @@ const { default: def, models } = await backyard.ai.models();
 const chatModels = models.filter((m) => m.kind === "chat");
 ```
 
-`kind` is `chat`, `image` or `embedding`. Provider model ids are only exposed when the admin
-enables it.
+`kind` is `chat` (for `chat`/`stream`), `image` (for `image`) or `embedding` (for `embed`).
+Provider model ids (`model`) are only included when the admin enables it.
 
 ## Warehouse
 
@@ -373,7 +408,7 @@ const r2 = await backyard.warehouse.query(
 //       rows: [{ day: "2026-01-01", orders: 120 }, …], row_count: 7, truncated: false }
 
 const { sources, queries } = await backyard.warehouse.sources();
-// sources = [{ name: "default", type: "bigquery", description }], queries = [{ name, description, params: ["team"] }]
+// sources = [{ name: "default", type: "bigquery", description }], queries = [{ name, description, params: ["team"], source }]
 ```
 
 - Raw SQL must start with `SELECT` or `WITH` (after comments) unless the admin allows any
@@ -401,13 +436,17 @@ const room = backyard.socket.room("lobby", { state: { status: "online" } });  //
 | `room.on("members", (members) => …)` | Full member list (excluding yourself) after any presence change. |
 | `room.members` | *sync* current `Member[]` (excluding yourself). |
 | `room.self` | *sync* your own `Member` once joined, else `null`. |
+| `room.state`, `room.joined` | *sync* the presence state you publish; whether the server confirmed the membership on the current connection. |
 | `room.send(data, { to?, echo? })` | *sync* broadcast any JSON (≤ 64 KiB); `to` = a member's `cid` for a direct message; `echo: true` also delivers it to yourself (default `false`). Queued while reconnecting. |
 | `room.setState(state)` | *sync* replace your presence state (JSON object ≤ 8 KiB). |
 | `room.updateState(partial)` | *sync* shallow-merge into your presence state. |
-| `room.off(event, handler)` | Remove a handler. |
+| `room.on("error", (err) => …)` | The server rejected joining (e.g. too many rooms), a message (too large, unknown `to`) or a state update (over 8 KiB). Without a handler these go to `socket.on("error")`. |
+| `room.off(event, handler)` | Remove a handler (`on` also returns an unsubscribe function). |
 | `room.leave()` | Leave the room. |
 | `backyard.socket.connected` | *sync* whether the websocket is connected. |
-| `backyard.socket.on("open" \| "close", handler)` | Connection status changes (show an "offline" badge). |
+| `backyard.socket.cid`, `backyard.socket.user` | *sync* this tab's connection id and the user the server identified, once connected (else `null`). |
+| `backyard.socket.on("open" \| "close" \| "error", handler)` | Connection status changes (show an "offline" badge) and realtime errors such as `rate_limited`. |
+| `backyard.socket.connect()` / `.disconnect()` | Open the websocket without rooms or subscriptions / close it until it is used again. |
 
 ```ts
 interface Member { cid: string; user: UserSummary; state: object; joined_at: string }
@@ -438,10 +477,10 @@ The SDK turns them into `BackyardError` with the same `code`.
 
 | `code` | HTTP | Meaning / what to do |
 |---|---|---|
-| `bad_request` | 400 | Invalid input: collection/id/field name, query operator, JSON body, unknown model alias. Fix the call. |
+| `bad_request` | 400 (405) | Invalid input: collection/id/field name, query operator, JSON body, a model of the wrong kind; `405` when the method is not allowed for the path. Fix the call. |
 | `unauthenticated` | 401 | Not signed in or session/token expired. The SDK redirects to `loginUrl`. |
 | `forbidden` | 403 | Missing `X-Backyard` header or cross-origin write, user not allowed (domain/group restrictions), raw SQL disabled, site owned by someone else (deploys). |
-| `not_found` | 404 | Unknown document/file/user/named query. (`get` methods return `null` instead.) |
+| `not_found` | 404 | Unknown document/file/user/named query/model alias. (`get` methods return `null` instead.) |
 | `conflict` | 409 | `create` with an id that exists. Use `set` or `update`. |
 | `too_large` | 413 | Document > 256 KiB, upload or deploy file over the limit, too many documents in the site. |
 | `rate_limited` | 429 | Slow down; `err.retryAfter` / `Retry-After` gives seconds to wait. |
@@ -525,11 +564,12 @@ Every successful write publishes a realtime event to subscribers of the collecti
 | Method & path | Body | Result |
 |---|---|---|
 | `POST /files` | `multipart/form-data`: field `file` (+ optional `name`) | `201` FileInfo |
-| `GET /files?limit=&offset=` | | `{"files": [FileInfo]}` newest first |
+| `GET /files?limit=&offset=` | | `{"files": [FileInfo], "has_more": bool}` newest first |
 | `GET /files/{id}` | | FileInfo \| `404` |
-| `DELETE /files/{id}` | | `204` |
+| `DELETE /files/{id}` | | `204` (also when missing) |
 
-Bytes are served (not under `/api`) at `/__backyard/files/{id}/{name}` with Range support.
+Bytes are served (not under `/api`) at `/__backyard/files/{id}/{name}` with Range support
+(HTML/SVG/XML with `Content-Security-Policy: sandbox`).
 
 ### AI
 
@@ -550,13 +590,14 @@ Bytes are served (not under `/api`) at `/__backyard/files/{id}/{name}` with Rang
 - `"stream": true` → `text/event-stream`, one `data: <json>` line per event:
   `{"type":"text","text":"…"}` (repeated), then
   `{"type":"done","model":"smart","stop_reason":"end_turn","usage":{…}}`, or
-  `{"type":"error","error":{"code":"upstream_error","message":"…"}}`.
+  `{"type":"error","error":{"code":"upstream_error","message":"…"}}`. Lines starting with `:`
+  (`: ping` keep-alives while the model is silent) are comments — ignore them.
 
 | Method & path | Body | Result |
 |---|---|---|
-| `POST /ai/image` | `{"prompt", "model"?, "size"?: "1024x1024", "n"?: 1}` | `{"images": [{"url": "/__backyard/files/…", "content_type": "image/png"}]}` |
-| `POST /ai/embed` | `{"input": string \| string[], "model"?}` | `{"model": "embed", "embeddings": [[…], …]}` |
-| `GET /ai/models` | | `{"default": "smart", "models": [{"name", "kind", "provider", "description"}]}` |
+| `POST /ai/image` | `{"prompt", "model"?, "size"?: "1024x1024", "n"?: 1}` | `{"model": "image", "images": [{"id", "url": "/__backyard/files/…", "content_type": "image/png"}]}` |
+| `POST /ai/embed` | `{"input": string \| string[], "model"?}` | `{"model": "embed", "embeddings": [[…], …], "usage": {"input_tokens", "output_tokens"}}` (one vector per input string) |
+| `GET /ai/models` | | `{"default": "smart", "models": [{"name", "kind", "provider", "model"?, "description"?}]}` |
 
 Clients pass aliases; raw `"provider/model-id"` names work only when the admin enables
 `ai.allow_raw_models`.
@@ -566,14 +607,16 @@ Clients pass aliases; raw `"provider/model-id"` names work only when the admin e
 | Method & path | Body | Result |
 |---|---|---|
 | `POST /warehouse/query` | `{"sql": "SELECT … WHERE team = ?", "params": ["growth"], "source": "default"}` or `{"query": "weekly_active_users", "params": {"team": "growth"}}` | `{"columns": [{"name","type"}], "rows": [{…}], "row_count": 7, "truncated": false}` |
-| `GET /warehouse` | | `{"sources": [{name, type, description}], "queries": [{name, description, params}]}` |
+| `GET /warehouse` | | `{"sources": [{name, type, description}], "queries": [{name, description, params, source}]}` |
 
 ## Websocket protocol
 
 `GET /__backyard/api/ws` (same auth as the API). JSON text frames, max 64 KiB. The first frame
 from the server is `{"t":"hello","cid":"c_8f3a…","user":{User}}`.
 
-Client → server (`id` is an optional correlation id echoed in `ack`/`joined`/`error`):
+Client → server (`id` is an optional correlation id echoed in `ack`/`joined`/`error`;
+`leave`, `state` and `send` frames with an `id` are also answered with `{"t":"ack","id"}` on
+success):
 
 | Frame | Meaning |
 |---|---|
@@ -594,10 +637,13 @@ Server → client:
 | `{"t":"msg","room":"lobby","from":{"cid":"…","user":UserSummary},"data":any}` | Room message |
 | `{"t":"error","id":…,"error":{"code","message"}}` | Error (e.g. `rate_limited`, `bad_request`) |
 
-`Member = {"cid", "user": UserSummary, "state": {…}, "joined_at": RFC3339}`,
-`UserSummary = {id, name, email, avatar_url}`. The server pings every 25 s and closes
-connections that do not answer within 60 s. Limits: 50 rooms and 100 subscriptions per
-connection, 60 msgs/s (burst 120), presence state ≤ 8 KiB.
+`Member = {"cid", "user": UserSummary, "state": {…}, "joined_at": RFC3339}` (`joined_at` with
+exactly three fractional digits; `members` sorted by `joined_at`, then `cid`),
+`UserSummary = {id, name, email, avatar_url}`. Errors never close the connection. The server
+pings every 25 s and closes connections that do not answer within 60 s. Limits: 50 rooms and 100
+subscriptions per connection, 60 msgs/s (burst 120), presence state ≤ 8 KiB, 50 connections per
+user (more are refused with HTTP `429`). The `Origin` must be the site's own origin (host mode)
+or the hub's (path mode).
 
 ## Hub endpoints
 
@@ -607,7 +653,7 @@ On the hub host (`https://backyard.example.com`):
 |---|---|
 | `GET /__backyard/api/me` | Current user |
 | `GET /__backyard/api/sites` | `{"sites": [SiteMeta]}` — the site directory |
-| `POST /__backyard/api/tokens` | `{"name", "ttl_hours"}` → `{"token", "expires_at"}` (personal API token; needs `X-Backyard: 1`) |
+| `POST /__backyard/api/tokens` | `{"name"?, "ttl_hours"?}` → `{"token", "expires_at", "name"?}` (personal API token; `ttl_hours` at most the server's token TTL, default 720; needs `X-Backyard: 1`; not for guests or static tokens) |
 | `GET /__backyard/api/info` | Server info: URL mode, auth mode, deploy methods, limits |
 | `/__backyard/api/deploy/…` | Deploy gateway (see [deploy.md](deploy.md)) |
 | `/docs`, `/llms.txt`, `/llms-full.txt` | Documentation for people and agents |

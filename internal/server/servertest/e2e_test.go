@@ -54,8 +54,10 @@ type instance struct {
 }
 
 // newInstance starts a path-mode server (auth mode none, anonymous deploys)
-// on blobDir and docs, fanning realtime out through broker.
-func newInstance(t *testing.T, blobDir string, docs docstore.Store, broker pubsub.Broker) *instance {
+// on blobDir and docs, fanning realtime out through broker. configure, if
+// given, adjusts the (defaulted) configuration and the dependencies before
+// the server is built.
+func newInstance(t *testing.T, blobDir string, docs docstore.Store, broker pubsub.Broker, configure ...func(*config.Config, *server.Deps)) *instance {
 	t.Helper()
 	ctx := context.Background()
 	var handler atomic.Pointer[http.Handler]
@@ -104,12 +106,16 @@ func newInstance(t *testing.T, blobDir string, docs docstore.Store, broker pubsu
 	if err != nil {
 		t.Fatalf("gateway: %v", err)
 	}
-	s, err := server.New(server.Deps{
+	deps := server.Deps{
 		Config: cfg, Blob: store, Docs: docs, Sites: reg, Auth: authn,
 		Tokens:   auth.NewTokens(cfg.Server.Secret, cfg.Auth.TokenTTL.D()),
 		Users:    identity.NewUserCache(docs, nil),
 		Realtime: hub, Gateway: gw, Version: "e2e",
-	})
+	}
+	for _, f := range configure {
+		f(cfg, &deps)
+	}
+	s, err := server.New(deps)
 	if err != nil {
 		t.Fatalf("server: %v", err)
 	}
@@ -188,18 +194,22 @@ func deploySite(t *testing.T, in *instance, site string, files map[string]string
 // openDocs returns the document stores to test against.
 func openDocs(t *testing.T) map[string]docstore.Store {
 	t.Helper()
-	ctx := context.Background()
-	out := map[string]docstore.Store{}
-	sq, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "backyard.db"))
-	if err != nil {
-		t.Fatalf("sqlite: %v", err)
-	}
-	t.Cleanup(func() { _ = sq.Close() })
-	out["sqlite"] = sq
+	out := map[string]docstore.Store{"sqlite": openSQLite(t)}
 	if pg := openPostgres(t); pg != nil {
 		out["postgres"] = pg
 	}
 	return out
+}
+
+// openSQLite opens a document store in a fresh SQLite database.
+func openSQLite(t *testing.T) docstore.Store {
+	t.Helper()
+	sq, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "backyard.db"))
+	if err != nil {
+		t.Fatalf("sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = sq.Close() })
+	return sq
 }
 
 // openPostgres opens a store in a fresh schema, or returns nil (logged) when

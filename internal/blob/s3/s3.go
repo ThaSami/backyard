@@ -15,11 +15,20 @@
 // Uploads of unknown or large size are sent as multipart uploads; ETags are
 // the store's ETags with quotes removed. Writes use SSE-KMS when a key id is
 // configured (presigned uploads then carry the required headers).
+//
+// Presigned uploads bind the declared size into the SigV4 signature (a
+// signed Content-Length, or for an empty object a signed Content-MD5 of the
+// empty body), so the store rejects a body of any other size. When flexible
+// checksums are enabled (AWS S3 by default; custom endpoints only when
+// AWS_REQUEST_CHECKSUM_CALCULATION asks for them, since many S3-compatible
+// stores reject the headers), a declared SHA-256 is also signed as
+// x-amz-checksum-sha256, which S3 verifies against the body.
 package s3
 
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -57,6 +66,8 @@ const (
 	deleteBatch = 1000
 	// cleanupTimeout bounds best-effort cleanup (aborting uploads).
 	cleanupTimeout = 30 * time.Second
+	// emptyMD5 is the base64 Content-MD5 of the empty body.
+	emptyMD5 = "1B2M2Y8AsgTpgAmY7PhCfg=="
 )
 
 // Option configures a Store.
@@ -88,16 +99,19 @@ func WithClientOptions(fns ...func(*awss3.Options)) Option {
 // Store is a blob.Store backed by an S3 bucket (optionally under a key
 // prefix). It is safe for concurrent use.
 type Store struct {
-	client        *awss3.Client
-	presign       *awss3.PresignClient
-	bucket        string
-	prefix        string
-	region        string
-	endpoint      string
-	kmsKeyID      string
-	partSize      int64
-	partChecksums bool
-	log           *slog.Logger
+	client   *awss3.Client
+	presign  *awss3.PresignClient
+	bucket   string
+	prefix   string
+	region   string
+	endpoint string
+	kmsKeyID string
+	partSize int64
+	// checksums reports whether flexible checksums are enabled: CRC32 on
+	// multipart parts and DeleteObjects, x-amz-checksum-sha256 on presigned
+	// uploads. Off for custom endpoints unless the environment asks for it.
+	checksums bool
+	log       *slog.Logger
 }
 
 var _ blob.Store = (*Store)(nil)
@@ -172,16 +186,16 @@ func New(ctx context.Context, cfg config.S3Config, opts ...Option) (*Store, erro
 		}
 	})
 	s := &Store{
-		client:        client,
-		presign:       awss3.NewPresignClient(client),
-		bucket:        cfg.Bucket,
-		prefix:        blobutil.NormPrefix(cfg.Prefix),
-		region:        awsCfg.Region,
-		endpoint:      endpoint,
-		kmsKeyID:      cfg.SSEKMSKeyID,
-		partSize:      o.partSize,
-		partChecksums: client.Options().RequestChecksumCalculation != aws.RequestChecksumCalculationWhenRequired,
-		log:           o.logger.With("component", "blob", "backend", "s3", "bucket", cfg.Bucket),
+		client:    client,
+		presign:   awss3.NewPresignClient(client),
+		bucket:    cfg.Bucket,
+		prefix:    blobutil.NormPrefix(cfg.Prefix),
+		region:    awsCfg.Region,
+		endpoint:  endpoint,
+		kmsKeyID:  cfg.SSEKMSKeyID,
+		partSize:  o.partSize,
+		checksums: client.Options().RequestChecksumCalculation != aws.RequestChecksumCalculationWhenRequired,
+		log:       o.logger.With("component", "blob", "backend", "s3", "bucket", cfg.Bucket),
 	}
 	return s, nil
 }
@@ -456,7 +470,7 @@ func (s *Store) putMultipart(ctx context.Context, key string, body *blobutil.Bod
 		cin.ServerSideEncryption = types.ServerSideEncryptionAwsKms
 		cin.SSEKMSKeyId = aws.String(s.kmsKeyID)
 	}
-	if s.partChecksums {
+	if s.checksums {
 		cin.ChecksumAlgorithm = types.ChecksumAlgorithmCrc32
 	}
 	created, err := s.client.CreateMultipartUpload(ctx, cin)
@@ -498,7 +512,7 @@ func (s *Store) putMultipart(ctx context.Context, key string, body *blobutil.Bod
 			Body:          bytes.NewReader(chunk),
 			ContentLength: aws.Int64(int64(len(chunk))),
 		}
-		if s.partChecksums {
+		if s.checksums {
 			pin.ChecksumAlgorithm = types.ChecksumAlgorithmCrc32
 		}
 		out, err := s.client.UploadPart(ctx, pin)
@@ -578,7 +592,7 @@ func (s *Store) DeletePrefix(ctx context.Context, prefix string) error {
 			Bucket: aws.String(s.bucket),
 			Delete: &types.Delete{Objects: batch, Quiet: aws.Bool(true)},
 		}
-		if s.partChecksums {
+		if s.checksums {
 			in.ChecksumAlgorithm = types.ChecksumAlgorithmCrc32
 		}
 		var optFns []func(*awss3.Options)
@@ -677,18 +691,38 @@ func (s *Store) List(ctx context.Context, prefix, delimiter string) (*blob.ListR
 }
 
 // PresignPut returns a URL accepting a PUT of the object's bytes. The
-// returned Headers (Content-Type, and SSE headers when SSE-KMS is enabled)
-// are part of the signature and must be sent verbatim.
-func (s *Store) PresignPut(ctx context.Context, key, contentType string, ttl time.Duration) (*blob.PresignedRequest, error) {
+// returned Headers are part of the signature and must be sent verbatim:
+// Content-Type; Content-Length (opts.Size > 0) or Content-MD5 of the empty
+// body (opts.Size == 0), so that S3 rejects a body of any other size;
+// X-Amz-Checksum-Sha256 when opts.SHA256 is set and flexible checksums are
+// enabled, so that S3 rejects other content (X-Amz-Sdk-Checksum-Algorithm
+// travels in the signed query string); SSE headers with SSE-KMS. Without a
+// size (-1) the URL accepts a body of any size.
+func (s *Store) PresignPut(ctx context.Context, key string, opts blob.PresignPutOptions, ttl time.Duration) (*blob.PresignedRequest, error) {
 	if err := s.checkKey(key); err != nil {
 		return nil, err
 	}
+	spec, err := blobutil.CheckPresignPut(key, opts)
+	if err != nil {
+		return nil, fmt.Errorf("blob/s3: presign put %q: %w", key, err)
+	}
 	ttl = blobutil.ClampTTL(ttl)
-	ct := blobutil.PresignContentType(key, contentType)
 	in := &awss3.PutObjectInput{
 		Bucket:      aws.String(s.bucket),
 		Key:         aws.String(s.fullKey(key)),
-		ContentType: aws.String(ct),
+		ContentType: aws.String(spec.ContentType),
+	}
+	switch {
+	case spec.Size > 0:
+		in.ContentLength = aws.Int64(spec.Size)
+	case spec.Size == 0:
+		// SigV4 never signs "Content-Length: 0"; pinning the digest of the
+		// empty body instead works on every S3-compatible store.
+		in.ContentMD5 = aws.String(emptyMD5)
+	}
+	if spec.SHA256 != nil && s.checksums {
+		in.ChecksumAlgorithm = types.ChecksumAlgorithmSha256
+		in.ChecksumSHA256 = aws.String(base64.StdEncoding.EncodeToString(spec.SHA256))
 	}
 	if s.kmsKeyID != "" {
 		in.ServerSideEncryption = types.ServerSideEncryptionAwsKms
@@ -700,7 +734,7 @@ func (s *Store) PresignPut(ctx context.Context, key, contentType string, ttl tim
 		return nil, fmt.Errorf("blob/s3: presign put %q: %w", key, err)
 	}
 	headers := signedHeaders(req.SignedHeader)
-	headers["Content-Type"] = ct
+	headers["Content-Type"] = spec.ContentType
 	return &blob.PresignedRequest{Method: http.MethodPut, URL: req.URL, Headers: headers, ExpiresAt: now.Add(ttl).UTC()}, nil
 }
 

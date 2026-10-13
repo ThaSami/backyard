@@ -242,7 +242,10 @@ $("#viewer").addEventListener("click", (e) => {
 document.querySelectorAll("[data-kind]").forEach((chip) =>
   chip.addEventListener("click", () => {
     state.kind = chip.dataset.kind;
-    document.querySelectorAll("[data-kind]").forEach((c) => c.classList.toggle("active", c === chip));
+    document.querySelectorAll("[data-kind]").forEach((c) => {
+      c.classList.toggle("active", c === chip);
+      c.setAttribute("aria-pressed", String(c === chip));
+    });
     render();
   }),
 );

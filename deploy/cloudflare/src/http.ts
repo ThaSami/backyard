@@ -210,10 +210,30 @@ export function escapeHTML(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 }
 
-/** Wraps a response with the security headers every Backyard response carries. */
-export function withSecurityHeaders(res: Response): Response {
+const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,128}$/;
+
+/**
+ * The id of a request (SPEC §3, §15: returned as X-Request-Id): a valid
+ * incoming X-Request-Id (8–128 of A-Z a-z 0-9 . _ -, like the Go server),
+ * else Cloudflare's Ray id (it names the request in Cloudflare's logs), else
+ * a random one.
+ */
+export function requestID(req: Request): string {
+  for (const v of [req.headers.get("X-Request-Id"), req.headers.get("CF-Ray")]) {
+    if (v && REQUEST_ID_RE.test(v)) return v;
+  }
+  const b = crypto.getRandomValues(new Uint8Array(12));
+  return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Wraps a response with the headers every Backyard response carries: the
+ * security headers and, when given, X-Request-Id.
+ */
+export function withSecurityHeaders(res: Response, requestId?: string): Response {
   const out = mutable(res);
   out.headers.set("X-Content-Type-Options", "nosniff");
   if (!out.headers.has("Referrer-Policy")) out.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  if (requestId) out.headers.set("X-Request-Id", requestId);
   return out;
 }

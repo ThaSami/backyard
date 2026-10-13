@@ -534,7 +534,10 @@ function createBackyard(g) {
         const dir = normalizeDir(opts.order);
         query.order = fields.map((f) => (String(f).indexOf(":") > 0 ? String(f) : f + ":" + dir)).join(",");
       } else if (opts.order) {
-        query.order = "_meta.created_at:" + normalizeDir(opts.order);
+        // The default order (creation time, then id) in the given direction:
+        // { order: "desc" } is the exact reverse of the default listing.
+        const dir = normalizeDir(opts.order);
+        query.order = "_meta.created_at:" + dir + ",id:" + dir;
       }
       const res = await request("GET", this._path(), { query });
       return withHasMore(res && res.docs, res && res.has_more);
@@ -668,7 +671,7 @@ function createBackyard(g) {
     async list(opts) {
       opts = opts || {};
       const res = await request("GET", "/files", { query: { limit: opts.limit, offset: opts.offset } });
-      return (res && res.files) || [];
+      return withHasMore(res && res.files, res && res.has_more);
     },
     async get(fileID) {
       if (!fileID) throw badRequest("get(id) requires a file id");
@@ -969,19 +972,31 @@ function createBackyard(g) {
       if (opts.model) body.model = opts.model;
       if (opts.size) body.size = opts.size;
       if (opts.n !== undefined && opts.n !== null) body.n = opts.n;
+      // Server: {model, images: [{id, url, content_type}]} (images are site files).
       const res = await request("POST", "/ai/image", { json: body, signal: opts.signal });
-      const images = (res && res.images) || [];
-      const first = images[0] || {};
-      return { url: first.url, content_type: first.content_type, images };
+      const images = res && Array.isArray(res.images) ? res.images.filter(isObject) : [];
+      if (!images.length || typeof images[0].url !== "string") {
+        throw new BackyardError("bad_response", "The server returned no image", { status: 200 });
+      }
+      const first = images[0];
+      const out = { id: first.id, url: first.url, content_type: first.content_type, images };
+      if (res.model !== undefined) out.model = res.model;
+      return out;
     },
     async embed(input, opts) {
       opts = opts || {};
       const many = Array.isArray(input);
-      if (!many && typeof input !== "string") throw badRequest("embed(input) requires a string or an array of strings");
+      if (many ? !input.every((s) => typeof s === "string") : typeof input !== "string") {
+        throw badRequest("embed(input) requires a string or an array of strings");
+      }
       const body = { input };
       if (opts.model) body.model = opts.model;
+      // Server: {model, embeddings: [[…], …], usage}; one vector per input.
       const res = await request("POST", "/ai/embed", { json: body, signal: opts.signal });
-      const embeddings = (res && res.embeddings) || [];
+      const embeddings = res && Array.isArray(res.embeddings) ? res.embeddings : null;
+      if (!embeddings || (many ? embeddings.length !== input.length : !Array.isArray(embeddings[0]))) {
+        throw new BackyardError("bad_response", "The server returned an unexpected embeddings response", { status: 200 });
+      }
       return many ? embeddings : embeddings[0];
     },
     models() {
@@ -1300,13 +1315,23 @@ function createBackyard(g) {
         for (const l of Array.from(s.listeners)) safeCall(l.onError, err);
         return;
       }
-      for (const r of rooms.values()) {
-        if (r._joinID === frameID) {
-          r._emit("error", err);
-          return;
+      // join/state/send frames carry "<room key>.<n>" ids (see Room._nextID).
+      const dot = frameID.indexOf(".");
+      if (dot > 0) {
+        const key = frameID.slice(0, dot);
+        for (const r of rooms.values()) {
+          if (r._key === key) {
+            r._fail(err);
+            return;
+          }
         }
       }
     }
+    socketError(err);
+  }
+
+  /** Reports a realtime error to socket.on("error") listeners, else to the console. */
+  function socketError(err) {
     if (sock.listeners.error.size) emitSocket("error", err);
     else warn("realtime error:", err.code, err.message);
   }
@@ -1335,13 +1360,48 @@ function createBackyard(g) {
     };
   }
 
+  const RFC3339_RE = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:[.,](\d+))?(Z|[+-]\d{2}:?\d{2})?$/i;
+
+  /**
+   * Parses an RFC 3339 timestamp into [epoch seconds in ms, nanoseconds] so
+   * that times compare correctly whatever the server's fractional precision
+   * (Go emits exactly 3 digits, the Cloudflare edition 6, others 0-9 with
+   * trailing zeros dropped) and independently of how a JS engine rounds
+   * sub-millisecond digits. Returns null when s is not a timestamp.
+   */
+  function parseTime(s) {
+    if (typeof s !== "string") return null;
+    const m = RFC3339_RE.exec(s.trim());
+    if (!m) {
+      const t = Date.parse(s);
+      if (isNaN(t)) return null;
+      const whole = Math.floor(t / 1000) * 1000;
+      return [whole, (t - whole) * 1e6];
+    }
+    let zone = (m[4] || "Z").toUpperCase();
+    if (zone !== "Z" && zone.indexOf(":") < 0) zone = zone.slice(0, 3) + ":" + zone.slice(3);
+    const secs = Date.parse(m[1] + "T" + m[2] + zone);
+    if (isNaN(secs)) return null;
+    return [secs, m[3] ? parseInt((m[3] + "00000000").slice(0, 9), 10) : 0];
+  }
+
+  /** Orders members by join time (oldest first; unknown times last), then by cid. */
+  function compareMembers(a, b) {
+    const ta = parseTime(a.joined_at);
+    const tb = parseTime(b.joined_at);
+    if (ta && tb) {
+      if (ta[0] !== tb[0]) return ta[0] - tb[0];
+      if (ta[1] !== tb[1]) return ta[1] - tb[1];
+    } else if (ta || tb) {
+      return ta ? -1 : 1;
+    }
+    const ca = String(a.cid);
+    const cb = String(b.cid);
+    return ca < cb ? -1 : ca > cb ? 1 : 0;
+  }
+
   function sortMembers(list) {
-    return list.slice().sort((a, b) => {
-      const ta = String(a.joined_at || "");
-      const tb = String(b.joined_at || "");
-      if (ta !== tb) return ta < tb ? -1 : 1;
-      return String(a.cid) < String(b.cid) ? -1 : String(a.cid) > String(b.cid) ? 1 : 0;
-    });
+    return list.slice().sort(compareMembers);
   }
 
   function cloneState(state) {
@@ -1363,6 +1423,14 @@ function createBackyard(g) {
       this._everJoined = false;
       this._left = false;
       this._token = {}; // identifies this incarnation of the room for queued sends
+      // Frames of this room carry ids "<key>.<n>" so that the server's error
+      // answers (e.g. a message or state too large) reach room.on("error");
+      // the server acknowledges them with {"t":"ack","id"}, which is ignored.
+      this._key = nextID("r");
+    }
+
+    _nextID() {
+      return nextID(this._key + ".");
     }
 
     /** Other members (excluding self), oldest first. */
@@ -1407,7 +1475,7 @@ function createBackyard(g) {
         return;
       }
       opts = opts || {};
-      const frame = { t: "send", room: this.name, data: data === undefined ? null : data };
+      const frame = { t: "send", id: this._nextID(), room: this.name, data: data === undefined ? null : data };
       if (opts.to) frame.to = String(opts.to);
       if (opts.echo) frame.echo = true;
       if (sock.connected && this._joinSent && rawSend(frame)) return;
@@ -1418,7 +1486,7 @@ function createBackyard(g) {
       if (this._left) return;
       this._state = cloneState(state);
       if (this._self) this._self = Object.assign({}, this._self, { state: this._state });
-      if (sock.connected && this._joinSent) rawSend({ t: "state", room: this.name, state: this._state });
+      if (sock.connected && this._joinSent) rawSend({ t: "state", id: this._nextID(), room: this.name, state: this._state });
     }
 
     updateState(partial) {
@@ -1442,9 +1510,16 @@ function createBackyard(g) {
       for (const fn of Array.from(set)) safeCall(fn, ...args);
     }
 
+    /** Reports a server error about this room's frames (join, state, send). */
+    _fail(err) {
+      const set = this._handlers.get("error");
+      if (set && set.size) this._emit("error", err);
+      else socketError(err);
+    }
+
     _join() {
       if (this._left) return;
-      this._joinID = nextID("j");
+      this._joinID = this._nextID();
       this._joinSent = rawSend({ t: "join", id: this._joinID, room: this.name, state: this._state });
     }
 

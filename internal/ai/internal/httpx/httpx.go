@@ -60,6 +60,17 @@ func Do(client *http.Client, provider string, req *http.Request) (*http.Response
 	return resp, nil
 }
 
+// DoJSON sends req like Do and decodes the bounded JSON response into out
+// like DecodeJSON. The response body is always closed, so callers of a
+// non-streaming endpoint never hold an *http.Response.
+func DoJSON(client *http.Client, provider string, req *http.Request, out any) error {
+	resp, err := Do(client, provider, req)
+	if err != nil {
+		return err
+	}
+	return DecodeJSON(provider, resp, out)
+}
+
 // TransportError converts a client.Do error. Context errors are passed
 // through (wrapped) so errors.Is(err, context.DeadlineExceeded) works.
 func TransportError(ctx context.Context, provider string, err error) error {

@@ -76,7 +76,7 @@ func TestDescribeAndClose(t *testing.T) {
 func TestPresignNotSupported(t *testing.T) {
 	s, _ := newStore(t)
 	ctx := context.Background()
-	if _, err := s.PresignPut(ctx, "a.txt", "text/plain", time.Minute); !errors.Is(err, blob.ErrNotSupported) {
+	if _, err := s.PresignPut(ctx, "a.txt", blob.PresignPutOptions{ContentType: "text/plain", Size: 1}, time.Minute); !errors.Is(err, blob.ErrNotSupported) {
 		t.Errorf("PresignPut err = %v", err)
 	}
 	if _, err := s.PresignGet(ctx, "a.txt", time.Minute); !errors.Is(err, blob.ErrNotSupported) {

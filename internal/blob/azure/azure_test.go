@@ -256,7 +256,7 @@ func TestNewValidationAndDescribe(t *testing.T) {
 	if d := s.Describe(); d != want {
 		t.Errorf("Describe = %+v, want %+v", d, want)
 	}
-	req, err := s.PresignPut(ctx, "sites/foo/index.html", "", time.Hour)
+	req, err := s.PresignPut(ctx, "sites/foo/index.html", blob.PresignPutOptions{Size: 10}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,11 +266,16 @@ func TestNewValidationAndDescribe(t *testing.T) {
 		q.Get("sp") != "cw" || q.Get("sr") != "b" || q.Get("spr") != "https" || q.Get("sig") == "" {
 		t.Errorf("SAS URL = %s", req.URL)
 	}
-	if req.Headers["x-ms-blob-type"] != "BlockBlob" || req.Headers["Content-Type"] != "text/html; charset=utf-8" {
+	// A SAS cannot bind the size: only the blob type and content type are
+	// sent (the deploy gateway verifies sizes at commit).
+	if len(req.Headers) != 2 || req.Headers["x-ms-blob-type"] != "BlockBlob" || req.Headers["Content-Type"] != "text/html; charset=utf-8" {
 		t.Errorf("Headers = %v", req.Headers)
 	}
 	if d := time.Until(req.ExpiresAt); d < 59*time.Minute || d > 61*time.Minute {
 		t.Errorf("ExpiresAt in %v", d)
+	}
+	if _, err := s.PresignPut(ctx, "a.txt", blob.PresignPutOptions{Size: 1, SHA256: "nothex"}, time.Hour); err == nil || errors.Is(err, blob.ErrNotSupported) {
+		t.Errorf("PresignPut(bad sha256) err = %v", err)
 	}
 	get, err := s.PresignGet(ctx, "a b.txt", 0)
 	if err != nil {
@@ -296,7 +301,7 @@ func TestNewValidationAndDescribe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sasOnly.PresignPut(ctx, "a.txt", "", time.Minute); !errors.Is(err, blob.ErrNotSupported) {
+	if _, err := sasOnly.PresignPut(ctx, "a.txt", blob.PresignPutOptions{Size: -1}, time.Minute); !errors.Is(err, blob.ErrNotSupported) {
 		t.Errorf("PresignPut with account SAS err = %v", err)
 	}
 }
@@ -347,7 +352,7 @@ func TestUserDelegationSAS(t *testing.T) {
 		t.Errorf("Describe = %+v", d)
 	}
 	for range 3 {
-		req, err := s.PresignPut(ctx, "up.txt", "text/plain", 15*time.Minute)
+		req, err := s.PresignPut(ctx, "up.txt", blob.PresignPutOptions{ContentType: "text/plain", Size: -1}, 15*time.Minute)
 		if err != nil {
 			t.Fatalf("PresignPut: %v", err)
 		}

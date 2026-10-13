@@ -12,6 +12,7 @@ import { maxUploadBytes } from "./config";
 import { decodeAnyBase64 } from "./crypto";
 import { collectionError, decodeQueryBody, docIDError, DOC_ID_RE, normalizeQuery, parseListParams, type RawQuery } from "./db/query";
 import { newULID } from "./db/ulid";
+import { canonicalDoc } from "./db/values";
 import {
   HttpError,
   badRequest,
@@ -30,7 +31,7 @@ import { cleanUser, normalizeEmail, type User } from "./identity";
 import { sniff } from "./mime";
 import { R2_KEY_HEADER, resolveR2Body } from "./object";
 import { pageNotFound, siteNotFound } from "./pages";
-import { parseOrigin, redirect, siteNameError, siteRoot, siteURL, type RequestContext } from "./router";
+import { decodePath, parseOrigin, redirect, siteNameError, siteRoot, siteURL, type RequestContext } from "./router";
 import { MULTIPART_OVERHEAD, type UploadRow } from "./site-do";
 import { chargeOrThrow, registry, siteStub } from "./stubs";
 import { siteMetaJSON } from "./sitemeta";
@@ -93,7 +94,7 @@ export async function serveSite(ctx: RequestContext): Promise<Response> {
     }
     return redirect(ctx.publicURL + ctx.rawPath + q, 302);
   }
-  if (p === "/__backyard/api" || p.startsWith("/__backyard/api/")) return siteAPI(ctx, p.slice("/__backyard/api".length) || "/");
+  if (p === "/__backyard/api" || p.startsWith("/__backyard/api/")) return siteAPI(ctx, apiSubPath(ctx));
   if (p.startsWith("/__backyard/files/")) return serveUploadedFile(ctx);
   if (p === "/__backyard" || p.startsWith("/__backyard/")) throw notFound(`no such endpoint: ${p.slice(0, 200)}`);
   return serveStatic(ctx);
@@ -217,14 +218,40 @@ interface Route {
 
 const SEG = "([^/]+)";
 
-/** Matches routes; 404 for unknown paths, 405 (with Allow) for wrong methods. */
+/**
+ * The site API path below /__backyard/api, segment by segment: each segment
+ * is decoded, except that "/" and "%" inside a segment stay escaped (%2F,
+ * %25). An encoded slash therefore stays inside its parameter, like in the Go
+ * server's router: "/db/c/a%2Fb" is the document id "a/b" (rejected with 400
+ * bad_request), not the path "/db/c/a/b" (404). dispatch decodes the
+ * parameters it passes to the handlers.
+ */
+export function apiSubPath(ctx: RequestContext): string {
+  const full = ctx.rawPath
+    .split("/")
+    .map((seg) => decodePath(seg).replace(/%/g, "%25").replace(/\//g, "%2F"))
+    .join("/");
+  const base = "/__backyard/api";
+  if (full !== base && !full.startsWith(base + "/")) return "/" + full; // an escaped "/" in the prefix: no route
+  return full.slice(base.length) || "/";
+}
+
+/** Reverses the escaping of apiSubPath in one route parameter. */
+function decodeParam(v: string): string {
+  return v.replace(/%2F|%25/g, (e) => (e === "%2F" ? "/" : "%"));
+}
+
+/**
+ * Matches routes; 404 for unknown paths, 405 (with Allow) for wrong methods.
+ * sub is a path from apiSubPath (or any path without "%" in parameters).
+ */
 export async function dispatch(ctx: RequestContext, user: User, sub: string, routes: Route[]): Promise<Response> {
   const method = ctx.req.method === "HEAD" ? "GET" : ctx.req.method;
   const allowed: string[] = [];
   for (const r of routes) {
     const m = r.re.exec(sub);
     if (!m) continue;
-    if (r.method === method) return r.h(ctx, user, m.slice(1));
+    if (r.method === method) return r.h(ctx, user, m.slice(1).map(decodeParam));
     allowed.push(r.method);
     if (r.method === "GET") allowed.push("HEAD");
   }
@@ -300,16 +327,14 @@ function docBodyLimit(ctx: RequestContext): number {
 }
 
 /**
- * Strips the reserved keys "id" and "_meta" from a write body. Keys are
- * defined, not assigned, so that a data key named "__proto__" is stored like
- * any other key (as the Go server does) instead of changing the prototype.
+ * Strips the reserved keys "id" and "_meta" from a write body and validates
+ * it like the Go docstore (canonicalDoc: at most 100 levels deep, no U+0000
+ * in strings or keys, finite numbers; 400 otherwise) before it travels to the
+ * site's Durable Object, which checks again. Keys are defined, not assigned,
+ * so that a data key named "__proto__" is stored like any other key.
  */
 function prepareData(body: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(body)) {
-    if (k !== "id" && k !== "_meta") Object.defineProperty(out, k, { value: v, enumerable: true, writable: true, configurable: true });
-  }
-  return out;
+  return canonicalDoc(body);
 }
 
 function bodyID(body: Record<string, unknown>): string {
@@ -530,6 +555,25 @@ function parseDataURL(s: string): { data: Uint8Array; mediaType: string } | null
   return data ? { data, mediaType: (meta[0] ?? "").trim().toLowerCase() } : null;
 }
 
+/** Longest image URL passed on to a provider (the Go server's limit). */
+const MAX_IMAGE_URL = 8192;
+
+/**
+ * Whether an image URL may be passed on to a provider (SPEC §5.4): an
+ * absolute http(s) URL with a host. Site-relative URLs such as
+ * /__backyard/files/… are rejected, as are other schemes (a data: URL that is
+ * not valid base64 included).
+ */
+export function isAbsoluteHTTPURL(s: string): boolean {
+  if (s.length > MAX_IMAGE_URL || !/^https?:\/\//i.test(s)) return false;
+  try {
+    const u = new URL(s);
+    return (u.protocol === "http:" || u.protocol === "https:") && u.hostname !== "";
+  } catch {
+    return false;
+  }
+}
+
 function parseContent(i: number, raw: unknown): Part[] {
   if (raw === undefined || raw === null) throw badRequest(`message ${i}: content is required`);
   if (typeof raw === "string") return [{ type: "text", text: raw }];
@@ -554,6 +598,7 @@ function parseContent(i: number, raw: unknown): Part[] {
       if (url) {
         const du = parseDataURL(url);
         if (du) return { type: "image", data: du.data, media_type: mt || du.mediaType } as Part;
+        if (!isAbsoluteHTTPURL(url)) throw badRequest(`message ${i} part ${j}: image url must be an absolute http(s) URL`);
         return { type: "image", url, media_type: mt } as Part;
       }
       throw badRequest(`message ${i} part ${j}: image needs data or url`);

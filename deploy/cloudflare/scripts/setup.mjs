@@ -13,10 +13,17 @@
 // State (the deploy token, URL, account, bucket, --var overrides) is kept in
 // $XDG_CONFIG_HOME/backyard/cloudflare/<worker>.json (mode 0600), so a plain
 // re-run keeps every earlier choice.
+//
+// Secrets are never guessed: BACKYARD_SECRET is generated only when wrangler
+// clearly reports that the Worker has none (or does not exist yet), since a new
+// one revokes every API token; any other failure to list the secrets stops the
+// setup. Generated secrets are printed only to an interactive terminal; in CI
+// (CI=true) or when the output is redirected, the deploy token is masked and
+// only written to the state file. BACKYARD_SECRET is never printed.
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { createInterface } from "node:readline";
 import { dirname, join, resolve } from "node:path";
@@ -148,8 +155,9 @@ function wranglerBin() {
 }
 
 /**
- * Runs wrangler. Output is streamed (unless quiet) and captured; stdin is
- * inherited so wrangler's prompts work, or fed from opts.input.
+ * Runs wrangler. Output is streamed (unless quiet) and captured (output: stdout
+ * and stderr, stdout: stdout only); stdin is inherited so wrangler's prompts
+ * work, or fed from opts.input.
  */
 function wrangler(args, opts = {}) {
   return new Promise((resolvePromise) => {
@@ -163,14 +171,16 @@ function wrangler(args, opts = {}) {
       child.stdin.end();
     }
     let output = "";
-    const onData = (stream) => (chunk) => {
+    let stdout = "";
+    const onData = (stream, isStdout) => (chunk) => {
       output += chunk.toString();
+      if (isStdout) stdout += chunk.toString();
       if (!opts.quiet) stream.write(chunk);
     };
-    child.stdout.on("data", onData(process.stdout));
-    child.stderr.on("data", onData(process.stderr));
-    child.on("error", (e) => resolvePromise({ code: 1, output: String(e) }));
-    child.on("close", (code) => resolvePromise({ code: code ?? 1, output }));
+    child.stdout.on("data", onData(process.stdout, true));
+    child.stderr.on("data", onData(process.stderr, false));
+    child.on("error", (e) => resolvePromise({ code: 1, output: String(e), stdout: "" }));
+    child.on("close", (code) => resolvePromise({ code: code ?? 1, output, stdout }));
   });
 }
 
@@ -179,26 +189,116 @@ function stateFile(worker) {
   return join(base, "backyard", "cloudflare", `${worker}.json`);
 }
 
+/**
+ * Reads the saved state ({} when there is none). A state file that exists but
+ * cannot be read stops the setup: carrying on would silently replace the
+ * remembered deploy token.
+ */
 function loadState(worker) {
+  const p = stateFile(worker);
+  let text;
   try {
-    return JSON.parse(readFileSync(stateFile(worker), "utf8"));
-  } catch {
-    return {};
+    text = readFileSync(p, "utf8");
+  } catch (e) {
+    if (e?.code === "ENOENT") return {};
+    fail(`cannot read ${p}: ${e?.message ?? e}`);
   }
+  try {
+    const state = JSON.parse(text);
+    if (state && typeof state === "object" && !Array.isArray(state)) return state;
+  } catch {
+    /* reported below */
+  }
+  fail(`${p} is not a valid state file (a JSON object): repair it, or delete it to start over (a new DEPLOY_TOKEN is then issued)`);
 }
 
+/**
+ * Writes the state atomically as a private file (0600, also when an older
+ * version left it readable by others): it holds the deploy token.
+ */
 function saveState(worker, state) {
   const p = stateFile(worker);
   mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
-  writeFileSync(p, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
+  const tmp = `${p}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, p);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
   return p;
+}
+
+/** Whether CI=… marks a CI run (any value but "", "0" or "false"). */
+export function isCI(env = process.env) {
+  const v = String(env.CI ?? "").trim().toLowerCase();
+  return v !== "" && v !== "0" && v !== "false";
+}
+
+/**
+ * Whether generated secrets may be shown: only on an interactive terminal,
+ * never in CI, where logs are kept and often shared.
+ */
+export function revealSecrets(env = process.env, isTTY = Boolean(process.stdout.isTTY)) {
+  return isTTY && !isCI(env);
+}
+
+/** A recognizable but useless form of a secret: "byd_…wxyz". */
+export function maskSecret(s) {
+  const v = String(s ?? "");
+  const prefix = /^[a-z]{2,8}_/.exec(v)?.[0] ?? "";
+  return prefix + "…" + (v.length >= 24 ? v.slice(-4) : "");
+}
+
+/**
+ * Extracts the secret names from the stdout of `wrangler secret list
+ * --format json`. Wrangler may print other lines first (e.g. "▲ [WARNING]
+ * Proxy environment variables detected", or "[…]" notices), so the array is
+ * the first line starting with "[" from which a JSON array of {name} objects
+ * parses (up to a line-final "]"). Anything else throws: never guess.
+ */
+export function parseSecretList(stdout) {
+  const s = String(stdout ?? "");
+  const lineFinal = (j) => {
+    let k = j + 1;
+    while (k < s.length && (s[k] === " " || s[k] === "\t" || s[k] === "\r")) k++;
+    return k === s.length || s[k] === "\n";
+  };
+  const ends = [];
+  for (let j = s.indexOf("]"); j >= 0; j = s.indexOf("]", j + 1)) if (lineFinal(j)) ends.push(j);
+  for (let i = s.indexOf("["); i >= 0; i = s.indexOf("[", i + 1)) {
+    if (i > 0 && s[i - 1] !== "\n") continue;
+    for (let k = ends.length - 1; k >= 0 && ends[k] > i; k--) {
+      let list;
+      try {
+        list = JSON.parse(s.slice(i, ends[k] + 1));
+      } catch {
+        continue;
+      }
+      if (Array.isArray(list) && list.every((x) => x && typeof x === "object" && typeof x.name === "string" && x.name !== "")) {
+        return new Set(list.map((x) => x.name));
+      }
+    }
+  }
+  throw new Error("no JSON list of secrets in the output of wrangler secret list");
+}
+
+/**
+ * True when wrangler reports that the Worker does not exist yet (`Worker
+ * "<name>" not found`, API error 10007). Authentication, permission and
+ * network errors must never be mistaken for a first deploy.
+ */
+export function isMissingWorker(output) {
+  return /Worker "[^"]*"(?: \(env: [^)]*\))? not found|\[code: 10007\]|does not exist on your account/i.test(String(output ?? ""));
 }
 
 /** Parses `wrangler whoami --json` ({loggedIn, email, accounts: [{id, name}]}); null when not logged in. */
 function parseWhoami(r) {
   if (r.code !== 0) return null;
   try {
-    const j = JSON.parse(r.output.slice(r.output.indexOf("{"), r.output.lastIndexOf("}") + 1));
+    const out = r.stdout ?? r.output;
+    const j = JSON.parse(out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1));
     if (!j.loggedIn) return null;
     const accounts = Array.isArray(j.accounts)
       ? j.accounts.filter((a) => a && typeof a.id === "string").map((a) => ({ id: a.id, name: String(a.name ?? a.id) }))
@@ -264,27 +364,23 @@ async function pickAccount(accounts, saved) {
 }
 
 /**
- * Names of the Worker's secrets. A Worker that does not exist yet has none;
- * any other failure stops the setup, so that a hiccup can never make it
- * replace BACKYARD_SECRET (which would revoke every token).
+ * The Worker's secrets: {exists, names}. Only wrangler's explicit "Worker not
+ * found" means a first deploy (no secrets); any other failure, or output that
+ * is not the JSON list, stops the setup, so that a warning line, an expired
+ * login or a network hiccup can never make it replace BACKYARD_SECRET (which
+ * would revoke every token).
  */
 async function existingSecrets(worker) {
   const r = await wrangler(["secret", "list", "--name", worker, "--format", "json"], { quiet: true });
   if (r.code !== 0) {
-    if (/Worker "[^"]*"(?: \(env: [^)]*\))? not found|\[code: 10007\]|does not exist on your account/i.test(r.output)) return new Set();
-    fail(`could not list the secrets of Worker ${worker}:\n${r.output.trim()}`);
+    if (isMissingWorker(r.output)) return { exists: false, names: new Set() };
+    fail(`could not list the secrets of Worker ${worker} (nothing was changed):\n${r.output.trim()}`);
   }
-  const end = r.output.lastIndexOf("]");
-  for (let i = r.output.indexOf("["); i >= 0 && i < end; i = r.output.indexOf("[", i + 1)) {
-    if (i > 0 && r.output[i - 1] !== "\n") continue;
-    try {
-      const list = JSON.parse(r.output.slice(i, end + 1));
-      if (Array.isArray(list)) return new Set(list.map((x) => x?.name).filter(Boolean));
-    } catch {
-      /* try the next "[" */
-    }
+  try {
+    return { exists: true, names: parseSecretList(r.stdout) };
+  } catch {
+    fail(`unexpected output of wrangler secret list for Worker ${worker} (nothing was changed):\n${r.output.trim()}`);
   }
-  fail(`unexpected output of wrangler secret list:\n${r.output.trim()}`);
 }
 
 async function putSecret(worker, name, value) {
@@ -375,8 +471,12 @@ async function main() {
   // Secrets: keep what exists, generate what is missing. They are uploaded
   // with the new version (wrangler deploy --secrets-file), so a first deploy
   // never runs without BACKYARD_SECRET.
-  const have = await existingSecrets(worker);
+  const listed = await existingSecrets(worker);
+  const have = listed.names;
+  if (opts.skipDeploy && !listed.exists) fail(`Worker ${worker} does not exist yet: run npm run setup without --skip-deploy first`);
   const secrets = {};
+  // Generated only when the Worker has none (or on request): a new value
+  // revokes every API token. It is never printed.
   if (!have.has("BACKYARD_SECRET") || opts.rotateSecret) secrets.BACKYARD_SECRET = randomBytes(32).toString("hex");
   const newToken = () => "byd_" + randomBytes(24).toString("base64url");
   let token;
@@ -459,10 +559,18 @@ async function main() {
 
   const hub = url || "https://<your-worker>.<your-subdomain>.workers.dev";
   console.log(`\n${green("✔")} Backyard is live at ${bold(cyan(hub))}\n`);
-  console.log("Connect the CLI (keep the token secret — it can deploy and delete sites):\n");
-  console.log(`  ${bold(`backyard login --server ${hub} --token ${token}`)}\n`);
+  if (revealSecrets()) {
+    console.log("Connect the CLI (keep the token secret — it can deploy and delete sites):\n");
+    console.log(`  ${bold(`backyard login --server ${hub} --token ${token}`)}\n`);
+  } else {
+    // CI logs are kept and shared: the token stays in the state file (0600).
+    const where = process.env.DEPLOY_TOKEN ? "$DEPLOY_TOKEN" : `<"deployToken" in ${saved}>`;
+    const why = isCI() ? "CI" : "the output is not a terminal";
+    console.log(`Connect the CLI with the deploy token ${maskSecret(token)} (not printed: ${why}):\n`);
+    console.log(`  ${bold(`backyard login --server ${hub} --token ${where}`)}\n`);
+  }
   console.log(`Then: ${bold("backyard init my-site && cd my-site && backyard deploy")}`);
-  console.log(dim(`\nThe deploy token is saved in ${saved}.`));
+  console.log(dim(`\nThe deploy token is saved in ${saved} (mode 0600).`));
   console.log(dim(`AI runs on Workers AI (free daily allowance); caps: LIMITS in wrangler.jsonc.`));
   const noR2 = state.r2 === false ? "R2 is off (--r2 turns it on)" : "enable R2 on the account and re-run setup for files up to 95 MiB";
   console.log(dim(`Files: ${bucket ? `R2 bucket ${bucket} for files above FILE_INLINE_MAX` : `stored in Durable Objects (25 MiB per file); ${noR2}`}.`));

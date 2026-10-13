@@ -57,7 +57,7 @@ const (
 type source int
 
 const (
-	srcIdP      source = iota // IdP / proxy claims or browser session
+	srcIDP      source = iota // IdP / proxy claims or browser session
 	srcAPIToken               // Backyard API token
 	srcStatic                 // static token from auth.tokens
 	srcAnon                   // anonymous guest (mode none)
@@ -335,7 +335,7 @@ func (a *authenticator) authenticateBearer(ctx context.Context, tok string) (*id
 	if err != nil {
 		return nil, fmt.Errorf("%w: invalid identity provider token: %w", ErrUnauthenticated, err)
 	}
-	return a.finalize(ctx, a.mapClaims(claims), srcIdP)
+	return a.finalize(ctx, a.mapClaims(claims), srcIDP)
 }
 
 // matchStatic compares the token's sha256 against every configured static
@@ -512,9 +512,13 @@ func remoteIP(addr string) net.IP {
 	return net.ParseIP(host)
 }
 
-// newCookie builds a cookie with Backyard's standard attributes.
+// newCookie builds a cookie with Backyard's standard attributes: HttpOnly,
+// SameSite=Lax, and Secure when server.public_url is https (SPEC §8).
 func (a *authenticator) newCookie(name, value, domain, path string, maxAge time.Duration) *http.Cookie {
-	c := &http.Cookie{
+	// Secure is scheme-dependent on purpose: browsers drop Secure cookies set
+	// over plain http (dev servers and http-only intranet hosts), which would
+	// make login impossible there.
+	c := &http.Cookie{ //nolint:gosec // G124: Secure follows server.public_url's scheme (see above).
 		Name:     name,
 		Value:    value,
 		Path:     path,

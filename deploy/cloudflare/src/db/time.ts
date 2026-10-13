@@ -1,21 +1,59 @@
 /**
- * Document timestamps: integer microseconds since the epoch (the precision
- * of every docstore backend), rendered like Go's time.Time JSON (RFC 3339 with
- * trailing zeros of the fraction removed).
+ * Timestamps on the wire, in the formats of the Go edition:
+ *
+ *   - document `_meta.created_at` / `_meta.updated_at` (and the other API
+ *     timestamps) are integer microseconds since the epoch (the precision of
+ *     every docstore backend) rendered like Go's time.Time JSON: RFC 3339 in
+ *     UTC with the trailing zeros of the fraction removed
+ *     ("2026-01-02T03:04:05.12Z"). Such strings do not sort chronologically
+ *     as text, so the server compares and orders them as integers
+ *     (db/query.ts) and filter values are parsed (parseRFC3339Micros);
+ *   - realtime presence `joined_at` has a fixed width of exactly three
+ *     fractional digits ("2026-01-02T03:04:05.120Z", internal/realtime's
+ *     joinedAtLayout), so clients may order members by comparing strings.
  */
+
+const pad = (n: number, w = 2) => String(n).padStart(w, "0");
+
+/** "YYYY-MM-DDTHH:MM:SS" of a Date in UTC (years outside 0..9999 unpadded, like Go). */
+function utcSeconds(d: Date): string {
+  const y = d.getUTCFullYear();
+  const year = y >= 0 && y <= 9999 ? pad(y, 4) : String(y);
+  return `${year}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
 
 /** Formats microseconds since the epoch as RFC 3339 in UTC (Go RFC3339Nano style). */
 export function formatMicros(us: number): string {
   const ms = Math.floor(us / 1000);
   const frac = us - ms * 1000; // 0..999 microseconds beyond the millisecond
   const d = new Date(ms);
-  const pad = (n: number, w = 2) => String(n).padStart(w, "0");
-  const y = d.getUTCFullYear();
-  const year = y >= 0 && y <= 9999 ? pad(y, 4) : String(y);
-  let s = `${year}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+  let s = utcSeconds(d);
   const micros = d.getUTCMilliseconds() * 1000 + frac;
   if (micros > 0) s += "." + pad(micros, 6).replace(/0+$/, "");
   return s + "Z";
+}
+
+/**
+ * Formats milliseconds since the epoch as RFC 3339 in UTC with exactly three
+ * fractional digits ("2026-01-02T03:04:05.120Z"): the fixed-width format of
+ * presence joined_at, which orders chronologically as a string.
+ */
+export function formatMillisFixed(ms: number): string {
+  const d = new Date(Math.floor(ms));
+  return `${utcSeconds(d)}.${pad(d.getUTCMilliseconds(), 3)}Z`;
+}
+
+const FIXED_MILLIS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+/**
+ * Returns an RFC 3339 timestamp in the fixed-width presence format, converting
+ * other RFC 3339 forms (e.g. from connection state saved by an older version);
+ * values that do not parse are returned unchanged.
+ */
+export function toFixedMillis(v: string): string {
+  if (FIXED_MILLIS_RE.test(v)) return v;
+  const us = parseRFC3339Micros(v);
+  return us === null ? v : formatMillisFixed(Math.floor(us / 1000));
 }
 
 const RFC3339_RE = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:[.,](\d+))?([Zz]|[+-]\d{2}:\d{2})$/;

@@ -13,6 +13,12 @@
 // "Storage Blob Delegator", included in "Storage Blob Data Contributor").
 // Account-SAS connection strings cannot presign.
 //
+// A SAS cannot restrict the size or content of an upload (it signs no
+// request headers), so presigned uploads accept any body for their blob:
+// PresignPutOptions.Size and SHA256 are not enforced and callers must verify
+// uploads afterwards (the deploy gateway compares sizes at commit and
+// deletes mismatching objects).
+//
 // On accounts with a hierarchical namespace (ADLS Gen2), directory
 // placeholder blobs (metadata hdi_isfolder=true) are hidden from listings.
 package azure
@@ -701,12 +707,17 @@ func (s *Store) signSAS(ctx context.Context, key string, perms sas.BlobPermissio
 
 // PresignPut returns a SAS URL accepting a PUT of the object's bytes. The
 // returned Headers (x-ms-blob-type: BlockBlob and Content-Type) must be sent
-// verbatim.
-func (s *Store) PresignPut(ctx context.Context, key, contentType string, ttl time.Duration) (*blob.PresignedRequest, error) {
+// verbatim. A SAS cannot bind opts.Size or opts.SHA256: the URL accepts a
+// body of any size and content until it expires (see the package doc).
+func (s *Store) PresignPut(ctx context.Context, key string, opts blob.PresignPutOptions, ttl time.Duration) (*blob.PresignedRequest, error) {
 	if err := s.checkKey(key); err != nil {
 		return nil, err
 	}
-	ct := blobutil.PresignContentType(key, contentType)
+	spec, err := blobutil.CheckPresignPut(key, opts)
+	if err != nil {
+		return nil, fmt.Errorf("blob/azure: presign put %q: %w", key, err)
+	}
+	ct := spec.ContentType
 	u, exp, err := s.signSAS(ctx, key, sas.BlobPermissions{Create: true, Write: true}, ttl)
 	if err != nil {
 		if errors.Is(err, blob.ErrNotSupported) {

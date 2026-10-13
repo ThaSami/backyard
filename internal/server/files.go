@@ -29,8 +29,14 @@ const filesCollection = "_files"
 const (
 	// maxFileName bounds sanitized file names (bytes).
 	maxFileName = 200
-	// uploadReadTimeout is the read deadline for upload bodies.
+	// uploadReadTimeout is the minimum read deadline for upload bodies.
 	uploadReadTimeout = 30 * time.Minute
+	// minUploadRate (bytes/s) is the slowest sustained upload the read
+	// deadline allows for: bodies above uploadReadTimeout × minUploadRate
+	// (450 MiB) get proportionally more time.
+	minUploadRate = 256 << 10
+	// maxUploadTimeout bounds the read deadline of any upload body.
+	maxUploadTimeout = 24 * time.Hour
 	// multipartOverhead allows for multipart framing and small fields.
 	multipartOverhead = 1 << 20
 	// maxFieldBytes bounds non-file form fields.
@@ -193,6 +199,17 @@ func (l *limitReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// uploadTimeout is how long reading an upload body of up to n bytes may
+// take: uploadReadTimeout, or longer for bodies too large to arrive in that
+// time at minUploadRate.
+func uploadTimeout(n int64) time.Duration {
+	secs := n / minUploadRate
+	if secs >= int64(maxUploadTimeout/time.Second) {
+		return maxUploadTimeout
+	}
+	return max(uploadReadTimeout, time.Duration(secs)*time.Second)
+}
+
 func (s *Server) maxUpload() int64 {
 	if n := s.cfg.Files.MaxUploadBytes; n > 0 {
 		return n
@@ -290,9 +307,18 @@ func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		s.writeAPIError(w, r, newError(http.StatusRequestEntityTooLarge, codeTooLarge, "file exceeds the maximum upload size of %d bytes", limit))
 		return
 	}
-	// Large uploads outlive server.read_timeout; the response is written
-	// after the body, so the write deadline moves too.
-	extendDeadlines(w, uploadReadTimeout, uploadReadTimeout+time.Minute)
+	// Large uploads outlive server.read_timeout (which net/http applies to
+	// the whole request, body included). Move the read deadline before
+	// anything reads the body: the multipart reader below parses it lazily,
+	// part by part, so every read of the upload happens after this point.
+	// The response is written after the body, so the write deadline moves
+	// too.
+	n := limit + multipartOverhead
+	if r.ContentLength > 0 {
+		n = r.ContentLength
+	}
+	timeout := uploadTimeout(n)
+	extendDeadlines(w, timeout, timeout+time.Minute)
 	r.Body = http.MaxBytesReader(w, r.Body, limit+multipartOverhead)
 	mr, err := r.MultipartReader()
 	if err != nil {
@@ -316,7 +342,7 @@ func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	for {
 		part, err := mr.NextPart()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {

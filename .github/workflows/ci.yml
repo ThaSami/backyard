@@ -182,6 +182,19 @@ jobs:
     if: needs.detect.outputs.conformance == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      # A warehouse source, so the warehouse checks run instead of the 501 ones.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: backyard
+          POSTGRES_PASSWORD: backyard
+          POSTGRES_DB: backyard
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U backyard -d backyard"
+          --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -191,17 +204,24 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
+      - name: shellcheck the runners
+        run: shellcheck conformance/*.sh
       - name: Build
         run: make build
-      - name: Run the suite against backyard serve --dev
-        run: BACKYARD_BIN="$PWD/bin/backyard" scripts/conformance.sh go
+      # Host mode as an anonymous guest, then path mode with a static token;
+      # AI aliases are backed by the suite's mock OpenAI-compatible provider.
+      - name: Run the suite against backyard serve --dev (host and path mode)
+        env:
+          BACKYARD_BIN: ${{ github.workspace }}/bin/backyard
+          CONFORMANCE_WAREHOUSE_DSN: postgres://backyard:backyard@127.0.0.1:5432/backyard?sslmode=disable
+        run: conformance/run-go.sh
 
   conformance-worker:
     name: Conformance (Cloudflare Worker)
     needs: detect
     if: needs.detect.outputs.conformance == 'true' && needs.detect.outputs.cloudflare == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -210,8 +230,9 @@ jobs:
       - name: Install the Worker
         working-directory: deploy/cloudflare
         run: npm ci --no-audit --no-fund
-      - name: Run the suite against wrangler dev --env local
-        run: scripts/conformance.sh worker
+      # Path mode as an anonymous guest, then host mode with the DEPLOY_TOKEN.
+      - name: Run the suite against wrangler dev --env local (path and host mode)
+        run: conformance/run-worker.sh
 
   terraform:
     name: Terraform (${{ matrix.module }})
@@ -394,8 +415,27 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # go: backyard serve --dev; worker: the Cloudflare edition under wrangler dev --env local.
-        target: [go, worker]
+        # go: the Playwright suite in e2e/ (it starts its own `backyard serve` instances, a fake AI
+        #     upstream and a mock OIDC provider); worker: web/test/e2e.test.mjs against the
+        #     Cloudflare edition under wrangler dev --env local.
+        include:
+          - target: go
+            lockfile: e2e/package-lock.json
+          - target: worker
+            lockfile: deploy/cloudflare/package-lock.json
+    services:
+      # For the dashboard-on-a-real-warehouse test (go target).
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: backyard
+          POSTGRES_PASSWORD: backyard
+          POSTGRES_DB: backyard
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U backyard -d backyard"
+          --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -406,25 +446,54 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ matrix.lockfile }}
+
+      # --- go: the Playwright suite (e2e/README.md) ------------------------------
       - name: Build backyard
         if: matrix.target == 'go'
         run: make build
+      - name: Install the e2e suite and Chromium
+        if: matrix.target == 'go'
+        working-directory: e2e
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+      - name: Test (Playwright)
+        if: matrix.target == 'go'
+        working-directory: e2e
+        env:
+          BACKYARD_BIN: ${{ github.workspace }}/bin/backyard
+          BACKYARD_TEST_POSTGRES_DSN: postgres://backyard:backyard@127.0.0.1:5432/backyard?sslmode=disable
+        run: npm test
+      - name: Test (web/test/e2e.test.mjs against backyard serve --dev)
+        if: matrix.target == 'go'
+        env:
+          BACKYARD_E2E_SERVE: go
+          BACKYARD_E2E_BIN: ${{ github.workspace }}/bin/backyard
+          BACKYARD_TEST_POSTGRES_DSN: postgres://backyard:backyard@127.0.0.1:5432/backyard?sslmode=disable
+          PLAYWRIGHT_CORE: ${{ github.workspace }}/e2e/node_modules/playwright-core/index.mjs
+        run: node --test web/test/e2e.test.mjs
+      - uses: actions/upload-artifact@v7
+        if: failure() && matrix.target == 'go'
+        with:
+          name: e2e-report
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/
+          retention-days: 7
+
+      # --- worker: the hub + SDK browser test against the Cloudflare edition -----
       - name: Install the Worker
         if: matrix.target == 'worker'
         working-directory: deploy/cloudflare
         run: npm ci --no-audit --no-fund
       - name: Install Chromium (playwright-core)
+        if: matrix.target == 'worker'
         run: |
           npm install --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/pw" playwright-core@1.56.1
           node "$RUNNER_TEMP/pw/node_modules/playwright-core/cli.js" install --with-deps chromium
           echo "PLAYWRIGHT_CORE=$RUNNER_TEMP/pw/node_modules/playwright-core/index.mjs" >> "$GITHUB_ENV"
-      - name: Test
-        env:
-          BACKYARD_BIN: ${{ github.workspace }}/bin/backyard
-        run: |
-          if [ -f e2e/package.json ]; then
-            (cd e2e && npm ci --no-audit --no-fund)
-            scripts/with-server.sh "${{ matrix.target }}" -- npm --prefix e2e test
-          else
-            scripts/with-server.sh "${{ matrix.target }}" -- node --test web/test/e2e.test.mjs
-          fi
+      - name: Test (web/test/e2e.test.mjs)
+        if: matrix.target == 'worker'
+        run: scripts/with-server.sh worker -- node --test web/test/e2e.test.mjs

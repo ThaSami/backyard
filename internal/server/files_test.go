@@ -6,9 +6,11 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"net/textproto"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/thasami/backyard/internal/config"
 )
@@ -323,4 +325,122 @@ func TestSanitizeFileName(t *testing.T) {
 			t.Errorf("sanitizeFileName(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
+}
+
+func TestUploadTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		n    int64
+		want time.Duration
+	}{
+		{0, uploadReadTimeout},
+		{100 << 20, uploadReadTimeout},
+		{450 << 20, uploadReadTimeout},
+		{1 << 30, 4096 * time.Second},
+		{5 << 30, 20480 * time.Second},
+		{1 << 62, maxUploadTimeout},
+	} {
+		if got := uploadTimeout(tc.n); got != tc.want {
+			t.Errorf("uploadTimeout(%d) = %v, want %v", tc.n, got, tc.want)
+		}
+	}
+}
+
+// slowBody yields chunks with a pause before each one.
+type slowBody struct {
+	chunks [][]byte
+	pause  time.Duration
+}
+
+func (s *slowBody) Read(p []byte) (int, error) {
+	if len(s.chunks) == 0 {
+		return 0, io.EOF
+	}
+	time.Sleep(s.pause)
+	n := copy(p, s.chunks[0])
+	s.chunks[0] = s.chunks[0][n:]
+	if len(s.chunks[0]) == 0 {
+		s.chunks = s.chunks[1:]
+	}
+	return n, nil
+}
+
+// split cuts b into n roughly equal chunks.
+func split(b []byte, n int) [][]byte {
+	var out [][]byte
+	size := (len(b) + n - 1) / n
+	for len(b) > 0 {
+		k := min(size, len(b))
+		out = append(out, b[:k])
+		b = b[k:]
+	}
+	return out
+}
+
+// TestSlowUploadOutlivesReadTimeout sends an upload body that takes several
+// times server.read_timeout to arrive (multipart headers included) through a
+// real HTTP server.
+func TestSlowUploadOutlivesReadTimeout(t *testing.T) {
+	const readTimeout = 250 * time.Millisecond
+	h := newHarness(t)
+	ts := httptest.NewUnstartedServer(h.h)
+	ts.Config.ReadTimeout = readTimeout
+	ts.Config.WriteTimeout = readTimeout
+	ts.Start()
+	defer ts.Close()
+
+	send := func(path, ctype string, body []byte, chunked bool, pause time.Duration) (int, string, error) {
+		t.Helper()
+		r, err := http.NewRequest("POST", ts.URL+path, &slowBody{chunks: split(body, 6), pause: pause})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !chunked {
+			r.ContentLength = int64(len(body))
+		}
+		r.Host = "foo.backyard.test"
+		r.Header.Set("X-Backyard", "1")
+		r.Header.Set("Content-Type", ctype)
+		resp, err := ts.Client().Do(r)
+		if err != nil {
+			return 0, "", err
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b), err
+	}
+
+	content := strings.Repeat("slow upload ", 4096)
+	for _, chunked := range []bool{true, false} {
+		body, ct := multipartBody(t,
+			part{field: "name", content: "report.txt"},
+			part{field: "file", filename: "r.txt", ctype: "text/plain", content: content})
+		raw, _ := io.ReadAll(body)
+		start := time.Now()
+		status, resp, err := send("/__backyard/api/files", ct, raw, chunked, readTimeout/2)
+		if err != nil || status != http.StatusCreated {
+			t.Fatalf("chunked=%v: slow upload: status %d, err %v: %s", chunked, status, err, resp)
+		}
+		if elapsed := time.Since(start); elapsed < 2*readTimeout {
+			t.Fatalf("upload took only %v; the test does not exercise the read timeout", elapsed)
+		}
+		var f fileJSON
+		if err := jsonUnmarshal([]byte(resp), &f); err != nil {
+			t.Fatal(err)
+		}
+		if f.Size != int64(len(content)) || f.Name != "report.txt" {
+			t.Fatalf("file = %+v", f)
+		}
+	}
+
+	// Control: other endpoints keep server.read_timeout, so the same pace
+	// fails there (and the same body sent promptly succeeds).
+	doc := []byte(`{"text":"` + strings.Repeat("x", 600) + `"}`)
+	if status, resp, err := send("/__backyard/api/db/notes", "application/json", doc, true, 0); err != nil || status != http.StatusCreated {
+		t.Fatalf("prompt JSON body: %d %v %s", status, err, resp)
+	}
+	status, resp, err := send("/__backyard/api/db/notes", "application/json", doc, true, readTimeout/2)
+	if err == nil && status < 400 {
+		t.Fatalf("slow JSON body was accepted (%d %s); the read timeout is not in effect", status, resp)
+	}
+	t.Logf("slow JSON body: status %d, err %v, %s", status, err, strings.TrimSpace(resp))
 }

@@ -14,7 +14,14 @@
 // A dedicated connection runs LISTEN; when it fails, it is re-established with
 // exponential backoff (notifications sent meanwhile are lost, matching the
 // at-most-once contract). Idle listener connections are health-checked
-// periodically. Publishing uses a connection pool.
+// periodically.
+//
+// Publishing, spill reads and the janitor share a small connection pool.
+// Each of those is a single short statement, so the pool opened from DSN is
+// bounded to Options.MaxPoolConns, by default derived from the CPU count and
+// clamped to 2–4 connections (pgxpool's own default of max(4, NumCPU) would
+// open dozens of connections per instance on large machines). A
+// pool_max_conns parameter in the DSN takes precedence over both.
 package postgres
 
 import (
@@ -24,6 +31,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,6 +64,12 @@ const (
 	maxBackoff     = 10 * time.Second
 	// schemaLockKey is the advisory lock serializing concurrent table creation.
 	schemaLockKey int64 = 0x6279_7073_7062 // "byps"+"pb"
+	// minPoolConns and maxPoolConns clamp the derived publish pool size.
+	minPoolConns = 2
+	maxPoolConns = 4
+	// applicationName identifies Backyard's pubsub connections in
+	// pg_stat_activity unless the DSN sets application_name.
+	applicationName = "backyard-pubsub"
 )
 
 // Options configure a Broker.
@@ -68,6 +83,11 @@ type Options struct {
 	// opened from DSN. It is not closed by Broker.Close. DSN is still required
 	// for the dedicated LISTEN connection.
 	Pool *pgxpool.Pool
+	// MaxPoolConns bounds the pool opened from DSN (ignored when Pool is set,
+	// and overridden by a pool_max_conns DSN parameter). Zero derives the
+	// size from the CPU count, clamped to 2–4: publishing is one short
+	// statement per message, so a few connections suffice.
+	MaxPoolConns int
 	// SpillTTL is how long spilled payloads are kept (default 5m).
 	SpillTTL time.Duration
 	// JanitorInterval is how often expired spill rows are deleted (default 1m).
@@ -143,7 +163,15 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 		return nil, fmt.Errorf("pubsub/postgres: parse dsn: %w", err)
 	}
 	if _, ok := cfg.RuntimeParams["application_name"]; !ok {
-		cfg.RuntimeParams["application_name"] = "backyard-pubsub"
+		cfg.RuntimeParams["application_name"] = applicationName
+	}
+	// pgx keeps pgxpool's pool_* DSN parameters as runtime parameters; the
+	// server would reject them on the LISTEN connection.
+	_, maxConnsSet := cfg.RuntimeParams["pool_max_conns"]
+	for k := range cfg.RuntimeParams {
+		if strings.HasPrefix(k, "pool_") {
+			delete(cfg.RuntimeParams, k)
+		}
 	}
 
 	b := &Broker{
@@ -158,7 +186,11 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 		}),
 	}
 	if b.pool == nil {
-		b.pool, err = pgxpool.New(ctx, opts.DSN)
+		pcfg, err := poolConfig(opts, maxConnsSet)
+		if err != nil {
+			return nil, err
+		}
+		b.pool, err = pgxpool.NewWithConfig(ctx, pcfg)
 		if err != nil {
 			return nil, fmt.Errorf("pubsub/postgres: open pool: %w", err)
 		}
@@ -178,11 +210,42 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 		return fail(err)
 	}
 
-	b.ctx, b.cancel = context.WithCancel(context.Background())
+	// The background goroutines live until Close, not until ctx (which only
+	// bounds startup) is done; they keep its values.
+	b.ctx, b.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	b.wg.Add(2)
 	go b.listen(conn)
 	go b.janitor()
 	return b, nil
+}
+
+// poolConfig returns the configuration of the pool opened from opts.DSN,
+// bounded as described in the package documentation. maxConnsSet reports
+// whether the DSN has a pool_max_conns parameter, which is kept as is.
+func poolConfig(opts Options, maxConnsSet bool) (*pgxpool.Config, error) {
+	cfg, err := pgxpool.ParseConfig(opts.DSN)
+	if err != nil {
+		// pgx parse errors do not include the password.
+		return nil, fmt.Errorf("pubsub/postgres: parse dsn: %w", err)
+	}
+	if !maxConnsSet {
+		cfg.MaxConns = int32(poolSize(opts.MaxPoolConns, runtime.NumCPU()))
+		cfg.MinConns = min(cfg.MinConns, cfg.MaxConns)
+		cfg.MinIdleConns = min(cfg.MinIdleConns, cfg.MaxConns)
+	}
+	if _, ok := cfg.ConnConfig.RuntimeParams["application_name"]; !ok {
+		cfg.ConnConfig.RuntimeParams["application_name"] = applicationName
+	}
+	return cfg, nil
+}
+
+// poolSize returns the publish pool size: requested when positive, otherwise
+// half the CPU count clamped to [minPoolConns, maxPoolConns].
+func poolSize(requested, cpus int) int {
+	if requested > 0 {
+		return min(requested, 1<<20)
+	}
+	return min(max(cpus/2, minPoolConns), maxPoolConns)
 }
 
 func (b *Broker) ensureSchema(ctx context.Context) error {
@@ -254,7 +317,9 @@ func (b *Broker) listen(conn *pgx.Conn) {
 			b.log.Info("listener reconnected")
 		}
 		err := b.receive(conn)
-		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		// b.ctx may already be canceled (Close): still give the connection a
+		// moment to terminate cleanly.
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(b.ctx), time.Second)
 		_ = conn.Close(closeCtx)
 		cancel()
 		conn = nil

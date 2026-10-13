@@ -223,12 +223,8 @@ func (p *Provider) Chat(ctx context.Context, req ai.ChatRequest) (*ai.ChatRespon
 	if err != nil {
 		return nil, err
 	}
-	resp, err := p.post(ctx, req.Model, "generateContent", "", body)
-	if err != nil {
-		return nil, err
-	}
 	var gr generateResponse
-	if err := httpx.DecodeJSON(p.name, resp, &gr); err != nil {
+	if err := p.postJSON(ctx, req.Model, "generateContent", body, &gr); err != nil {
 		return nil, err
 	}
 	out := &ai.ChatResponse{Model: firstNonEmpty(gr.ModelVersion, req.Model), Usage: gr.UsageMetadata.toAI(), StopReason: ai.StopOther}
@@ -481,12 +477,8 @@ func (p *Provider) imagen(ctx context.Context, req ai.ImageRequest, n int) (*ai.
 		params["aspectRatio"] = ar
 	}
 	body := imagenRequest{Instances: []map[string]string{{"prompt": req.Prompt}}, Parameters: params}
-	resp, err := p.post(ctx, req.Model, "predict", "", body)
-	if err != nil {
-		return nil, err
-	}
 	var ir imagenResponse
-	if err := httpx.DecodeJSON(p.name, resp, &ir); err != nil {
+	if err := p.postJSON(ctx, req.Model, "predict", body, &ir); err != nil {
 		return nil, err
 	}
 	out := &ai.ImageResponse{}
@@ -524,8 +516,8 @@ func (p *Provider) geminiImage(ctx context.Context, req ai.ImageRequest, n int) 
 			Contents:         []content{{Role: "user", Parts: []part{{Text: req.Prompt}}}},
 			GenerationConfig: gc,
 		}
-		resp, err := p.post(ctx, req.Model, "generateContent", "", body)
-		if err != nil {
+		var gr generateResponse
+		if err := p.postJSON(ctx, req.Model, "generateContent", body, &gr); err != nil {
 			// Older image models only accept TEXT+IMAGE output.
 			var ue *ai.UpstreamError
 			if len(modalities) == 1 && errors.As(err, &ue) && ue.Status == http.StatusBadRequest &&
@@ -533,10 +525,6 @@ func (p *Provider) geminiImage(ctx context.Context, req ai.ImageRequest, n int) 
 				modalities = []string{"TEXT", "IMAGE"}
 				continue
 			}
-			return nil, err
-		}
-		var gr generateResponse
-		if err := httpx.DecodeJSON(p.name, resp, &gr); err != nil {
 			return nil, err
 		}
 		got := 0
@@ -692,12 +680,8 @@ func (p *Provider) embedChunk(ctx context.Context, model string, input []string)
 		for i, s := range input {
 			body.Instances[i] = map[string]string{"content": s}
 		}
-		resp, err := p.post(ctx, model, "predict", "", body)
-		if err != nil {
-			return nil, 0, err
-		}
 		var pr predictEmbedResponse
-		if err := httpx.DecodeJSON(p.name, resp, &pr); err != nil {
+		if err := p.postJSON(ctx, model, "predict", body, &pr); err != nil {
 			return nil, 0, err
 		}
 		vecs := make([][]float64, len(pr.Predictions))
@@ -713,12 +697,8 @@ func (p *Provider) embedChunk(ctx context.Context, model string, input []string)
 	for i, s := range input {
 		body.Requests[i] = embedContentRequest{Model: m, Content: content{Parts: []part{{Text: s}}}}
 	}
-	resp, err := p.post(ctx, model, "batchEmbedContents", "", body)
-	if err != nil {
-		return nil, 0, err
-	}
 	var br batchEmbedResponse
-	if err := httpx.DecodeJSON(p.name, resp, &br); err != nil {
+	if err := p.postJSON(ctx, model, "batchEmbedContents", body, &br); err != nil {
 		return nil, 0, err
 	}
 	vecs := make([][]float64, len(br.Embeddings))
@@ -761,7 +741,8 @@ func (p *Provider) modelURL(project, model, method, query string) string {
 	return u
 }
 
-func (p *Provider) post(ctx context.Context, model, method, query string, body any) (*http.Response, error) {
+// newRequest builds an authenticated POST request for a model method.
+func (p *Provider) newRequest(ctx context.Context, model, method, query string, body any) (*http.Request, error) {
 	var (
 		token   string
 		project string
@@ -788,7 +769,27 @@ func (p *Provider) post(ctx context.Context, model, method, query string, body a
 	for k, v := range p.headers {
 		req.Header.Set(k, v)
 	}
+	return req, nil
+}
+
+// post sends a request whose response is streamed; the caller closes the
+// body. Non-2xx responses are returned as *ai.UpstreamError.
+func (p *Provider) post(ctx context.Context, model, method, query string, body any) (*http.Response, error) {
+	req, err := p.newRequest(ctx, model, method, query, body)
+	if err != nil {
+		return nil, err
+	}
 	return httpx.Do(p.client, p.name, req)
+}
+
+// postJSON sends a non-streaming request and decodes the JSON response into
+// out, always closing the response body.
+func (p *Provider) postJSON(ctx context.Context, model, method string, body, out any) error {
+	req, err := p.newRequest(ctx, model, method, "", body)
+	if err != nil {
+		return err
+	}
+	return httpx.DoJSON(p.client, p.name, req, out)
 }
 
 // credentials returns a Vertex AI access token and the project id,

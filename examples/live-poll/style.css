@@ -5,10 +5,11 @@
   --ink: #1d1c1a;
   --ink-2: #5f5d58;
   --line: #e4e2dc;
-  --accent: #2a78d6;
-  --accent-soft: #2a78d61f;
+  --accent: #2266c8;
+  --accent-ink: #ffffff;
+  --accent-soft: #2266c81f;
   --track: #0b0b0b12;
-  --good: #0ca30c;
+  --good: #087f08;
   font: 17px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
@@ -20,8 +21,10 @@
     --ink-2: #a9a79f;
     --line: #2e2d2a;
     --accent: #4b93ea;
+    --accent-ink: #0b1b30;
     --accent-soft: #4b93ea26;
     --track: #ffffff14;
+    --good: #0ca30c;
   }
 }
 
@@ -67,7 +70,7 @@ input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 .link { border: 0; background: none; color: var(--accent); cursor: pointer; padding: .25rem 0; font-size: .9rem; }
 .row { display: flex; gap: .5rem; margin-top: 1rem; }
 .primary, .secondary { border-radius: 10px; padding: .6rem 1.1rem; font-weight: 600; cursor: pointer; }
-.primary { border: 0; background: var(--accent); color: #fff; }
+.primary { border: 0; background: var(--accent); color: var(--accent-ink); }
 .secondary { border: 1px solid var(--line); background: var(--surface); }
 .share { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--line); }
 .share code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .85rem; }

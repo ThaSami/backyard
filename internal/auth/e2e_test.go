@@ -64,7 +64,7 @@ func TestOIDCEndToEndOverHTTP(t *testing.T) {
 				}
 				return dialer.DialContext(ctx, network, addr)
 			},
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // test server certificate
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // self-signed httptest certificate
 		},
 	}
 	get := func(u string) (string, string) {

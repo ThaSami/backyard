@@ -118,7 +118,8 @@ test("list maps options to the query string and returns docs with hasMore", asyn
     [{ orderBy: "votes" }, { order: "votes:asc" }],
     [{ orderBy: ["votes", "title"], order: "desc" }, { order: "votes:desc,title:desc" }],
     [{ orderBy: "votes:desc" }, { order: "votes:desc" }],
-    [{ order: "desc" }, { order: "_meta.created_at:desc" }],
+    [{ order: "desc" }, { order: "_meta.created_at:desc,id:desc" }],
+    [{ order: "asc" }, { order: "_meta.created_at:asc,id:asc" }],
     [{ limit: 0 }, { limit: "0" }],
   ];
   for (const [opts, query] of cases) {

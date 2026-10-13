@@ -2,19 +2,25 @@ package gcs
 
 import (
 	"context"
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -73,7 +79,7 @@ func TestEmulatorCannotPresign(t *testing.T) {
 	f := newFake(t)
 	s := f.newStore(t, "")
 	defer s.Close()
-	if _, err := s.PresignPut(context.Background(), "a.txt", "", time.Minute); !errors.Is(err, blob.ErrNotSupported) {
+	if _, err := s.PresignPut(context.Background(), "a.txt", blob.PresignPutOptions{Size: -1}, time.Minute); !errors.Is(err, blob.ErrNotSupported) {
 		t.Errorf("PresignPut err = %v", err)
 	}
 	if _, err := s.PresignGet(context.Background(), "a.txt", time.Minute); !errors.Is(err, blob.ErrNotSupported) {
@@ -170,6 +176,14 @@ func TestGenETag(t *testing.T) {
 
 func writeServiceAccount(t *testing.T) (path, email string) {
 	t.Helper()
+	path, email, _ = writeServiceAccountKey(t)
+	return path, email
+}
+
+// writeServiceAccountKey writes a service-account key file and also returns
+// the generated key (to verify signatures).
+func writeServiceAccountKey(t *testing.T) (path, email string, key *rsa.PrivateKey) {
+	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -193,7 +207,7 @@ func writeServiceAccount(t *testing.T) (path, email string) {
 	if err := os.WriteFile(path, b, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return path, email
+	return path, email, key
 }
 
 // With a service-account key, URLs are V4-signed locally; the signed
@@ -206,11 +220,14 @@ func TestPresignWithServiceAccountKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	req, err := s.PresignPut(ctx, "sites/foo/app.js", "", 2*time.Hour)
+	req, err := s.PresignPut(ctx, "sites/foo/app.js", blob.PresignPutOptions{Size: 1234}, 2*time.Hour)
 	if err != nil {
 		t.Fatalf("PresignPut: %v", err)
 	}
-	if req.Method != http.MethodPut || req.Headers["Content-Type"] != "text/javascript; charset=utf-8" {
+	if req.Method != http.MethodPut || !maps.Equal(req.Headers, map[string]string{
+		"Content-Type":                "text/javascript; charset=utf-8",
+		"x-goog-content-length-range": "1234,1234",
+	}) {
 		t.Errorf("PresignPut = %+v", req)
 	}
 	u, err := url.Parse(req.URL)
@@ -226,8 +243,20 @@ func TestPresignWithServiceAccountKey(t *testing.T) {
 	}
 	if q.Get("X-Goog-Algorithm") != "GOOG4-RSA-SHA256" ||
 		!strings.HasPrefix(q.Get("X-Goog-Credential"), email+"/") ||
-		!strings.Contains(q.Get("X-Goog-SignedHeaders"), "content-type") {
+		q.Get("X-Goog-SignedHeaders") != "content-type;host;x-goog-content-length-range" {
 		t.Errorf("signed URL query = %v", q)
+	}
+	// Without a size, any body size is accepted.
+	unsized, err := s.PresignPut(ctx, "sites/foo/app.js", blob.PresignPutOptions{Size: -1}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uu, _ := url.Parse(unsized.URL)
+	if sh := uu.Query().Get("X-Goog-SignedHeaders"); sh != "content-type;host" || len(unsized.Headers) != 1 {
+		t.Errorf("unsized PresignPut: signed %q, headers %v", sh, unsized.Headers)
+	}
+	if _, err := s.PresignPut(ctx, "a.txt", blob.PresignPutOptions{Size: -2}, time.Minute); err == nil || errors.Is(err, blob.ErrNotSupported) {
+		t.Errorf("PresignPut(negative size) err = %v", err)
 	}
 	if d := time.Until(req.ExpiresAt); d < 119*time.Minute || d > 121*time.Minute {
 		t.Errorf("ExpiresAt in %v", d)
@@ -240,7 +269,7 @@ func TestPresignWithServiceAccountKey(t *testing.T) {
 	if exp := gu.Query().Get("X-Goog-Expires"); get.Method != http.MethodGet || (exp != "900" && exp != "899") {
 		t.Errorf("PresignGet = %+v", get)
 	}
-	if _, err := s.PresignPut(ctx, "../x", "", time.Minute); !errors.Is(err, blob.ErrInvalidKey) {
+	if _, err := s.PresignPut(ctx, "../x", blob.PresignPutOptions{Size: -1}, time.Minute); !errors.Is(err, blob.ErrInvalidKey) {
 		t.Errorf("PresignPut(invalid) err = %v", err)
 	}
 }
@@ -285,9 +314,95 @@ func TestPingFallsBackToListing(t *testing.T) {
 	}
 }
 
-// replay sends a presigned request to the fake server instead of
-// storage.googleapis.com, keeping the signed Host.
-func replay(t *testing.T, f *fakeGCS, pr *blob.PresignedRequest, body string) (int, string) {
+// signedGCS fronts fake-gcs-server (which ignores authentication) with what
+// GCS checks on V4 signed URLs: the GOOG4-RSA-SHA256 signature over the
+// signed headers as received (verified with the service account's public
+// key), the expiry, and x-goog-content-length-range against the body size.
+func signedGCS(t *testing.T, f *fakeGCS, pub *rsa.PublicKey) string {
+	t.Helper()
+	target, err := url.Parse(f.srv.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := verifyGOOG4(r, pub, time.Now()); err != nil {
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprintf(w, "<Error><Code>SignatureDoesNotMatch</Code><Message>%s</Message></Error>", err)
+			return
+		}
+		if rng := r.Header.Get("X-Goog-Content-Length-Range"); rng != "" {
+			lo, hi, _ := strings.Cut(rng, ",")
+			minLen, err1 := strconv.ParseInt(lo, 10, 64)
+			maxLen, err2 := strconv.ParseInt(hi, 10, 64)
+			if err1 != nil || err2 != nil || r.ContentLength < minLen || r.ContentLength > maxLen {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprintf(w, "<Error><Code>EntityTooLarge</Code><Message>Content-Length %d outside %s</Message></Error>", r.ContentLength, rng)
+				return
+			}
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	return ts.URL
+}
+
+// verifyGOOG4 recomputes a V4 signed URL's canonical request from the
+// request as received, independently of the storage library.
+func verifyGOOG4(r *http.Request, pub *rsa.PublicKey, now time.Time) error {
+	q := r.URL.Query()
+	if q.Get("X-Goog-Algorithm") != "GOOG4-RSA-SHA256" {
+		return fmt.Errorf("unsupported algorithm %q", q.Get("X-Goog-Algorithm"))
+	}
+	cred := strings.Split(q.Get("X-Goog-Credential"), "/")
+	if len(cred) != 5 || cred[4] != "goog4_request" {
+		return fmt.Errorf("malformed credential %q", q.Get("X-Goog-Credential"))
+	}
+	date := q.Get("X-Goog-Date")
+	signedAt, err := time.Parse("20060102T150405Z", date)
+	if err != nil {
+		return err
+	}
+	expires, err := strconv.Atoi(q.Get("X-Goog-Expires"))
+	if err != nil || now.After(signedAt.Add(time.Duration(expires)*time.Second)) {
+		return errors.New("expired")
+	}
+	signedHeaders := q.Get("X-Goog-SignedHeaders")
+	var headers []string
+	for _, name := range strings.Split(signedHeaders, ";") {
+		v := strings.Join(r.Header.Values(name), ",")
+		if name == "host" {
+			v = r.Host
+		}
+		headers = append(headers, name+":"+strings.Join(strings.Fields(v), " "))
+	}
+	sig, err := hex.DecodeString(q.Get("X-Goog-Signature"))
+	if err != nil {
+		return err
+	}
+	q.Del("X-Goog-Signature")
+	path, _, _ := strings.Cut(r.RequestURI, "?")
+	creq := strings.Join([]string{
+		r.Method, path, strings.ReplaceAll(q.Encode(), "+", "%20"),
+		strings.Join(headers, "\n") + "\n", signedHeaders, "UNSIGNED-PAYLOAD",
+	}, "\n")
+	creqSum := sha256.Sum256([]byte(creq))
+	sts := "GOOG4-RSA-SHA256\n" + date + "\n" + strings.Join(cred[1:], "/") + "\n" + hex.EncodeToString(creqSum[:])
+	stsSum := sha256.Sum256([]byte(sts))
+	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, stsSum[:], sig); err != nil {
+		return errors.New("the request signature does not match the signed headers")
+	}
+	return nil
+}
+
+// replay sends a presigned request to server (the fake, or signedGCS in
+// front of it) instead of storage.googleapis.com, keeping the signed Host.
+func replay(t *testing.T, server string, pr *blob.PresignedRequest, body string) (int, string) {
+	t.Helper()
+	return replayWith(t, server, pr, body, nil)
+}
+
+func replayWith(t *testing.T, server string, pr *blob.PresignedRequest, body string, mutate func(*http.Request)) (int, string) {
 	t.Helper()
 	u, err := url.Parse(pr.URL)
 	if err != nil {
@@ -296,7 +411,7 @@ func replay(t *testing.T, f *fakeGCS, pr *blob.PresignedRequest, body string) (i
 	if u.Scheme != "https" || u.Host != "storage.googleapis.com" {
 		t.Fatalf("signed URL %s does not target storage.googleapis.com over https", pr.URL)
 	}
-	fake, _ := url.Parse(f.srv.URL())
+	fake, _ := url.Parse(server)
 	u.Scheme, u.Host = fake.Scheme, fake.Host
 	var rd io.Reader
 	if body != "" {
@@ -310,6 +425,9 @@ func replay(t *testing.T, f *fakeGCS, pr *blob.PresignedRequest, body string) (i
 	for k, v := range pr.Headers {
 		req.Header.Set(k, v)
 	}
+	if mutate != nil {
+		mutate(req)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -320,41 +438,72 @@ func replay(t *testing.T, f *fakeGCS, pr *blob.PresignedRequest, body string) (i
 }
 
 // Signed URLs address the prefixed object (with escaping) and carry the
-// signed Content-Type; replayed against fake-gcs-server (which does not
-// verify signatures) they store and return the object.
+// signed Content-Type and size range; replayed against fake-gcs-server
+// behind a GOOG4 verifier they store and return the object, and bodies of
+// another size or altered signed headers are rejected.
 func TestPresignRoundTripWithServiceAccount(t *testing.T) {
 	f := newFake(t)
 	f.srv.CreateBucketWithOpts(fakestorage.CreateBucketOpts{Name: "acme"})
-	path, _ := writeServiceAccount(t)
+	path, _, key := writeServiceAccountKey(t)
+	gcs := signedGCS(t, f, &key.PublicKey)
 	ctx := context.Background()
 	s, err := New(ctx, config.GCSConfig{Bucket: "acme", Prefix: "pfx", CredentialsFile: path})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	const key = "presign/up load ü+%.txt"
-	put, err := s.PresignPut(ctx, key, "text/plain; charset=utf-8", time.Hour)
+	const name = "presign/up load ü+%.txt"
+	put, err := s.PresignPut(ctx, name, blob.PresignPutOptions{ContentType: "text/plain; charset=utf-8", Size: 12}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if code, body := replay(t, f, put, "signed bytes"); code != http.StatusOK {
+	for _, tc := range []struct {
+		what   string
+		body   string
+		mutate func(*http.Request)
+		status int
+	}{
+		{"larger body", "signed bytes!", nil, http.StatusBadRequest},
+		{"smaller body", "signed", nil, http.StatusBadRequest},
+		{"widened range", "signed bytes and more", func(r *http.Request) { r.Header.Set("X-Goog-Content-Length-Range", "0,100") }, http.StatusForbidden},
+		{"range dropped", "signed bytes and more", func(r *http.Request) { r.Header.Del("X-Goog-Content-Length-Range") }, http.StatusForbidden},
+		{"other content type", "signed bytes", func(r *http.Request) { r.Header.Set("Content-Type", "text/html") }, http.StatusForbidden},
+	} {
+		if code, body := replayWith(t, gcs, put, tc.body, tc.mutate); code != tc.status {
+			t.Errorf("%s: status %d (%s), want %d", tc.what, code, body, tc.status)
+		}
+	}
+	if _, err := f.srv.GetObject("acme", "pfx/"+name); err == nil {
+		t.Fatal("a rejected upload stored the object")
+	}
+	if code, body := replay(t, gcs, put, "signed bytes"); code != http.StatusOK {
 		t.Fatalf("signed PUT status %d: %s", code, body)
 	}
-	obj, err := f.srv.GetObject("acme", "pfx/"+key)
+	empty, err := s.PresignPut(ctx, "presign/empty", blob.PresignPutOptions{Size: 0}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty.Headers["x-goog-content-length-range"] != "0,0" {
+		t.Errorf("empty upload headers = %v", empty.Headers)
+	}
+	if code, _ := replay(t, gcs, empty, "x"); code != http.StatusBadRequest {
+		t.Errorf("body for a 0-byte upload: status %d", code)
+	}
+	obj, err := f.srv.GetObject("acme", "pfx/"+name)
 	if err != nil {
 		t.Fatalf("object not stored under the prefixed name: %v", err)
 	}
 	if string(obj.Content) != "signed bytes" || obj.ContentType != "text/plain; charset=utf-8" {
 		t.Errorf("stored object = %q (%s)", obj.Content, obj.ContentType)
 	}
-	get, err := s.PresignGet(ctx, key, time.Hour)
+	get, err := s.PresignGet(ctx, name, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(get.Headers) != 0 {
 		t.Errorf("PresignGet headers = %v, want none", get.Headers)
 	}
-	if code, body := replay(t, f, get, ""); code != http.StatusOK || body != "signed bytes" {
+	if code, body := replay(t, gcs, get, ""); code != http.StatusOK || body != "signed bytes" {
 		t.Errorf("signed GET = %d %q", code, body)
 	}
 }

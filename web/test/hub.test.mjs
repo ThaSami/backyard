@@ -551,3 +551,164 @@ test("deleteSite", async () => {
     credentials: "same-origin",
   });
 });
+
+// --- presigned uploads (XMLHttpRequest PUT) ---------------------------------
+
+/** A scriptable XMLHttpRequest double; the test plays the storage service. */
+function fakeXHR() {
+  const made = [];
+  class XHR {
+    constructor() {
+      this.headers = [];
+      this.upload = {};
+      this.status = 0;
+      this.responseText = "";
+      this.responseHeaders = {};
+      made.push(this);
+    }
+    open(method, url) {
+      this.method = method;
+      this.url = url;
+    }
+    setRequestHeader(k, v) {
+      if (/^content-length$/i.test(k)) throw new Error("Refused to set unsafe header");
+      this.headers.push([k, v]);
+    }
+    getResponseHeader(k) {
+      return this.responseHeaders[k.toLowerCase()] ?? null;
+    }
+    send(body) {
+      this.body = body;
+    }
+    abort() {
+      this.aborted = true;
+    }
+    // --- storage side
+    respond(status, text = "", headers = {}) {
+      this.status = status;
+      this.responseText = text;
+      this.responseHeaders = headers;
+      this.upload.onprogress && this.upload.onprogress({ loaded: this.body.size });
+      this.onload && this.onload();
+    }
+    fail() {
+      this.onerror && this.onerror();
+    }
+  }
+  return { XHR, made };
+}
+
+test("uploads PUT exactly the presigned headers and the raw bytes (no browser-added Content-Type)", async () => {
+  const { XHR, made } = fakeXHR();
+  const upload = hub.createUploader({ XMLHttpRequest: XHR, origin: "https://backyard.acme.com" });
+  const f = new File(["<h1>hi</h1>"], "index.html", { type: "text/html" });
+  const cases = [
+    // Azure SAS: x-ms-blob-type is required and must reach the service verbatim.
+    { "x-ms-blob-type": "BlockBlob", "Content-Type": "text/html; charset=utf-8" },
+    // S3 SigV4: signed x-amz-* headers (values untouched), Host/Content-Length left to the browser.
+    { "Content-Type": "text/html", "X-Amz-Checksum-Sha256": "q1w2e3==", "x-amz-meta-sha256": "ab12", Host: "bucket.s3.amazonaws.com", "Content-Length": "11" },
+    // GCS V4 and the gateway's own upload endpoint.
+    { "Content-Type": "text/html" },
+    {},
+  ];
+  for (const headers of cases) {
+    const progress = [];
+    const p = upload({ url: "https://storage.example.com/b/index.html?sig=1", method: "PUT", headers, file: f, onProgress: (n) => progress.push(n) });
+    const x = made[made.length - 1];
+    assert.equal(x.method, "PUT");
+    assert.equal(x.url, "https://storage.example.com/b/index.html?sig=1");
+    const expected = Object.entries(headers).filter(([k]) => !/^(host|content-length)$/i.test(k));
+    assert.deepEqual(x.headers, expected, JSON.stringify(headers));
+    assert.equal(x.withCredentials, undefined, "no cookies to storage");
+    assert.equal(x.body.type, "", "a type-less body: the browser adds no Content-Type of its own");
+    assert.equal(await x.body.text(), "<h1>hi</h1>");
+    x.respond(201);
+    await p;
+    assert.deepEqual(progress, [11]);
+  }
+  assert.deepEqual(plain(hub.uploadHeaders({ "content-type": "a", "Content-Type": "b", "x-n": 5, "x-arr": ["a", "b"], "x-null": null, "bad name": "x", "Sec-Fetch-Mode": "cors" })), [
+    ["Content-Type", "b"],
+    ["x-n", "5"],
+    ["x-arr", "a,b"],
+  ]);
+});
+
+test("a presigned PUT blocked by CORS (no HTTP response) explains the bucket CORS fix", async () => {
+  const { XHR, made } = fakeXHR();
+  const upload = hub.createUploader({ XMLHttpRequest: XHR, origin: "https://backyard.acme.com" });
+  const f = new File(["x"], "app.js");
+  let p = upload({ url: "https://acme-sites.s3.eu-west-1.amazonaws.com/sites/x/app.js?X-Amz-Signature=1", method: "PUT", headers: { "Content-Type": "text/javascript", "x-amz-checksum-sha256": "abc" }, file: f });
+  made[made.length - 1].fail();
+  let err = await p.catch((e) => e);
+  assert.equal(err.name, "HubError");
+  assert.equal(err.code, "cors");
+  assert.equal(err.retryable, true, "a real network blip is retried");
+  assert.match(err.message, /^Uploading app\.js to acme-sites\.s3\.eu-west-1\.amazonaws\.com failed: network or CORS error\./);
+  assert.match(err.message, /bucket CORS must allow PUT from https:\/\/backyard\.acme\.com with the headers Content-Type, x-amz-checksum-sha256/);
+
+  // Some browsers report a blocked response as a load with status 0.
+  p = upload({ url: "https://acct.blob.core.windows.net/c/app.js?sv=1", method: "PUT", headers: { "x-ms-blob-type": "BlockBlob" }, file: f });
+  made[made.length - 1].respond(0);
+  err = await p.catch((e) => e);
+  assert.equal(err.code, "cors");
+  assert.match(err.message, /bucket CORS must allow PUT from https:\/\/backyard\.acme\.com with the headers x-ms-blob-type/);
+
+  // Same-origin uploads (the gateway's own endpoint) are plain network errors.
+  p = upload({ url: "/__backyard/api/deploy/uploads/tok", method: "PUT", headers: {}, file: f });
+  made[made.length - 1].fail();
+  err = await p.catch((e) => e);
+  assert.equal(err.code, "network_error");
+  assert.equal(err.message, "Network error while uploading app.js");
+});
+
+test("upload HTTP errors carry the storage service's reason (JSON or S3/GCS/Azure XML)", async () => {
+  const { XHR, made } = fakeXHR();
+  const upload = hub.createUploader({ XMLHttpRequest: XHR, origin: "https://backyard.acme.com" });
+  const f = new File(["x"], "a.css");
+  const run = async (status, text, headers) => {
+    const p = upload({ url: "https://s.example/a.css", method: "PUT", headers: {}, file: f });
+    made[made.length - 1].respond(status, text, headers);
+    return p.catch((e) => e);
+  };
+  let err = await run(403, '<?xml version="1.0"?><Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>');
+  assert.equal(err.message, "Uploading a.css failed: Request has expired (AccessDenied) (HTTP 403)");
+  assert.equal(err.status, 403);
+  err = await run(400, JSON.stringify({ error: { code: "bad_request", message: "size or sha256 mismatch" } }));
+  assert.equal(err.message, "Uploading a.css failed: size or sha256 mismatch (HTTP 400)");
+  err = await run(503, "", { "retry-after": "7" });
+  assert.equal(err.message, "Uploading a.css failed (HTTP 503)");
+  assert.equal(err.retryAfter, 7);
+  assert.equal(hub.uploadErrorDetail("<Error><Code>AuthenticationFailed</Code></Error>"), "AuthenticationFailed");
+});
+
+test("deploySite + createUploader: a CORS failure surfaces after the retries", async () => {
+  const { XHR, made } = fakeXHR();
+  const upload = hub.createUploader({ XMLHttpRequest: XHR, origin: "https://backyard.acme.com" });
+  const gw = fakeGateway();
+  const files = await hashed([["index.html", "x"]]);
+  const fetchPresigned = async (url, init) => {
+    const res = await gw.fetch(url, init);
+    if (!/\/deploys$/.test(url)) return res;
+    const plan = await res.json();
+    for (const u of plan.uploads) u.url = "https://bucket.example.com/" + u.path;
+    return Response.json(plan);
+  };
+  const p = hub.deploySite({ gateway: "/g", site: "x", files, fetch: fetchPresigned, upload, retryDelay: 1 });
+  for (let i = 0; i < 3; i++) {
+    while (made.length <= i) await new Promise((r) => setTimeout(r, 1));
+    made[i].fail();
+  }
+  const err = await p.catch((e) => e);
+  assert.equal(made.length, 3, "retried");
+  assert.equal(err.code, "cors");
+  assert.match(err.message, /bucket CORS must allow PUT from https:\/\/backyard\.acme\.com/);
+});
+
+test("expired sessions: login responses are recognised and the login URL returns to the page", () => {
+  const h = (ct) => ({ get: (k) => (k.toLowerCase() === "content-type" ? ct : null) });
+  assert.equal(hub.isLoginResponse({ type: "opaqueredirect", status: 0, ok: false, headers: h("") }), true);
+  assert.equal(hub.isLoginResponse({ type: "basic", status: 200, ok: true, headers: h("text/html; charset=utf-8") }), true);
+  assert.equal(hub.isLoginResponse({ type: "basic", status: 200, ok: true, headers: h("application/json") }), false);
+  assert.equal(hub.isLoginResponse({ type: "basic", status: 401, ok: false, headers: h("application/json") }), false, "JSON 401s carry login_url");
+  assert.equal(hub.loginURLFor("https://backyard.acme.com/?q=a b#x"), "/__backyard/auth/login?rd=https%3A%2F%2Fbackyard.acme.com%2F%3Fq%3Da%20b%23x");
+});

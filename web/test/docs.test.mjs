@@ -3,7 +3,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { loadHubScript, plain } from "./helpers.mjs";
 
-const { renderMarkdown, slugify, safeURL, rewriteDocLink } = loadHubScript("docs.js").BackyardDocs;
+const docs = loadHubScript("docs.js").BackyardDocs;
+const { renderMarkdown, slugify, safeURL, rewriteDocLink } = docs;
 const html = (md, opts) => renderMarkdown(md, opts).html.trim();
 
 test("headings get unique anchors, a TOC entry and the h1 is the title", () => {
@@ -207,4 +208,36 @@ test("CRLF input, tabs and empty documents", () => {
   assert.equal(html("# T\r\n\r\n-\ta\r\n"), '<h1 id="t">T</h1>\n<ul>\n<li>a</li>\n</ul>');
   assert.equal(html(""), "");
   assert.equal(html(null), "");
+});
+
+test("expired sessions: login responses, the login URL and the re-login guard", () => {
+  const { isLoginResponse, loginURL, shouldRelogin } = docs;
+  const h = (ct) => ({ get: (k) => (k.toLowerCase() === "content-type" ? ct : null) });
+  // fetch(…, { redirect: "manual" }) of a redirect to the login page / IdP.
+  assert.equal(isLoginResponse({ type: "opaqueredirect", status: 0, ok: false, headers: h(null) }), true);
+  assert.equal(isLoginResponse({ type: "basic", status: 401, ok: false, headers: h("text/html") }), true);
+  // A proxy serving its HTML login page in place of the markdown.
+  assert.equal(isLoginResponse({ type: "basic", status: 200, ok: true, headers: h("text/html; charset=utf-8") }), true);
+  assert.equal(isLoginResponse({ type: "basic", status: 200, ok: true, redirected: true, url: "https://hub.test/__backyard/auth/login?rd=x", headers: h("text/markdown") }), true);
+  assert.equal(isLoginResponse({ type: "basic", status: 200, ok: true, headers: h("text/markdown; charset=utf-8") }), false);
+  assert.equal(isLoginResponse({ type: "basic", status: 404, ok: false, headers: h("text/html") }), false);
+  assert.equal(isLoginResponse(null), false);
+
+  assert.equal(loginURL("https://backyard.acme.com/docs?doc=api#files"), "/__backyard/auth/login?rd=https%3A%2F%2Fbackyard.acme.com%2Fdocs%3Fdoc%3Dapi%23files");
+
+  const mem = new Map();
+  const storage = { getItem: (k) => mem.get(k) ?? null, setItem: (k, v) => mem.set(k, String(v)) };
+  assert.equal(shouldRelogin(storage, 1_000_000), true, "first time: go");
+  assert.equal(shouldRelogin(storage, 1_010_000), false, "again within 30 s: a loop, stop");
+  assert.equal(shouldRelogin(storage, 1_031_000), true, "later: go again");
+  assert.equal(shouldRelogin(null, 5), true, "no storage: go");
+  const broken = {
+    getItem() {
+      throw new Error("SecurityError");
+    },
+    setItem() {
+      throw new Error("SecurityError");
+    },
+  };
+  assert.equal(shouldRelogin(broken, 5), true);
 });

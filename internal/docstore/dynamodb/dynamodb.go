@@ -123,7 +123,7 @@ func Open(ctx context.Context, cfg config.DynamoDBConfig) (*Store, error) {
 		if awsCfg.Region == "" {
 			awsCfg.Region = "us-east-1"
 		}
-		var cerr error = errors.New("no credentials provider")
+		cerr := errors.New("no credentials provider")
 		if awsCfg.Credentials != nil {
 			cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			_, cerr = awsCfg.Credentials.Retrieve(cctx)

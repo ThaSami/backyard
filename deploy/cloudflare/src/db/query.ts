@@ -21,6 +21,7 @@
  */
 import { HttpError } from "../http";
 import { parseRFC3339Micros } from "./time";
+import { cleanOperand } from "./values";
 
 export const COLLECTION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 export const SYSTEM_COLLECTION_RE = /^_[A-Za-z0-9][A-Za-z0-9_-]{0,62}$/;
@@ -100,8 +101,9 @@ export function fieldError(field: unknown): string {
   return "";
 }
 
+/** JSON scalars (non-finite numbers pass here and are rejected by cleanOperand, as in Go). */
 function isScalar(v: unknown): boolean {
-  return v === null || typeof v === "string" || typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v));
+  return v === null || typeof v === "string" || typeof v === "boolean" || typeof v === "number";
 }
 
 function isPlain(v: unknown): v is Record<string, unknown> {
@@ -161,7 +163,12 @@ export function decodeQueryBody(body: unknown): RawQuery {
   return out;
 }
 
-/** Validates q and applies defaults (limit, default order, id tiebreaker). */
+/**
+ * Validates q and applies defaults (limit, default order, id tiebreaker), like
+ * docstore.Query.Normalize followed by PrepareQuery: filter operands are
+ * canonicalized like stored data (cleanOperand), so a string with U+0000 or a
+ * non-finite number is a 400 rather than a filter that silently never matches.
+ */
 export function normalizeQuery(q: RawQuery, maxList: number): Query {
   if (maxList <= 0) maxList = 1000;
   const where: Filter[] = [];
@@ -197,6 +204,9 @@ export function normalizeQuery(q: RawQuery, maxList: number): Query {
   const offset = q.offset ?? 0;
   if (offset < 0) throw invalid("offset must be >= 0");
   if (offset > 100_000) throw invalid("offset too large");
+  for (const f of where) {
+    f.value = Array.isArray(f.value) ? f.value.map((v) => cleanOperand(f.field, v)) : cleanOperand(f.field, f.value);
+  }
   return { where, orderBy, limit, offset };
 }
 

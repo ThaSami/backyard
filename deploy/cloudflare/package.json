@@ -19,7 +19,7 @@
     "test:scripts": "node --test test/scripts/*.test.mjs",
     "pretypecheck": "npm run sync",
     "typecheck": "tsc --noEmit",
-    "build": "npm run sync && wrangler deploy --dry-run --env= --outdir .wrangler/dist",
+    "build": "node scripts/sync-assets.mjs --strict && wrangler deploy --dry-run --env= --outdir .wrangler/dist",
     "predeploy": "node scripts/sync-assets.mjs --strict",
     "deploy": "wrangler deploy --env=",
     "deploy:ci": "node scripts/sync-assets.mjs --strict && wrangler deploy --env=",

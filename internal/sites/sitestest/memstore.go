@@ -1,6 +1,8 @@
 // Package sitestest provides test helpers for code built on the sites
 // registry and the deploy gateway: an in-memory blob.Store with optional
-// presigned uploads served by an http.Handler.
+// presigned uploads served by an http.Handler. Like S3, the handler rejects
+// a body whose size or SHA-256 differs from the PresignPutOptions (unless
+// SetLaxPresign makes it accept anything, like Azure SAS URLs).
 //
 // It is meant for tests only; production code never imports it.
 package sitestest
@@ -32,6 +34,8 @@ type memObject struct {
 type presignGrant struct {
 	key         string
 	contentType string
+	size        int64  // -1 = any
+	sha256      string // lowercase hex, "" = any
 	expires     time.Time
 }
 
@@ -41,6 +45,7 @@ type MemStore struct {
 	objs    map[string]*memObject
 	grants  map[string]presignGrant
 	presign string // base URL for presigned PUTs ("" = unsupported)
+	lax     bool   // presigned PUTs accept any size and content
 	puts    int
 	gets    int
 	now     func() time.Time
@@ -72,8 +77,20 @@ func (s *MemStore) EnablePresign(baseURL string) {
 	s.presign = strings.TrimSuffix(baseURL, "/")
 }
 
+// SetLaxPresign makes presigned URLs accept a body of any size and content
+// (like Azure SAS URLs, which cannot bind them); by default PresignHandler
+// enforces the declared size and SHA-256 (like S3 with flexible checksums).
+func (s *MemStore) SetLaxPresign(lax bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lax = lax
+}
+
 // PresignHandler serves PUTs to URLs returned by PresignPut, mimicking a
-// cloud storage endpoint: the signed Content-Type must be sent verbatim.
+// cloud storage endpoint: the signed Content-Type must be sent verbatim, a
+// body of another size than the declared one is rejected with 403 (as S3
+// does for a signed Content-Length) and one with another SHA-256 with 400
+// (S3's BadDigest), unless SetLaxPresign(true) was called.
 func (s *MemStore) PresignHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
@@ -83,6 +100,7 @@ func (s *MemStore) PresignHandler() http.Handler {
 		tok := r.URL.Query().Get("sig")
 		s.mu.Lock()
 		g, ok := s.grants[tok]
+		lax := s.lax
 		s.mu.Unlock()
 		if !ok || s.now().After(g.expires) {
 			http.Error(w, "invalid signature", http.StatusForbidden)
@@ -96,7 +114,20 @@ func (s *MemStore) PresignHandler() http.Handler {
 			http.Error(w, "content type does not match signature", http.StatusForbidden)
 			return
 		}
-		if _, err := s.Put(r.Context(), g.key, r.Body, r.ContentLength, g.contentType); err != nil {
+		if !lax && g.size >= 0 && r.ContentLength != g.size {
+			http.Error(w, "SignatureDoesNotMatch: Content-Length does not match the signed size", http.StatusForbidden)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if sum := sha256.Sum256(body); !lax && g.sha256 != "" && hex.EncodeToString(sum[:]) != g.sha256 {
+			http.Error(w, "BadDigest: the SHA256 you specified did not match the calculated checksum", http.StatusBadRequest)
+			return
+		}
+		if _, err := s.Put(r.Context(), g.key, bytes.NewReader(body), int64(len(body)), g.contentType); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -305,16 +336,25 @@ func (s *MemStore) List(ctx context.Context, prefix, delimiter string) (*blob.Li
 }
 
 // PresignPut implements blob.Store. It returns ErrNotSupported unless
-// EnablePresign was called.
-func (s *MemStore) PresignPut(ctx context.Context, key, contentType string, ttl time.Duration) (*blob.PresignedRequest, error) {
+// EnablePresign was called. The URL accepts exactly opts.Size bytes (any
+// size when -1) whose SHA-256 is opts.SHA256 (any content when "").
+func (s *MemStore) PresignPut(ctx context.Context, key string, opts blob.PresignPutOptions, ttl time.Duration) (*blob.PresignedRequest, error) {
 	if err := checkKey(key); err != nil {
 		return nil, err
+	}
+	if opts.Size < -1 {
+		return nil, fmt.Errorf("memstore: invalid upload size %d", opts.Size)
+	}
+	sha := strings.ToLower(opts.SHA256)
+	if sum, err := hex.DecodeString(sha); err != nil || (sha != "" && len(sum) != sha256.Size) {
+		return nil, fmt.Errorf("memstore: invalid upload sha256 %q", opts.SHA256)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.presign == "" {
 		return nil, blob.ErrNotSupported
 	}
+	contentType := opts.ContentType
 	if contentType == "" {
 		contentType = blob.DetectContentType(key, nil)
 	}
@@ -322,7 +362,7 @@ func (s *MemStore) PresignPut(ctx context.Context, key, contentType string, ttl 
 	_, _ = rand.Read(b)
 	tok := hex.EncodeToString(b)
 	exp := s.now().Add(ttl)
-	s.grants[tok] = presignGrant{key: key, contentType: contentType, expires: exp}
+	s.grants[tok] = presignGrant{key: key, contentType: contentType, size: opts.Size, sha256: sha, expires: exp}
 	return &blob.PresignedRequest{
 		Method:    http.MethodPut,
 		URL:       s.presign + "/" + url.PathEscape(key) + "?sig=" + tok,

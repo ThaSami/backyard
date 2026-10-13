@@ -5,10 +5,10 @@
   --ink: #1d1c1a;
   --ink-2: #5f5d58;
   --line: #e4e2dc;
-  --accent: #2a78d6;
+  --accent: #2266c8;
   --thumb: #ecebe6;
-  --good: #0ca30c;
-  --danger: #d03b3b;
+  --good: #087f08;
+  --danger: #bf3434;
   font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
@@ -21,6 +21,8 @@
     --line: #2e2d2a;
     --accent: #4b93ea;
     --thumb: #262624;
+    --good: #0ca30c;
+    --danger: #e5605f;
   }
 }
 

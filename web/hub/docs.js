@@ -456,7 +456,59 @@
     return "/docs?doc=" + encodeURIComponent(name) + (m[2] || "");
   }
 
-  globalThis.BackyardDocs = { renderMarkdown, slugify, safeURL, rewriteDocLink };
+  // ===========================================================================
+  // Expired sessions
+
+  /** The hub's login entry point (SPEC §8); rd brings the browser back. */
+  const LOGIN_PATH = "/__backyard/auth/login";
+
+  /** The login URL that returns to href after signing in. */
+  function loginURL(href) {
+    return LOGIN_PATH + "?rd=" + encodeURIComponent(String(href));
+  }
+
+  /**
+   * Whether a fetch of a document was answered by a login flow instead of the
+   * document: the server or an identity-aware proxy redirects (an
+   * "opaqueredirect" with redirect: "manual"; followed, it would end at the
+   * IdP and fail as a CORS error), answers 401, or serves its HTML login page
+   * in place of the markdown.
+   */
+  function isLoginResponse(res) {
+    if (!res) return false;
+    if (res.type === "opaqueredirect" || res.status === 401) return true;
+    if (res.redirected && /\/__backyard\/auth\//.test(String(res.url || ""))) return true;
+    const ct = String((res.headers && res.headers.get && res.headers.get("Content-Type")) || "").toLowerCase();
+    return !!res.ok && ct.indexOf("text/html") >= 0;
+  }
+
+  /** Re-login attempts closer together than this are not repeated (no redirect loops). */
+  const RELOGIN_WINDOW_MS = 30000;
+  const RELOGIN_KEY = "backyard.reloginAt";
+
+  /**
+   * Decides whether to send the browser to the login page now: at most once
+   * per RELOGIN_WINDOW_MS (tracked in storage, normally sessionStorage), so a
+   * login that does not fix the session cannot loop. Returns true when the
+   * caller should navigate.
+   */
+  function shouldRelogin(storage, nowMs) {
+    let last = 0;
+    try {
+      last = Number(storage && storage.getItem(RELOGIN_KEY)) || 0;
+    } catch (_) {
+      last = 0;
+    }
+    if (last && nowMs - last >= 0 && nowMs - last < RELOGIN_WINDOW_MS) return false;
+    try {
+      if (storage) storage.setItem(RELOGIN_KEY, String(nowMs));
+    } catch (_) {
+      /* storage unavailable: still redirect once */
+    }
+    return true;
+  }
+
+  globalThis.BackyardDocs = { renderMarkdown, slugify, safeURL, rewriteDocLink, loginURL, isLoginResponse, shouldRelogin };
 
   if (typeof document === "undefined" || !document.body || document.body.id !== "docs-page") return;
 
@@ -486,6 +538,10 @@
   function enhanceCode(root) {
     for (const block of root.querySelectorAll(".code-block")) {
       const code = block.querySelector("code");
+      // Long lines scroll horizontally: keyboard users must be able to focus
+      // the block to scroll it (WCAG 2.1.1).
+      const pre = block.querySelector("pre");
+      if (pre) pre.tabIndex = 0;
       const lang = code && code.dataset.lang;
       if (lang) {
         const label = document.createElement("span");
@@ -563,12 +619,37 @@
     return true;
   }
 
-  function status(text) {
+  function status(text, link) {
     main.textContent = "";
     const p = document.createElement("p");
     p.className = "docs-status";
     p.textContent = text;
+    if (link) {
+      const a = document.createElement("a");
+      a.href = link.href;
+      a.textContent = link.text;
+      p.append(" ", a);
+    }
     main.append(p);
+  }
+
+  function sessionStore() {
+    try {
+      return window.sessionStorage;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /** The session expired: sign in again and come back to this page. */
+  function relogin() {
+    const target = loginURL(location.href);
+    if (shouldRelogin(sessionStore(), Date.now())) {
+      status("Your session has expired. Signing you in again…");
+      location.assign(target);
+      return;
+    }
+    status("Your session has expired.", { href: target, text: "Sign in again" });
   }
 
   async function show(doc, fromNavigation) {
@@ -577,7 +658,17 @@
     status("Loading…");
     let text;
     try {
-      const res = await fetch("/docs/" + encodeURIComponent(doc) + ".md", { credentials: "same-origin", headers: { Accept: "text/markdown, text/plain" } });
+      // redirect: "manual": a login redirect must not be followed by fetch
+      // (it would end at the IdP as an opaque CORS failure).
+      const res = await fetch("/docs/" + encodeURIComponent(doc) + ".md", {
+        credentials: "same-origin",
+        redirect: "manual",
+        headers: { Accept: "text/markdown, text/plain" },
+      });
+      if (isLoginResponse(res)) {
+        if (seq === loadSeq) relogin();
+        return;
+      }
       if (res.status === 404) throw new Error("This document does not exist.");
       if (!res.ok) throw new Error("Could not load the document (HTTP " + res.status + ").");
       text = await res.text();
@@ -617,7 +708,9 @@
 
   if (window.matchMedia && window.matchMedia("(max-width: 860px)").matches) document.getElementById("docs-nav-details").open = false;
 
-  fetch("/__backyard/api/info", { credentials: "same-origin", headers: { Accept: "application/json" } })
+  // Cosmetic (the server name): never follow a login redirect from here (it
+  // would start a login flow in the background); show() handles expiry.
+  fetch("/__backyard/api/info", { credentials: "same-origin", redirect: "manual", headers: { Accept: "application/json" } })
     .then((r) => (r.ok ? r.json() : null))
     .then((info) => {
       if (!info || !info.name) return;

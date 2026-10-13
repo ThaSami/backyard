@@ -9,7 +9,7 @@
  */
 import { getConfig } from "./config";
 import type { Env } from "./env";
-import { HttpError, errorResponse, withSecurityHeaders } from "./http";
+import { HttpError, errorResponse, requestID, withSecurityHeaders } from "./http";
 import { serveHub } from "./hub";
 import { errorPage } from "./pages";
 import { route, wantsJSON, type RequestContext } from "./router";
@@ -88,6 +88,6 @@ async function handle(req: Request, env: Env, ectx: ExecutionContext): Promise<R
 export default {
   async fetch(req: Request, env: Env, ectx: ExecutionContext): Promise<Response> {
     const res = await handle(req, env, ectx);
-    return res.status === 101 ? res : withSecurityHeaders(res);
+    return res.status === 101 ? res : withSecurityHeaders(res, requestID(req));
   },
 } satisfies ExportedHandler<Env>;

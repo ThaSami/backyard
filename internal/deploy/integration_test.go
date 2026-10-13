@@ -1,14 +1,20 @@
 package deploy
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -98,6 +104,22 @@ func runBackendE2E(t *testing.T, store blob.Store, wantPresigned bool) {
 		if got := string(e.object("e2e", "css/site.css")); got != "body { color: blue }" {
 			t.Errorf("site.css after corrupt upload = %q", got)
 		}
+	} else {
+		// Storage that cannot bind the declared size (Azure SAS, or a fake
+		// that does not verify signatures) accepts a larger body; the
+		// commit must then fail and delete it.
+		files := map[string]string{"oversized.txt": "small"}
+		cr := e.createDeploy("alice", "e2e", files)
+		if code := e.upload(cr.Uploads[0], strings.Repeat("x", 4096)); code < 300 {
+			resp, body := e.commit("alice", "e2e", cr.DeployID, entriesFor(files))
+			wantStatus(t, resp, body, 409, CodeConflict)
+			if !strings.Contains(string(body), "oversized.txt (4096 bytes in storage, expected 5; deleted)") {
+				t.Errorf("commit after an oversized upload: %s", body)
+			}
+		}
+		if b := e.object("e2e", "oversized.txt"); b != nil {
+			t.Errorf("oversized upload survived: %d bytes", len(b))
+		}
 	}
 
 	files, err := c.SiteFiles(ctx, "e2e")
@@ -157,9 +179,41 @@ func TestIntegrationFSStore(t *testing.T) {
 }
 
 func TestIntegrationS3PresignedFake(t *testing.T) {
+	if n := testIntegrationS3PresignedFake(t); n != 0 {
+		t.Errorf("%d checksum headers sent to an S3-compatible endpoint", n)
+	}
+}
+
+// With flexible checksums (the AWS default), presigned uploads also carry
+// a signed x-amz-checksum-sha256 that the client must send.
+func TestIntegrationS3PresignedFakeChecksums(t *testing.T) {
+	t.Setenv("AWS_REQUEST_CHECKSUM_CALCULATION", "when_supported")
+	t.Setenv("AWS_RESPONSE_CHECKSUM_VALIDATION", "when_supported")
+	if n := testIntegrationS3PresignedFake(t); n == 0 {
+		t.Error("no presigned upload carried x-amz-checksum-sha256")
+	}
+}
+
+// testIntegrationS3PresignedFake runs the backend e2e against gofakes3 and
+// returns how many presigned PUTs carried x-amz-checksum-sha256 (each one
+// verified against its body, as S3 does).
+func testIntegrationS3PresignedFake(t *testing.T) int {
 	backend := s3mem.New()
-	faker := gofakes3.New(backend, gofakes3.WithLogger(gofakes3.DiscardLog()))
-	ts := httptest.NewServer(faker.Server())
+	fake := gofakes3.New(backend, gofakes3.WithLogger(gofakes3.DiscardLog())).Server()
+	var checksums atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if want := r.Header.Get("X-Amz-Checksum-Sha256"); want != "" && r.URL.Query().Has("X-Amz-Signature") {
+			checksums.Add(1)
+			body, err := io.ReadAll(r.Body)
+			sum := sha256.Sum256(body)
+			if err != nil || base64.StdEncoding.EncodeToString(sum[:]) != want {
+				http.Error(w, "<Error><Code>BadDigest</Code></Error>", http.StatusBadRequest)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		fake.ServeHTTP(w, r)
+	}))
 	t.Cleanup(ts.Close)
 	if err := backend.CreateBucket("deploy-test"); err != nil {
 		t.Fatal(err)
@@ -178,6 +232,7 @@ func TestIntegrationS3PresignedFake(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	runBackendE2E(t, store, true)
+	return int(checksums.Load())
 }
 
 func TestIntegrationAzuritePresigned(t *testing.T) {
@@ -210,7 +265,7 @@ func TestIntegrationAzuritePresigned(t *testing.T) {
 		t.Fatalf("azure store: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	if _, err := store.PresignPut(context.Background(), "probe.txt", "text/plain", time.Minute); err != nil {
+	if _, err := store.PresignPut(context.Background(), "probe.txt", blob.PresignPutOptions{ContentType: "text/plain", Size: -1}, time.Minute); err != nil {
 		t.Skipf("azure store cannot presign here: %v", err)
 	}
 	runBackendE2E(t, store, true)

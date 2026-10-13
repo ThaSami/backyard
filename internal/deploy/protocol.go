@@ -2,6 +2,49 @@
 // side (Gateway, mountable inside the main server, as `backyard gateway`, or as
 // an AWS Lambda function), the Go client used by the CLI and MCP server, and
 // the local file collection/ignore rules shared by every deploy method.
+//
+// # Upload integrity
+//
+// A deploy is planned (create), uploaded file by file, then committed. The
+// plan validates every declared size against the per-file and per-site
+// limits, and each upload is bound to its declared size and SHA-256:
+//
+//   - The gateway's own endpoint (PUT {G}/uploads/{token}; fs storage or
+//     deploy.presign: false) streams the body through a verifier, so a body
+//     of another size or digest is never stored.
+//   - Presigned storage URLs bind what the backend can enforce (see
+//     blob.PresignPutOptions): on S3 the size is signed (Content-Length, or
+//     the Content-MD5 of the empty body) and, on AWS, the SHA-256 as
+//     x-amz-checksum-sha256, so S3 rejects any other body; on GCS
+//     x-goog-content-length-range pins the size (GCS cannot check SHA-256);
+//     an Azure SAS URL cannot restrict the body at all.
+//
+// The commit is the second line of defence: every listed file must exist
+// with its declared size. A stored object of the wrong size that is not the
+// version the previous manifest recorded is deleted, and the commit fails
+// with 409 conflict naming the paths, so no unverified object of the wrong
+// size outlives a commit attempt (a previously committed version is kept:
+// that file was merely not replaced). Digests are not re-read at commit,
+// which would mean downloading every changed file.
+//
+// # Uncommitted uploads
+//
+// Uploads write directly to sites/<site>/<path> (rsync semantics; deploys
+// are not atomic), so an upload that is never committed stays in storage:
+//
+//   - A path that is not in the current manifest (a new file) becomes an
+//     orphan object: it is served like any object under the site but is not
+//     in the manifest, never counts as "unchanged", and is deleted by the
+//     next successful commit (which deletes everything it does not list) or
+//     with the site; a refresh after a direct sync adopts it instead.
+//   - A path in the current manifest is replaced in place, as rsync would.
+//
+// This is accepted and bounded rather than cleaned up by a janitor: upload
+// URLs expire with their deploy id (DeployTTL), are bound to sizes the plan
+// checked against the limits (except on Azure, see above), and are only
+// issued to the site's authorized deployers by a rate-limited create whose
+// audit record ("deploy.create") counts the uploads, their bytes and the
+// new paths among them.
 package deploy
 
 import (

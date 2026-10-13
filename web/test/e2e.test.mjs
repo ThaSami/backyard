@@ -1,7 +1,20 @@
 // End-to-end browser test of the hub and the SDK against a REAL server: the
 // Go server (`backyard serve --dev`) or the Cloudflare Worker (`wrangler dev`).
-// Skipped unless BACKYARD_E2E_URL is set and playwright-core + Chromium are
-// available (see browser.test.mjs):
+// Needs playwright-core and Chromium (see browser.test.mjs).
+//
+// Against the Go server of this checkout, started and stopped by the test
+// (it builds ./cmd/backyard — or uses BACKYARD_E2E_BIN — and runs
+// `backyard serve --dev` on localhost:$BACKYARD_E2E_PORT, default 18231, with a
+// throwaway data directory, a deploy token and a fake OpenAI-compatible AI
+// upstream; with BACKYARD_TEST_POSTGRES_DSN also a Postgres warehouse):
+//
+//   BACKYARD_E2E_SERVE=go \
+//   PLAYWRIGHT_CORE=/opt/node-tools/node_modules/playwright-core/index.mjs \
+//   PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers node --test web/test/e2e.test.mjs
+//
+// (BACKYARD_E2E_SERVE takes precedence over BACKYARD_E2E_URL.) Against a
+// server that is already running (`make e2e` does this with
+// scripts/with-server.sh, for the Go server or the Worker):
 //
 //   BACKYARD_E2E_URL=http://127.0.0.1:8080 [BACKYARD_E2E_TOKEN=<deploy token>] \
 //   PLAYWRIGHT_CORE=/tmp/pw/node_modules/playwright-core/index.mjs \
@@ -18,14 +31,21 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import http from "node:http";
 
-const BASE = (process.env.BACKYARD_E2E_URL || "").replace(/\/+$/, "");
-const TOKEN = process.env.BACKYARD_E2E_TOKEN || "";
+const SERVE = (process.env.BACKYARD_E2E_SERVE || "").trim().toLowerCase();
+if (SERVE && SERVE !== "go" && SERVE !== "1") throw new Error(`BACKYARD_E2E_SERVE=${SERVE}: only "go" is supported`);
+let BASE = SERVE ? "" : (process.env.BACKYARD_E2E_URL || "").replace(/\/+$/, "");
+let TOKEN = process.env.BACKYARD_E2E_TOKEN || "";
+/** Set when the test runs its own Go server: AI and the stream keep-alive are then known to work. */
+let goServer = null;
 
 let pw = null;
-let skipReason = BASE ? "" : "BACKYARD_E2E_URL is not set";
-if (BASE) {
+let skipReason = BASE || SERVE ? "" : "set BACKYARD_E2E_SERVE=go (or BACKYARD_E2E_URL)";
+if (BASE || SERVE) {
   try {
     pw = await import(process.env.PLAYWRIGHT_CORE || "playwright-core");
   } catch {
@@ -33,18 +53,172 @@ if (BASE) {
   }
 }
 
-let browser = null;
-before(async () => {
-  if (!pw) return;
-  try {
-    const chromium = pw.chromium || (pw.default && pw.default.chromium);
-    browser = await chromium.launch({ executablePath: process.env.BACKYARD_TEST_CHROMIUM || undefined });
-  } catch (err) {
-    skipReason = "Chromium is not available: " + String(err.message || err).split("\n")[0];
+// --- the Go server under test (BACKYARD_E2E_SERVE=go) ------------------------
+
+const REPO = fileURLToPath(new URL("../../", import.meta.url));
+
+/** A 1×1 PNG returned by the fake image model. */
+const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+
+/** Prompts containing this word make the fake model think long enough for the server's ": ping" keep-alive (15 s). */
+const SLOW = "slowly";
+
+/**
+ * A fake OpenAI-compatible upstream (chat completions with streaming, image
+ * generation, embeddings), so the Go server's AI endpoints answer for real.
+ */
+async function startFakeAI() {
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      let body = {};
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      } catch {
+        body = {};
+      }
+      const send = (status, obj) => {
+        res.writeHead(status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(obj));
+      };
+      const path = new URL(req.url, "http://x").pathname;
+      if (path.endsWith("/chat/completions")) {
+        const last = (body.messages || []).filter((m) => m.role === "user").pop() || {};
+        const text = typeof last.content === "string" ? last.content : (last.content || []).map((p) => p.text || "").join("");
+        const reply = body.response_format ? '{"ok": true}' : "echo: " + text;
+        const usage = { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 };
+        if (!body.stream) {
+          return send(200, { id: "c1", object: "chat.completion", model: body.model, choices: [{ index: 0, message: { role: "assistant", content: reply }, finish_reason: "stop" }], usage });
+        }
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        const ev = (o) => res.write("data: " + JSON.stringify(o) + "\n\n");
+        const timer = setTimeout(
+          () => {
+            for (const piece of reply.match(/.{1,4}/gs) || []) ev({ id: "c1", object: "chat.completion.chunk", model: body.model, choices: [{ index: 0, delta: { content: piece }, finish_reason: null }] });
+            ev({ id: "c1", object: "chat.completion.chunk", model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+            ev({ id: "c1", object: "chat.completion.chunk", model: body.model, choices: [], usage });
+            res.end("data: [DONE]\n\n");
+          },
+          text.includes(SLOW) ? 16_500 : 0,
+        );
+        res.on("close", () => clearTimeout(timer));
+        return;
+      }
+      if (path.endsWith("/images/generations")) {
+        return send(200, { created: 1, data: Array.from({ length: body.n || 1 }, () => ({ b64_json: PNG.toString("base64") })) });
+      }
+      if (path.endsWith("/embeddings")) {
+        const input = Array.isArray(body.input) ? body.input : [body.input];
+        return send(200, { object: "list", model: body.model, data: input.map((t, i) => ({ object: "embedding", index: i, embedding: [String(t).length, 0.5, -1] })), usage: { prompt_tokens: input.length, total_tokens: input.length } });
+      }
+      send(404, { error: { message: "no such endpoint: " + path } });
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return { url: `http://127.0.0.1:${server.address().port}/v1`, close: () => new Promise((resolve) => server.close(resolve)) };
+}
+
+async function waitHealthy(url, proc, logs, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (proc.exitCode !== null) throw new Error(`backyard serve exited with ${proc.exitCode}:\n${logs.join("")}`);
+    try {
+      const res = await fetch(url + "/__backyard/healthz");
+      if (res.ok) return;
+    } catch {
+      /* not listening yet */
+    }
+    if (Date.now() > deadline) throw new Error(`backyard serve did not become healthy:\n${logs.join("")}`);
+    await new Promise((r) => setTimeout(r, 200));
   }
-});
+}
+
+/** Builds and starts `backyard serve --dev` with a throwaway configuration. */
+async function startGoServer() {
+  const port = Number(process.env.BACKYARD_E2E_PORT || 18231);
+  const dir = mkdtempSync(join(tmpdir(), "backyard-e2e-go-"));
+  let bin = process.env.BACKYARD_E2E_BIN || "";
+  if (!bin) {
+    bin = join(dir, "backyard");
+    const built = spawnSync("go", ["build", "-o", bin, "./cmd/backyard"], { cwd: REPO, stdio: ["ignore", "inherit", "inherit"], timeout: 600_000 });
+    if (built.status !== 0) throw new Error("go build ./cmd/backyard failed");
+  }
+  const fakeAI = await startFakeAI();
+  const token = "e2e-" + randomBytes(16).toString("hex");
+  const pg = process.env.BACKYARD_TEST_POSTGRES_DSN || "";
+  const config = {
+    server: { listen: `:${port}`, dev: true, name: "Backyard E2E" },
+    auth: { mode: "none", tokens: [{ name: "e2e", sha256: createHash("sha256").update(token).digest("hex"), admin: true }] },
+    storage: { type: "fs", fs: { root: join(dir, "data") } },
+    database: { type: "sqlite", sqlite: { path: join(dir, "backyard.db") } },
+    ai: {
+      default_model: "smart",
+      providers: { fake: { type: "openai", base_url: fakeAI.url, api_key: "test" } },
+      models: {
+        smart: { provider: "fake", model: "fake-chat", kind: "chat", description: "Fake chat model" },
+        image: { provider: "fake", model: "fake-image", kind: "image" },
+        embedding: { provider: "fake", model: "fake-embed", kind: "embedding" },
+      },
+    },
+    ...(pg ? { warehouse: { allow_raw_sql: true, sources: { default: { type: "postgres", dsn: pg } } } } : {}),
+    telemetry: { log_level: "warn" },
+  };
+  const cfgPath = join(dir, "backyard.yaml");
+  writeFileSync(cfgPath, JSON.stringify(config, null, 2)); // JSON is valid YAML
+  const logs = [];
+  const proc = spawn(bin, ["serve", "--dev", "--config", cfgPath], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+  proc.stdout.on("data", (b) => logs.push(b.toString()));
+  proc.stderr.on("data", (b) => logs.push(b.toString()));
+  const url = `http://localhost:${port}`;
+  try {
+    await waitHealthy(url, proc, logs, 60_000);
+  } catch (err) {
+    proc.kill("SIGKILL");
+    await fakeAI.close();
+    rmSync(dir, { recursive: true, force: true });
+    throw err;
+  }
+  return {
+    url,
+    token,
+    logs,
+    warehouse: !!pg,
+    async stop() {
+      if (proc.exitCode === null) {
+        const exited = new Promise((resolve) => proc.once("exit", resolve));
+        proc.kill("SIGTERM");
+        const timer = setTimeout(() => proc.kill("SIGKILL"), 10_000);
+        await exited;
+        clearTimeout(timer);
+      }
+      await fakeAI.close();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+let browser = null;
+before(
+  async () => {
+    if (!pw) return;
+    if (SERVE) {
+      goServer = await startGoServer();
+      BASE = goServer.url;
+      TOKEN = goServer.token;
+    }
+    try {
+      const chromium = pw.chromium || (pw.default && pw.default.chromium);
+      browser = await chromium.launch({ executablePath: process.env.BACKYARD_TEST_CHROMIUM || undefined });
+    } catch (err) {
+      skipReason = "Chromium is not available: " + String(err.message || err).split("\n")[0];
+    }
+  },
+  { timeout: 900_000 },
+);
 after(async () => {
   if (browser) await browser.close();
+  if (goServer) await goServer.stop();
 });
 
 /** Opens a page and collects uncaught exceptions and script console errors. */
@@ -123,7 +297,7 @@ test("hub deploy + SDK end to end against a real server", { timeout: 180_000 }, 
     assert.equal(site.url, siteURL);
     assert.equal(site.apiBase, siteURL + "__backyard");
 
-    const r = await a.page.evaluate(async () => {
+    const r = await a.page.evaluate(async ({ slowPrompt, imageN }) => {
       const out = {};
       const errOf = (p) => p.then(
         () => null,
@@ -189,7 +363,24 @@ test("hub deploy + SDK end to end against a real server", { timeout: 180_000 }, 
       if (models instanceof Error) {
         out.ai = { unavailable: models.code };
       } else {
-        out.ai = { default: models.default };
+        out.ai = { default: models.default, kinds: models.models.map((m) => m.kind).sort() };
+        // A stream whose model stays silent past the server's keep-alive
+        // interval: the headers come at once, then ": ping" comments (read raw
+        // here), and the SDK still delivers the answer. Runs in the background.
+        let slow = null;
+        if (slowPrompt) {
+          const started = Date.now();
+          const raw = fetch(backyard.site.apiBase + "/api/ai/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Backyard": "1", Accept: "text/event-stream" },
+            body: JSON.stringify({ messages: [{ role: "user", content: slowPrompt }], stream: true }),
+          }).then(async (res) => {
+            const headersAfter = Date.now() - started;
+            return { status: res.status, type: res.headers.get("content-type"), headersAfter, text: await res.text() };
+          });
+          const s = backyard.ai.stream(slowPrompt);
+          slow = Promise.all([raw, s.done.then((d) => ({ content: d.content, stop: d.stop_reason }))]);
+        }
         out.ai.chat = (await backyard.ai.chat("ping")).content;
         const s = backyard.ai.stream("hi", { onText: () => {} });
         const chunks = [];
@@ -197,18 +388,42 @@ test("hub deploy + SDK end to end against a real server", { timeout: 180_000 }, 
         const final = await s.done;
         out.ai.stream = { joined: chunks.join(""), content: final.content, chunks: chunks.length, stop: final.stop_reason };
         out.ai.json = (await backyard.ai.chat("x", { json: true }).catch((e) => ({ json: e.code }))).json;
-        const img = await backyard.ai.image("a dot").catch((e) => ({ error: e.code }));
-        out.ai.image = img.error ? img : { ok: typeof img.url === "string" && img.images.length >= 1 };
+        const img = await backyard.ai.image("a dot", { n: imageN }).catch((e) => ({ error: e.code }));
+        out.ai.image = img.error
+          ? img
+          : {
+              ok: typeof img.url === "string" && img.images.length >= 1,
+              n: img.images.length,
+              idOK: typeof img.id === "string" && img.id === img.images[0].id && img.url.includes("/__backyard/files/" + img.id + "/"),
+              type: img.content_type,
+              model: img.model,
+              file: img.id ? ((await backyard.files.get(img.id)) || {}).content_type : undefined,
+            };
         if (img.url) out.ai.imageFetch = await fetch(img.url).then((x) => [x.status, x.headers.get("content-type")]);
         const emb = await backyard.ai.embed(["a", "bb"]).catch((e) => ({ error: e.code }));
         out.ai.embed = Array.isArray(emb) ? emb.length : emb;
+        out.ai.embedOne = await backyard.ai.embed("abc").catch((e) => ({ error: e.code }));
+        out.ai.embedMany = emb;
+        const page = await backyard.files.list({ limit: 1 });
+        out.ai.filesPage = { n: page.length, hasMore: page.hasMore, keys: Object.keys(page) };
+        if (slow) {
+          const [raw, sdk] = await slow;
+          out.ai.slow = {
+            status: raw.status,
+            type: raw.type,
+            fastHeaders: raw.headersAfter < 5000,
+            ping: raw.text.includes(": ping\n\n"),
+            done: raw.text.includes('"type":"done"'),
+            sdk,
+          };
+        }
       }
 
       // Warehouse (optional).
       const wh = await backyard.warehouse.query("SELECT 1 AS n").catch((e) => e);
       out.warehouse = wh instanceof Error ? { code: wh.code, status: wh.status } : { rows: wh.rows, row_count: wh.row_count };
       return out;
-    });
+    }, { slowPrompt: goServer ? "Answer " + SLOW : "", imageN: goServer ? 2 : 1 });
 
     assert.deepEqual(r.me, { hasId: true, cached: true });
     assert.deepEqual(r.created, { id: "a", version: 1, by: "string" });
@@ -248,6 +463,31 @@ test("hub deploy + SDK end to end against a real server", { timeout: 180_000 }, 
       assert.equal(r.ai.stream.stop, "end_turn");
       t.diagnostic("AI: " + JSON.stringify(r.ai));
     }
+    if (goServer) {
+      // Our own server has the fake AI upstream: every AI response shape is checked.
+      assert.deepEqual(r.ai.kinds, ["chat", "embedding", "image"]);
+      assert.equal(r.ai.default, "smart");
+      assert.equal(r.ai.chat, "echo: ping");
+      assert.deepEqual(r.ai.json, { ok: true });
+      assert.equal(r.ai.stream.content, "echo: hi");
+      assert.deepEqual(r.ai.image, { ok: true, n: 2, idOK: true, type: "image/png", model: "image", file: "image/png" });
+      assert.deepEqual(r.ai.imageFetch, [200, "image/png"]);
+      assert.deepEqual(r.ai.embedOne, [3, 0.5, -1]);
+      assert.deepEqual(r.ai.embedMany, [
+        [1, 0.5, -1],
+        [2, 0.5, -1],
+      ]);
+      assert.deepEqual(r.ai.filesPage, { n: 1, hasMore: true, keys: ["0"] });
+      assert.deepEqual(r.ai.slow, {
+        status: 200,
+        type: "text/event-stream",
+        fastHeaders: true,
+        ping: true,
+        done: true,
+        sdk: { content: "echo: Answer " + SLOW, stop: "end_turn" },
+      });
+      if (goServer.warehouse) assert.deepEqual(r.warehouse.rows, [{ n: 1 }]);
+    }
     t.diagnostic("warehouse: " + JSON.stringify(r.warehouse));
     if (r.warehouse.rows) assert.deepEqual(r.warehouse.rows, [{ n: 1 }]);
     else assert.ok(["unsupported", "forbidden", "not_found", "bad_request"].includes(r.warehouse.code), JSON.stringify(r.warehouse));
@@ -276,6 +516,19 @@ test("hub deploy + SDK end to end against a real server", { timeout: 180_000 }, 
     const log = await a.page.evaluate(() => window.log);
     assert.deepEqual(log.filter((l) => !l.startsWith("members:")).sort(), ["msg:hi:true", "update:green"]);
     assert.equal(await a.page.evaluate(() => room.members.length), 1);
+    // The server answers frames that carry an id with an ack or an error with
+    // that id: the SDK routes the errors to the room.
+    const roomErrors = await b.page.evaluate(async () => {
+      const errs = [];
+      room.on("error", (e) => errs.push(e.code));
+      room.send("psst", { to: "c_0123456789abcdef" }); // no such member
+      room.setState({ big: "x".repeat(9000) }); // over the 8 KiB presence limit
+      room.send("still fine");
+      await new Promise((res) => setTimeout(res, 1000));
+      room.setState({ color: "green" });
+      return errs;
+    });
+    assert.deepEqual(roomErrors, ["not_found", "too_large"]);
     await b.page.evaluate(() => room.leave());
     await a.page.waitForFunction(() => window.room.members.length === 0, null, { timeout: 15_000 });
     assert.deepEqual(hub.problems.concat(a.problems, b.problems), [], "no script errors on the hub or the site");

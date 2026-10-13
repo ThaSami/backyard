@@ -5,10 +5,11 @@
   --ink: #1d1c1a;
   --ink-2: #5f5d58;
   --line: #e4e2dc;
-  --accent: #2a78d6;
-  --accent-soft: #2a78d61f;
-  --good: #0ca30c;
-  --danger: #d03b3b;
+  --accent: #2266c8;
+  --accent-ink: #ffffff;
+  --accent-soft: #2266c81f;
+  --good: #087f08;
+  --danger: #bf3434;
   font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
@@ -20,7 +21,10 @@
     --ink-2: #a9a79f;
     --line: #2e2d2a;
     --accent: #4b93ea;
+    --accent-ink: #0b1b30;
     --accent-soft: #4b93ea26;
+    --good: #0ca30c;
+    --danger: #e5605f;
   }
 }
 
@@ -70,7 +74,7 @@ h1 { margin: .25rem 0 0; font-size: clamp(1.8rem, 5vw, 2.5rem); letter-spacing: 
 .add select, .add input { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: .65rem .75rem; }
 .add input { flex: 1; min-width: 0; }
 .add input:focus, .add select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
-.add button { border: 0; border-radius: 12px; padding: .65rem 1.2rem; background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; }
+.add button { border: 0; border-radius: 12px; padding: .65rem 1.2rem; background: var(--accent); color: var(--accent-ink); font-weight: 600; cursor: pointer; }
 .add button:disabled { opacity: .6; }
 
 .empty { color: var(--ink-2); text-align: center; padding: 2rem 0 1rem; margin: 0; }

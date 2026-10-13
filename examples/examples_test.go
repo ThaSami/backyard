@@ -5,12 +5,14 @@
 package examples_test
 
 import (
+	"math"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -164,4 +166,56 @@ func TestExampleScriptsParse(t *testing.T) {
 	if n == 0 {
 		t.Fatal("no example scripts found")
 	}
+}
+
+// paletteRe finds the per-person color palettes (avatars, cursor name tags).
+var paletteRe = regexp.MustCompile(`const COLORS = \[([^\]]*)\]`)
+
+// TestPaletteContrast checks that white text (initials, names) stays readable
+// on every color of the per-person palettes: WCAG AA asks for 4.5:1 for
+// normal text. Which colors a page shows depends on the user ids, so the
+// browser accessibility checks (e2e/) cannot be relied on to see them all.
+func TestPaletteContrast(t *testing.T) {
+	hexRe := regexp.MustCompile(`"#([0-9a-fA-F]{6})"`)
+	n := 0
+	for _, dir := range exampleDirs(t) {
+		src := read(t, path.Join(dir, "app.js"))
+		for _, m := range paletteRe.FindAllStringSubmatch(src, -1) {
+			for _, c := range hexRe.FindAllStringSubmatch(m[1], -1) {
+				n++
+				if r := contrast("ffffff", c[1]); r < 4.5 {
+					t.Errorf("%s/app.js: white on #%s has contrast %.2f:1, want ≥ 4.5:1", dir, c[1], r)
+				}
+			}
+		}
+	}
+	if n == 0 {
+		t.Fatal("no palette colors found")
+	}
+}
+
+// contrast is the WCAG 2 contrast ratio of two sRGB colors ("rrggbb").
+func contrast(a, b string) float64 {
+	la, lb := luminance(a), luminance(b)
+	if la < lb {
+		la, lb = lb, la
+	}
+	return (la + 0.05) / (lb + 0.05)
+}
+
+func luminance(hex string) float64 {
+	var rgb [3]float64
+	for i := range rgb {
+		v, err := strconv.ParseUint(hex[2*i:2*i+2], 16, 8)
+		if err != nil {
+			panic(err)
+		}
+		c := float64(v) / 255
+		if c <= 0.03928 {
+			rgb[i] = c / 12.92
+		} else {
+			rgb[i] = math.Pow((c+0.055)/1.055, 2.4)
+		}
+	}
+	return 0.2126*rgb[0] + 0.7152*rgb[1] + 0.0722*rgb[2]
 }

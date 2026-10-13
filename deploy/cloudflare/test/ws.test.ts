@@ -130,7 +130,8 @@ describe("websocket protocol", () => {
     const selfA = joinedA.self as { cid: string; user: { id: string; name: string }; state: unknown; joined_at: string };
     expect(selfA.cid).toBe(helloA.cid);
     expect(selfA.state).toEqual({ color: "red" });
-    expect(selfA.joined_at).toMatch(/^\d{4}-\d\d-\d\dT.*Z$/);
+    // Fixed width with milliseconds, like the Go edition ("2026-01-02T03:04:05.120Z").
+    expect(selfA.joined_at).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
     expect(Object.keys(selfA.user).sort()).toEqual(["id", "name"]);
 
     b.send({ t: "join", id: "r2", room: "lobby" });
@@ -177,6 +178,29 @@ describe("websocket protocol", () => {
     b.ws.close(1000, "bye");
     expect(await a.t("presence")).toMatchObject({ op: "leave", member: { cid: helloB.cid } });
     a.ws.close(1000, "bye");
+  });
+
+  it("lists members by joined_at, then cid, with fixed-width timestamps", async () => {
+    const site = uniqueSite("order");
+    const clients: { c: Client; cid: string }[] = [];
+    for (let i = 0; i < 4; i++) {
+      const c = await connect(site, await guestCookie());
+      clients.push({ c, cid: String((await c.t("hello")).cid) });
+    }
+    for (const [i, { c }] of clients.slice(0, 3).entries()) {
+      c.send({ t: "join", id: `j${i}`, room: "lobby" });
+      await c.t("joined");
+    }
+    const last = clients[3]!.c;
+    last.send({ t: "join", id: "j3", room: "lobby" });
+    const joined = await last.t("joined");
+    const members = joined.members as { cid: string; joined_at: string }[];
+    expect(members.map((m) => m.cid).sort()).toEqual(clients.slice(0, 3).map((x) => x.cid).sort());
+    for (const m of members) expect(m.joined_at).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+    const sorted = [...members].sort((a, b) => (a.joined_at !== b.joined_at ? (a.joined_at < b.joined_at ? -1 : 1) : a.cid < b.cid ? -1 : 1));
+    expect(members).toEqual(sorted);
+    expect(String((joined.self as { joined_at: string }).joined_at) >= members[members.length - 1]!.joined_at).toBe(true);
+    for (const { c } of clients) c.ws.close(1000, "bye");
   });
 
   it("checks the Origin and requires an upgrade", async () => {

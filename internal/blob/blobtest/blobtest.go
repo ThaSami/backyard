@@ -15,12 +15,19 @@
 // deletes (crossing remote page and batch sizes), and, when the store
 // supports it, presigned PUT/GET round trips over net/http (the download
 // URL must also work without any extra headers, as a redirect target).
+//
+// Options declare what a backend's presigned uploads enforce, so the suite
+// also checks that wrong-size (PresignEnforcesSize) or wrong-content
+// (PresignEnforcesSHA256) bodies are rejected without storing anything:
+//
+//	blobtest.Run(t, newStore, blobtest.PresignEnforcesSize())
 package blobtest
 
 import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -36,9 +43,31 @@ import (
 	"github.com/thasami/backyard/internal/blob"
 )
 
+// Option declares a capability of the store under test.
+type Option func(*suite)
+
+type suite struct {
+	presignSize   bool
+	presignSHA256 bool
+}
+
+// PresignEnforcesSize declares that the storage endpoint rejects a PUT to a
+// presigned URL whose body size differs from PresignPutOptions.Size (S3 and
+// GCS do; Azure SAS URLs cannot).
+func PresignEnforcesSize() Option { return func(s *suite) { s.presignSize = true } }
+
+// PresignEnforcesSHA256 declares that the storage endpoint also rejects a
+// body of the right size whose SHA-256 differs from PresignPutOptions.SHA256
+// (S3 with flexible checksums).
+func PresignEnforcesSHA256() Option { return func(s *suite) { s.presignSHA256 = true } }
+
 // Run executes the conformance suite against stores built by newStore.
-func Run(t *testing.T, newStore func(t *testing.T) blob.Store) {
+func Run(t *testing.T, newStore func(t *testing.T) blob.Store, opts ...Option) {
 	t.Helper()
+	var cfg suite
+	for _, o := range opts {
+		o(&cfg)
+	}
 	tests := []struct {
 		name string
 		fn   func(t *testing.T, s blob.Store)
@@ -63,6 +92,7 @@ func Run(t *testing.T, newStore func(t *testing.T) blob.Store) {
 		{"ContextCanceled", testContextCanceled},
 		{"PingDescribe", testPingDescribe},
 		{"Presign", testPresign},
+		{"PresignEnforcement", func(t *testing.T, s blob.Store) { testPresignEnforcement(t, s, cfg) }},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -578,7 +608,7 @@ func testInvalidKeys(t *testing.T, s blob.Store) {
 		_, err = s.Put(ctx, key, strings.NewReader("x"), 1, "text/plain")
 		check("Put", err)
 		check("Delete", s.Delete(ctx, key))
-		_, err = s.PresignPut(ctx, key, "text/plain", time.Minute)
+		_, err = s.PresignPut(ctx, key, blob.PresignPutOptions{ContentType: "text/plain", Size: 1}, time.Minute)
 		check("PresignPut", err)
 		_, err = s.PresignGet(ctx, key, time.Minute)
 		check("PresignGet", err)
@@ -864,13 +894,23 @@ func headerValue(h map[string]string, name string) string {
 	return ""
 }
 
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// exact returns upload options pinning data's size and digest.
+func exact(contentType string, data []byte) blob.PresignPutOptions {
+	return blob.PresignPutOptions{ContentType: contentType, Size: int64(len(data)), SHA256: sha256Hex(data)}
+}
+
 func testPresign(t *testing.T, s blob.Store) {
 	ctx := testCtx(t)
 	const key = "presign/up load ü.txt"
 	const ct = "text/plain; charset=utf-8"
 	data := []byte("uploaded via presigned URL\n")
 	before := time.Now()
-	req, err := s.PresignPut(ctx, key, ct, 10*time.Minute)
+	req, err := s.PresignPut(ctx, key, exact(ct, data), 10*time.Minute)
 	if errors.Is(err, blob.ErrNotSupported) {
 		if _, gerr := s.PresignGet(ctx, key, time.Minute); !errors.Is(gerr, blob.ErrNotSupported) {
 			t.Errorf("PresignPut unsupported but PresignGet err = %v", gerr)
@@ -918,8 +958,9 @@ func testPresign(t *testing.T, s blob.Store) {
 		t.Errorf("presigned GET without headers body = %q, want %q", body, data)
 	}
 
-	// Without a content type, the one derived from the key is signed.
-	req2, err := s.PresignPut(ctx, "presign/page.html", "", time.Minute)
+	// Without a content type, the one derived from the key is signed;
+	// without a size or digest, any body is accepted.
+	req2, err := s.PresignPut(ctx, "presign/page.html", blob.PresignPutOptions{Size: -1}, time.Minute)
 	if err != nil {
 		t.Fatalf("PresignPut(no content type): %v", err)
 	}
@@ -930,9 +971,105 @@ func testPresign(t *testing.T, s blob.Store) {
 	if st := mustStat(t, s, "presign/page.html"); st.ContentType != "text/html; charset=utf-8" || st.Size != 9 {
 		t.Errorf("Stat after presigned PUT = %+v", st)
 	}
+
+	// Empty objects.
+	req3, err := s.PresignPut(ctx, "presign/empty.txt", exact("", nil), time.Minute)
+	if err != nil {
+		t.Fatalf("PresignPut(empty): %v", err)
+	}
+	doHTTP(t, req3, []byte{}, http.StatusOK, http.StatusCreated, http.StatusNoContent)
+	if st := mustStat(t, s, "presign/empty.txt"); st.Size != 0 {
+		t.Errorf("Stat after empty presigned PUT = %+v", st)
+	}
+
+	// Invalid options are errors (not ErrNotSupported) and sign nothing.
+	for name, opts := range map[string]blob.PresignPutOptions{
+		"negative size":                         {Size: -2},
+		"malformed sha256":                      {Size: 1, SHA256: "not-hex"},
+		"sha256 of a non-empty body for size 0": {Size: 0, SHA256: sha256Hex([]byte("x"))},
+	} {
+		if r, err := s.PresignPut(ctx, "presign/bad.txt", opts, time.Minute); err == nil || errors.Is(err, blob.ErrNotSupported) {
+			t.Errorf("PresignPut(%s) = %+v, %v; want an error", name, r, err)
+		}
+	}
 }
 
-func doHTTP(t *testing.T, pr *blob.PresignedRequest, body []byte, okStatus ...int) []byte {
+// testPresignEnforcement checks that the storage endpoint rejects bodies
+// that differ from what a presigned URL was issued for, as far as the store
+// declares it can enforce, and that a rejected upload stores nothing.
+func testPresignEnforcement(t *testing.T, s blob.Store, cfg suite) {
+	if !cfg.presignSize && !cfg.presignSHA256 {
+		t.Skip("store does not declare presigned upload enforcement")
+	}
+	ctx := testCtx(t)
+	data := []byte("exactly these bytes")
+	presign := func(key string, opts blob.PresignPutOptions) *blob.PresignedRequest {
+		t.Helper()
+		req, err := s.PresignPut(ctx, key, opts, 10*time.Minute)
+		if errors.Is(err, blob.ErrNotSupported) {
+			t.Skip("store does not support presigning")
+		}
+		if err != nil {
+			t.Fatalf("PresignPut(%q): %v", key, err)
+		}
+		return req
+	}
+	rejected := func(req *blob.PresignedRequest, body []byte, what string) {
+		t.Helper()
+		if code, out := sendPresigned(t, req, body); code < 400 {
+			t.Errorf("%s: presigned PUT status %d, want a rejection (%s)", what, code, out)
+		}
+	}
+
+	if cfg.presignSize {
+		const key = "enforce/new.txt"
+		req := presign(key, exact("text/plain", data))
+		rejected(req, append(bytes.Clone(data), "and more"...), "larger body")
+		rejected(req, data[:5], "smaller body")
+		if _, err := s.Stat(ctx, key); !errors.Is(err, blob.ErrNotFound) {
+			t.Errorf("Stat after rejected uploads err = %v, want ErrNotFound", err)
+		}
+		// The URL still accepts the declared body.
+		doHTTP(t, req, data, http.StatusOK, http.StatusCreated, http.StatusNoContent)
+		if got, _ := mustGet(t, s, key); !bytes.Equal(got, data) {
+			t.Errorf("Get after presigned PUT = %q", got)
+		}
+
+		// A rejected upload never replaces an existing object.
+		const existing = "enforce/existing.txt"
+		mustPut(t, s, existing, []byte("previous"), "text/plain")
+		rejected(presign(existing, exact("text/plain", data)), bytes.Repeat(data, 2), "larger body over an existing object")
+		if got, _ := mustGet(t, s, existing); string(got) != "previous" {
+			t.Errorf("existing object after rejected upload = %q", got)
+		}
+
+		// A 0-byte upload URL accepts nothing else.
+		empty := presign("enforce/empty.txt", blob.PresignPutOptions{Size: 0})
+		rejected(empty, []byte("x"), "body for a 0-byte upload")
+		if _, err := s.Stat(ctx, "enforce/empty.txt"); !errors.Is(err, blob.ErrNotFound) {
+			t.Errorf("Stat after rejected 0-byte upload err = %v, want ErrNotFound", err)
+		}
+		doHTTP(t, empty, []byte{}, http.StatusOK, http.StatusCreated, http.StatusNoContent)
+	}
+
+	if cfg.presignSHA256 {
+		const key = "enforce/digest.txt"
+		req := presign(key, exact("text/plain", data))
+		forged := bytes.ToUpper(data) // same size, other bytes
+		rejected(req, forged, "same-size body with another sha256")
+		if _, err := s.Stat(ctx, key); !errors.Is(err, blob.ErrNotFound) {
+			t.Errorf("Stat after rejected upload err = %v, want ErrNotFound", err)
+		}
+		doHTTP(t, req, data, http.StatusOK, http.StatusCreated, http.StatusNoContent)
+		if got, _ := mustGet(t, s, key); !bytes.Equal(got, data) {
+			t.Errorf("Get after presigned PUT = %q", got)
+		}
+	}
+}
+
+// sendPresigned performs a presigned request with exactly its headers and
+// returns the status and body.
+func sendPresigned(t *testing.T, pr *blob.PresignedRequest, body []byte) (int, []byte) {
 	t.Helper()
 	var rd io.Reader
 	if body != nil {
@@ -947,6 +1084,7 @@ func doHTTP(t *testing.T, pr *blob.PresignedRequest, body []byte, okStatus ...in
 			req.Host = v
 			continue
 		}
+		// net/http sends the real body length whatever the header says.
 		req.Header.Set(k, v)
 	}
 	resp, err := http.DefaultClient.Do(req)
@@ -958,8 +1096,14 @@ func doHTTP(t *testing.T, pr *blob.PresignedRequest, body []byte, okStatus ...in
 	if err != nil {
 		t.Fatalf("reading presigned %s response: %v", pr.Method, err)
 	}
-	if !slices.Contains(okStatus, resp.StatusCode) {
-		t.Fatalf("presigned %s status %d: %s", pr.Method, resp.StatusCode, out)
+	return resp.StatusCode, out
+}
+
+func doHTTP(t *testing.T, pr *blob.PresignedRequest, body []byte, okStatus ...int) []byte {
+	t.Helper()
+	code, out := sendPresigned(t, pr, body)
+	if !slices.Contains(okStatus, code) {
+		t.Fatalf("presigned %s status %d: %s", pr.Method, code, out)
 	}
 	return out
 }

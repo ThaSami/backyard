@@ -36,10 +36,7 @@ type uploadClaims struct {
 	Exp         int64  `json:"exp"`
 }
 
-var (
-	errBadToken     = errors.New("deploy: invalid token")
-	errExpiredToken = errors.New("deploy: token expired")
-)
+var errBadToken = errors.New("deploy: invalid token")
 
 // newNonce returns a random 128-bit hex id.
 func newNonce() string {
