@@ -140,6 +140,10 @@ describe("websocket", { skip }, () => {
     assertMember(ja.self, { cid: a.hello.cid, user: users.alice, state: { color: "red" } });
     assert.deepEqual(ja.members, [], "members excludes self");
 
+    // joined_at has millisecond precision and equal ones are ordered by cid
+    // (SPEC §6), so two joins within the same millisecond could list bob
+    // first. Let the clock move on: bob's joined_at is then strictly later.
+    await new Promise((r) => setTimeout(r, 10));
     const jb = await b.request({ t: "join", id: "j2", room }, (f) => f.t === "joined");
     assertMember(jb.self, { cid: b.hello.cid, user: users.bob, state: {} });
     assert.equal(jb.members.length, 1);
@@ -150,9 +154,9 @@ describe("websocket", { skip }, () => {
     assert.deepEqual(pj.member, jb.self);
 
     const jc = await c.request({ t: "join", id: "j3", room, state: { n: 3 } }, (f) => f.t === "joined");
-    assert.deepEqual(jc.members.map((m) => m.cid), [a.hello.cid, b.hello.cid], "members sorted by joined_at, then cid");
+    assert.deepEqual(jc.members.map((m) => m.cid), [a.hello.cid, b.hello.cid], "members in joined_at order (alice joined first)");
     const sorted = [...jc.members].sort((x, y) => (x.joined_at < y.joined_at ? -1 : x.joined_at > y.joined_at ? 1 : x.cid < y.cid ? -1 : 1));
-    assert.deepEqual(jc.members, sorted);
+    assert.deepEqual(jc.members, sorted, "members sorted by joined_at, then cid");
     await a.next((f) => f.t === "presence" && f.op === "join" && f.member.cid === c.hello.cid);
     await b.next((f) => f.t === "presence" && f.op === "join" && f.member.cid === c.hello.cid);
 
