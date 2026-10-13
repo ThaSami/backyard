@@ -55,9 +55,11 @@ kept), and every `5xx` failure is logged at error level with its request id — 
 | Event | Source |
 |---|---|
 | `auth: login`, `auth: login denied by allowed_domains/allowed_groups` | OIDC login |
-| `auth: issued CLI token` | browser → CLI token hand-off |
-| `token.issue` | `POST /__backyard/api/tokens` (`backyard token create`) |
-| `deploy.create`, `deploy.commit`, `deploy.reject_uploads`, `deploy.clear_conflicts` | deploy gateway (files, bytes, new paths, deletions) |
+| `auth: issued CLI token` | browser → CLI token hand-off (`confirmed` when the user confirmed a cross-site request) |
+| `auth: CLI login confirmation rejected …` | a confirmation form that expired or was not issued for this user and session |
+| `auth: request carries session cookies of different users …`, `… guest cookies of different guests …` | conflicting (possibly planted) cookies; the request was refused and foreign cookie variants expired |
+| `token.issue` | `POST /__backyard/api/tokens` (`backyard token create`); `from_api_token` when an API token minted it (its lifetime was capped) |
+| `deploy.create`, `deploy.commit`, `deploy.reject_uploads`, `deploy.clear_conflicts` | deploy gateway (files, bytes, new paths, deletions; `deploy.commit` also counts the files whose digest it `verified` and those `superseded` by another deploy) |
 | `site.refresh`, `site.delete`, `site.owners` | deploy gateway |
 
 Ship the log stream to your SIEM for retention. In addition, the server stores `token.issue`

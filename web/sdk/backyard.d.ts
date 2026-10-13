@@ -193,7 +193,13 @@ declare namespace Backyard {
    */
   type Doc<T extends Data = Data> = T & { id: string; _meta: DocMeta };
 
-  /** An array of documents with a non-enumerable `hasMore` flag (more results exist past `limit`). */
+  /**
+   * An array of documents with a non-enumerable `hasMore` flag: more results
+   * exist after this page. A page can hold fewer than `limit` documents and
+   * still have `hasMore` (the Cloudflare edition ends a page at about 8 MiB
+   * of documents), so to page, advance `offset` by the number of documents
+   * received, not by `limit`.
+   */
   type DocList<T extends Data = Data> = Doc<T>[] & { readonly hasMore: boolean };
 
   /**
@@ -245,24 +251,60 @@ declare namespace Backyard {
     order?: "asc" | "desc";
   }
 
-  /** A realtime change event (SPEC §6 `db` frame). */
+  /**
+   * A realtime change event (SPEC §6 `db` frame).
+   *
+   * The server may send a create or update without its document (`"doc": null`
+   * plus the id) when the event would be too large to broadcast: the Go
+   * server does so for documents of about 1 MiB or more, possible when
+   * `database.max_doc_bytes` is raised. {@link Collection.subscribe} then
+   * re-reads the document (`GET /db/{collection}/{id}`) before delivering the
+   * event, so `doc` is the current document, which may already include later
+   * changes.
+   */
   interface ChangeEvent<T extends Data = Data> {
     op: "create" | "update" | "delete";
     collection: string;
     /** Id of the changed document. */
     id: string;
-    /** The document after the change; `null` for deletes. */
+    /**
+     * The document after the change. `null` for deletes, and for a create or
+     * update whose document the server sent without content and the SDK could
+     * not re-read (the error goes to {@link SubscribeHandlers.onError}).
+     */
     doc: Doc<T> | null;
   }
 
-  /** Callbacks for {@link Collection.subscribe}. */
+  /**
+   * Callbacks for {@link Collection.subscribe}. Events are delivered in the
+   * order they arrive. `onCreate` and `onUpdate` always get a full document:
+   * when an event arrives without one (see {@link ChangeEvent}), the SDK
+   * re-reads it first and later events wait for that read.
+   */
   interface SubscribeHandlers<T extends Data = Data> {
+    /**
+     * A document was created. Never called with `null`: if the document has
+     * to be re-read and is already gone, the event is delivered as a delete;
+     * if the re-read fails, `onCreate` is skipped and `onError` is called.
+     */
     onCreate?(doc: Doc<T>): void;
+    /** A document was changed. Never called with `null` (same rules as `onCreate`). */
     onUpdate?(doc: Doc<T>): void;
+    /**
+     * A document was deleted. Can also be called for a create or update
+     * whose document was deleted before the SDK could re-read it, so it may
+     * name a document `onCreate` never reported, or be called twice for one
+     * delete: remove by id and ignore unknown ids.
+     */
     onDelete?(id: string): void;
     /** Called for every event (after the specific callback). */
     onChange?(event: ChangeEvent<T>): void;
-    /** The server rejected the subscription (e.g. invalid collection name). */
+    /**
+     * The server rejected the subscription (e.g. invalid collection name),
+     * or the document of a create or update that arrived without one could
+     * not be re-read. In that case only `onChange` gets the event, with
+     * `doc: null`; re-fetch (or use {@link Collection.watch}) to catch up.
+     */
     onError?(error: BackyardError): void;
   }
 
@@ -340,7 +382,9 @@ declare namespace Backyard {
      * Receives changes made by anyone, in realtime (over the shared
      * websocket). Only live events are delivered: after a reconnect, use
      * {@link watch} (which re-fetches) if you must not miss changes.
-     * Passing a function is shorthand for `{ onChange }`.
+     * Passing a function is shorthand for `{ onChange }`. Events arrive in
+     * order; a create or update the server sent without its document is
+     * re-read first (see {@link SubscribeHandlers}).
      */
     subscribe(handlers: SubscribeHandlers<T> | ((event: ChangeEvent<T>) => void)): Unsubscribe;
     /**
@@ -405,6 +449,11 @@ declare namespace Backyard {
     | { type: "text"; text: string }
     /** Inline image: base64 `data` (no `data:` prefix) and its media type. */
     | { type: "image"; data: string; media_type: "image/png" | "image/jpeg" | "image/gif" | "image/webp" | (string & {}) }
+    /**
+     * Image by URL: the `url` of one of this site's uploads (as returned by
+     * `files.upload`; the server reads it from storage), a `data:` URL, or an
+     * absolute public http(s) URL. Other site-relative URLs are rejected.
+     */
     | { type: "image"; url: string };
 
   interface Message {

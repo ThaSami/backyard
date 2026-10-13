@@ -57,6 +57,15 @@ describe("paths and names", () => {
     ["a\\b", 'path may not contain "\\"'],
     ["a\nb", "path contains a control character"],
     ["x".repeat(1025), "path longer than 1024 bytes"],
+    [".git", 'path may not contain a ".git" segment'],
+    [".git/config", 'path may not contain a ".git" segment'],
+    ["a/.GIT/HEAD", 'path may not contain a ".git" segment'],
+    ["vendor/lib/.Git", 'path may not contain a ".git" segment'],
+    [".github/workflows/ci.yml", ""],
+    [".gitignore", ""],
+    ["a/.git.bak/x", ""],
+    ["a/x.git", ""],
+    ["git/HEAD", ""],
   ])("validatePath(%j)", (p, want) => expect(validatePath(p)).toBe(want));
 
   it("sanitizes upload names", () => {

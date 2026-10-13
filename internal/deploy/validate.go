@@ -18,11 +18,35 @@ const (
 	maxMessageBytes    = 4096
 )
 
-// ValidatePath reports why a site-relative path is unacceptable, or "" when
-// it is valid: relative, "/"-separated, no "." / ".." / empty segments, at
-// most MaxPathBytes, valid UTF-8 without control characters or backslashes,
-// and not under "__backyard/".
+// ValidatePath reports why a site-relative path is unacceptable for a
+// deploy or a gateway read, or "" when it is valid: ValidatePathSyntax, and
+// no segment may be ".git" in any letter case (HasGitSegment).
+//
+// The ".git" rule is defense in depth: deploys never publish repository
+// metadata (the CLI's ignore rules cannot re-include .git/, see
+// ProtectedIgnore), so a client sending such a path is broken or hostile,
+// and a gateway never serves one back to a "backyard pull" (a crafted
+// .git/config runs commands on the next git command in the pulled folder).
+// Case-insensitive file systems (macOS, Windows) resolve ".GIT" to ".git".
+// The Cloudflare edition's validatePath applies the same rule.
 func ValidatePath(p string) string {
+	if why := ValidatePathSyntax(p); why != "" {
+		return why
+	}
+	if HasGitSegment(p) {
+		return `path may not contain a ".git" segment`
+	}
+	return ""
+}
+
+// ValidatePathSyntax reports why p is not a well-formed site-relative path,
+// or "" when it is: relative, "/"-separated, no "." / ".." / empty
+// segments, at most MaxPathBytes, valid UTF-8 without control characters or
+// backslashes, and not under "__backyard/". It does not apply ValidatePath's
+// ".git" rule, so clients use it for paths a site may already hold (stored
+// before the rule, or by a direct sync) that they only need to name safely,
+// e.g. to skip or delete them.
+func ValidatePathSyntax(p string) string {
 	switch {
 	case p == "":
 		return "empty path"
@@ -51,6 +75,17 @@ func ValidatePath(p string) string {
 		}
 	}
 	return ""
+}
+
+// HasGitSegment reports whether a "/"-separated segment of p is ".git" in
+// any letter case.
+func HasGitSegment(p string) bool {
+	for seg := range strings.SplitSeq(p, "/") {
+		if strings.EqualFold(seg, ".git") {
+			return true
+		}
+	}
+	return false
 }
 
 // validSitePath validates p and that the resulting storage key is usable.

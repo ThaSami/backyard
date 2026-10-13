@@ -41,7 +41,8 @@ Every command accepts:
   expiry, device-flow refresh token, preferred deploy method, the server's `/info`. Several
   servers: `backyard login --profile staging --server …`, then `--profile staging`.
 - `.backyard.json` — per-project settings (`site`, `dir`, `method`, `ignore`), searched in the
-  current folder and its parents.
+  current folder and its parents. `dir` is relative to the file and must stay inside its
+  folder: an absolute path, a `..` that leaves it or a symlink leading out is an error.
 - `.backyardignore` — gitignore-style deploy exclusions at the root of the deployed folder.
 
 ---
@@ -74,7 +75,10 @@ backyard init dashboard --template app --dir ./web
 Serve a folder as a live site at `http://<site>.localhost:<port>/` with a complete local backend
 (database, realtime, files, AI if configured); edits show up on reload. Data is kept in
 `./.backyard-data`. Pass `--config` to use AI providers or a warehouse from a server config; the
-server still runs in dev mode on localhost.
+server still runs in dev mode on localhost. Besides the site and hub URLs it prints a `check:`
+line, `curl -s -H 'Host: <site>.localhost:<port>' http://127.0.0.1:<port>/`, for tools that
+cannot resolve `*.localhost` (containers, CI, scripts); `http://localhost:<port>/` is the dev
+hub, not the site.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -105,8 +109,17 @@ runs `az storage blob sync`; `rsync` targets the server's `deploy.rsync_target`;
 `api` when the gateway is reachable and you are logged in (or anonymous deploys are allowed),
 else the first direct method the server advertises whose tool is installed.
 
-Ignored by default: `.git/`, `node_modules/`, `.claude/`, `.cursor/`, `.github/`, `CLAUDE.md`,
-`AGENTS.md`, `.backyard.json`, dotfiles (except `.well-known/`) plus `.backyardignore` lines.
+Never uploaded: `.git/`, `.backyard.json` and `.backyardignore` (in any letter case, at any
+depth; nothing can re-include them). Ignored by default: `node_modules/`, `.claude/`,
+`.cursor/`, `.github/`, `CLAUDE.md`, `AGENTS.md`, `.DS_Store` and dotfiles (except
+`.well-known/`), plus the lines of `.backyardignore` and the `.backyard.json` `ignore` list,
+which may re-include those defaults with `!` (e.g. `!.htaccess`). See
+[deploying sites](deploying-sites.md#backyardignore).
+
+The direct methods (`s3`, `gcs`, `azure`) never delete what their excludes match, so after the
+sync the CLI lists the site through the gateway and removes stored files that the ignore rules
+exclude (rsync does this itself with `--delete-excluded`), then refreshes the site. A failed
+removal fails the deploy; without a usable gateway a note says what was left.
 
 ```sh
 backyard deploy
@@ -116,16 +129,25 @@ backyard deploy --method s3 -y
 ```
 
 With `--json`: `{site, url, method, dry_run, uploaded, unchanged, deleted, bytes, files,
-command, meta}`.
+command, cleanup, meta}` — `command` is the sync command of a direct method and `cleanup` the
+commands removing ignored files (listed by dry runs too).
 
 ### `backyard pull <site> [dir]`
 
 Download the deployed files of a site into `dir` (default `./<site>`) — handy to fork or remix
 another site. Local files that differ from the site are not overwritten unless `--force`.
 
+Files a deploy never publishes are skipped, even if the site holds them and even with
+`--force`: dotfiles and dot-folders (`.git/`, `.claude/`, `.env`…; `.well-known/` is kept),
+`node_modules/`, `.backyard.json`, `.backyardignore`, `CLAUDE.md` and `AGENTS.md`, compared the
+way case-insensitive and Windows file systems resolve names. A site cannot plant repository
+metadata (a crafted `.git/config`), project settings or agent instructions in your folder. The
+skipped paths are listed on stderr; with `--json` the output is `{site, dir, downloaded,
+unchanged, skipped}`.
+
 | Flag | Default | Meaning |
 |---|---|---|
-| `-f`, `--force` | `false` | Overwrite local files that differ. |
+| `-f`, `--force` | `false` | Overwrite local files that differ (never skipped files). |
 
 ### `backyard skill install`
 
@@ -149,8 +171,10 @@ using this CLI's login. Logs go to stderr. Tools: `backyard_docs`, `backyard_ini
 
 Start it in the project folder: `backyard_init` and `backyard_deploy` only use folders inside
 the working directory, and any other folder only when the agent names it by the absolute path of
-an existing directory; the filesystem root, the home directory and folders holding credentials
-(`~/.ssh`, `~/.config`, the CLI's own config folder…) are always refused.
+an existing directory; the filesystem root, the home directory, folders holding credentials
+(`~/.ssh`, `~/.config`, `~/Library`, `~/AppData`, the CLI's own config folder…) and hidden
+folders outside the working directory are always refused. Without a `dir`, `backyard_deploy`
+publishes the project's `.backyard.json` `dir`, like `backyard deploy`.
 `backyard_read_site_file` refuses binary file types without downloading them, and its content
 is untrusted data written by other people. Tool results and errors never contain tokens or
 signed upload URLs.
@@ -210,7 +234,7 @@ Open a site (or, without a name, the hub) in the browser.
 
 | Command | Meaning |
 |---|---|
-| `backyard token create` | Mint a personal API token acting as you, e.g. for CI (`BACKYARD_TOKEN`). Printed on stdout. Flags: `--name` (default `cli`, shown in audit logs), `--ttl` (default `720h`; `90d` style accepted; at most the server's `auth.token_ttl`). |
+| `backyard token create` | Mint a personal API token acting as you, e.g. for CI (`BACKYARD_TOKEN`). Printed on stdout. Flags: `--name` (default `cli`, shown in audit logs), `--ttl` (default `720h`; `90d` style accepted; at most the server's `auth.token_ttl`). When your stored credential is a Backyard token (a browser `backyard login`), the new token expires no later than that login — a token cannot extend its own lifetime; after `backyard login --device` it gets the full `--ttl`. Behind an identity-aware proxy, `POST /__backyard/api/tokens` with an `Authorization` header must be exempt from the proxy (the AWS, Google Cloud and Cloudflare Terraform modules do this). |
 | `backyard token hash [token]` | Print the hex SHA-256 of a static bearer token and the `backyard.yaml` snippet that accepts it. `-` (or nothing) reads the token from stdin. Flag: `--name` (default `ci`). |
 
 ```sh

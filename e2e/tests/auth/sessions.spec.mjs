@@ -101,6 +101,72 @@ test("the CLI's browser sign-in hands a personal API token to the loopback serve
   }
 });
 
+test("a link from another site to the CLI sign-in asks first, and only Allow hands over the token", async ({ newUser, state }) => {
+  // One loopback server plays two parts: the CLI's listener (/callback) and,
+  // under http://localhost (another site than http://127.0.0.1), a foreign
+  // page that links to the CLI sign-in (/attack).
+  const received = [];
+  const loopback = http.createServer((req, res) => {
+    const u = new URL(req.url, "http://127.0.0.1");
+    if (u.pathname === "/attack") {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(`<!doctype html><title>Elsewhere</title><link rel=icon href='data:,'><a id=go href="${u.searchParams.get("to")}">Free stuff</a>`);
+      return;
+    }
+    received.push(u);
+    res.writeHead(200, { "Content-Type": "text/html" });
+    res.end("<!doctype html><title>CLI</title><link rel=icon href='data:,'><p id=done>You can close this tab.</p>");
+  });
+  await new Promise((resolve) => loopback.listen(0, "127.0.0.1", resolve));
+  const port = loopback.address().port;
+  const callback = `http://127.0.0.1:${port}/callback`;
+  const attack = (to) => `http://localhost:${port}/attack?to=${encodeURIComponent(to)}`;
+  try {
+    const alice = await person(newUser, state, "alice");
+    const page = await alice.newPage();
+    await page.goto("/"); // signs in (silently at the IdP)
+    await expect(page.locator("#user-name")).toHaveText("Alice Smith");
+
+    const st = rand();
+    const cli = `${URLS.oidc}/__backyard/auth/cli?redirect_uri=${encodeURIComponent(callback)}&state=${st}`;
+    await page.goto(attack(cli));
+    await page.locator("#go").click();
+    await expect(page).toHaveURL(cli);
+    await expect(page.locator("h1")).toHaveText("Allow the Backyard CLI on this computer to sign in as alice@example.com?");
+    await expect(page.locator("body")).toContainText(`http://127.0.0.1:${port}`);
+    expect(received).toHaveLength(0); // nothing was handed over yet
+
+    // Cancel goes back to the hub and hands over nothing.
+    await page.locator("#cancel").click();
+    await expect(page.locator("#user-name")).toHaveText("Alice Smith");
+    expect(received).toHaveLength(0);
+
+    // Allow: the form posts back and the answer redirects to the CLI (the
+    // page's CSP form-action lets that redirect through).
+    await page.goto(attack(cli));
+    await page.locator("#go").click();
+    await page.locator("#allow").click();
+    await expect(page.locator("#done")).toHaveText("You can close this tab.");
+    expect(received).toHaveLength(1);
+    expect(received[0].pathname).toBe("/callback");
+    expect(received[0].searchParams.get("state")).toBe(st);
+    const me = await fetch(`${URLS.oidc}/__backyard/api/deploy/me`, { headers: { Authorization: `Bearer ${received[0].searchParams.get("token")}` } });
+    expect(me.status).toBe(200);
+    expect(await me.json()).toMatchObject({ id: "alice@example.com" });
+
+    // mode=display from a foreign page: confirmed, the token is shown.
+    await page.goto(attack(`${URLS.oidc}/__backyard/auth/cli?mode=display`));
+    await page.locator("#go").click();
+    await expect(page.locator("h1")).toHaveText("Create a Backyard CLI token for alice@example.com?");
+    await expect(page.locator("body")).not.toContainText("eyJ");
+    await page.locator("#allow").click();
+    await expect(page.locator("body")).toContainText(`backyard login --server ${URLS.oidc} --token eyJ`);
+    expect(received).toHaveLength(1);
+  } finally {
+    await new Promise((resolve) => loopback.close(resolve));
+  }
+});
+
 test("the docs page signs in again when the session is gone", async ({ newUser, state }) => {
   const alice = await person(newUser, state, "alice");
   const page = await alice.newPage();

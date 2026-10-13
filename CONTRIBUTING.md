@@ -214,7 +214,9 @@ The Terraform modules also have `terraform test` suites with mocked providers
   has a row in [docs/configuration.md](docs/configuration.md) (and every row is a real key),
   every `§n` names a section of the specification, and statements tied to code match it (key
   derivation labels, site URL examples, limits, quoted configuration errors, AI limits, the MCP
-  tools and their parameters).
+  tools and their parameters, the passive upload types of both editions, the warehouse and
+  realtime size limits, the direct-sync command flags, the files no ignore rule can deploy, the
+  login state cookie, and the Cloudflare edition's page budget and Access bypass paths).
 - Keep the [changelog](CHANGELOG.md) up to date: add user-visible changes to the topmost,
   unreleased version.
 

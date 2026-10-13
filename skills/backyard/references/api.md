@@ -148,7 +148,17 @@ const posts = backyard.db.collection("posts");   // sync; nothing is created unt
 | `backyard.db.collections()` | `string[]` | Names of this site's collections. |
 
 Arrays returned by `list`, `find` and `Query.get` carry a non-enumerable `hasMore` boolean:
-`true` when more documents match beyond `limit`.
+`true` when more documents match after this page. A page can hold **fewer** than `limit`
+documents and still have `hasMore` (the Cloudflare edition ends a page at about 8 MiB of
+documents), so advance `offset` by the number of documents received, not by `limit`:
+
+```js
+const all = [];
+for (let page; !page || page.hasMore; ) {
+  page = await posts.list({ limit: 500, offset: all.length });
+  all.push(...page);
+}
+```
 
 ### Queries
 
@@ -201,7 +211,8 @@ reused. The same query as a wire object (for `find`, and the HTTP API):
   objects, reversed for descending order — so missing and `null` values sort **first
   ascending, last descending**. Ties are broken by `id` ascending.
 - Default order: `_meta.created_at` ascending, then `id`.
-- `limit` defaults to 100, max 1000. Page with `offset` while `hasMore` is true.
+- `limit` defaults to 100, max 1000. Page with `offset` while `hasMore` is true, advancing it
+  by the number of documents each page returned (a page may hold fewer than `limit`).
 - There are no aggregates, joins or full-text search — compute them in JavaScript.
 
 ### Realtime: watch and subscribe
@@ -217,8 +228,11 @@ const stop = posts.watch(render, posts.where("status", "==", "open").orderBy("vo
 ```
 
 **`collection.subscribe(handlers)`** — raw change events from anyone (including yourself),
-delivered over the page's websocket. Only live events are delivered — after a reconnect,
-changes that happened while offline are not replayed (use `watch` when you must not miss any).
+delivered over the page's websocket, in order. Only live events are delivered — after a
+reconnect, changes that happened while offline are not replayed (use `watch` when you must not
+miss any). `onCreate`/`onUpdate` always get a full document: when a document is too large to
+travel in the event (about 1 MiB, only possible if the admins raised the document size limit),
+the SDK re-reads it first. Treat `onDelete` ids you do not know as harmless (remove by id).
 
 ```js
 const unsubscribe = posts.subscribe({
@@ -266,8 +280,10 @@ interface FileInfo {
 
 `url` is site-relative and works directly in `<img src>`, `<video src>` (Range requests are
 supported) and `<a href download>`. Uploaded files are visible to everyone who can open the
-site. Uploaded HTML, SVG and XML files are served with `Content-Security-Policy: sandbox`, so
-they display but never run scripts as your site — host pages as site files instead. Files have
+site. Only passive types (images, audio, video, plain text, CSV, PDF, JSON) are served as
+they are; anything else — HTML, SVG, XML, scripts, unknown types — gets
+`Content-Security-Policy: sandbox`, so it displays but never runs scripts as your site. Host
+pages as site files instead. Files have
 no realtime feed: to show other people's uploads live, also create a db document per upload
 and `watch` that collection.
 
@@ -304,21 +320,35 @@ const res = await backyard.ai.chat(input, {
   `{ role: "user" | "assistant" | "system", content: string | ContentBlock[] }`. System
   messages are hoisted into the system prompt.
 - Content blocks: `{ type: "text", text }`, `{ type: "image", data: "<base64 without data: prefix>", media_type: "image/png" }`,
+  `{ type: "image", url: f.url }` (an upload of this site),
   `{ type: "image", url: "data:image/png;base64,…" }` or `{ type: "image", url: "https://…" }`.
-  A URL must be absolute and **publicly reachable** (the provider or Backyard's guarded fetcher
-  downloads it; private and internal addresses are refused) — so a site-relative upload URL
-  such as `f.url` does **not** work. Send images you have in the browser (a `File`, a canvas, an
-  upload) as a data URL instead; images are limited to 20 MiB each.
+  The OpenAI shape `{ type: "image_url", image_url: { url } }` is accepted too.
+  - **Uploads of this site work directly:** pass the `url` that `backyard.files.upload` (or
+    `backyard.ai.image`) returned. The server reads the file from storage — nothing is
+    fetched — and detects its type from the bytes (png, jpeg, gif or webp). Another site's
+    file, an unknown file or any other site-relative URL is rejected (`bad_request`).
+  - Other URLs must be absolute and **publicly reachable** (the provider or Backyard's guarded
+    fetcher downloads them; private and internal addresses are refused).
+  - Images you only have in the browser (a picked `File` you did not upload, a canvas) go as a
+    data URL.
+  - Images are limited to 20 MiB each, and images loaded from URLs to 64 MiB per request.
 
 ```js
+const f = await backyard.files.upload(input.files[0]);     // or a file uploaded earlier
+const { content } = await backyard.ai.chat([{ role: "user", content: [
+  { type: "text", text: "Describe this photo in one sentence." },
+  { type: "image", url: f.url },
+] }]);
+
+// Not uploaded: send it as a data URL.
 const toDataURL = (blob) => new Promise((ok, fail) => {
   const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = () => fail(r.error); r.readAsDataURL(blob);
 });
-const photo = await (await fetch(f.url)).blob();            // e.g. a file uploaded earlier
-const { content } = await backyard.ai.chat([{ role: "user", content: [
-  { type: "text", text: "Describe this photo in one sentence." },
-  { type: "image", url: await toDataURL(photo) },
-] }]);
+canvas.toBlob(async (png) => {
+  const { content } = await backyard.ai.chat([{ role: "user", content: [
+    { type: "text", text: "What did I draw?" }, { type: "image", url: await toDataURL(png) },
+  ] }]);
+});
 ```
 
 - `stop_reason` is normalized to `end_turn`, `max_tokens`, `stop_sequence`, `refusal` or `other`.
@@ -413,7 +443,8 @@ const { sources, queries } = await backyard.warehouse.sources();
 
 - Raw SQL must start with `SELECT` or `WITH` (after comments) unless the admin allows any
   statement; Postgres sources run in a read-only transaction.
-- Results are capped (default 10,000 rows → `truncated: true`) and time out after 60 s by default.
+- Results are capped (default 10,000 rows, and 32 MiB of row data → `truncated: true`) and time
+  out after 60 s by default. Aggregate in SQL instead of fetching wide raw rows.
 - Column `type` is the engine's type name. Values arrive as JSON: dates/timestamps as strings,
   big integers/decimals may be strings — convert with `Number()` when charting.
 - Rate limited per user; cache results in memory instead of re-querying on every render.
@@ -505,8 +536,8 @@ see [deploy.md](deploy.md#cloudflare-edition-free-tier).
 | Site (deploy) | 500 MiB total, 10,000 files, 100 MiB per file |
 | Websocket | 64 KiB per frame; 60 msgs/s sustained, burst 120; 50 rooms and 100 subscriptions per connection; presence state ≤ 8 KiB; 50 connections per user |
 | Rate limits (per user) | API 600/min · db writes 300/min · AI 20 calls/min and 2,000,000 tokens/day · uploads 60/min · warehouse 30 queries/min · deploys 60/h |
-| AI | `max_tokens` capped by the server (default 8192) |
-| Warehouse | 10,000 rows per result, 60 s timeout |
+| AI | `max_tokens` capped by the server (default 8192); chat images ≤ 20 MiB each, ≤ 64 MiB per request for images loaded from URLs (uploads included) |
+| Warehouse | 10,000 rows and 32 MiB per result, 60 s timeout |
 
 ## HTTP API
 
@@ -569,7 +600,8 @@ Every successful write publishes a realtime event to subscribers of the collecti
 | `DELETE /files/{id}` | | `204` (also when missing) |
 
 Bytes are served (not under `/api`) at `/__backyard/files/{id}/{name}` with Range support
-(HTML/SVG/XML with `Content-Security-Policy: sandbox`).
+(every type except passive ones — raster images, audio/video, plain text, CSV, PDF, JSON,
+octet-stream — with `Content-Security-Policy: sandbox`).
 
 ### AI
 
@@ -632,7 +664,7 @@ Server → client:
 
 | Frame | Meaning |
 |---|---|
-| `{"t":"db","sub":"s1","collection":"posts","op":"create"\|"update"\|"delete","doc":{…}\|null,"doc_id":"…"}` | Database change (`doc` is the flattened document; `null` for deletes) |
+| `{"t":"db","sub":"s1","collection":"posts","op":"create"\|"update"\|"delete","doc":{…}\|null,"doc_id":"…"}` | Database change (`doc` is the flattened document; `null` for deletes, and for a create or update too large to broadcast: read it with `GET /db/{c}/{doc_id}`) |
 | `{"t":"presence","room":"lobby","op":"join"\|"leave"\|"update","member":Member}` | Presence change |
 | `{"t":"msg","room":"lobby","from":{"cid":"…","user":UserSummary},"data":any}` | Room message |
 | `{"t":"error","id":…,"error":{"code","message"}}` | Error (e.g. `rate_limited`, `bad_request`) |

@@ -121,12 +121,15 @@ Written by `backyard init`; found by searching the current folder and its parent
 
 ### `.backyardignore` and default ignores
 
-Never uploaded: `.git/`, `node_modules/`, `.claude/`, `.cursor/`, `.github/`, `CLAUDE.md`,
-`AGENTS.md`, `.backyard.json`, `.backyardignore`, `.DS_Store`, and every path segment starting
-with `.` (dotfiles such as `.env`) except `.well-known/`.
+Never uploaded, whatever you configure: `.git/`, `.backyard.json` and `.backyardignore` (any
+letter case, any depth). Ignored by default: `node_modules/`, `.claude/`, `.cursor/`, `.github/`,
+`CLAUDE.md`, `AGENTS.md`, `.DS_Store`, and every path segment starting with `.` (dotfiles such
+as `.env`) except `.well-known/`.
 
 Add more with a `.backyardignore` in the deployed folder (gitignore syntax: `#` comments, `!`
-negation, trailing `/` for directories, `**`, leading `/` anchors to the root):
+negation, trailing `/` for directories, `**`, leading `/` anchors to the root). A `!` line can
+publish something the defaults skip (`!.htaccess`), but never the never-uploaded files — don't
+re-include agent files or dotfiles unless the user asks:
 
 ```gitignore
 drafts/
@@ -144,8 +147,8 @@ drafts/
 | `api` | Backyard deploy gateway protocol (diffed uploads to presigned URLs, then commit) | a login/token (or anonymous deploys) |
 | `s3` | `aws s3 sync <dir> s3://<bucket>/<prefix>sites/<site>/ --delete --no-follow-symlinks --exclude …` | AWS CLI + credentials for the bucket |
 | `gcs` | `gcloud storage rsync <dir> gs://<bucket>/<prefix>sites/<site> --recursive --delete-unmatched-destination-objects --exclude=…` (falls back to `gsutil -m rsync -r -d -e -x`) | gcloud + bucket access |
-| `azure` | `az storage blob sync --account-name <a> -c <container> -s <dir> -d <prefix>sites/<site> --delete-destination true --exclude-pattern …` | Azure CLI + storage access |
-| `rsync` | `rsync -az --delete --delete-excluded --exclude … <dir>/ <rsync_target>/<site>/` | SSH access to the server's `deploy.rsync_target` |
+| `azure` | `az storage blob sync --account-name <a> -c <container> -s <dir> -d <prefix>sites/<site> --delete-destination true --exclude-pattern … --exclude-path …` | Azure CLI + storage access |
+| `rsync` | `rsync -az --delete --delete-excluded --filter='P .backyard-tmp-*' --exclude … <dir>/ <rsync_target>/<site>/` | SSH access to the server's `deploy.rsync_target` |
 | `auto` (default) | `api` when the gateway is reachable and you are logged in (or anonymous deploys are allowed); otherwise the first direct method the server advertises whose tool is installed | |
 
 Bucket names, prefixes and the rsync target come from the server (`GET
@@ -229,7 +232,7 @@ when unset), or use the Terraform in `deploy/terraform/cloudflare`.
 | Topic | Cloudflare edition |
 |---|---|
 | URLs | Path mode on `https://<worker>.<account>.workers.dev/s/<site>/` by default; a custom domain (path mode) or host mode with a wildcard route `*.<domain>/*`. |
-| Who can open sites | `AUTH_MODE=none` (default): **anyone with the link** can open sites and use their APIs; visitors get anonymous guest identities (`me.anonymous === true`); only holders of the `DEPLOY_TOKEN` can deploy (unless `ALLOW_ANONYMOUS_DEPLOY`). `AUTH_MODE=access`: Cloudflare Access (free for up to 50 users; Okta, Entra ID, Google… as identity providers) protects the hub and every site, `backyard login` uses the browser flow and `/__backyard/api/deploy/*` must bypass Access. |
+| Who can open sites | `AUTH_MODE=none` (default): **anyone with the link** can open sites and use their APIs; visitors get anonymous guest identities (`me.anonymous === true`); only holders of the `DEPLOY_TOKEN` can deploy (unless `ALLOW_ANONYMOUS_DEPLOY`). `AUTH_MODE=access`: Cloudflare Access (free for up to 50 users; Okta, Entra ID, Google… as identity providers) protects the hub and every site, `backyard login` uses the browser flow, and `/__backyard/api/deploy/*` (plus `/__backyard/api/tokens` for `backyard token create`) must bypass Access. Any other `AUTH_MODE` value makes the Worker answer `503` until it is fixed. |
 | Database & realtime | Per-site Durable Object with SQLite — same query semantics; realtime runs in that object. |
 | Files | Up to 25 MiB per file (95 MiB with the optional R2 bucket); 200 MiB and 2,000 files per site. Files up to 5 MiB live in the Durable Object, bigger ones in R2. |
 | AI | Workers AI (free daily allowance) behind the aliases `smart`, `fast`, `image`, `embed` (configurable with `AI_MODELS`), plus optional Anthropic/OpenAI keys. `max_tokens` is capped at 4096. |
@@ -244,7 +247,10 @@ or `rate_limited`, and handle anonymous visitors (`me.anonymous`).
 Deploy from CI with a token in `BACKYARD_TOKEN`:
 
 - **Personal token** (acts as you): `backyard token create --name github-actions --ttl 720h`
-  (at most the server's `auth.token_ttl`, 30 days by default; renew it before it expires).
+  (at most the server's `auth.token_ttl`, 30 days by default; renew it before it expires). It
+  never outlives the CLI login that minted it: right after a fresh `backyard login` it gets the
+  full lifetime, later only what the login has left (a `--device` login always gets the full
+  lifetime).
 - **Static token** (acts as `token:<name>`, never expires, survives people leaving): create one
   with `openssl rand -hex 32 | tee ci-token.txt | backyard token hash --name ci` and give the
   admin the printed snippet for `auth.tokens` (`[{name: ci, sha256: <hash>}]`).

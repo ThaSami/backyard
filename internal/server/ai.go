@@ -51,6 +51,29 @@ type chatPart struct {
 	Data      string `json:"data"`
 	MediaType string `json:"media_type"`
 	URL       string `json:"url"`
+	// ImageURL accepts the OpenAI-style part {"type":"image_url",
+	// "image_url":{"url":"…"}} (or a bare string), which agents often
+	// produce; it is equivalent to {"type":"image","url":"…"}.
+	ImageURL json.RawMessage `json:"image_url"`
+}
+
+// imageURL returns the part's URL, falling back to the OpenAI-style
+// image_url object or string.
+func (p chatPart) imageURL() string {
+	if p.URL != "" || len(p.ImageURL) == 0 {
+		return p.URL
+	}
+	var s string
+	if json.Unmarshal(p.ImageURL, &s) == nil {
+		return s
+	}
+	var o struct {
+		URL string `json:"url"`
+	}
+	if json.Unmarshal(p.ImageURL, &o) == nil {
+		return o.URL
+	}
+	return ""
 }
 
 // aiEnabled writes 501 when AI is not configured.
@@ -404,6 +427,7 @@ func parseContent(i int, raw json.RawMessage) ([]ai.Part, *apiError) {
 
 func parseImagePart(i, j int, p chatPart) (ai.Part, *apiError) {
 	part := ai.Part{Type: "image", MediaType: strings.ToLower(strings.TrimSpace(p.MediaType))}
+	p.URL = p.imageURL()
 	switch {
 	case p.Data != "":
 		if data, mt, ok := ai.ParseDataURL(p.Data); ok {

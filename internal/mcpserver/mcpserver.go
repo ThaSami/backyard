@@ -143,11 +143,13 @@ publish the current project like the backyard deploy command: the folder named b
 .backyard.json's "site", else the project folder's name. The directory must be inside the working
 directory (relative paths are resolved against it); a folder elsewhere is only published when
 given as the absolute path of an existing directory; folders holding credentials or settings
-(hidden folders such as ~/.ssh or ~/.config, the home directory itself) are refused. Dotfiles,
-node_modules, .git, CLAUDE.md and AGENTS.md are never uploaded. Uses the user's current Backyard
-CLI login; if it reports that you are not logged in, ask the user to run "backyard login" in a
-terminal. Use dry_run to preview. A site last deployed by someone else is not replaced unless
-overwrite is true: ask the user before setting it (or pick another site name).`,
+(hidden folders such as ~/.ssh or ~/.config, the home directory itself) are refused. .git and
+the project files (.backyard.json, .backyardignore) are never uploaded; dotfiles, node_modules,
+CLAUDE.md and AGENTS.md are skipped unless .backyardignore re-includes them with "!" lines.
+Uses the user's current Backyard CLI login; if it reports that you are not logged in, ask the
+user to run "backyard login" in a terminal. Use dry_run to preview. A site last deployed by
+someone else is not replaced unless overwrite is true: ask the user before setting it (or pick
+another site name).`,
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: &t, IdempotentHint: true, OpenWorldHint: &t},
 	}, safe(s, s.deploy))
 
@@ -582,6 +584,12 @@ func (s *server) deploy(ctx context.Context, _ *mcp.CallToolRequest, in DeployIn
 	}
 	if err := validSite(site); err != nil {
 		return nil, DeployOutput{}, fmt.Errorf("%w; pass a valid \"site\"", err)
+	}
+	if cfg, err := s.configPublished(dir, ignore); err != nil {
+		return nil, DeployOutput{}, err
+	} else if cfg != "" {
+		return nil, DeployOutput{}, fmt.Errorf("refusing to deploy %s: its ignore rules (%s, %s \"ignore\") would upload "+
+			"the Backyard CLI's credentials (%s)", dir, deploy.IgnoreFile, clientconfig.ProjectFileName, cfg)
 	}
 	sess, err := s.session(ctx)
 	if err != nil {

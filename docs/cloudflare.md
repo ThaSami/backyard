@@ -28,7 +28,10 @@ backyard init my-site && cd my-site
 backyard deploy          # → https://backyard.<account>.workers.dev/s/my-site/
 ```
 
-Re-run setup to upgrade; earlier choices are remembered. Options after `--`:
+Re-run setup to upgrade; earlier choices are remembered on the machine that made them. A
+Worker's existing `DEPLOY_TOKEN` is never replaced unless you pass `--rotate-token`: on another
+machine (or in CI) setup keeps the token it does not know and tells you to run it with
+`DEPLOY_TOKEN=<token>` to remember it there. Options after `--`:
 `--worker-name <name>`, `--r2`, `--var KEY:VALUE` (e.g. `--var AUTH_MODE:access`),
 `--rotate-token`. A GitHub Actions workflow and Terraform for a custom domain with Cloudflare
 Access ([`deploy/terraform/cloudflare`](../deploy/terraform/cloudflare/README.md)) are included.
@@ -53,6 +56,17 @@ between all sites and the hub** — see [security](security.md#host-mode-vs-path
 
 With the default `AUTH_MODE=none`, anyone with a link can open sites and use their APIs as an
 anonymous guest; put Cloudflare Access in front (free for up to 50 users) for a company login.
+`AUTH_MODE` must be exactly `none` or `access`: any other value (a typo, or a Go server mode
+such as `oidc`) makes the Worker **fail closed** — every request except
+`/__backyard/healthz` gets `503`, `/__backyard/readyz` names the problem, and `npx wrangler
+tail` shows it — rather than silently running without sign-in.
+
+Access must let through the paths the Worker authenticates itself: `/__backyard/api/deploy`
+and `/__backyard/api/deploy/*` (deploys with `DEPLOY_TOKEN` or API tokens, signed upload URLs),
+`/__backyard/api/tokens` (`backyard token create`; a minted token never outlives the token that
+asked for it) and the health checks `/__backyard/healthz` and `/__backyard/readyz`. The
+[Terraform module](../deploy/terraform/cloudflare/README.md) creates this Bypass policy
+(`bypass_paths`).
 
 Within the shared contract, a few edition differences are visible to pages and CLIs (all
 listed in the [specification](spec/SPEC.md#16-cloudflare-edition-free-tier)):
@@ -62,11 +76,19 @@ listed in the [specification](spec/SPEC.md#16-cloudflare-edition-free-tier)):
   site in one transaction. Uploads of deploys that never commit are garbage-collected later.
 - **Smaller AI requests:** at most 4 images per `backyard.ai.image` call (Go server: 10) and
   100 strings per `backyard.ai.embed` call (Go server: 2048). Provider failures map to the same
-  status codes as on the Go server.
+  status codes as on the Go server. The daily image caps (`LIMITS`) count images, not calls:
+  `n: 4` uses four.
+- **Query pages have a byte budget:** a page carries at most about 8 MiB of stored documents,
+  so with large documents a `list` or query returns fewer than `limit` documents with
+  `hasMore: true`. Page by advancing `offset` by the number of documents received
+  (`offset += docs.length`), not by `limit` — that works on both editions.
 - **Dot segments:** the Workers runtime resolves `/./` and `/../` in a URL before the Worker
   sees it, so such a URL is served as its cleaned path instead of being redirected.
 - **Sign-in:** Cloudflare Access (or nobody, in `none`) signs people in, so
-  `/__backyard/auth/login?rd=…` simply redirects to `rd`.
+  `/__backyard/auth/login?rd=…` simply redirects to `rd`, and `/__backyard/auth/logout` clears
+  the guest cookie (`none`) or sends you to Access's logout (`access`). The CLI login's
+  cross-site confirmation, the cap on tokens minted with a token and the refusal of conflicting
+  sign-in cookies (including planted `CF_Authorization` cookies) work as on the Go server.
 
 Everything else — free-plan quotas and Backyard's guardrails, configuration variables, AI
 model aliases, local development, CI, differences from the Go edition, upgrades and

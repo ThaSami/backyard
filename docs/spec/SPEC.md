@@ -195,9 +195,14 @@ not affected.
 
 Uploaded files (`/__backyard/files/{id}/{name}`, §5.3) are authenticated like site files and
 served with `Content-Disposition: inline; filename=…` and `Cache-Control: private, no-cache`.
-Active content — `text/html`, `application/xhtml+xml`, `image/svg+xml`, `text/xml`,
-`application/xml`, `*+xml` — additionally gets `Content-Security-Policy: sandbox`, so an
-uploaded document can never run script with the site's origin.
+The stored type comes from the uploading client, so it cannot be trusted: only **passive**
+types are served without a sandbox — `image/png`, `image/apng`, `image/jpeg`, `image/gif`,
+`image/webp`, `image/avif`, `image/bmp`, `image/x-icon`, `image/vnd.microsoft.icon`,
+`text/plain`, `text/csv`, `application/pdf`, `application/json`, `application/octet-stream`,
+and `audio/*` or `video/*` whose subtype has no `+` suffix. Every other type (HTML, SVG, any
+XML including `text/xsl` and every `+xml` type, scripts, unknown or unparsable types)
+additionally gets `Content-Security-Policy: sandbox`, so an uploaded document can never run
+script with the site's origin.
 
 A small in-memory LRU cache (`storage.cache_bytes`, `storage.cache_ttl`) fronts blob reads for
 objects ≤ 1 MiB.
@@ -280,7 +285,8 @@ Wire shape of a document is **flattened**:
 On write, the body is the plain data object. Keys `id` and `_meta` in a write body are not
 stored as data (`id` is used as the document id on create / must match on put). `_meta.version`
 starts at 1 and every write (PUT, PATCH) increments it. Max document size
-`database.max_doc_bytes` (default 256 KiB) of JSON data; a larger document, or a create that would
+`database.max_doc_bytes` (default 256 KiB) of JSON data, measured as stored (without HTML
+escaping: `<`, `>` and `&` count one byte each); a larger document, or a create that would
 exceed `database.max_docs_per_site`, fails with `413 too_large`.
 
 | Method & path | Body | Result |
@@ -328,6 +334,9 @@ Query:
   order: `_meta.created_at asc, id asc`. `GET /db/{c}` also accepts
   `orderBy=field[,field2]&order=asc|desc`.
 * `limit` default 100, max `database.max_list` (default 1000). `has_more` true if more matched.
+  A page may hold **fewer** than `limit` documents and still have `has_more` (the Cloudflare
+  edition ends a page at its byte budget, §16; every page holds at least one document), so
+  clients page by advancing `offset` by the number of documents received, not by `limit`.
 * Every successful write publishes a realtime event (§6).
 
 ### 5.3 Files
@@ -381,6 +390,8 @@ against `db_writes_per_minute`. Serving rules: §3.
     Claude API) or downloaded by an SSRF-guarded fetcher (public addresses only).
   * Inline images ≤ 20 MiB each; images loaded from URLs (uploads and downloads together) ≤ 64
     MiB per request, and ≤ 20 MiB each.
+  * The OpenAI-style part `{"type":"image_url","image_url":{"url":"…"}}` (or `"image_url":"…"`)
+    is accepted as an alias of `{"type":"image","url":"…"}` by both editions.
 * `max_tokens` is capped by `ai.max_tokens` and a smaller per-alias `max_tokens`; without one
   the request gets min(4096, cap). `model` in responses is always the alias. An unknown alias →
   `404 not_found`; an alias of the wrong kind → `400 bad_request`; AI not configured → `501
@@ -435,7 +446,12 @@ Clients choose **aliases**, never raw provider model ids, unless `ai.allow_raw_m
   unknown columns, missing parameters) and are passed on; `502`/`500` messages are generic and
   name the request id (`X-Request-Id`, §5) under which the server logged the cause, because
   engine and connection errors can reveal host, user and database names. Results are capped at
-  `warehouse.max_rows` (then `truncated: true`) and bounded by `warehouse.timeout`.
+  `warehouse.max_rows` rows **and** at 32 MiB of row data (their JSON encoding plus a small
+  per-value overhead); the rows stop at the last one that fits both caps and the result has
+  `truncated: true`. Sources enforce the size cap while they read (Postgres cancels the
+  statement and never buffers a row larger than what is left of the cap; BigQuery and Athena
+  fetch no further pages). A single Postgres row too large for the cap ends the result; when it
+  is the first row, `columns` may be empty. Queries are bounded by `warehouse.timeout`.
 
 ### 5.6 JavaScript SDK (`window.backyard`)
 
@@ -542,6 +558,14 @@ Server → client:
 | `{"t":"msg","room":"lobby","from":{"cid":"…","user":UserSummary},"data":any}` | message |
 | `{"t":"error","id"?:…,"error":{"code","message"}}` | error |
 
+`doc` is the flattened document after the change and `null` for deletes. A `create` or `update`
+frame may also carry `"doc": null` (with `doc_id` and `op` as usual) when the event is too large
+to broadcast: the Go server sends the change without its document when the encoded event would
+exceed its 1 MiB pub/sub payload limit, which is possible when `database.max_doc_bytes` is
+raised. Clients read such a document with `GET /db/{c}/{doc_id}`; the SDK's `subscribe` does so
+before it delivers the event (in arrival order), so `onCreate`/`onUpdate` always receive a
+document. Events are encoded without HTML escaping.
+
 `Member = {"cid","user":UserSummary,"state":{…},"joined_at":RFC3339}`;
 `UserSummary = {id, name, email, avatar_url}`. `joined_at` has a fixed width of exactly three
 fractional digits (`2026-01-02T03:04:05.120Z`) so members order correctly as strings; `members`
@@ -617,10 +641,13 @@ is a short opaque id of the last deploy (`d_<hex>`), not the signed deploy token
    `{"files": [{"path": "index.html", "size": 1234, "sha256": "<hex>", "content_type": "text/html"}], "message": "…"}`
    → `{"deploy_id": "<signed>", "uploads": [{"path", "url", "method": "PUT", "headers": {…}}], "unchanged": ["app.js"], "expires_at": "…"}`
    Paths: relative, `/`-separated, no `..`, no leading `/`, ≤ 1024 bytes, may not start with
-   `__backyard/`. Limits from §7.1 enforced. A file is `unchanged` when the current manifest has
-   the same sha256 **and** the manifest-recorded etag+size still match storage (detects
-   out-of-band syncs). Ownership: in `sites.ownership: owner` mode the first deployer becomes
-   owner; later deploys require being an owner or admin.
+   `__backyard/`, and no segment may be `.git` in any letter case (deploys never publish
+   repository metadata, §13; both gateways apply the same rule to deploy plans, commits,
+   uploads and `GET G/sites/{site}/files/{path…}`, answering `400 bad_request`). Limits from
+   §7.1 enforced. A file is `unchanged` when the current manifest has the same sha256 **and**
+   the manifest-recorded etag+size still match storage (detects out-of-band syncs). Ownership:
+   in `sites.ownership: owner` mode the first deployer becomes owner; later deploys require
+   being an owner or admin.
 2. Client `PUT`s each upload URL with **all** the given headers and the raw bytes. Upload URLs
    are either presigned storage URLs (s3/gcs/azure) or `G/uploads/{signed-token}` (fs storage,
    `deploy.presign: false`, or credentials that cannot presign). Every upload is bound to the
@@ -640,23 +667,32 @@ is a short opaque id of the last deploy (`d_<hex>`), not the signed deploy token
    every listed file exists with the right size, deletes objects under `sites/<site>/` not in the
    list, writes manifest + SiteMeta → `{"site": SiteMeta, "url": "https://site.base/", "deleted": 3}`.
    A listed file that is missing or stored with another size fails the commit with `409
-   conflict` naming the paths (the first 10). A stored object of the wrong size that is not the
-   version the previous manifest recorded is deleted first, so no unverified object outlives a
-   commit attempt (a previously committed version that this deploy did not replace is kept).
-   Digests are not re-read at commit.
+   conflict` naming the paths (the first 10). A stored object of the wrong size is left in place
+   where every upload URL binds the size (the gateway's own upload endpoint, S3, GCS): it is the
+   verified upload of another, overlapping deploy, or a direct sync. Only with presigned Azure
+   SAS uploads, which bind nothing, is a wrong-size object that is not the version the previous
+   manifest recorded deleted first, so no unverified object outlives a commit attempt (a
+   previously committed version that this deploy did not replace is kept). For every listed
+   file whose stored object the previous manifest does not describe, the commit records the
+   SHA-256 of the bytes stored **now**, with their etag: a checksum the store verified itself
+   where it reports one (S3 `x-amz-checksum-sha256`), otherwise the hash of the object as read.
+   The declared digest only says what this deploy uploaded; another deploy may have replaced
+   the object since. A file that vanishes or changes size during that check fails the commit
+   with `409` too.
 
 `deploy_id` is an HMAC-signed, expiring (1 h) token binding site + actor; commit rejects a
 mismatched actor or site; upload URLs expire with it. Deploys are not atomic (same as rsync);
-the commit makes deletions last so a site is never empty mid-deploy. Uploads write directly to
-`sites/<site>/<path>`, so the uploads of a deploy that is never committed stay in storage: a path
-of the current manifest is replaced in place (as rsync would), and a new path becomes an object
-that is served like any other file of the site but is not in the manifest (never `unchanged`)
-until a later commit deletes it as unlisted, a refresh adopts it, or the site is deleted. The
-Cloudflare edition differs here (§16). State-changing gateway requests need `X-Backyard: 1`
-unless they carry a bearer token without browser cross-site signals (`Origin`,
-`Sec-Fetch-Site`); upload URLs are exempt (the signed token is the capability).
-Creates and refreshes (not commits) count against `ratelimit.deploys_per_hour` per actor
-(anonymous: per client IP).
+the commit makes deletions last so a site is never empty mid-deploy. Deploys of one site may
+overlap; the last write wins per file, and the manifest records what storage holds. Uploads
+write directly to `sites/<site>/<path>`, so the uploads of a deploy that is never committed
+stay in storage: a path of the current manifest is replaced in place (as rsync would), and a
+new path becomes an object that is served like any other file of the site but is not in the
+manifest (never `unchanged`) until a later commit deletes it as unlisted, a refresh adopts it,
+or the site is deleted. The Cloudflare edition differs here (§16). State-changing gateway
+requests need `X-Backyard: 1` unless they carry a bearer token without browser cross-site
+signals (`Origin`, `Sec-Fetch-Site`); upload URLs are exempt (the signed token is the
+capability). Creates and refreshes (not commits) count against `ratelimit.deploys_per_hour` per
+actor (anonymous: per client IP).
 
 ## 8. Authentication
 
@@ -672,8 +708,14 @@ only when those are absent (in mode `none` an invalid bearer token is always `40
 
 * Authorization-code + PKCE, `nonce`, against `auth.oidc.issuer` (discovery).
 * `GET /__backyard/auth/login?rd=<url>` (hub) → stores `{state, verifier, nonce, rd}` in a 10-min
-  signed cookie `backyard_oauth` → IdP. `rd` must be an absolute URL on the hub or a site host
-  (or a relative path) — anything else is replaced by the hub URL (no open redirects).
+  signed login state cookie → IdP. `rd` must be an absolute URL on the hub or a site host
+  (or a relative path) — anything else is replaced by the hub URL (no open redirects). When
+  `server.public_url` is https the state cookie is `__Host-backyard_oauth` (`Secure; Path=/`,
+  no `Domain`), which only the hub itself can set, so a site's page cannot plant its author's
+  login state (login CSRF); a `backyard_oauth` cookie is then ignored. Over http (browsers
+  refuse `__Host-` without `Secure`) it is `backyard_oauth` at `Path=/__backyard/auth/` (`/`
+  with a callback path outside it), and in host mode the server logs a startup warning that
+  the login state is not protected.
 * `GET /__backyard/auth/callback` → exchange, verify ID token, map claims (+ optional userinfo),
   enforce allowed domains/groups → session cookie `backyard_session` (AES-GCM sealed JSON
   `{user, exp}`, key derived from `server.secret`; `Domain=.<base_domain>` in host mode, none in
@@ -733,10 +775,17 @@ HS256 JWTs signed with `keys.Derive(secret, "backyard/api-token/v1")`:
 allowed groups; 30 s clock leeway). Default TTL `auth.token_ttl` (720h). Minted by
 `/__backyard/auth/cli` (browser → CLI loopback) and `POST /__backyard/api/tokens`
 `{name?, ttl_hours?}` → `200 {token, expires_at, name?}` (`ttl_hours` ≤ `auth.token_ttl`, default
-that TTL; anonymous users and static tokens get `403`; needs `X-Backyard: 1`). Revocation =
-rotate `server.secret`. Static tokens: `auth.tokens: [{name, sha256, admin?}]` (hex sha256 of the
-token string; `backyard token hash` prints it); they authenticate as
-`{id: "token:<name>", name, admin: <bool>}` and cannot mint API tokens.
+that TTL; anonymous users and static tokens get `403`; needs `X-Backyard: 1`). A token minted
+by a request whose credential is a Backyard API token expires **no later than that token**:
+`ttl_hours` and the default are capped at its remaining lifetime (whole seconds, never past
+its `exp`; `expires_at` reports the result), and a presented token with almost nothing left
+gets `401 unauthenticated`. So a token cannot extend its own lifetime, and offboarding at the
+IdP ends access once the last token minted from a fresh authentication expires. Tokens minted
+for a browser session, a proxy identity (or Cloudflare Access) or an IdP-issued JWT (device
+flow) get the full lifetime. Revocation = rotate `server.secret`. Static tokens:
+`auth.tokens: [{name, sha256, admin?}]` (hex sha256 of the token string; `backyard token hash`
+prints it); they authenticate as `{id: "token:<name>", name, admin: <bool>}` and cannot mint
+API tokens.
 
 CLI login (`GET /__backyard/auth/cli?redirect_uri=http://127.0.0.1:PORT/callback&state=…`):
 requires an authenticated browser user (session cookie or proxy identity — bearer tokens are not
@@ -769,9 +818,24 @@ CSRF token does not verify for the current user, session and request. A verified
 the API token like a direct request and answers `303` to the loopback URL (or shows the token
 for `mode=display`).
 
-Cookies are `HttpOnly; SameSite=Lax; Path=/` and `Secure` when `server.public_url` is https. Their
-`Domain` is `.<base_domain>` in host mode, and host-only in path mode and for `localhost`, IP or
-single-label base domains (browsers reject those as cookie domains).
+Cookies are `HttpOnly; SameSite=Lax; Path=/` and `Secure` when `server.public_url` is https
+(the http login state cookie of §8.1 excepted). Their `Domain` is `.<base_domain>` in host
+mode, and host-only in path mode and for `localhost`, IP or single-label base domains
+(browsers reject those as cookie domains).
+
+**Conflicting cookies fail closed.** Site JavaScript cannot read these cookies, but in host
+mode a site's page can set a cookie of the same name for the parent domain or a longer `Path`,
+which browsers send alongside — and before — Backyard's own; a sealed session or signed guest
+id is not tied to a browser, so a site author could plant their own. Backyard therefore reads
+every `backyard_session` (mode `none`: `backyard_anon`) cookie of a request, ignores invalid
+ones, and when valid ones name different users treats the request as unauthenticated (`401`,
+or the login redirect; never the first cookie). It then expires, best effort, every variant
+of that cookie it does not set itself: host-only and the cookie domain (or hub host) and its
+parent domains, crossed with each path prefix of the request (up to 8 segments) — never its
+own `Domain=.<base_domain>` (or host-only) `Path=/` cookie, which would leave the planted one
+alone. In the usual case the next request works again. Cookies the server cannot reach (a
+partitioned cookie, a deeper path) keep failing closed. So in mode `none`, too, a browser
+request can be refused with `401`. Several valid cookies of the same user are fine.
 
 ## 9. Storage layout (blob keys, after optional `storage.<type>.prefix`)
 
@@ -842,7 +906,7 @@ backyard login   [--device] [--no-browser]     (plus the global --server/--gatew
 backyard logout | whoami
 backyard sites   list [filter] | info <site> | delete <site> [-y]
 backyard open    [site]                        open site (or hub) in the browser
-backyard pull    <site> [dir] [-f]             download a site's files
+backyard pull    <site> [dir] [-f]             download a site's files (never what deploys never publish)
 backyard token   create [--name cli] [--ttl 720h|90d] | hash [token|-] [--name ci]
 backyard skill   install [--global|--project] [-y]
 backyard mcp                                   MCP server over stdio (for agents)
@@ -861,22 +925,51 @@ Env overrides: `BACKYARD_SERVER`, `BACKYARD_GATEWAY`, `BACKYARD_TOKEN`, `BACKYAR
 `BACKYARD_DEPLOY_METHOD`.
 
 Project file `.backyard.json` (searched in the current directory and its parents; `dir` is
-relative to the file): `{"site": "lunch-vote", "dir": ".", "method": "auto", "ignore":
-[…]}`. Default deploy ignores: `.git/`, `.backyard.json`, `.backyardignore`, `node_modules/`,
-`.claude/`, `.cursor/`, `.github/`, `CLAUDE.md`, `AGENTS.md`, `.DS_Store`, any path segment
-starting with `.` except `.well-known/`; plus gitignore-style lines from `.backyardignore` in
-the deployed folder's root (`#` comments, `!` negation, trailing `/`, leading or inner `/`
-anchors, `**`; as in git, a path inside an excluded directory cannot be re-included).
+relative to the file and must name a folder inside the file's folder — an absolute path, a
+`..` that leaves it or a symlink leading out is an error): `{"site": "lunch-vote", "dir": ".",
+"method": "auto", "ignore": […]}`. Deploy ignore rules come in two tiers:
 
-Deploy methods:
+* **Never uploaded**, whatever the configuration: `.git/` (at any depth), `.backyard.json` and
+  `.backyardignore`, in any letter case. No `!` line can re-include them, and the gateways
+  reject `.git` path segments anyway (§7.3).
+* **Ignored by default**: `node_modules/`, `.claude/`, `.cursor/`, `.github/`, `CLAUDE.md`,
+  `AGENTS.md`, `.DS_Store` and every other path segment starting with `.` except
+  `.well-known/`. The lines of `.backyardignore` in the deployed folder's root and the
+  `.backyard.json` `ignore` list come after these defaults and may re-include them with `!`
+  (e.g. `!.htaccess`).
+
+The pattern syntax is gitignore's (`#` comments, `!` negation where the last matching pattern
+wins, trailing `/`, leading or inner `/` anchors, `**`; as in git, a path inside an excluded
+directory cannot be re-included; a UTF-8 byte order mark at the start of `.backyardignore` is
+ignored). `backyard pull` never writes a path that the default rules exclude (both tiers),
+even with `-f` and even if the site holds it (published by a direct sync, the raw gateway API
+or before these rules); it lists such paths as skipped. Segments are compared the way
+case-insensitive and Windows file systems resolve them.
+
+Deploy methods (direct methods compute their excludes by walking the folder with the same
+rules as `api`, resolve a symlinked folder first and never follow symlinks out of it):
 * `api` — §7 protocol via the gateway.
-* `s3` — `aws s3 sync <dir> s3://<bucket>/<prefix>sites/<site>/ --delete --exclude …`
-* `gcs` — `gcloud storage rsync <dir> gs://<bucket>/<prefix>sites/<site> --recursive --delete-unmatched-destination-objects --exclude=<regex>` (falls back to `gsutil -m rsync -r -d -x`)
-* `azure` — `az storage blob sync --account-name <a> -c <container> -s <dir> -d <prefix>sites/<site> --delete-destination true --exclude-pattern …`
-* `rsync` — `rsync -az --delete --exclude … <dir>/ <rsync_target>/<site>/`
+* `s3` — `aws s3 sync <dir> s3://<bucket>/<prefix>sites/<site>/ --delete --no-follow-symlinks [--region r] [--endpoint-url e] --exclude …`
+  (each excluded directory as `dir/*` and file by its escaped path, plus name globs that mean
+  the same in `fnmatch`)
+* `gcs` — `gcloud storage rsync <dir> gs://<bucket>/<prefix>sites/<site> --recursive --delete-unmatched-destination-objects --exclude=<regex>`
+  (falls back to `gsutil -m rsync -r -d -e -x <regex>`)
+* `azure` — `az storage blob sync --account-name <a> -c <container> -s <dir> -d <prefix>sites/<site> --delete-destination true [--exclude-pattern "p1;p2"] [--exclude-path "d1/;f2"]`
+* `rsync` — `rsync -az --delete --delete-excluded --filter='P .backyard-tmp-*' --include=…/--exclude=… <dir>/ <rsync_target>/<site>/`
+  (`--delete-excluded` removes files the rules exclude from the target; the protect rule
+  keeps the `fs` store's in-flight temporary files)
 * `auto` — `api` if a gateway is reachable and the user has a token (or anonymous deploys are
   allowed); otherwise the first advertised direct method whose tool is installed.
-After a direct sync the CLI calls `POST G/sites/{site}/refresh` (best effort).
+
+The sync tools never delete destination files that their excludes match. So after an `s3`,
+`gcs` or `azure` sync, when the gateway is usable (reachable, with a token or anonymous
+deploys), the CLI lists the site (`GET G/sites/{site}/files`) and removes the stored files the
+ignore rules exclude (`aws s3 rm <dest> --recursive --exclude '*' --include <escaped path>…`,
+`gcloud storage rm` / `gsutil -m rm` — names containing `*?[]#` cannot be addressed and are
+reported — or `az storage blob delete`); a failed removal fails the deploy. Then it calls `POST
+G/sites/{site}/refresh` (best effort). Without a usable gateway it prints a note instead. The
+CLI uses a profile's cached `/info` (storage, rsync target) only for that profile's own
+server, never when `--server`/`BACKYARD_SERVER` names another one.
 
 Login flows (`backyard login`): `--token` (or `-` for stdin) stores a given token; `--device`
 runs the OAuth device grant against `info.auth.device`; a server with anonymous deploys needs
@@ -900,10 +993,14 @@ external gateway advertised in `info.gateway_url` is adopted when reachable.
   `backyard_open_url`. `backyard_init` and `backyard_deploy` use folders inside the working
   directory; any other folder only when named by the absolute path of an existing directory,
   and never the filesystem root, the home directory or a folder that holds credentials (the
-  CLI's config folder, hidden folders of the home directory such as `~/.ssh`).
-  `backyard_read_site_file` refuses binary file types without downloading them and
-  returns at most 256 KiB of text, which is untrusted data. Tool results and errors never
-  contain tokens or signed upload URLs.
+  CLI's config folder or one whose deploy would include its config file, hidden folders of the
+  home directory such as `~/.ssh`, and `~/Library` or `~/AppData`, unless the agent was started
+  inside one), nor a hidden folder outside the working directory. Without `dir`,
+  `backyard_deploy` publishes the current project like `backyard deploy` (its `.backyard.json`
+  `dir`) and reports the folder it published; naming the root of a project whose `dir` points
+  elsewhere is refused. `backyard_read_site_file` refuses binary file types without
+  downloading them and returns at most 256 KiB of text, which is untrusted data. Tool results
+  and errors never contain tokens or signed upload URLs.
 * Hub serves `/llms.txt` and `/llms-full.txt`.
 
 ## 15. Observability
@@ -942,26 +1039,45 @@ storage are available on free); R2 and paid features are optional.
   transaction (so deploys are atomic on this edition), and content uploaded by deploys that
   never commit is garbage-collected by a later commit once it is an hour old.
 * **Database:** documents in the site DO's SQLite with the exact query semantics of §5.2
-  (shared conformance tests). Realtime is local to the site DO (single instance per site).
+  (shared conformance tests). A query page travels from the DO to the Worker as one RPC result,
+  so it carries at most about 8 MiB of stored JSON: a page cut short holds fewer than `limit`
+  documents (always at least one) and says `has_more: true`, and clients advance `offset` by
+  the number of documents received (§5.2). Realtime is local to the site DO (single instance
+  per site); `db` frames always carry the document.
 * **AI:** `workers-ai` provider via the `AI` binding (free daily allowance) with configurable
   aliases (`AI_MODELS` JSON var); optional `anthropic`/`openai`(-compatible) providers via
   secrets (optionally through Cloudflare AI Gateway). Image generation via Workers AI image
   models. Embeddings via Workers AI. Smaller per-request limits than the Go server (§5.4): at
-  most 4 images per `/ai/image` request and 100 inputs per `/ai/embed` request.
+  most 4 images per `/ai/image` request and 100 inputs per `/ai/embed` request. Chat images
+  follow §5.4 exactly (the site's own uploads are read from the DO or R2; 20 MiB per image,
+  64 MiB per request).
 * **Warehouse:** not available on Cloudflare (`501 unsupported`) unless `WAREHOUSE_URL` points
   to a Backyard Go server's warehouse API (proxy) — optional.
 * **Auth:** `AUTH_MODE` = `none` (anonymous cookie identity; deploys need `DEPLOY_TOKEN` unless
   `ALLOW_ANONYMOUS_DEPLOY`) or `access` (Cloudflare Access: verify `Cf-Access-Jwt-Assertion`
   against `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs` with `ACCESS_AUD`; Okta,
-  Entra ID, Google etc. are configured as Access identity providers). Backyard API tokens (§8.3,
-  HS256 with `BACKYARD_SECRET`) and the `/__backyard/auth/cli` browser flow work identically.
-  Unlike the Go server's proxy modes (§8.2), `/__backyard/auth/logout` (`GET`/`POST`) exists in
-  both modes: it clears the guest cookie (`none`) or redirects to `/cdn-cgi/access/logout`
-  (`access`).
-  Access must bypass `/__backyard/api/deploy/*` (service tokens or a Bypass policy) — Terraform
-  in `deploy/terraform/cloudflare` sets this up.
-* **Guardrails (free tier):** per-user/IP daily caps for AI calls, deploys and uploads, and a
-  platform-wide site cap, stored in `RegistryDO`; configurable via `LIMITS` JSON var.
+  Entra ID, Google etc. are configured as Access identity providers). Any other `AUTH_MODE`
+  (a typo, or a Go mode such as `oidc`) **fails closed**: every request except
+  `/__backyard/healthz` answers `503`, and `/__backyard/readyz` reports the problem, because
+  falling back to `none` would make public a Worker meant to sit behind Access. Backyard API
+  tokens (§8.3, HS256 with `BACKYARD_SECRET`), the `/__backyard/auth/cli` browser flow with its
+  cross-site confirmation (`GET` or `POST`, CSRF key `backyard/cli-confirm/v1`, bound to the
+  user), the cap that keeps a bearer-minted token from outliving the presenting token, and the
+  conflicting-cookie rule (§8.3) work identically; the rule also covers Access's own
+  `CF_Authorization` cookie (valid cookies, or cookie and header, naming different users →
+  `401`). Unlike the Go server's proxy modes (§8.2), `/__backyard/auth/logout` (`GET`/`POST`)
+  exists in both modes: it clears the guest cookie (`none`) or redirects to
+  `/cdn-cgi/access/logout` (`access`).
+  Access must bypass the paths the Worker authenticates itself — `/__backyard/api/deploy` and
+  `/__backyard/api/deploy/*` (bearer tokens, signed upload URLs, the public `info`),
+  `/__backyard/api/tokens` (`backyard token create` sends an API token) and the health checks
+  `/__backyard/healthz` and `/__backyard/readyz` — with a Bypass policy (or service tokens);
+  Terraform in `deploy/terraform/cloudflare` sets this up.
+* **Guardrails (free tier):** per-user/IP daily caps for AI calls, generated images, deploys,
+  uploads and document writes, platform-wide daily AI caps, and a platform-wide site cap
+  (reserved atomically, so parallel first deploys cannot exceed it), stored in `RegistryDO`;
+  configurable via the `LIMITS` JSON var. The image caps count images: an `/ai/image` request
+  with `n: 4` uses 4, and is refused (`429`) without running the model when fewer are left.
 * **Deploying the platform:** `cd deploy/cloudflare && npm ci && npm run setup` (wrangler login,
   secrets, optional R2 bucket, deploy, prints the `backyard login` command), or
   `backyard cloudflare setup` which runs the same script; GitHub Actions example included.

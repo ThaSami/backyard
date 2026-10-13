@@ -3,19 +3,36 @@ package deploy
 import (
 	"path"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // IgnoreFile is the per-directory ignore file read by CollectFiles.
 const IgnoreFile = ".backyardignore"
 
-// DefaultIgnore returns the built-in ignore patterns (SPEC §13): VCS and
-// tooling directories, agent instruction files, and every path segment
-// starting with "." except ".well-known/".
-func DefaultIgnore() []string {
+// Built-in ignore rules (SPEC §13) come in two tiers.
+//
+// ProtectedIgnore covers what a deploy must never publish, whatever the
+// configuration: repository metadata (".git" at any depth: the directory,
+// or the file a submodule or worktree has in its place) and Backyard's
+// own project files (".backyard.json", ".backyardignore"). These patterns
+// match in any letter case, as case-insensitive file systems (macOS,
+// Windows) resolve them, and as the gateways reject any ".git" segment
+// (ValidatePath). WithDefaultIgnore places them after every configured
+// pattern, so no "!" line can re-include them: the last matching pattern
+// wins, and a path inside an excluded directory cannot be re-included.
+//
+// The other defaults (overridableIgnore) are conveniences that a project
+// may override explicitly with "!" lines in .backyardignore or the
+// .backyard.json "ignore" list: node_modules/, agent instructions and
+// settings (.claude/, .cursor/, CLAUDE.md, AGENTS.md), .github/, .DS_Store
+// and every other path segment starting with "." except ".well-known/".
+// For example "!.htaccess" publishes .htaccess files and "!.*" publishes
+// every dotfile, while "!.git/" or "!.backyard.json" change nothing.
+
+// overridableIgnore returns the default patterns "!" lines may override.
+func overridableIgnore() []string {
 	return []string{
-		".git/",
-		".backyard.json",
-		IgnoreFile,
 		"node_modules/",
 		".claude/",
 		".cursor/",
@@ -26,6 +43,52 @@ func DefaultIgnore() []string {
 		".*",
 		"!.well-known/",
 	}
+}
+
+// ProtectedIgnore returns the default patterns no configuration can
+// override: ".git" (directory or file) and the project files, as
+// case-insensitive globs (".[gG][iI][tT]" …).
+func ProtectedIgnore() []string {
+	return []string{
+		anyCaseGlob(".git"),
+		anyCaseGlob(".backyard.json"),
+		anyCaseGlob(IgnoreFile),
+	}
+}
+
+// DefaultIgnore returns the built-in ignore patterns alone: the overridable
+// defaults followed by ProtectedIgnore. It is what a folder without any
+// ignore configuration gets (WithDefaultIgnore(nil)).
+func DefaultIgnore() []string {
+	return WithDefaultIgnore(nil)
+}
+
+// WithDefaultIgnore returns the complete, ordered pattern list for the
+// configured patterns: the overridable defaults, then patterns (which may
+// re-include some of them with "!" lines), then ProtectedIgnore (which
+// nothing can re-include). Every consumer — CollectFiles, the direct-sync
+// exclude translation, the prune of ignored site files — evaluates this
+// list as one gitignore sequence.
+func WithDefaultIgnore(patterns []string) []string {
+	out := overridableIgnore()
+	out = append(out, patterns...)
+	return append(out, ProtectedIgnore()...)
+}
+
+// anyCaseGlob returns a glob matching the literal name s in any ASCII letter
+// case: each letter becomes a "[xX]" class; s must hold no glob
+// metacharacters.
+func anyCaseGlob(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		lo, up := unicode.ToLower(r), unicode.ToUpper(r)
+		if r < utf8.RuneSelf && lo != up {
+			b.WriteString("[" + string(lo) + string(up) + "]")
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // Ignored reports whether a site-relative path is excluded by patterns (used

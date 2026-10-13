@@ -184,9 +184,41 @@ func defaultConfigPath() string {
 }
 
 // defaultIgnored reports whether a deploy never uploads the relative path
-// rel ("/"-separated) under the default ignore rules.
+// rel ("/"-separated) under the default ignore rules. A folder's
+// .backyardignore or its project's "ignore" list may re-include some of
+// them (e.g. "!.*"), so deploys check again with those (configPublished).
 func defaultIgnored(rel string) bool {
 	return deploy.NewMatcher(deploy.DefaultIgnore()).Ignored(rel, false)
+}
+
+// configPublished returns a CLI config file holding credentials that a
+// deploy of dir with the project's ignore lines would upload ("" when
+// none): sensitiveDir only applies the default rules, which "!" lines in
+// dir/.backyardignore or .backyard.json can override for dotfiles (the
+// protected rules cover .git and the project files only).
+func (s *server) configPublished(dir string, ignore []string) (string, error) {
+	real := realPath(dir)
+	var m *deploy.Matcher
+	for _, cfg := range s.configFiles() {
+		if !within(real, cfg) {
+			continue
+		}
+		rel, err := filepath.Rel(real, cfg)
+		if err != nil {
+			return cfg, nil
+		}
+		if m == nil {
+			patterns, err := deploy.IgnorePatterns(real, ignore)
+			if err != nil {
+				return "", err
+			}
+			m = deploy.NewMatcher(patterns)
+		}
+		if !m.Ignored(filepath.ToSlash(rel), false) {
+			return cfg, nil
+		}
+	}
+	return "", nil
 }
 
 // realPath resolves the symlinks of the longest existing prefix of the

@@ -463,6 +463,40 @@ describe("ordering and pagination (conformance table)", () => {
     expect(e8.v).toBe(sum);
   });
 
+  it("compares integers beyond 2^53 as doubles, like Go's float64 (raw JSON bodies)", async () => {
+    // Stored as the shortest text of the double (1760000000123456800), which
+    // SQLite reads as an INTEGER and compares exactly with the REAL operand
+    // 1760000000123456768 unless it is CAST first.
+    const site = uniqueSite("bigint");
+    const raw = (path: string, body: string) => call(api(site, path), { method: "POST", headers: apiHeaders(), body });
+    for (const body of [
+      '{"id":"i1","v":1760000000123456789}',
+      '{"id":"i2","v":1760000000123457024}',
+      '{"id":"i3","v":1760000000123456512}',
+      '{"id":"i4","v":"1760000000123456789"}',
+      '{"id":"i8","arr":[1760000000123456789,1]}',
+      '{"id":"i9","arr":[1760000000123457024]}',
+    ]) {
+      expect((await raw("/db/big", body)).status, body).toBe(201);
+    }
+    const q = async (filter: string) => {
+      const res = await raw("/db/big/query", `{"where":[${filter}],"limit":1000}`);
+      expect(res.status, filter).toBe(200);
+      return ((await res.json()) as { docs: Doc[] }).docs.map((d) => d.id);
+    };
+    expect(await q('{"field":"v","op":"==","value":1760000000123456789}')).toEqual(["i1"]);
+    expect(await q('{"field":"v","op":"==","value":1760000000123456768}')).toEqual(["i1"]);
+    expect(await q('{"field":"v","op":"!=","value":1760000000123456789}')).toEqual(["i2", "i3"]);
+    expect(await q('{"field":"v","op":"<=","value":1760000000123456789}')).toEqual(["i1", "i3"]);
+    expect(await q('{"field":"v","op":">=","value":1760000000123456789}')).toEqual(["i1", "i2"]);
+    expect(await q('{"field":"v","op":">","value":1760000000123456789}')).toEqual(["i2"]);
+    expect(await q('{"field":"v","op":"<","value":1760000000123456789}')).toEqual(["i3"]);
+    expect(await q('{"field":"v","op":"in","value":[1760000000123456789,1]}')).toEqual(["i1"]);
+    expect(await q('{"field":"v","op":"not-in","value":[1760000000123456789]}')).toEqual(["i2", "i3"]);
+    expect(await q('{"field":"arr","op":"contains","value":1760000000123456789}')).toEqual(["i8"]);
+    expect(await q('{"field":"arr","op":"contains","value":1760000000123457024}')).toEqual(["i9"]);
+  });
+
   it("orders strings bytewise, booleans false < true, and mixed types by rank", async () => {
     const s = await seed("ords", [
       ["s01", { v: "b" }], ["s02", { v: "B" }], ["s03", { v: "a" }], ["s04", { v: "" }], ["s05", { v: "é" }],

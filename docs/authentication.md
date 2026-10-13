@@ -85,6 +85,13 @@ to start unless `server.base_domain` is a real domain and the host of `server.pu
 that domain or one of its subdomains. For local tests use `server.url_mode: path`, or a domain
 whose subdomains resolve to 127.0.0.1 such as `lvh.me`.
 
+**Use https.** Over https the short-lived login state cookie is `__Host-backyard_oauth`, which
+only the hub can set, so a page on some site cannot plant its author's login in your browser.
+Over plain http it is `backyard_oauth` and the server warns at startup that the login state is
+unprotected in host mode. Session cookies that a site's page planted next to yours never sign
+you in as someone else: conflicting cookies fail closed (see
+[security](security.md#cookies-and-sessions)).
+
 ### Okta, step by step
 
 1. **Create the web app.** Okta Admin Console → **Applications → Create App Integration →
@@ -183,8 +190,9 @@ a directory for profiles. Make sure only the load balancer can reach Backyard (C
 ingress "internal and load balancing", no public `run.app` URL).
 
 CLIs cannot pass IAP, so the [Google Cloud module](../deploy/terraform/gcp/README.md#iap-notes)
-adds a second backend service **without** IAP for `/__backyard/api/deploy/*` requests that
-carry an `Authorization` header; Backyard itself rejects those without a valid token.
+adds a second backend service **without** IAP for `/__backyard/api/deploy/*` and
+`/__backyard/api/tokens` (`backyard token create`) requests that carry an `Authorization`
+header; Backyard itself rejects those without a valid token.
 
 ## `alb`: AWS ALB with Okta (or any OIDC IdP)
 
@@ -202,7 +210,7 @@ The ALB runs the login (`authenticate-oidc`) and forwards a signed `X-Amzn-Oidc-
 4. Listener rule: `authenticate-oidc` with the issuer, authorization, token and userinfo
    endpoints from the IdP's discovery document, then forward to Backyard. Exempt
    `/__backyard/healthz`, `/__backyard/readyz` and — for CLIs and CI — `/__backyard/api/deploy/*`
-   (pass through when there is no ALB session).
+   and `/__backyard/api/tokens` (pass through when there is no ALB session).
 5. Configure:
 
    ```yaml
@@ -238,9 +246,16 @@ auth:
 
 Run oauth2-proxy with `--pass-user-headers`, `--cookie-domain=.backyard.acme.com` and
 `--whitelist-domain=.backyard.acme.com` so one login covers every site. For CLIs, route
-`/__backyard/api/deploy/*` requests that carry `Authorization: Bearer …` from your edge proxy
-straight to Backyard. Because that peer is **not** in `trusted_proxies`, Backyard only accepts
-the bearer token there and ignores any identity header a client might add.
+`/__backyard/api/deploy/*` and `/__backyard/api/tokens` requests that carry `Authorization:
+Bearer …` from your edge proxy straight to Backyard. Because that peer is **not** in
+`trusted_proxies`, Backyard only accepts the bearer token there and ignores any identity header
+a client might add.
+
+`trusted_proxies` is what makes header mode safe: every listed peer can claim any identity.
+List only the proxies themselves. On Kubernetes the
+[Helm chart](../deploy/helm/backyard/README.md#identity-aware-proxies) refuses to render header
+mode without `jwt_header` while `trusted_proxies` covers whole ranges (its default is the
+private ranges, i.e. every pod), unless its `networkPolicy` admits only the proxy.
 
 ### JWT-signing proxies (Pomerium and others)
 
@@ -291,10 +306,10 @@ auth:
 ```
 
 Create a self-hosted Access application for `backyard.acme.com` and `*.backyard.acme.com` with
-your IdP (Okta, Entra ID, Google…), and a **Bypass** policy for `/__backyard/api/deploy/*` and
-`/__backyard/healthz` so CLIs can deploy with bearer tokens (drag-and-drop deploys on the hub
-then also need a token, which the hub asks for). Access JWTs carry the email but usually no
-groups.
+your IdP (Okta, Entra ID, Google…), and a **Bypass** policy for `/__backyard/api/deploy/*`,
+`/__backyard/api/tokens` and `/__backyard/healthz` so CLIs can deploy and mint tokens with
+bearer tokens (drag-and-drop deploys on the hub then also need a token, which the hub asks
+for). Access JWTs carry the email but usually no groups.
 
 The [Cloudflare edition](cloudflare.md) supports Access natively (`AUTH_MODE=access`), and
 [`deploy/terraform/cloudflare`](../deploy/terraform/cloudflare/README.md) creates the
@@ -322,7 +337,13 @@ derived from `server.secret`; they carry the user's id, email, name, groups and 
 - `backyard login` mints one through the browser (see [CLI login](#cli-login)).
 - `backyard token create --name ci --ttl 168h` mints another (e.g. for a script); the hub's
   API does the same: `POST /__backyard/api/tokens` with `{"name", "ttl_hours"}`.
-- Lifetime: `auth.token_ttl` (default 720h = 30 days), which is also the maximum.
+- Lifetime: `auth.token_ttl` (default 720h = 30 days), which is also the maximum. A token
+  minted with a Backyard API token as the credential (`POST /__backyard/api/tokens` with a
+  bearer token, e.g. `backyard token create` after a browser login) expires no later than that
+  token: `ttl_hours` and the default are capped, and `expires_at` reports the result. So a token
+  cannot extend its own lifetime, and someone removed from the IdP loses access when their
+  tokens expire. Tokens minted for a browser session, a proxy identity or an IdP-issued JWT
+  (device flow) get the full `auth.token_ttl`.
 - Revocation: tokens are stateless — rotating `server.secret` revokes **all** of them (and all
   sessions). Keep lifetimes short for anything automated.
 - Guests and static tokens cannot mint API tokens.
@@ -386,8 +407,9 @@ IAP, ALB, Cloudflare Access and oauth2-proxy authenticate browsers, not CLIs. Th
 logs in through the browser (the proxy is happy) but must deploy with its bearer token on a
 path the proxy lets through:
 
-- a **proxy-exempt route** on the hub for `/__backyard/api/deploy/*` (ALB rule, a GCP backend
-  service without IAP, an Access bypass policy), or
+- a **proxy-exempt route** on the hub for `/__backyard/api/deploy/*` — and, for `backyard token
+  create`, `/__backyard/api/tokens` with an `Authorization` header — (ALB rule, a GCP backend
+  service without IAP, an Access bypass policy; the Terraform modules set these up), or
 - a **standalone gateway** — `backyard gateway` on its own host, or the
   [AWS Lambda gateway](deploying-sites.md#the-aws-lambda-gateway) — advertised to CLIs with
   `deploy.gateway_url`. `backyard login` adopts it automatically, or pass

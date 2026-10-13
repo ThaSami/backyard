@@ -342,7 +342,10 @@ func (a *cliApp) runPull(ctx context.Context, site, dir string, force bool) erro
 		skipped   []string
 	)
 	for _, f := range files {
-		if why := deploy.ValidatePath(f.Path); why != "" {
+		// The syntax only: a site may still hold paths that today's gateway
+		// rules reject (a .git/ written before them, or by a direct sync),
+		// and those are skipped below like every path deploys never publish.
+		if why := deploy.ValidatePathSyntax(f.Path); why != "" {
 			return fmt.Errorf("refusing to pull %q: %s", f.Path, why)
 		}
 		if pullSkips(f.Path) {
@@ -383,6 +386,7 @@ func (a *cliApp) runPull(ctx context.Context, site, dir string, force bool) erro
 	)
 	ctx, cancelAll := context.WithCancel(ctx)
 	defer cancelAll()
+	fallback := sync.OnceValue(func() *deploy.Client { return a.embeddedGatewayFallback(ctx, s, c) })
 	work := make(chan job)
 	for range min(4, max(1, len(jobs))) {
 		wg.Add(1)
@@ -390,6 +394,9 @@ func (a *cliApp) runPull(ctx context.Context, site, dir string, force bool) erro
 			defer wg.Done()
 			for j := range work {
 				err := a.pullOne(ctx, c, site, dir, j.file, j.target)
+				if responseTooLarge(err) {
+					err = a.pullThroughEmbedded(ctx, fallback(), site, dir, j.file, j.target, err)
+				}
 				mu.Lock()
 				if err != nil && firstErr == nil {
 					firstErr = err
@@ -438,6 +445,73 @@ feed:
 		}
 		a.errf("Skipped %d files that deploys never publish (dotfiles, .git/, node_modules/, .backyard.json, CLAUDE.md, AGENTS.md…):\n  %s%s\n",
 			len(skipped), strings.Join(list, "\n  "), more)
+	}
+	return nil
+}
+
+// responseTooLarge reports whether err is a gateway's 413 too_large: on a
+// file read, that is a gateway that cannot return the file (an AWS Lambda
+// gateway's 6 MB response cap), not a limit of the site.
+func responseTooLarge(err error) bool {
+	var ae *deploy.APIError
+	return errors.As(err, &ae) && ae.Status == http.StatusRequestEntityTooLarge && ae.Code == deploy.CodeTooLarge
+}
+
+// embeddedGatewayFallback returns a client for the server's embedded gateway
+// (<public URL>/__backyard/api/deploy, which has no response size cap and
+// accepts the same tokens) when the session uses another gateway, or nil.
+// The public URL is the session's server, else the public_url the
+// gateway's info names (the profile's cached copy, or asked once). The
+// token never moves from an https gateway to a plain-http one.
+func (a *cliApp) embeddedGatewayFallback(ctx context.Context, s *clientconfig.Session, c *deploy.Client) *deploy.Client {
+	server := s.Server
+	if server == "" {
+		info := s.CachedInfo()
+		if info == nil {
+			info, _ = a.fetchInfo(ctx, c)
+		}
+		if info != nil {
+			server = info.PublicURL
+		}
+	}
+	if server != "" {
+		var err error
+		if server, err = clientconfig.NormalizeURL(server); err != nil {
+			return nil
+		}
+	}
+	emb := clientconfig.GatewayURL(server, "")
+	if emb == "" || strings.EqualFold(emb, strings.TrimSuffix(s.Gateway, "/")) {
+		return nil
+	}
+	if hasScheme(s.Gateway, "https") && !hasScheme(emb, "https") {
+		return nil
+	}
+	return a.client(emb, s.Token)
+}
+
+// hasScheme reports whether the URL raw uses scheme (case-insensitively).
+func hasScheme(raw, scheme string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && strings.EqualFold(u.Scheme, scheme)
+}
+
+// pullThroughEmbedded retries a download the gateway answered with 413
+// too_large (first) through the server's embedded gateway fb. Without fb it
+// returns first, whose message (from the Lambda gateway) already names the
+// embedded gateway when the gateway knows the server's public URL; when the
+// retry fails too, both errors and a hint naming fb's URL.
+func (a *cliApp) pullThroughEmbedded(ctx context.Context, fb *deploy.Client, site, dir string, f deploy.SiteFile, target string, first error) error {
+	if fb == nil {
+		return first // the gateway's message names the embedded gateway when it knows it
+	}
+	if err := a.pullOne(ctx, fb, site, dir, f, target); err != nil {
+		return fmt.Errorf("%w\n  retrying through the server's embedded gateway %s failed too: %v\n"+
+			"  hint: this deploy gateway cannot return files this large (an AWS Lambda gateway returns at most 6 MB); "+
+			"pull from where the server is reachable: `backyard pull %s --gateway %s`", first, fb.BaseURL, err, site, fb.BaseURL)
+	}
+	if !a.g.json {
+		a.errf("Note: %s is too large for the deploy gateway; downloaded it through the server's embedded gateway %s.\n", f.Path, fb.BaseURL)
 	}
 	return nil
 }

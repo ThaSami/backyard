@@ -325,6 +325,12 @@ func (g *Gateway) serveSite(w http.ResponseWriter, r *http.Request, u *identity.
 		writeJSON(w, 200, map[string]any{"files": files})
 	case strings.HasPrefix(sub, "files/") && r.Method == http.MethodGet:
 		p, err := url.PathUnescape(strings.TrimPrefix(sub, "files/"))
+		if err == nil {
+			if why := deploy.ValidatePath(p); why != "" {
+				writeErr(w, 400, "bad_request", why) // as the real gateway (e.g. any .git segment)
+				return
+			}
+		}
 		if err != nil || s == nil || s.Files[p] == nil {
 			writeErr(w, 404, "not_found", "file not found")
 			return

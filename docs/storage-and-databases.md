@@ -100,7 +100,10 @@ storage:
 On Cloud Run and GKE there is no private key, so upload URLs are signed through the IAM
 Credentials API as `signer_email` (default: the detected service account), which needs
 `roles/iam.serviceAccountTokenCreator` on itself. Presigned uploads pin the size
-(`x-goog-content-length-range`); GCS cannot verify a SHA-256 digest.
+(`x-goog-content-length-range`); GCS cannot verify a SHA-256 digest, so a commit reads the
+files it has not seen before to record their digest. For drag-and-drop deploys from the hub,
+the bucket's CORS rule must allow `PUT` from the hub origin with the `Content-Type` and
+`x-goog-content-length-range` headers (the Google Cloud module sets this up).
 
 ### `azure` — Azure Blob Storage
 
@@ -117,8 +120,9 @@ Authentication: `connection_string`, else `account` + `account_key`, else
 `DefaultAzureCredential` (managed identity, workload identity, Azure CLI). Upload URLs are
 service SAS URLs (shared key) or user-delegation SAS URLs (the identity needs *Storage Blob
 Delegator*, included in *Storage Blob Data Contributor*). A SAS cannot restrict the uploaded
-body at all, so only the commit's size check guards these uploads (see below). Directory
-placeholder blobs of hierarchical-namespace (ADLS Gen2) accounts are ignored.
+body at all, so only the commit's size check guards these uploads (see below), and it deletes
+objects of the wrong size. Directory placeholder blobs of hierarchical-namespace (ADLS Gen2)
+accounts are ignored.
 
 ### Upload integrity
 
@@ -132,12 +136,20 @@ the deploy plan declared, as far as the store can enforce it:
 | `gcs` | V4 signed URL | size |
 | `azure` | SAS URL | nothing |
 
-The commit is the second line of defence: every listed file must exist with its declared size.
-A stored object of the wrong size that is not the version the previous manifest recorded is
-deleted, and the commit fails with `409 conflict` naming the paths. Uploads write straight to
-`sites/<site>/<path>` (deploys are not atomic, like rsync), so the uploads of a deploy that is
-never committed stay until a later commit deletes them as unlisted (or the site is deleted).
-See [SPEC §7.3](spec/SPEC.md#73-deploy-diffed-rsync-semantics).
+The commit is the second line of defence: every listed file must exist with its declared size,
+or the commit fails with `409 conflict` naming the paths. Where the upload URLs bind the size
+(the gateway's own endpoint, S3, GCS), an object of another size can only be the verified
+upload of another, overlapping deploy (or a direct sync), so it stays and only this commit
+fails. With presigned Azure SAS uploads, which bind nothing, a wrong-size object that is not
+the version the previous manifest recorded is deleted, so no unverified object outlives the
+commit. For each file whose stored object the previous manifest does not describe, the commit
+records the SHA-256 of the bytes stored **now**: S3 reports the checksum it verified itself
+(`x-amz-checksum-sha256`, one `HeadObject` per file), other stores are read and hashed. The
+manifest therefore never pairs one deploy's digest with another deploy's bytes, and later
+diffs stay correct. Uploads write straight to `sites/<site>/<path>` (deploys are not atomic,
+like rsync), so the uploads of a deploy that is never committed stay until a later commit
+deletes them as unlisted (or the site is deleted). See
+[SPEC §7.3](spec/SPEC.md#73-deploy-diffed-rsync-semantics).
 
 ## Document store
 

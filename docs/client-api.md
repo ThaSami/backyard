@@ -57,6 +57,8 @@ const { content } = await backyard.ai.chat("Summarize: " + text, { model: "fast"
 const s = backyard.ai.stream(question, { onText: (t) => (out.textContent += t) });
 await s.done;
 const { json } = await backyard.ai.chat(`Extract {name, date} from: ${text}`, { json: true });
+const caption = await backyard.ai.chat([{ role: "user", content: [  // an upload's url works as an image
+  { type: "text", text: "Describe this photo." }, { type: "image", url: f.url }] }]);
 const image = await backyard.ai.image("a watercolor fox");          // {id, url, content_type, images}
 const vector = await backyard.ai.embed("vacation policy");          // number[]
 

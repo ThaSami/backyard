@@ -76,7 +76,7 @@ claude mcp add backyard -- backyard mcp
 |---|---|---|
 | `backyard_docs` | `topic?` (`skill`, the default, `api`, `recipes` or `deploy`) | Returns the documentation as markdown. Agents call it first. |
 | `backyard_init` | `dir`, `site`, `agents?` | Scaffolds a site (`index.html`, `.backyard.json`, agent files, skill). Never overwrites. |
-| `backyard_deploy` | `dir?`, `site?`, `message?`, `dry_run?`, `overwrite?` | Publishes a folder and returns the URL and counts. Without `dir` it publishes the current project like `backyard deploy` (the folder `.backyard.json` names, else the working directory). Refuses to replace a site someone else deployed last unless `overwrite` is true — which agents must only set after asking the user. |
+| `backyard_deploy` | `dir?`, `site?`, `message?`, `dry_run?`, `overwrite?` | Publishes a folder and returns the URL, the folder it published (`dir`) and counts. Without `dir` it publishes the current project like `backyard deploy` (the folder `.backyard.json` names, else the working directory). The same ignore rules apply: `.git/` and the project files are never uploaded. Refuses to replace a site someone else deployed last unless `overwrite` is true — which agents must only set after asking the user. |
 | `backyard_list_sites` | `query?` | Sites with title, description, URL and last deploy — to find existing tools and free names. |
 | `backyard_site_files` | `site` | A site's deployed files (path, size; at most 2,000 listed). |
 | `backyard_read_site_file` | `site`, `path` | One text file of a site (≤ 256 KiB) — to study or reuse another site's code. Binary file types (images, fonts, archives, media…) are refused without being downloaded, and so is a file whose content is not text. |
@@ -119,8 +119,9 @@ the project and away from credentials:
 
 Each file carries the site name, the server URL, the workflow (`backyard dev`, `backyard
 deploy`), the golden rules and the API cheat sheet — extracted from the skill at build time, so
-they always match it. None of these files is ever deployed (they are in the default ignore
-list). Templates live in [`templates/`](../templates/templates.go).
+they always match it. None of these files is deployed (they are in the default ignore list,
+which only an explicit `!` line in `.backyardignore` would override), and `backyard pull` never
+writes them. Templates live in [`templates/`](../templates/templates.go).
 
 ## `/llms.txt` and friends
 
@@ -141,7 +142,10 @@ The Cloudflare edition serves the same paths.
 1. Read `backyard_docs` (or the skill); restate the idea; pick a site name and check it is free
    (`backyard sites info <name>` / `backyard_list_sites`).
 2. `backyard init <name>`; build the page with relative asset paths and the absolute SDK path.
-3. Preview with `backyard dev --no-open` in the background; fix console errors.
+3. Preview with `backyard dev --no-open` in the background; fix console errors. Outside a
+   browser `*.localhost` often does not resolve, so check the page with the line `backyard dev`
+   prints: `curl -s -H 'Host: <site>.localhost:4321' http://127.0.0.1:4321/`
+   (`http://localhost:4321/` is the dev hub, not the site).
 4. `backyard deploy` (or `backyard_deploy`) and hand the URL to the user.
 
 Guardrails that apply to agents as to people: deploys are diffed, rate limited and audited; a

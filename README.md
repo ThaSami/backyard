@@ -223,8 +223,12 @@ Backyard trusts **everyone your IdP signs in** — that is the point — and nob
   documented trade-off);
 - secrets stay server-side; all keys derive from one `server.secret` with HKDF; tokens are
   short-lived JWTs or hashed static tokens;
-- rate limits, quotas, upload limits, read-only warehouse roles, sandboxed uploaded HTML/SVG,
-  SSRF-guarded fetching and audit logs bound the damage of a runaway page.
+- rate limits, quotas, upload limits, read-only warehouse roles, sandboxed uploads (only known
+  passive types are served without a sandbox), SSRF-guarded fetching and audit logs bound the
+  damage of a runaway page;
+- in host mode a site's page cannot sign visitors in as someone else (conflicting cookies fail
+  closed), a CLI login another site started needs confirmation, and `backyard pull` never
+  writes repository metadata or agent files from a site.
 
 Read [docs/security.md](docs/security.md) before going to production; report vulnerabilities
 privately as described in [SECURITY.md](SECURITY.md).

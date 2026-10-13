@@ -59,7 +59,7 @@ mode on `localhost` the hub's session cookie never reaches `<site>.localhost` (s
 | Project | Spec | Covers |
 |---|---|---|
 | sites | `hub.spec.mjs` | site directory, titles/descriptions, search, list/grid, copy buttons, CLI commands |
-| sites | `hub-deploy.spec.mjs` | folder picker, file picker + `.backyard.json`, synthesized and real OS drag and drop, diffed redeploys, ignores, rejected tokens, deleting with a token |
+| sites | `hub-deploy.spec.mjs` | folder picker, file picker + `.backyard.json`, synthesized and real OS drag and drop, diffed redeploys, ignores, rejected tokens, a `#token=` link that asks before it is used, deleting with a token |
 | sites | `lunch-vote`, `live-poll`, `cursors`, `templates` | realtime between two or more browser contexts (= people): data, presence joining and leaving |
 | sites | `ai-chat.spec.mjs` | token-by-token streaming, Markdown, history, model/style choice, upstream failures; SDK image, embeddings, JSON |
 | sites | `file-drop.spec.mjs` | picker, drop and paste uploads, live gallery, filters, viewer, delete |
@@ -70,7 +70,7 @@ mode on `localhost` the hub's session cookie never reaches `<site>.localhost` (s
 | sites | `security.spec.mjs` | uploaded HTML/SVG sandboxed; a site cannot call another site's API or websocket |
 | sites | `responsive`, `a11y` | no horizontal scrolling on a phone, light and dark mode, axe-core WCAG 2.1 AA with real data |
 | auth | `oidc.spec.mjs` | site visit → IdP → back with the mapped identity (`backyard.me()`), cookies, 401s, allowed domains, sign-out |
-| auth | `sessions.spec.mjs` | hub deploys with the browser session, the CLI's browser sign-in, re-sign-in from the hub, docs and SDK |
+| auth | `sessions.spec.mjs` | hub deploys with the browser session, the CLI's browser sign-in (and its confirmation page when another site links to it), re-sign-in from the hub, docs and SDK |
 | auth | `examples.spec.mjs` | the examples in path mode with real names and avatars, AI/warehouse not configured |
 
 ## Conventions for tests

@@ -217,8 +217,15 @@ test.describe("hub deploy", () => {
 
   test("a rejected deploy token is reported and can be forgotten", async ({ page, pageProblems }) => {
     pageProblems.allow(/the server responded with a status of 401/); // the bogus token, on purpose
+    // A link carrying a token the server rejects is not used at all.
     await openHub(page, "#token=not-a-valid-token");
+    await expect(page.locator("#banner")).toHaveText("The deploy token in the link you opened was rejected by the server, so it is not used.");
+    await expect(page.locator("#handoff-dialog")).toBeHidden();
+    await expect(page.locator("#deploy-token")).toHaveValue("");
+    // Pasted into the token box, it is reported when deploying.
     await expect(page.locator("#token-box")).toBeVisible();
+    await page.locator("#token-box summary").click();
+    await page.locator("#deploy-token").fill("not-a-valid-token");
     await page.locator("#site-name").fill(`e2e-token-${rand()}`);
     await page.locator("#files-input").setInputFiles([{ name: "index.html", mimeType: "text/html", buffer: Buffer.from("<!doctype html><title>t</title>") }]);
     await expect(page.locator("#deploy-btn")).toBeEnabled();
@@ -273,11 +280,16 @@ test.describe("hub deploy", () => {
     await expect(page.locator(`.site[data-site="${name}"]`)).toBeVisible();
     await expect(page.locator(`button[aria-label="Delete ${name}"]`)).toHaveCount(0);
 
-    // The token handed over in the URL fragment unlocks deleting.
+    // The token handed over in the URL fragment unlocks deleting, once the
+    // visitor confirms whose token it is (a link alone never switches identity).
     page = await context.newPage();
     await openHub(page, `#token=${encodeURIComponent(state.adminToken)}`);
-    await expect(page.locator("#toast")).toHaveText(/^Deploy token (saved in this browser|set for this visit)$/);
     expect(new URL(page.url()).hash).toBe(""); // the fragment is removed at once
+    await expect(page.locator("#handoff-dialog")).toBeVisible();
+    await expect(page.locator("#handoff-title")).toHaveText(/^Use the deploy token of .+\?$/);
+    await expect(page.locator("#deploy-token")).toHaveValue("");
+    await page.locator("#handoff-use").click();
+    await expect(page.locator("#toast")).toHaveText(/^Deploy token (saved in this browser|set for this visit)$/);
     await page.locator(`button[aria-label="Delete ${name}"]`).click();
     const dialog = page.locator("#delete-dialog");
     await expect(dialog).toBeVisible();

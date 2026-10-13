@@ -116,6 +116,7 @@ function wsAccept(req, socket, handlers) {
  * edition): deleting sites then needs the deploy token.
  * tokens: {"<bearer token>": User} — the accounts of API tokens, as the deploy
  * gateway's GET /me reports them (requireToken is "token:deploy", an admin).
+ * maxEventDocBytes: db events of larger documents are sent with "doc": null.
  * Returns { url, state, close() }.
  */
 export async function startStub(opts = {}) {
@@ -157,6 +158,9 @@ export async function startStub(opts = {}) {
     return state.docs.get(c);
   };
   const publish = (collection, op, doc, id) => {
+    // Like the Go server, a change whose document is too large for one broker
+    // message is published without it ("doc": null, SPEC §6).
+    if (doc && opts.maxEventDocBytes && Buffer.byteLength(JSON.stringify(doc)) > opts.maxEventDocBytes) doc = null;
     for (const conn of state.conns) {
       const sid = conn.subs.get(collection);
       if (sid !== undefined) conn.send({ t: "db", sub: sid, collection, op, doc, doc_id: id });

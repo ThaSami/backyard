@@ -188,6 +188,54 @@ func TestCredentialFoldersAreRefused(t *testing.T) {
 	}
 }
 
+// TestDeployRefusesReincludedCredentials: the default rules skip a CLI
+// config file in a dot folder of the deployed folder, but "!" lines in its
+// .backyardignore or the project's "ignore" list can re-include dotfiles;
+// the deploy then checks with those rules and refuses.
+func TestDeployRefusesReincludedCredentials(t *testing.T) {
+	var cfg string
+	e := newEnv(t, true, func(o *Options) {
+		cwd, _ := o.Getwd()
+		cfg = filepath.Join(cwd, "proj", ".backyard-cli", "config.json")
+		o.ConfigPath = cfg
+	})
+	proj := filepath.Join(e.cwd, "proj")
+	mkdir(t, proj, "index.html")
+	mkdir(t, filepath.Dir(cfg))
+	raw, err := os.ReadFile(e.cfg) // the logged-in profile
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Default rules: the dot folder is skipped, the deploy is fine.
+	var out DeployOutput
+	decode(t, e.call("backyard_deploy", map[string]any{"dir": proj, "site": "proj"}), &out)
+	if files := e.g.SiteFiles("proj"); len(files) != 1 || files["index.html"] == "" {
+		t.Fatalf("deployed %v", files)
+	}
+	for _, tc := range []struct{ file, content string }{
+		{".backyardignore", "!.*\n"},
+		{".backyardignore", "!.backyard-cli/\n"},
+		{".backyard.json", `{"site":"proj","ignore":["!.backyard-cli/"]}`},
+	} {
+		_ = os.Remove(filepath.Join(proj, ".backyardignore"))
+		_ = os.Remove(filepath.Join(proj, ".backyard.json"))
+		if err := os.WriteFile(filepath.Join(proj, tc.file), []byte(tc.content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		res := e.call("backyard_deploy", map[string]any{"dir": proj, "site": "proj"})
+		if !res.IsError || !strings.Contains(text(res), "credentials") {
+			t.Errorf("%s %q: error=%v %q", tc.file, tc.content, res.IsError, text(res))
+		}
+	}
+	if n := e.g.Count(http.MethodPost, "/deploys"); n != 1 {
+		t.Fatalf("%d deploys reached the gateway, want only the first", n)
+	}
+}
+
 // TestHomeAsWorkingDirectory: an agent started in the home directory still
 // cannot publish the whole home directory.
 func TestHomeAsWorkingDirectory(t *testing.T) {

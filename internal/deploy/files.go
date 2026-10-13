@@ -35,10 +35,11 @@ const maxIgnoreFileBytes = 1 << 20
 const utf8BOM = "\uFEFF"
 
 // IgnorePatterns returns the complete pattern list CollectFiles applies to
-// dir: DefaultIgnore, then the lines of dir/.backyardignore (if present),
-// then extra. Direct-sync methods use it to build exclude flags.
+// dir: WithDefaultIgnore of the lines of dir/.backyardignore (if present)
+// followed by extra — so those may re-include the overridable defaults but
+// never ProtectedIgnore. Direct-sync methods use it to build exclude flags.
 func IgnorePatterns(dir string, extra []string) ([]string, error) {
-	patterns := DefaultIgnore()
+	var patterns []string
 	f, err := os.Open(filepath.Join(dir, IgnoreFile))
 	switch {
 	case err == nil:
@@ -62,11 +63,12 @@ func IgnorePatterns(dir string, extra []string) ([]string, error) {
 	case !errors.Is(err, fs.ErrNotExist):
 		return nil, fmt.Errorf("deploy: read %s: %w", IgnoreFile, err)
 	}
-	return append(patterns, extra...), nil
+	return WithDefaultIgnore(append(patterns, extra...)), nil
 }
 
-// CollectFiles walks dir applying DefaultIgnore, dir/.backyardignore and
-// extra patterns (gitignore syntax), hashing every selected file. Symlinks to
+// CollectFiles walks dir applying the default ignore rules,
+// dir/.backyardignore and extra patterns (gitignore syntax, see
+// IgnorePatterns), hashing every selected file. Symlinks to
 // files are followed; symlinked directories are not.
 //
 // Symlinks whose target lies outside dir, broken symlinks and special files

@@ -55,6 +55,7 @@ deploy-dependent tests are skipped.
 | `BACKYARD_SITE_URL_TEMPLATE` | site URL template, e.g. `https://{site}.apps.acme.dev/` (default: derived from the hub URL and `base_domain`) |
 | `BACKYARD_RESOLVE_IP` | address that site host names resolve to (host mode without wildcard DNS) |
 | `BACKYARD_CONFORMANCE_AI` | `mock`: the AI aliases are backed by `mock/openai.mjs` (exact answers are checked); `live`: call the real provider (costs tokens); empty: no provider calls |
+| `BACKYARD_CONFORMANCE_SECRET` | the server's `server.secret` (`BACKYARD_SECRET`): lets the suite sign a Backyard API token of a non-anonymous user (SPEC §8.3) to check that tokens minted with it never outlive it; the runners set it. Without it, `BACKYARD_TOKEN` is used when it is a Backyard API token, else those tests are skipped |
 | `BACKYARD_CONFORMANCE_PREFIX` | prefix of the test site names (default `cf`) |
 | `BACKYARD_SKIP_SDK_BYTES=1` | do not compare the served SDK with `web/sdk` (testing another version) |
 | `BACKYARD_QUERYCASES` | path of the shared query cases (default `internal/docstore/conformance/querycases.json`) |
@@ -72,6 +73,7 @@ site host names that do not resolve to the hub's address (`lib/env.mjs`).
 | `lib/deploy.mjs` | the gateway protocol as a client (plan → upload → commit) |
 | `lib/ws.mjs` | websocket client with a frame queue, handshake probe |
 | `lib/shapes.mjs` | wire-shape assertions (User, SiteMeta, Doc, FileInfo, timestamps) |
+| `lib/tokens.mjs` | Backyard API tokens (SPEC §8.3 key derivation and HS256 layout), JWT claims |
 | `tests/*.test.mjs` | the suite, one file per area |
 | `mock/openai.mjs` | deterministic OpenAI-compatible provider used by the runners |
 | `run-go.sh`, `run-worker.sh` | runners for the two editions |
@@ -99,6 +101,14 @@ Tests detect capabilities instead of checking the edition:
 * **Early `413` for oversized uploads** — checked by sending only the headers;
   skipped when the server (or a proxy such as `wrangler dev`) waits for the
   declared body before answering.
+* **Browser sign-in** — the CLI login tests (`auth.test.mjs`: the cross-site
+  confirmation page, its CSRF-checked `POST`, the direct `302`) need an
+  identity the browser itself carries; they run in mode `none` (guest cookie)
+  and are skipped when the cross-site probe answers anything but the
+  confirmation page (`oidc`: a redirect to the IdP; a proxy mode without its
+  identity: `401`). The hub's `login?rd=` redirect is checked outside `oidc`.
+  In path mode sites share the hub's origin, so a site's `Referer` does not
+  count as cross-site there.
 * **Token identities** — with `BACKYARD_TOKEN` every client is the same user,
   so the anonymous-cookie and per-user connection-cap tests are skipped; site
   deletion is checked only for non-anonymous identities (guests get `401`).

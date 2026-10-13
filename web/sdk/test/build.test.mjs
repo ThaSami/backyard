@@ -95,6 +95,27 @@ test("the d.ts documents every member and named export", () => {
   }
 });
 
+test("the d.ts describes db events without their document and short query pages", () => {
+  /** A doc comment as one line. */
+  const flat = (c) => c.replace(/\s*\n\s*\*\s*/g, " ");
+  const change = /\n  (\/\*\*(?:(?!\*\/)[\s\S])*\*\/)\n  interface ChangeEvent<[^{]*\{([\s\S]*?)\n  \}/.exec(types);
+  assert.ok(change, "ChangeEvent with its doc comment");
+  assert.match(change[1], /"doc": null/);
+  assert.match(change[1], /GET \/db\/\{collection\}\/\{id\}/);
+  assert.match(flat(change[2]), /the SDK could not re-read/);
+  assert.match(change[2], /\bdoc: Doc<T> \| null;/);
+  const handlers = /interface SubscribeHandlers<[^{]*\{([\s\S]*?)\n  \}/.exec(types);
+  assert.ok(handlers, "SubscribeHandlers");
+  // The SDK re-reads such documents, so the handlers never get null.
+  assert.match(handlers[1], /\bonCreate\?\(doc: Doc<T>\): void;/);
+  assert.match(handlers[1], /\bonUpdate\?\(doc: Doc<T>\): void;/);
+  assert.match(handlers[1], /\bonDelete\?\(id: string\): void;/);
+  assert.match(handlers[1], /\bonError\?\(error: BackyardError\): void;/);
+  const docList = /\n  (\/\*\*(?:(?!\*\/)[\s\S])*\*\/)\n  type DocList</.exec(types);
+  assert.ok(docList, "DocList with its doc comment");
+  assert.match(flat(docList[1]), /advance `offset` by the number of documents received/);
+});
+
 // --- ES module build, evaluated in this (real) realm --------------------------
 
 let importCounter = 0;

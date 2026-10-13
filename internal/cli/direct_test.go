@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -19,8 +20,9 @@ import (
 	"github.com/thasami/backyard/internal/deploy"
 )
 
-// defaultsPlus returns the default ignore patterns plus extra lines.
-func defaultsPlus(extra ...string) []string { return append(deploy.DefaultIgnore(), extra...) }
+// defaultsPlus returns the complete pattern list for the configured lines
+// extra, as deploy.IgnorePatterns builds it.
+func defaultsPlus(extra ...string) []string { return deploy.WithDefaultIgnore(extra) }
 
 func TestS3Argv(t *testing.T) {
 	dir := t.TempDir()
@@ -39,9 +41,9 @@ func TestS3Argv(t *testing.T) {
 	}
 	wantArgv := []string{"aws", "s3", "sync", dir, "s3://acme/backyard/sites/demo/", "--delete", "--no-follow-symlinks",
 		"--region", "eu-west-1", "--endpoint-url", "https://minio:9000",
-		// Names whose glob means the same in fnmatch, at the root and below.
-		"--exclude", ".backyard.json", "--exclude", "*/.backyard.json",
-		"--exclude", ".backyardignore", "--exclude", "*/.backyardignore",
+		// Names whose glob means the same in fnmatch, at the root and below
+		// (the any-case project file globs are not: their files, when
+		// present, are listed by path).
 		"--exclude", "CLAUDE.md", "--exclude", "*/CLAUDE.md",
 		"--exclude", "AGENTS.md", "--exclude", "*/AGENTS.md",
 		"--exclude", ".DS_Store", "--exclude", "*/.DS_Store",
@@ -124,8 +126,11 @@ func TestGCSRegexMatchesMatcher(t *testing.T) {
 		{"defaults+user", defaultsPlus("*.map", "/drafts/", "docs/**/private", "!keep.map", "build/**", "[Tt]emp?.txt", "a\\*b")},
 		{"negated dotfile", defaultsPlus("!.htaccess")},
 		{"defaults", deploy.DefaultIgnore()},
+		// .git/ and the project files cannot be re-included.
+		{"re-include protected", defaultsPlus("!.*", "!.git/", "!.GIT/", "!**/.git/**", "!.backyard.json", "!.backyardignore", "!*")},
 	}
 	paths := []string{
+		".GIT/config", "sub/.Git/HEAD", ".Backyard.json", "sub/.backyardignore", "a/.git",
 		"index.html", "app.js", "app.js.map", "keep.map", "sub/keep.map", "sub/x.map",
 		".git/config", "sub/.git/HEAD", "node_modules/a/b.js", "x/node_modules/c.js",
 		".well-known/security.txt", ".well-known/.hidden", "sub/.well-known/x", ".env", "sub/.env", "a/.cache/b",
@@ -174,6 +179,10 @@ print(json.dumps(out))`
 			if want := m.Ignored(p, false); got[ci][i] != want {
 				t.Errorf("%s: path %q: regex excludes=%v, matcher=%v (regex %s)", c.name, p, got[ci][i], want, res[ci])
 			}
+			protected := deploy.HasGitSegment(p) || strings.EqualFold(path.Base(p), ".backyard.json") || strings.EqualFold(path.Base(p), ".backyardignore")
+			if protected && !got[ci][i] {
+				t.Errorf("%s: %q is published", c.name, p)
+			}
 		}
 	}
 }
@@ -195,7 +204,7 @@ func TestAzureArgv(t *testing.T) {
 	}
 	want := []string{"az", "storage", "blob", "sync", "--account-name", "acmestore", "-c", "backyard", "-s", dir,
 		"-d", "prod/sites/demo", "--delete-destination", "true",
-		"--exclude-pattern", ".backyard.json;.backyardignore;CLAUDE.md;AGENTS.md;.DS_Store;.*",
+		"--exclude-pattern", "CLAUDE.md;AGENTS.md;.DS_Store;.*",
 		"--exclude-path", ".git/;drafts/;keep/notes.md;node_modules/;sub/node_modules/"}
 	if !reflect.DeepEqual(cmd.Argv(), want) {
 		t.Fatalf("az argv =\n%q\nwant\n%q", cmd.Argv(), want)
@@ -420,8 +429,11 @@ func TestS3SyncMatchesMatcher(t *testing.T) {
 		// ... and a negated anchored wildcard must not re-include ignored files.
 		{"negated anchored wildcard", defaultsPlus("*.json", "!/*.json")},
 		{"literal metacharacters", defaultsPlus(`/odd\*[[]1].txt`, "weird (1)+[x].html")},
+		// .git/ and the project files cannot be re-included.
+		{"re-include protected", defaultsPlus("!.*", "!.git/", "!.GIT/", "!**/.git/**", "!.backyard.json", "!.backyardignore", "!*")},
 	}
 	local := []string{
+		".GIT/config", "sub/.Git/HEAD", ".Backyard.json", "sub/.backyardignore", "a/.git",
 		"index.html", "app.js", "app.js.map", "keep.map", "sub/keep.map", "sub/x.map",
 		".git/config", "sub/.git/HEAD", "node_modules/a/b.js", "x/node_modules/c.js", "node_modules/a/package.json",
 		".well-known/security.txt", ".well-known/acme-challenge/token", ".well-known/.htaccess",

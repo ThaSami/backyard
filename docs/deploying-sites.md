@@ -32,17 +32,29 @@ travel. Bucket names, prefixes and the rsync target come from the server's
 | Method | What runs | Needs |
 |---|---|---|
 | `api` | The [deploy gateway protocol](spec/SPEC.md#7-deploy-gateway-protocol): the CLI hashes the folder, the gateway answers with upload URLs for new/changed files only, the CLI uploads them (8 in parallel, `--concurrency`) and commits. | A login or token (or anonymous deploys). No cloud account. |
-| `s3` | `aws s3 sync <dir> s3://<bucket>/<prefix>sites/<site>/ --delete --exclude …` | AWS CLI with write access to the bucket. |
-| `gcs` | `gcloud storage rsync <dir> gs://<bucket>/<prefix>sites/<site> --recursive --delete-unmatched-destination-objects --exclude=<regex>` (falls back to `gsutil -m rsync -r -d -x`) | gcloud (or gsutil) with bucket access. |
-| `azure` | `az storage blob sync --account-name <a> -c <container> -s <dir> -d <prefix>sites/<site> --delete-destination true --exclude-pattern …` | Azure CLI with Storage Blob Data Contributor. |
-| `rsync` | `rsync -az --delete --exclude … <dir>/ <rsync_target>/<site>/` | SSH access to `deploy.rsync_target` on a server with `storage.type: fs`. |
+| `s3` | `aws s3 sync <dir> s3://<bucket>/<prefix>sites/<site>/ --delete --no-follow-symlinks --exclude …` | AWS CLI with write access to the bucket. |
+| `gcs` | `gcloud storage rsync <dir> gs://<bucket>/<prefix>sites/<site> --recursive --delete-unmatched-destination-objects --exclude=<regex>` (falls back to `gsutil -m rsync -r -d -e -x <regex>`) | gcloud (or gsutil) with bucket access. |
+| `azure` | `az storage blob sync --account-name <a> -c <container> -s <dir> -d <prefix>sites/<site> --delete-destination true --exclude-pattern … --exclude-path …` | Azure CLI with Storage Blob Data Contributor. |
+| `rsync` | `rsync -az --delete --delete-excluded --filter='P .backyard-tmp-*' --exclude … <dir>/ <rsync_target>/<site>/` | SSH access to `deploy.rsync_target` on a server with `storage.type: fs`. |
 | `auto` (default) | `api` when the gateway is reachable and you are logged in (or anonymous deploys are allowed); otherwise the first direct method the server advertises whose tool is installed. | |
 
-After a direct sync the CLI asks the gateway to refresh the site (`POST
-…/sites/<site>/refresh`), which rebuilds its manifest, title and description. Direct methods
-suit platform teams and CI runners that already hold cloud credentials; everyone else uses
-`api`. The server lists the methods it supports in `deploy.methods` (default: `api` plus the
-storage-native one — `rsync` for fs storage once `deploy.rsync_target` is set).
+The direct methods apply exactly the ignore rules of `api`: the CLI walks the folder with them
+and turns the result into the tool's excludes (a symlinked folder is resolved first, and
+symlinks leading out of it are never followed). The sync tools never delete files that their
+excludes match, so after an `s3`, `gcs` or `azure` sync the CLI lists the site through the
+gateway and removes stored files that the ignore rules exclude (`aws s3 rm`, `gcloud storage
+rm`/`gsutil rm`, `az storage blob delete`; rsync does it with `--delete-excluded`, and its
+`P .backyard-tmp-*` rule protects the `fs` store's in-flight files). A failed removal fails the
+deploy; `--dry-run --json` lists the commands as `cleanup`. Then the CLI asks the gateway to
+refresh the site (`POST …/sites/<site>/refresh`), which rebuilds its manifest, title and
+description. Without a reachable gateway and a login, ignored files stay published and the CLI
+says so: deploy once with `--method api`. A profile's cached bucket and rsync target are only
+used for that profile's server. Direct methods suit platform teams and CI runners that already
+hold cloud credentials; everyone else uses `api`. The Terraform modules (AWS, Google Cloud,
+Azure) and the systemd kit let direct-sync deployers write only below `<prefix>sites/`, never
+the server's `_meta/` or the uploads. The server lists the methods it supports in
+`deploy.methods` (default: `api` plus the storage-native one — `rsync` for fs storage once
+`deploy.rsync_target` is set).
 
 ### What a deploy guarantees
 
@@ -52,13 +64,16 @@ storage-native one — `rsync` for fs storage once `deploy.rsync_target` is set)
   can enforce it (the gateway's own upload endpoint checks both, S3 the size and — on AWS — the
   SHA-256, GCS the size; an Azure SAS URL cannot restrict the body — see
   [upload integrity](storage-and-databases.md#upload-integrity)). The commit checks every
-  file's size before it deletes anything; a file stored with the wrong size is deleted and the
-  commit fails with `409 conflict` naming it — run the deploy again.
+  file's size before it deletes anything; a missing file or one stored with the wrong size
+  fails the commit with `409 conflict` naming it — run the deploy again. (With presigned Azure
+  SAS uploads, which cannot bind the size, such an object is also deleted.) The manifest
+  records the SHA-256 of the bytes actually stored, so the next deploy's diff is right even if
+  another deploy replaced a file in between.
 - **Not atomic:** like rsync, visitors may briefly see a mix of old and new files; deletions
-  happen last, so a site is never empty mid-deploy. Uploads of a deploy that never commits stay
-  in storage (new paths are served but not part of the site's manifest) until the next
-  successful deploy removes them. The Cloudflare edition is the exception: its commit switches
-  the whole site at once.
+  happen last, so a site is never empty mid-deploy. Two deploys of one site may overlap; the
+  last write wins per file. Uploads of a deploy that never commits stay in storage (new paths
+  are served but not part of the site's manifest) until the next successful deploy removes
+  them. The Cloudflare edition is the exception: its commit switches the whole site at once.
 - **Limits** (`sites.*`): 500 MiB per site, 10,000 files, 100 MiB per file by default;
   `ratelimit.deploys_per_hour` (60) per person.
 
@@ -75,20 +90,27 @@ Written by `backyard init`; the CLI finds it in the current folder or a parent.
 | Field | Meaning |
 |---|---|
 | `site` | Site name. |
-| `dir` | Folder to deploy, relative to the file — e.g. `"dist"` for build output. Default `"."`. |
+| `dir` | Folder to deploy, relative to the file — e.g. `"dist"` for build output. Default `"."`. It must stay inside the file's folder: an absolute path, a `..` that leaves it or a symlink leading out is an error, so a project file that came with a cloned repository or a pulled site cannot point a deploy at another folder. |
 | `method` | Preferred deploy method. |
 | `ignore` | Extra gitignore-style patterns. |
 
 ### `.backyardignore`
 
-Never uploaded, whatever you configure: `.git/`, `.backyard.json`, `.backyardignore`,
-`node_modules/`, `.claude/`, `.cursor/`, `.github/`, `CLAUDE.md`, `AGENTS.md`, `.DS_Store` and
-every path segment starting with `.` (`.env`, `.backyard-data/`…) except `.well-known/`.
+**Never uploaded**, whatever you configure: `.git/` (at any depth), `.backyard.json` and
+`.backyardignore`, in any letter case. No `!` line re-includes them, and both gateways refuse
+any path with a `.git` segment.
 
-Add more in a `.backyardignore` file at the root of the deployed folder. The syntax is
-gitignore's: `#` comments, `!` negation (the last matching pattern wins), a trailing `/` for
-directories, a leading or inner `/` anchors to the root, `**` matches any depth, and a path
-inside an excluded directory cannot be re-included.
+**Ignored by default:** `node_modules/`, `.claude/`, `.cursor/`, `.github/`, `CLAUDE.md`,
+`AGENTS.md`, `.DS_Store` and every other path segment starting with `.` (`.env`,
+`.backyard-data/`…) except `.well-known/`.
+
+Add more in a `.backyardignore` file at the root of the deployed folder (or the `ignore` list of
+`.backyard.json`). The syntax is gitignore's: `#` comments, `!` negation (the last matching
+pattern wins), a trailing `/` for directories, a leading or inner `/` anchors to the root, `**`
+matches any depth, and a path inside an excluded directory cannot be re-included. Your lines
+come after the defaults, so a `!` line can publish something the defaults skip — `!.htaccess`
+publishes `.htaccess` files, `!.*` every dotfile — but never the "never uploaded" files. A
+UTF-8 byte order mark at the start of the file is ignored.
 
 ```gitignore
 # keys and certificates must never be published
@@ -101,7 +123,8 @@ drafts/
 
 `backyard init` writes a starter `.backyardignore`. The same rules are translated into each
 direct-sync tool's exclude flags. Symlinks pointing outside the folder are skipped; a file
-under `__backyard/` cannot be deployed (that path prefix is reserved).
+under `__backyard/` cannot be deployed (that path prefix is reserved). `backyard pull` never
+writes the files that the defaults exclude, even if a site holds them.
 
 ## Ownership
 
@@ -131,7 +154,8 @@ Deploy from any pipeline with two environment variables:
 - `BACKYARD_TOKEN` — a [static token](authentication.md#static-tokens) (acts as
   `token:<name>`, never expires, survives people leaving) or a personal API token from
   `backyard token create --name ci --ttl 720h` (acts as you, expires after at most
-  `auth.token_ttl`).
+  `auth.token_ttl`, and never later than the browser `backyard login` it was minted with — mint
+  it right after logging in, or after `backyard login --device`, for the full lifetime).
 
 ```yaml
 # .github/workflows/deploy-site.yml
@@ -196,7 +220,18 @@ make lambda          # dist/backyard-lambda.zip (linux/arm64, provided.al2023 ru
 | `BACKYARD_GATEWAY_URL` | The URL advertised to CLIs (else `deploy.gateway_url`, else derived from the request). |
 
 The [AWS Terraform module](../deploy/terraform/aws/README.md) deploys it
-(`enable_lambda_gateway`) and sets `deploy.gateway_url` on the server.
+(`enable_lambda_gateway`) and sets `deploy.gateway_url` on the server. It passes
+`BACKYARD_SECRET_ARN`, so the secret never sits in the function's configuration.
+
+**Limits.** A Lambda function returns at most 6 MB per response (after base64 and JSON
+encoding). The gateway gzips text responses of 32 KiB or more for clients that accept it (the
+CLI does), so deploy plans of thousands of files — 10,000 with realistic presigned URLs — fit.
+Reading a file back through it (`backyard pull`, agents reading other sites) works up to about
+4.4 MB for binary files; anything larger gets a `413` that names the fix: `backyard login
+--server <public_url> --gateway <public_url>/__backyard/api/deploy` uses the embedded gateway,
+which has no such limit and accepts the same tokens. A commit verifies each changed file: with
+the default S3 setup (flexible checksums) one `HeadObject` per file, otherwise by reading it,
+so a very large first deploy may need a higher `lambda_timeout` than the default 60 s.
 
 ## Troubleshooting
 
@@ -207,7 +242,9 @@ The [AWS Terraform module](../deploy/terraform/aws/README.md) deploys it
 | `forbidden` | Ownership mode and you are not an owner, or the gates (`allowed_domains`/`allowed_groups`) exclude you. |
 | `invalid site name` | Lowercase letters, digits and `-`, ≤ 63 characters, not reserved. |
 | `too_large` | A file or the whole site is over the limits — deploy the build folder, ignore sources. |
-| `conflict: N file(s) were not uploaded correctly` | An upload went missing or arrived with another size (an interrupted upload, a file changed while deploying, a proxy rewriting bodies); objects of the wrong size were deleted. Deploy again. |
+| `conflict: N file(s) were not uploaded correctly` | An upload went missing or arrived with another size (an interrupted upload, a file changed while deploying, a proxy rewriting bodies, or another deploy of the site that overwrote the file in between). Deploy again. With presigned Azure SAS uploads the objects of the wrong size were deleted. |
+| `413` reading or deploying through the Lambda gateway | The response does not fit a Lambda function's 6 MB: use the embedded gateway (`backyard login --server <url> --gateway <url>/__backyard/api/deploy`). |
 | `rate_limited` | More than `deploys_per_hour`; wait. |
-| A file is missing on the site | It is ignored (dotfile, default ignore, `.backyardignore`) — check with `--dry-run`. |
+| A file is missing on the site | It is ignored (dotfile, default ignore, `.backyardignore`) — check with `--dry-run`; re-include a default with a `!` line. `.git/`, `.backyard.json` and `.backyardignore` are never published. |
+| `invalid path …: path may not contain a ".git" segment` | A client tried to deploy repository metadata; the gateways refuse it. Use the CLI, which never uploads `.git/`. |
 | Old content still shows | Reload: sites are served with `Cache-Control: no-cache` and ETags. With several instances, caches expire after `storage.cache_ttl` (5 s). |

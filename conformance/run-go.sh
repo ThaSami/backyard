@@ -69,7 +69,7 @@ stop_pid() {
 }
 
 # Invoked by the EXIT trap (shellcheck cannot tell when the script ends with exit).
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 cleanup() {
 	status=$?
 	stop_pid "$server_pid"
@@ -127,14 +127,14 @@ if [ "$ai_port" != "off" ]; then
 	ai_mode="mock"
 fi
 
-# write_config MODE TOKEN_SHA256 DATA_DIR FEATURES: prints the server
+# write_config MODE TOKEN_SHA256 DATA_DIR FEATURES SECRET: prints the server
 # configuration; FEATURES "full" adds AI and the warehouse.
 write_config() {
 	cat <<EOF
 server:
   listen: "127.0.0.1:$port"
   url_mode: $1
-  secret: "$(rand_hex 32)"
+  secret: "$5"
 storage:
   type: fs
   fs:
@@ -204,9 +204,10 @@ for mode in $modes; do
 	data="$work/$mode"
 	mkdir -p "$data"
 	token="byd_conformance_$(rand_hex 16)"
+	secret="$(rand_hex 32)"
 	features="full"
 	[ "$mode" = "path" ] && features="none"
-	write_config "$mode" "$(sha256_hex "$token")" "$data" "$features" >"$data/backyard.yaml"
+	write_config "$mode" "$(sha256_hex "$token")" "$data" "$features" "$secret" >"$data/backyard.yaml"
 	log "starting backyard serve --dev ($mode mode) on 127.0.0.1:$port"
 	(
 		cd "$data"
@@ -232,7 +233,7 @@ for mode in $modes; do
 	(
 		cd "$here"
 		BACKYARD_URL="http://localhost:$port" BACKYARD_TOKEN="$suite_token" BACKYARD_CONFORMANCE_AI="$suite_ai" \
-			node --test --test-reporter=spec "$@" "tests/*.test.mjs"
+			BACKYARD_CONFORMANCE_SECRET="$secret" node --test --test-reporter=spec "$@" "tests/*.test.mjs"
 	)
 	rc=$?
 	set -e

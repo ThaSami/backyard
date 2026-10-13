@@ -30,7 +30,12 @@ const unsubscribe = todos.subscribe({
 ```
 
 Every successful write through the API (`create`, `set`, `update`, `delete`) publishes one
-event to the site's subscribers on every instance.
+event to the site's subscribers on every instance. Events are delivered in order, and
+`onCreate`/`onUpdate` always get the full document: when a document is too large to travel in
+the event itself (about 1 MiB or more, possible only if `database.max_doc_bytes` is raised on
+the Go server), the server sends the change without it and the SDK re-reads the document
+before delivering the event (it may then already include later changes). If that read fails,
+`onError` is called and only `onChange` sees the event, with `doc: null`.
 
 ## Rooms and presence
 
@@ -75,7 +80,7 @@ first server frame is `{"t":"hello","cid":"c_…","user":{…}}`.
 
 | Server → client | Meaning |
 |---|---|
-| `{"t":"db","sub":"s1","collection":"posts","op":"create\|update\|delete","doc":{…}\|null,"doc_id":"…"}` | Document change (flattened document; `null` for deletes) |
+| `{"t":"db","sub":"s1","collection":"posts","op":"create\|update\|delete","doc":{…}\|null,"doc_id":"…"}` | Document change (flattened document; `null` for deletes, and for a create or update too large to broadcast — read it with `GET /db/{c}/{doc_id}`) |
 | `{"t":"presence","room":"lobby","op":"join\|leave\|update","member":Member}` | Presence change |
 | `{"t":"msg","room":"lobby","from":{"cid","user"},"data":…}` | Room message |
 | `{"t":"error","id":…,"error":{"code","message"}}` | Error for a frame (the connection stays open) |

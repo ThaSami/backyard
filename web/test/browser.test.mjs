@@ -202,6 +202,50 @@ test("SDK in a real browser: context, db, realtime, files, AI streaming, rooms, 
   }
 });
 
+test("SDK in a real browser: db events without their document are re-read, in order", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  const stub = await startStub({ pages: { "index.html": SITE_PAGE, "": SITE_PAGE }, maxEventDocBytes: 1024 });
+  const context = await browser.newContext();
+  try {
+    const { page, problems } = await open(context, stub.url + "/s/demo/index.html");
+    const r = await page.evaluate(async () => {
+      const posts = backyard.db.collection("posts");
+      const events = [];
+      const changes = [];
+      posts.subscribe({
+        onCreate: (d) => events.push("create:" + d.id + ":" + d.body.length),
+        onUpdate: (d) => events.push("update:" + d.id + ":" + d.body.length),
+        onDelete: (id) => events.push("delete:" + id),
+        onChange: (e) => changes.push(e.op + ":" + e.id + ":" + (e.doc ? "doc" : "null")),
+        onError: (e) => events.push("error:" + e.code),
+      });
+      await new Promise((resolve) => backyard.socket.on("open", resolve));
+      await new Promise((r) => setTimeout(r, 100));
+      const until = async (n) => {
+        for (let i = 0; i < 100 && events.length < n; i++) await new Promise((r) => setTimeout(r, 20));
+      };
+      await posts.create({ body: "small" }, { id: "s" });
+      await until(1);
+      await posts.create({ body: "x".repeat(2000) }, { id: "big" });
+      await until(2);
+      await posts.update("big", { body: "y".repeat(3000) });
+      await until(3);
+      await posts.update("s", { body: "smaller" });
+      await posts.delete("big");
+      await until(5);
+      return { events, changes };
+    });
+    assert.deepEqual(r.events, ["create:s:5", "create:big:2000", "update:big:3000", "update:s:7", "delete:big"]);
+    assert.deepEqual(r.changes, ["create:s:doc", "create:big:doc", "update:big:doc", "update:s:doc", "delete:big:null"]);
+    const reads = stub.state.requests.filter((q) => q.method === "GET" && q.path.startsWith("/db/posts/")).map((q) => q.path);
+    assert.deepEqual(reads, ["/db/posts/big", "/db/posts/big"], "only the documents sent without content are read");
+    assert.deepEqual(problems, []);
+  } finally {
+    await context.close();
+    await stub.close();
+  }
+});
+
 test("hub: header, CLI commands, site directory, folder deploy with a deploy token, docs", async (t) => {
   if (!browser) return t.skip(skipReason);
   const stub = await startStub({

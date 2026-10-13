@@ -121,7 +121,7 @@ See [authentication](authentication.md) for step-by-step setups.
 | `auth.admin_groups` | list of strings | `[]` | Groups whose members are admins. |
 | `auth.allowed_domains` | list of strings | `[]` (anyone) | Only these email domains may use Backyard (`403` otherwise). |
 | `auth.allowed_groups` | list of strings | `[]` (anyone) | Only members of these groups may use Backyard. |
-| `auth.token_ttl` | duration | `720h` | Lifetime — and maximum lifetime — of API tokens minted by the server (CLI login, `backyard token create`). |
+| `auth.token_ttl` | duration | `720h` | Lifetime — and maximum lifetime — of API tokens minted by the server (CLI login, `backyard token create`). A token minted with an API token as the credential expires no later than that token. |
 | `auth.tokens` | list | `[]` | Static bearer tokens, e.g. for CI: `[{name, sha256, admin}]`. |
 | `auth.tokens[].name` | string | — | Shown in audit logs; the token acts as user `token:<name>`. |
 | `auth.tokens[].sha256` | string | — | Hex SHA-256 of the token (64 characters). `backyard token hash` prints it. The token itself is never stored. |
@@ -252,7 +252,7 @@ The document store behind `backyard.db`, plus the user cache, upload metadata an
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `database.type` | `sqlite` \| `postgres` \| `dynamodb` \| `memory` | `sqlite` | Backend. `memory` loses everything on restart (tests, demos). |
-| `database.max_doc_bytes` | int | `262144` (256 KiB) | Largest document (JSON). Keep it below ~390000 on DynamoDB (400 KB item limit). |
+| `database.max_doc_bytes` | int | `262144` (256 KiB) | Largest document: its JSON data as stored (`<`, `>` and `&` count one byte each). Keep it below ~390000 on DynamoDB (400 KB item limit). Above about 1 MiB a document no longer fits one realtime event: subscribers get the change with `doc: null` and the SDK re-reads the document ([SPEC §6](spec/SPEC.md#6-realtime-websocket-get-__backyardapiws)). |
 | `database.max_list` | int | `1000` | Largest `limit` of a list or query (default page size is 100). |
 | `database.max_docs_per_site` | int | `100000` | Soft per-site document quota (`413 too_large` beyond it); negative = unlimited. |
 | `database.sqlite.path` | path | `<storage.fs.root>/backyard.db` | Database file (WAL mode; single node). |
@@ -336,7 +336,7 @@ See [warehouse](warehouse.md).
 | `warehouse.default_source` | string | `default`, or the only source | Source for raw SQL without `source`. |
 | `warehouse.allow_raw_sql` | bool | `false` | Allow ad-hoc SQL from sites (otherwise only named queries). |
 | `warehouse.allow_any_statement` | bool | `false` | Disable the single-`SELECT`/`WITH` statement guard. Avoid. |
-| `warehouse.max_rows` | int | `10000` | Row cap per result (`truncated: true` beyond). |
+| `warehouse.max_rows` | int | `10000` | Row cap per result (`truncated: true` beyond). Results are also capped at 32 MiB of row data (fixed). |
 | `warehouse.timeout` | duration | `60s` | Query timeout. |
 | `warehouse.queries.<name>.source` | string | `default_source` | Source of a named query. |
 | `warehouse.queries.<name>.sql` | string | **required** | SQL with `@param` placeholders. |

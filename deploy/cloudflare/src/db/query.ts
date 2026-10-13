@@ -5,6 +5,10 @@
  *
  *   - comparisons only match values of the same JSON type ("3" never equals 3);
  *     json_type() guards every comparison;
+ *   - numbers compare as IEEE doubles, like Go's float64: a stored integer
+ *     beyond 2^53 is CAST to REAL before it meets the (double) operand, since
+ *     SQLite compares INTEGER with REAL exactly ("in"/"not-in" compare the
+ *     JSON.stringify texts of both sides, which are equal for equal doubles);
  *   - a missing field never matches; "== null" matches an explicit null only;
  *     "<="/">=" null match null, "<"/">"/"!=" null match nothing;
  *   - "in" = any ==, "not-in" = all != (so all values must share the field's type);
@@ -277,7 +281,10 @@ function dataCompare(b: Builder, path: string, field: string, op: Op, v: unknown
       return;
     }
     case "number":
-      b.w(`(${jt} IN ${NUM_TYPES} AND ${jx} ${sqlOp} ${b.p(value)})`);
+      // CAST: SQLite compares an INTEGER and a REAL exactly, but a stored
+      // integer above 2^53 is the shortest text of a double (JSON.stringify),
+      // not that double itself; numbers compare as doubles (like Go's float64).
+      b.w(`(${jt} IN ${NUM_TYPES} AND CAST(${jx} AS REAL) ${sqlOp} ${b.p(value)})`);
       return;
     case "string":
       b.w(`(${jt} = 'text' AND ${jx} ${sqlOp} ${b.p(value)})`);
@@ -360,7 +367,7 @@ function dataContains(b: Builder, path: string, field: string, v: unknown): void
       cond = `e.type = '${value ? "true" : "false"}'`;
       break;
     case "number":
-      cond = `e.type IN ${NUM_TYPES} AND e.value = ${b.p(value)}`;
+      cond = `e.type IN ${NUM_TYPES} AND CAST(e.value AS REAL) = ${b.p(value)}`;
       break;
     case "string":
       cond = `e.type = 'text' AND e.value = ${b.p(value)}`;

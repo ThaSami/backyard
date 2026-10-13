@@ -24,6 +24,9 @@ for (const colorScheme of ["light", "dark"]) {
     test("hub with a selection, the token box and the delete dialog", async ({ page, state }) => {
       await page.goto(`${server.url}/#token=${encodeURIComponent(state.adminToken)}`);
       await expect(page.locator("#site-list")).not.toHaveAttribute("aria-busy", /.*/);
+      await expect(page.locator("#handoff-dialog")).toBeVisible();
+      await expectAccessible(page, "hub token dialog");
+      await page.locator("#handoff-use").click();
       await page.locator("#files-input").setInputFiles([
         { name: "index.html", mimeType: "text/html", buffer: Buffer.from("<!doctype html><title>x</title>") },
         { name: ".env", mimeType: "text/plain", buffer: Buffer.from("x") },

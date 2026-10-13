@@ -12,5 +12,11 @@
 //     labels of both editions, the site URL examples of SPEC §2, the limits
 //     where a negative value means unlimited, the quoted oidc host-mode
 //     configuration errors, the AI request limits, and the MCP tools and
-//     their parameters.
+//     their parameters;
+//   - and so do the statements about hardened behaviour
+//     (contract_hardening_test.go): the passive upload types of both
+//     editions (SPEC §3), the warehouse result cap, the realtime payload
+//     limit, the flags of the direct-sync commands, the files no ignore
+//     configuration can deploy, the login state cookie, and the Cloudflare
+//     edition's query page budget and Access bypass paths.
 package docs

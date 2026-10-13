@@ -495,6 +495,70 @@ func TestDirectDeployRemovesIgnoredFiles(t *testing.T) {
 	}
 }
 
+// TestDirectDeployNeverPublishesGit: "!" lines may re-include dotfiles,
+// but never .git/ or the project files. The direct-sync excludes keep them
+// out whatever .backyardignore and .backyard.json say, and a .git/ the site
+// still holds from before (which the gateway no longer serves) is removed
+// by the prune.
+func TestDirectDeployNeverPublishesGit(t *testing.T) {
+	h := newHarness(t)
+	g := loggedIn(t, h)
+	g.Info.Methods = []string{"api", "s3", "rsync"}
+	g.Info.Storage = &blob.Description{Type: "s3", Bucket: "acme-backyard"}
+	g.Info.RsyncTarget = "deploy@host:/srv/sites/"
+	h.tools["aws"], h.tools["rsync"] = true, true
+	g.AddSite("site", map[string]string{"index.html": "old", ".git/config": "[core]", ".GIT/HEAD": "ref", ".htaccess": "x"}, alice.ID)
+	writeFiles(t, filepath.Join(h.cwd, "site"), map[string]string{
+		"index.html": "new", ".htaccess": "x", ".git/config": "[core]", ".git/HEAD": "ref", ".GIT/HEAD": "ref",
+		".Backyard.json": "{}", ".backyardignore": "!.*\n!.git/\n!.GIT/\n!**/.git/**\n!.backyardignore\n!.Backyard.json\n",
+		".backyard.json": `{"site":"site","ignore":["!.git/","!.backyard.json"]}`,
+	})
+	h.cwd = filepath.Join(h.cwd, "site")
+
+	h.mustRun("deploy", "-m", "s3", "--dry-run", "--json")
+	var dry deployOutput
+	if err := json.Unmarshal([]byte(h.out.String()), &dry); err != nil {
+		t.Fatal(err)
+	}
+	var excluded []string
+	for i, a := range dry.Command {
+		if a == "--exclude" && i+1 < len(dry.Command) {
+			excluded = append(excluded, dry.Command[i+1])
+		}
+	}
+	slices.Sort(excluded)
+	if want := []string{".Backyard.json", ".GIT/*", ".backyard.json", ".backyardignore", ".git/*"}; !slices.Equal(excluded, want) {
+		t.Fatalf("s3 excludes = %q, want %q (command %q)", excluded, want, dry.Command)
+	}
+	var files []string
+	for _, f := range dry.Files {
+		files = append(files, f.Path)
+	}
+	if !slices.Equal(files, []string{".htaccess", "index.html"}) {
+		t.Fatalf("files = %q", files)
+	}
+	wantRm := []string{"aws", "s3", "rm", "s3://acme-backyard/sites/site/", "--recursive",
+		"--exclude", "*", "--include", ".GIT/HEAD", "--include", ".git/config"}
+	if len(dry.Cleanup) != 1 || !reflect.DeepEqual(dry.Cleanup[0], wantRm) {
+		t.Fatalf("cleanup = %q, want %q", dry.Cleanup, wantRm)
+	}
+
+	// rsync applies the first matching filter: the protected excludes come
+	// before every configured rule.
+	dry = deployOutput{}
+	h.mustRun("deploy", "-m", "rsync", "--dry-run", "--json")
+	if err := json.Unmarshal([]byte(h.out.String()), &dry); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"rsync", "-az", "--delete", "--delete-excluded", "--filter=P .backyard-tmp-*",
+		"--exclude=.[bB][aA][cC][kK][yY][aA][rR][dD][iI][gG][nN][oO][rR][eE]",
+		"--exclude=.[bB][aA][cC][kK][yY][aA][rR][dD].[jJ][sS][oO][nN]", "--exclude=.[gG][iI][tT]",
+		"--include=.backyard.json", "--include=.git/", "--include=.Backyard.json", "--include=.backyardignore"}
+	if len(dry.Command) < len(want) || !reflect.DeepEqual(dry.Command[:len(want)], want) {
+		t.Fatalf("rsync argv = %q, want prefix %q", dry.Command, want)
+	}
+}
+
 func TestDeployDirectDryRunPrintsCommand(t *testing.T) {
 	h := newHarness(t)
 	g := loggedIn(t, h)

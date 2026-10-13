@@ -150,8 +150,7 @@ await backyard.files.delete(id)
 const r = await backyard.ai.chat("Summarize: " + text, { system: "Be brief", model: "smart", maxTokens: 800, temperature: 0.2 })
 r.content; r.model; r.stop_reason; r.usage   // stop_reason: end_turn|max_tokens|stop_sequence|refusal|other
 const { json } = await backyard.ai.chat("Extract {name, date} as JSON from: " + text, { json: true })
-const dataUrl = await new Promise((ok) => { const r = new FileReader(); r.onload = () => ok(r.result); r.readAsDataURL(fileOrBlob); })
-await backyard.ai.chat([{ role: "user", content: [{ type: "text", text: "What is this?" }, { type: "image", url: dataUrl }] }])  // data: URL or public https URL, ≤ 20 MiB
+await backyard.ai.chat([{ role: "user", content: [{ type: "text", text: "What is this?" }, { type: "image", url: f.url }] }])  // image: this site's upload url, a data: URL or a public https URL, ≤ 20 MiB
 const s = backyard.ai.stream(messages, { onText: t => (out.textContent += t) })
 for await (const chunk of s) { /* chunk.text */ }   // either iterate or use onText
 const final = await s.done                // {content, model, stop_reason, usage}
@@ -253,7 +252,7 @@ calls `backyard.db` reads and writes the including site's data. To study or fork
 | What | Limit |
 |---|---|
 | Document size | 256 KiB of JSON |
-| `list`/query `limit` | default 100, max 1000 (`hasMore`/`has_more` tells if more exist) |
+| `list`/query `limit` | default 100, max 1000 (`hasMore`/`has_more` tells if more exist; a page may hold fewer than `limit`, so advance `offset` by the documents received) |
 | Documents per site | 100,000 |
 | Upload size | 100 MiB per file |
 | Site size | 500 MiB, 10,000 files, 100 MiB per file |

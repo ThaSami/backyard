@@ -30,6 +30,7 @@ function createBackyard(g) {
   const PONG_TIMEOUT = 20000; // a ping unanswered for this long means the connection is dead (ms)
   const CONNECT_TIMEOUT = 20000; // give up on a connection without "hello" after this long (ms)
   const WATCH_DEBOUNCE = 50; // live-query refetch coalescing window (ms)
+  const REREAD_TIMEOUT = 30000; // re-reading a document a db event carried without content (ms)
   const MAX_QUEUE = 1000; // outgoing frames buffered while (re)connecting
 
   const OPS = ["==", "!=", "<", "<=", ">", ">=", "in", "not-in", "contains"];
@@ -463,6 +464,54 @@ function createBackyard(g) {
     }
   }
 
+  /**
+   * A create/update event whose document the server sent without content:
+   * the Go server sends `"doc": null` (with doc_id) when the encoded event
+   * would exceed the pub/sub payload limit (SPEC §6).
+   */
+  function lacksDoc(ev) {
+    return (ev.op === "create" || ev.op === "update") && !isObject(ev.doc);
+  }
+
+  /** Pending re-reads per event object, so the subscribers of one event share one GET. */
+  const rereads = new WeakMap();
+
+  /**
+   * Re-reads the document of an event that carried none (GET /db/{c}/{id}).
+   * Resolves to the document, or null when it no longer exists; rejects on
+   * errors and after REREAD_TIMEOUT (so a hung request cannot stall the
+   * subscription's later events forever).
+   */
+  function rereadDoc(collection, ev) {
+    let p = rereads.get(ev);
+    if (p) return p;
+    if ((typeof ev.id !== "string" && typeof ev.id !== "number") || ev.id === "") {
+      p = Promise.reject(new BackyardError("bad_response", "realtime event for " + JSON.stringify(collection) + " has neither a document nor a document id"));
+    } else {
+      p = new Promise((resolve, reject) => {
+        const ctl = typeof g.AbortController === "function" ? new g.AbortController() : null;
+        const timer = setT(() => {
+          if (ctl) ctl.abort();
+          reject(new BackyardError("network_error", "Timed out re-reading document " + JSON.stringify(String(ev.id)) + " of " + JSON.stringify(collection)));
+        }, REREAD_TIMEOUT);
+        const path = "/db/" + enc(collection) + "/" + enc(ev.id);
+        request("GET", path, { nullOn404: true, signal: ctl ? ctl.signal : undefined }).then(
+          (doc) => {
+            clearT(timer);
+            if (doc === null || isObject(doc)) resolve(doc); // null: 404, the document is gone
+            else reject(new BackyardError("bad_response", "re-reading document " + JSON.stringify(String(ev.id)) + " of " + JSON.stringify(collection) + " returned no document"));
+          },
+          (err) => {
+            clearT(timer);
+            reject(err);
+          },
+        );
+      });
+    }
+    rereads.set(ev, p);
+    return p;
+  }
+
   /** Normalizes a Query instance or a plain query object to the wire shape. */
   function toWireQuery(q) {
     if (q instanceof Query) return q.toJSON();
@@ -570,17 +619,69 @@ function createBackyard(g) {
       if (typeof handlers === "function") handlers = { onChange: handlers };
       if (!isObject(handlers)) throw badRequest("subscribe(handlers) requires an object of callbacks");
       const h = handlers;
-      return subscribeCollection(
-        this.name,
+      const name = this.name;
+      const deliver = (ev) => {
+        if (ev.op === "create") safeCall(h.onCreate, ev.doc);
+        else if (ev.op === "update") safeCall(h.onUpdate, ev.doc);
+        else if (ev.op === "delete") safeCall(h.onDelete, ev.id);
+        safeCall(h.onChange, ev);
+      };
+      // Events are delivered in arrival order. A create/update that arrives
+      // without its document (lacksDoc) is completed by re-reading it first,
+      // and the events behind it wait. Events with a document and nothing
+      // pending ahead of them are delivered synchronously.
+      const queue = [];
+      let active = true;
+      let busy = false;
+      const pump = () => {
+        if (busy) return;
+        busy = true;
+        while (active && queue.length) {
+          const ev = queue.shift();
+          if (!lacksDoc(ev)) {
+            deliver(ev);
+            continue;
+          }
+          const resume = () => {
+            busy = false;
+            pump();
+          };
+          rereadDoc(name, ev).then(
+            (doc) => {
+              if (active) {
+                if (doc) deliver({ op: ev.op, collection: ev.collection, id: ev.id, doc });
+                // Gone already: report a delete, unless one is queued anyway.
+                else if (!queue.some((e) => e.op === "delete" && e.id === ev.id)) deliver({ op: "delete", collection: ev.collection, id: ev.id, doc: null });
+              }
+              resume();
+            },
+            (err) => {
+              if (active) {
+                if (h.onError) safeCall(h.onError, err);
+                else warn("could not read document " + JSON.stringify(String(ev.id)) + " of a change to " + JSON.stringify(name) + ":", err.message);
+                safeCall(h.onChange, ev); // doc stays null; onCreate/onUpdate need a document
+              }
+              resume();
+            },
+          );
+          return;
+        }
+        busy = false;
+      };
+      const unsubscribe = subscribeCollection(
+        name,
         (ev) => {
-          if (ev.op === "create") safeCall(h.onCreate, ev.doc);
-          else if (ev.op === "update") safeCall(h.onUpdate, ev.doc);
-          else if (ev.op === "delete") safeCall(h.onDelete, ev.id);
-          safeCall(h.onChange, ev);
+          queue.push(ev);
+          pump();
         },
         null,
-        (err) => (h.onError ? safeCall(h.onError, err) : warn("subscription to " + JSON.stringify(this.name) + " failed:", err.message)),
+        (err) => (h.onError ? safeCall(h.onError, err) : warn("subscription to " + JSON.stringify(name) + " failed:", err.message)),
       );
+      return function stop() {
+        active = false;
+        queue.length = 0;
+        unsubscribe();
+      };
     }
 
     watch(callback, query, opts) {

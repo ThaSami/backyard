@@ -26,7 +26,7 @@ comes from `templates/files/agents/CLAUDE.md.tmpl` — a different thing.)
 | `deploy/cloudflare` | The Cloudflare Workers edition (TypeScript); `src/generated/` is generated, don't edit |
 | `deploy/{terraform,helm,docker-compose,systemd}` | Deployment kits |
 | `conformance/`, `e2e/` | Cross-edition black-box API suite (`node --test`; `run-go.sh`, `run-worker.sh`) and the Playwright browser suite |
-| `docs/` | User and operator documentation; `docs_test.go` checks links, make targets and config keys, `contract_test.go` statements tied to code (key labels, site URLs, limits, MCP tools) |
+| `docs/` | User and operator documentation; `docs_test.go` checks links, make targets and config keys, `contract_test.go` and `contract_hardening_test.go` statements tied to code (key labels, site URLs, limits, MCP tools, upload sandbox types, direct-sync flags, ignore rules…) |
 
 ## Invariants
 
@@ -51,7 +51,8 @@ comes from `templates/files/agents/CLAUDE.md.tmpl` — a different thing.)
 7. **Keys derive from `server.secret` per purpose** (`internal/keys`, HKDF-SHA256, salt
    `backyard`, info `backyard/<purpose>/v1`) — never reuse a key across purposes.
 8. **Security defaults stay on:** CSRF header + Origin checks, `trusted_proxies` gating,
-   sandboxed uploaded HTML/SVG, SSRF-guarded fetches, rate limits. Don't weaken them for
+   uploads sandboxed unless their type is on the passive allowlist (both editions),
+   conflicting cookies failing closed, SSRF-guarded fetches, rate limits. Don't weaken them for
    convenience.
 9. **Docs describe only what exists.** Every command, flag, key, endpoint and default in
    `docs/` and `skills/` must match the code (check with `go run ./cmd/backyard <cmd> --help`

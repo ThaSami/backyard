@@ -280,10 +280,21 @@ describe("deploys", { skip: !deployable && "no BACKYARD_TOKEN and anonymous depl
       ["bad sha256", [{ ...good, sha256: "abc" }]],
       ["negative size", [{ ...good, size: -1 }]],
       ["file vs directory", [good, { ...good, path: "index.html/x" }]],
+      // Deploys never publish repository metadata, whatever the letter case.
+      [".git segment", [good, { ...good, path: ".git/config" }]],
+      ["nested .git segment", [good, { ...good, path: "sub/.git/HEAD" }]],
+      [".git segment in another case", [good, { ...good, path: "sub/.GiT/config" }]],
+      [".git as the file name", [good, { ...good, path: "vendor/.git" }]],
     ];
     for (const [what, files] of cases) {
       assertError(await createDeploy(client, env, site, files), 400, "bad_request", what);
     }
+    // Only a segment that is exactly ".git" is refused.
+    const gitLike = [good, ".gitignore", ".github/workflows/ci.yml", "x.git/a", ".gitkeep"].map((f) => (typeof f === "string" ? { ...good, path: f } : f));
+    expectStatus(await createDeploy(client, env, site, gitLike), 200, "names that merely start with .git");
+    // Gateway reads apply the same rule.
+    assertError(await client.get(`${env.gateway}/sites/${site}/files/.git/config`), 400, "bad_request", "reading .git/config");
+    assertError(await client.get(`${env.gateway}/sites/${site}/files/a/.GIT/HEAD`), 400, "bad_request", "reading a/.GIT/HEAD");
     const r = await client.post(`${env.gateway}/sites/${site}/deploys`, "{not json", { raw: true });
     assertError(r, 400, "bad_request", "invalid JSON");
   });

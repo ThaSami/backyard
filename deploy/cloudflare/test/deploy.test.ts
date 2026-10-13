@@ -318,6 +318,23 @@ describe("deploy gateway protocol", () => {
     ).toBe(400);
     expect((await post(site, [{ path: "big.bin", size: 200 * 1024 * 1024, sha256: sha }])).status).toBe(413);
 
+    // No ".git" segment, in any case, anywhere in a path (deploy and read).
+    for (const path of [".git/config", "a/.GIT/HEAD", "x/.Git"]) {
+      const r = await post(site, [
+        { path: "index.html", size: 1, sha256: sha },
+        { path, size: 1, sha256: sha },
+      ]);
+      expect(r.status, path).toBe(400);
+      expect(await r.json(), path).toEqual({
+        error: { code: "bad_request", message: `invalid path ${JSON.stringify(path)}: path may not contain a ".git" segment` },
+      });
+    }
+    for (const path of [".git/config", "sub/.GIT/HEAD"]) {
+      const r = await call(`/__backyard/api/deploy/sites/${site}/files/${path}`, { headers: tokenHeaders() });
+      expect(r.status, path).toBe(400);
+      expect(((await r.json()) as { error: { code: string } }).error.code).toBe("bad_request");
+    }
+
     // CSRF: no header and no bearer → 403; bearer without browser signals is fine.
     let res = await call(`/__backyard/api/deploy/sites/${site}/deploys`, { method: "POST", body: "{}" });
     expect(res.status).toBe(403);

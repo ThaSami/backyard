@@ -5,7 +5,12 @@ export const MAX_PATH_BYTES = 1024;
 
 const enc = new TextEncoder();
 
-/** Reports why a site-relative path is unacceptable, or "" when it is valid. */
+/**
+ * Reports why a site-relative path is unacceptable, or "" when it is valid.
+ * Besides the shape rules of SPEC §7.3, no segment may be ".git" in any case
+ * (defense in depth: deploys never publish a repository, and gateway reads
+ * never serve one; the Go gateway applies the same rule).
+ */
 export function validatePath(p: unknown): string {
   if (typeof p !== "string" || p === "") return "empty path";
   if (enc.encode(p).length > MAX_PATH_BYTES) return "path longer than 1024 bytes";
@@ -18,6 +23,7 @@ export function validatePath(p: unknown): string {
   for (const seg of p.split("/")) {
     if (seg === "") return "path contains an empty segment";
     if (seg === "." || seg === "..") return 'path may not contain "." or ".." segments';
+    if (seg.toLowerCase() === ".git") return 'path may not contain a ".git" segment';
   }
   return "";
 }

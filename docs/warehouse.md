@@ -92,11 +92,20 @@ Defense in depth, in this order of importance:
    transaction that is always rolled back, over the extended protocol (one statement, no
    multi-statement strings that could `COMMIT`), with `statement_timeout` from the deadline.
 3. **The statement guard** for raw SQL (above).
-4. **Caps:** `warehouse.max_rows` (10,000 rows, then `truncated: true`; Postgres cancels larger
-   results server-side), `warehouse.timeout` (60 s; BigQuery jobs and Athena queries are
-   cancelled when the caller goes away), `ratelimit.warehouse_per_minute` (30 per user).
+4. **Caps:** `warehouse.max_rows` (10,000 rows) and **32 MiB of row data** per result (each
+   row's JSON encoding plus a small per-value overhead; a fixed limit). Rows stop at the last
+   one that fits both caps, and the result says `truncated: true`. The size cap is enforced
+   while rows are read, so a few very wide rows cannot make the server buffer gigabytes:
+   Postgres cancels the statement server-side and never reads a row larger than what is left
+   of the cap (such a row ends the result; when it is the first one, `columns` may be empty),
+   and BigQuery and Athena stop fetching pages. Also `warehouse.timeout` (60 s; BigQuery jobs
+   and Athena queries are cancelled when the caller goes away) and
+   `ratelimit.warehouse_per_minute` (30 per user).
 
-SQL text and parameter values are never logged.
+SQL text and parameter values are never logged. Each query logs one `warehouse query` line
+with the source, the kind (raw SQL or named, plus the named query's name), the SQL length
+(`sql_bytes`), the parameter count, the duration and the outcome (`rows`, `result_bytes`,
+`truncated`, or the error class).
 
 ## Results
 

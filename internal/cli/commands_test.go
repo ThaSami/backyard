@@ -10,6 +10,8 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -314,6 +316,105 @@ func TestPullStreamsLargeFiles(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
 		t.Fatalf("left behind: %v", entries)
+	}
+}
+
+// lambdaGateway fakes an AWS Lambda gateway in front of g: it forwards to
+// g's gateway, except that file reads above limit bytes get the 413
+// too_large a Lambda function answers for responses above its 6 MB cap.
+func lambdaGateway(t *testing.T, g *clitest.Gateway, limit int) *httptest.Server {
+	t.Helper()
+	target, err := url.Parse(g.GatewayURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := &httputil.ReverseProxy{Rewrite: func(pr *httputil.ProxyRequest) { pr.SetURL(target) }}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if site, p, ok := strings.Cut(strings.TrimPrefix(r.URL.Path, "/sites/"), "/files/"); ok && r.Method == http.MethodGet {
+			if b := g.SiteFiles(site)[p]; len(b) > limit {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				_, _ = w.Write([]byte(`{"error":{"code":"too_large","message":"the response is larger than an AWS Lambda function can return (6 MB, after encoding); use the server's embedded gateway instead"}}`))
+				return
+			}
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestPullFallsBackToTheEmbeddedGateway: an AWS Lambda gateway cannot
+// return files above about 4.4 MB (413 too_large); pull downloads those
+// through the server's embedded gateway, which takes the same token.
+func TestPullFallsBackToTheEmbeddedGateway(t *testing.T) {
+	old := pullStreamAbove
+	pullStreamAbove = 60 // big.bin is streamed, mid.bin read in memory
+	t.Cleanup(func() { pullStreamAbove = old })
+	files := map[string]string{"index.html": "small", "mid.bin": strings.Repeat("m", 40), "big.bin": strings.Repeat("b", 100)}
+
+	h := newHarness(t)
+	g := loggedIn(t, h)
+	g.AddSite("media", files, "bob@acme.com")
+	lambda := lambdaGateway(t, g, 20)
+	h.writeProfile("default", &clientconfig.Profile{Server: g.URL, Gateway: lambda.URL, Token: "alice-token",
+		Login: clientconfig.LoginBrowser}, true)
+	check := func(dir string) {
+		t.Helper()
+		for p, want := range files {
+			if got, err := os.ReadFile(filepath.Join(dir, p)); err != nil || string(got) != want {
+				t.Errorf("%s = %.20q %v", p, got, err)
+			}
+		}
+	}
+	h.mustRun("pull", "media")
+	check(filepath.Join(h.cwd, "media"))
+	// The Lambda answered the big files itself; the server served them once.
+	if g.Count(http.MethodGet, clitest.GatewayPath+"/sites/media/files/big.bin") != 1 ||
+		!strings.Contains(h.err.String(), "big.bin is too large for the deploy gateway; downloaded it through the server's embedded gateway "+g.GatewayURL()) {
+		t.Fatalf("requests %v\nstderr %s", g.Requests(), h.err.String())
+	}
+
+	// CI without a profile: the gateway's info names the public URL.
+	h.writeProfile("default", &clientconfig.Profile{}, true)
+	t.Setenv(clientconfig.EnvGateway, lambda.URL)
+	t.Setenv(clientconfig.EnvToken, "alice-token")
+	h.mustRun("--json", "pull", "media", "ci")
+	check(filepath.Join(h.cwd, "ci"))
+
+	// When the embedded gateway fails too, the error says what to do.
+	t.Setenv(clientconfig.EnvGateway, "")
+	t.Setenv(clientconfig.EnvToken, "")
+	other := clitest.NewGateway(t) // a server that does not hold the site
+	other.Tokens["alice-token"] = alice
+	h.writeProfile("default", &clientconfig.Profile{Server: other.URL, Gateway: lambda.URL, Token: "alice-token"}, true)
+	errOut := h.mustFail("pull", "media", "again")
+	for _, want := range []string{"too_large", "retrying through the server's embedded gateway " + other.GatewayURL(),
+		"not_found", "backyard pull media --gateway " + other.GatewayURL()} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("stderr lacks %q:\n%s", want, errOut)
+		}
+	}
+
+	// Nothing to fall back to when the 413 comes from the embedded gateway
+	// itself: the error is returned as is.
+	fallback := func(server, gateway string) string {
+		fb := (&cliApp{deps: h.deps()}).embeddedGatewayFallback(t.Context(), &clientconfig.Session{Resolved: &clientconfig.Resolved{
+			Server: server, Gateway: gateway, Token: "tok"}}, nil)
+		if fb == nil {
+			return ""
+		}
+		return fb.BaseURL
+	}
+	if got := fallback(g.URL, g.GatewayURL()+"/"); got != "" {
+		t.Fatalf("fallback to the same gateway: %s", got)
+	}
+	// The token never moves from an https gateway to plain http.
+	if got := fallback("http://backyard.acme.com", "https://lambda.acme.com"); got != "" {
+		t.Fatalf("fallback from https to http: %s", got)
+	}
+	if got := fallback("https://backyard.acme.com", "https://lambda.acme.com"); got != "https://backyard.acme.com/__backyard/api/deploy" {
+		t.Fatalf("fallback = %q", got)
 	}
 }
 

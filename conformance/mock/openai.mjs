@@ -8,9 +8,13 @@
 //
 // A last user message containing "MOCK_FAIL" makes the call fail with HTTP 401
 // (a provider failure the server reports as 502 upstream_error); one with
-// "MOCK_LENGTH" finishes with finish_reason "length" (stop_reason max_tokens).
+// "MOCK_LENGTH" finishes with finish_reason "length" (stop_reason max_tokens);
+// one with "MOCK_IMAGES" is answered with what arrived of its images:
+// "mock: images <media type>:<sha256 of the bytes>" per inline (data:) image,
+// "url:<url>" per image the provider would have to download, "none" without.
 //
 //   node mock/openai.mjs [port]      (default 18490; prints "listening <port>")
+import { createHash } from "node:crypto";
 import http from "node:http";
 
 const PNG = Buffer.from(
@@ -28,6 +32,27 @@ function lastUserText(messages) {
   return "";
 }
 
+function lastUserMessage(messages) {
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+    if (messages[i].role === "user") return messages[i];
+  }
+  return null;
+}
+
+/** Describes the image parts of a message (see MOCK_IMAGES above). */
+function describeImages(message) {
+  const parts = Array.isArray(message?.content) ? message.content : [];
+  const out = [];
+  for (const p of parts) {
+    if (p?.type !== "image_url") continue;
+    const url = String(p.image_url?.url ?? "");
+    const m = /^data:([^;,]*);base64,(.*)$/s.exec(url);
+    if (m) out.push(`${m[1]}:${createHash("sha256").update(Buffer.from(m[2], "base64")).digest("hex")}`);
+    else out.push(`url:${url}`);
+  }
+  return out.length ? out.join(" ") : "none";
+}
+
 function send(res, status, body) {
   const b = JSON.stringify(body);
   res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(b) });
@@ -38,7 +63,8 @@ function chat(req, res, body) {
   const text = lastUserText(body.messages);
   if (text.includes("MOCK_FAIL")) return send(res, 401, { error: { message: "mock: invalid api key", type: "invalid_request_error" } });
   const wantsJSON = body.response_format?.type === "json_object";
-  const content = wantsJSON ? JSON.stringify({ echo: text }) : `mock: ${text}`;
+  let content = wantsJSON ? JSON.stringify({ echo: text }) : `mock: ${text}`;
+  if (text.includes("MOCK_IMAGES")) content = `mock: images ${describeImages(lastUserMessage(body.messages))}`;
   const usage = { prompt_tokens: 7, completion_tokens: 5, total_tokens: 12 };
   const limit = body.max_completion_tokens ?? body.max_tokens;
   const truncated = text.includes("MOCK_LENGTH");

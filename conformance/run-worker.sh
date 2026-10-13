@@ -79,7 +79,7 @@ stop_group() {
 }
 
 # Invoked by the EXIT trap (shellcheck cannot tell when the script ends with exit).
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 cleanup() {
 	status=$?
 	stop_group "$server_pid"
@@ -132,6 +132,7 @@ for mode in $modes; do
 	data="$work/$mode"
 	mkdir -p "$data"
 	token="byd_conformance_$(rand_hex 16)"
+	secret="$(rand_hex 32)"
 	log "starting wrangler dev --env local ($mode mode) on 127.0.0.1:$port"
 	(
 		cd "$cf"
@@ -140,7 +141,7 @@ for mode in $modes; do
 		# The wrangler arguments (this subshell's own positional parameters).
 		set -- --port "$port" --ip 127.0.0.1 --persist-to "$data/state" --show-interactive-dev-session=false \
 			--var AUTH_MODE:none --var ALLOW_ANONYMOUS_DEPLOY:true \
-			--var "BACKYARD_SECRET:$(rand_hex 32)" --var "DEPLOY_TOKEN:$token"
+			--var "BACKYARD_SECRET:$secret" --var "DEPLOY_TOKEN:$token"
 		if [ "$mode" = "host" ]; then
 			set -- "$@" --var URL_MODE:host --var BASE_DOMAIN:localhost
 		else
@@ -174,7 +175,7 @@ for mode in $modes; do
 	(
 		cd "$here"
 		BACKYARD_URL="$url" BACKYARD_TOKEN="$suite_token" BACKYARD_CONFORMANCE_AI="$suite_ai" \
-			node --test --test-reporter=spec "$@" "tests/*.test.mjs"
+			BACKYARD_CONFORMANCE_SECRET="$secret" node --test --test-reporter=spec "$@" "tests/*.test.mjs"
 	)
 	rc=$?
 	set -e

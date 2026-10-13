@@ -45,8 +45,10 @@ The site name comes from --site, .backyard.json or the folder name. Methods:
          are allowed), else the first direct method the server advertises whose tool
          is installed
 
-Files ignored by default: .git/, node_modules/, .claude/, .cursor/, .github/, CLAUDE.md,
-AGENTS.md, .backyard.json, dotfiles (except .well-known/) plus .backyardignore lines.`,
+Never uploaded: .git/, .backyard.json and .backyardignore (in any letter case, at any depth).
+Ignored by default: node_modules/, .claude/, .cursor/, .github/, CLAUDE.md, AGENTS.md,
+.DS_Store and dotfiles (except .well-known/), plus the lines of .backyardignore and the
+.backyard.json "ignore" list, which may re-include those defaults with "!" (e.g. "!.htaccess").`,
 		Example: `  backyard deploy
   backyard deploy dist --site lunch-vote
   backyard deploy --dry-run
@@ -469,7 +471,9 @@ func (a *cliApp) ignoredSiteFiles(ctx context.Context, p *deployPlan) ([]string,
 	m := deploy.NewMatcher(p.patterns)
 	var stale []string
 	for _, f := range files {
-		if deploy.ValidatePath(f.Path) == "" && m.Ignored(f.Path, false) {
+		// ValidatePathSyntax, not ValidatePath: a .git/ the site still holds
+		// (published before the gateways rejected it) must be removed too.
+		if deploy.ValidatePathSyntax(f.Path) == "" && m.Ignored(f.Path, false) {
 			stale = append(stale, f.Path)
 		}
 	}

@@ -2,7 +2,7 @@
 // reconnect with resubscribe/rejoin, keepalive (SPEC §5.6, §6).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createEnv, plain, flush } from "./helpers/harness.mjs";
+import { createEnv, plain, flush, apiError } from "./helpers/harness.mjs";
 
 const user = (id) => ({ id, name: id.split("@")[0], email: id, avatar_url: "" });
 const member = (cid, id, state = {}, joined_at = "2026-01-01T00:00:0" + cid.slice(-1) + "Z") => ({ cid, user: user(id), state, joined_at });
@@ -109,6 +109,187 @@ test("subscription errors go to onError", () => {
   ws.hello();
   ws.push({ t: "error", id: "s1", error: { code: "bad_request", message: "invalid collection name" } });
   assert.deepEqual(errs, [["bad_request", "invalid collection name"]]);
+});
+
+// --- db events without their document (SPEC §6: the Go server sends
+// "doc": null with doc_id when an event exceeds the pub/sub payload limit) ---
+
+/** Records every callback of a subscriber as compact tuples. */
+function recorder(out) {
+  return {
+    onCreate: (d) => out.push(["create", d.id, d.title]),
+    onUpdate: (d) => out.push(["update", d.id, d.title]),
+    onDelete: (id) => out.push(["delete", id]),
+    onChange: (e) => out.push(["change", e.op, e.id, e.doc === null ? null : e.doc.title]),
+    onError: (err) => out.push(["error", err.code]),
+  };
+}
+
+/** GET requests for documents of a collection. */
+const docReads = (env, c) => env.requests.filter((r) => r.method === "GET" && r.path.startsWith("/__backyard/api/db/" + c + "/")).map((r) => r.path);
+
+test("a create/update without its document is re-read before onCreate/onUpdate; later events wait, in order", async () => {
+  const env = createEnv();
+  const pending = [];
+  env.on("GET", /^\/__backyard\/api\/db\/posts\/[^/]+$/, (req) => new Promise((resolve) => pending.push({ req, resolve })));
+  const posts = env.backyard.db.collection("posts");
+  const a = [];
+  const b = [];
+  posts.subscribe(recorder(a));
+  posts.subscribe((e) => b.push([e.op, e.id, e.doc && e.doc.title]));
+  const ws = env.ws();
+  ws.hello();
+  ws.push({ t: "db", sub: "s1", collection: "posts", op: "create", doc: null, doc_id: "a:1" });
+  ws.push({ t: "db", sub: "s1", collection: "posts", op: "update", doc: doc("a:1", { title: "v2" }), doc_id: "a:1" });
+  ws.push({ t: "db", sub: "s1", collection: "posts", op: "create", doc: doc("p2", { title: "p2" }), doc_id: "p2" });
+  assert.deepEqual(a, [], "nothing is delivered ahead of the pending re-read");
+  assert.deepEqual(b, []);
+  await flush();
+  assert.equal(pending.length, 1, "the subscribers of one event share one GET");
+  assert.equal(pending[0].req.path, "/__backyard/api/db/posts/a%3A1");
+  assert.equal(pending[0].req.credentials, "same-origin");
+  pending[0].resolve(doc("a:1", { title: "v1" }));
+  await flush(5);
+  assert.deepEqual(a, [
+    ["create", "a:1", "v1"],
+    ["change", "create", "a:1", "v1"],
+    ["update", "a:1", "v2"],
+    ["change", "update", "a:1", "v2"],
+    ["create", "p2", "p2"],
+    ["change", "create", "p2", "p2"],
+  ]);
+  assert.deepEqual(b, [
+    ["create", "a:1", "v1"],
+    ["update", "a:1", "v2"],
+    ["create", "p2", "p2"],
+  ]);
+  // Back to synchronous dispatch once nothing is pending.
+  ws.push({ t: "db", sub: "s1", collection: "posts", op: "delete", doc: null, doc_id: "p2" });
+  assert.deepEqual(a.slice(-2), [
+    ["delete", "p2"],
+    ["change", "delete", "p2", null],
+  ]);
+  assert.deepEqual(docReads(env, "posts"), ["/__backyard/api/db/posts/a%3A1"], "deletes and full events are never re-read");
+});
+
+test("a re-read that finds the document gone is delivered as a delete, once", async () => {
+  const env = createEnv();
+  const pending = [];
+  env.on("GET", /^\/__backyard\/api\/db\/posts\/[^/]+$/, (req) => new Promise((resolve) => pending.push({ req, resolve })));
+  const a = [];
+  env.backyard.db.collection("posts").subscribe(recorder(a));
+  const ws = env.ws();
+  ws.hello();
+  // Gone, and no delete is queued: reported as a delete.
+  ws.push({ t: "db", sub: "s1", collection: "posts", op: "update", doc: null, doc_id: "p1" });
+  await flush();
+  pending[0].resolve(apiError(404, "not_found", "document not found"));
+  await flush(5);
+  assert.deepEqual(a, [
+    ["delete", "p1"],
+    ["change", "delete", "p1", null],
+  ]);
+  // Gone, and its delete event is already queued: only that one is delivered.
+  a.length = 0;
+  ws.push({ t: "db", sub: "s1", collection: "posts", op: "create", doc: null, doc_id: "p2" });
+  ws.push({ t: "db", sub: "s1", collection: "posts", op: "delete", doc: null, doc_id: "p2" });
+  await flush();
+  assert.equal(pending.length, 2);
+  pending[1].resolve(apiError(404, "not_found", "document not found"));
+  await flush(5);
+  assert.deepEqual(a, [
+    ["delete", "p2"],
+    ["change", "delete", "p2", null],
+  ]);
+  assert.deepEqual(env.errors, []);
+});
+
+test("a failed re-read goes to onError (or a warning); onChange still sees the event and later events flow", async () => {
+  const env = createEnv();
+  env.on("GET", "/__backyard/api/db/posts/p1", apiError(500, "internal", "boom"));
+  env.on("GET", "/__backyard/api/db/posts/p2", () => new Promise(() => {})); // hangs
+  const a = [];
+  const posts = env.backyard.db.collection("posts");
+  posts.subscribe(recorder(a));
+  const ws = env.ws();
+  ws.hello();
+  ws.push({ t: "db", sub: "s1", collection: "posts", op: "create", doc: null, doc_id: "p1" });
+  ws.push({ t: "db", sub: "s1", collection: "posts", op: "update", doc: doc("p0", { title: "x" }), doc_id: "p0" });
+  await flush(5);
+  assert.deepEqual(a, [
+    ["error", "internal"],
+    ["change", "create", "p1", null],
+    ["update", "p0", "x"],
+    ["change", "update", "p0", "x"],
+  ]);
+
+  // A re-read that never answers times out (30 s) instead of stalling the subscription.
+  a.length = 0;
+  ws.push({ t: "db", sub: "s1", collection: "posts", op: "update", doc: null, doc_id: "p2" });
+  ws.push({ t: "db", sub: "s1", collection: "posts", op: "delete", doc: null, doc_id: "p0" });
+  await flush();
+  const read = env.requests.find((r) => r.path === "/__backyard/api/db/posts/p2");
+  assert.ok(read && read.signal, "the re-read can be aborted");
+  env.clock.tick(29_999);
+  await flush();
+  assert.deepEqual(a, []);
+  env.clock.tick(1);
+  await flush(5);
+  assert.equal(read.signal.aborted, true, "the timed-out request is aborted");
+  assert.deepEqual(a, [
+    ["error", "network_error"],
+    ["change", "update", "p2", null],
+    ["delete", "p0"],
+    ["change", "delete", "p0", null],
+  ]);
+
+  // Without onError: a console warning; onCreate is still not called with null.
+  const created = [];
+  env.backyard.db.collection("posts").subscribe({ onCreate: (d) => created.push(d) });
+  ws.push({ t: "db", sub: "s1", collection: "posts", op: "create", doc: null, doc_id: "p1" });
+  await flush(5);
+  assert.deepEqual(created, []);
+  assert.match(env.warnings.join("\n"), /could not read document "p1" of a change to "posts": boom/);
+});
+
+test("stop() while a re-read is pending delivers nothing more", async () => {
+  const env = createEnv();
+  const pending = [];
+  env.on("GET", "/__backyard/api/db/posts/p1", () => new Promise((resolve) => pending.push(resolve)));
+  const a = [];
+  const stop = env.backyard.db.collection("posts").subscribe(recorder(a));
+  const ws = env.ws();
+  ws.hello();
+  ws.push({ t: "db", sub: "s1", collection: "posts", op: "create", doc: null, doc_id: "p1" });
+  ws.push({ t: "db", sub: "s1", collection: "posts", op: "delete", doc: null, doc_id: "p9" });
+  await flush();
+  stop();
+  stop(); // idempotent
+  assert.deepEqual(ws.frames("unsub"), [{ t: "unsub", id: "s1" }]);
+  pending[0](doc("p1", { title: "t" }));
+  await flush(5);
+  assert.deepEqual(a, []);
+});
+
+test("watch() refetches on an event without its document and never reads the document itself", async () => {
+  const env = createEnv();
+  let lists = 0;
+  env.on("GET", "/__backyard/api/db/posts", () => {
+    lists++;
+    return { docs: [doc("p1", { title: "big" })], has_more: false };
+  });
+  const results = [];
+  const stop = env.backyard.db.collection("posts").watch((docs) => results.push(plain(docs).map((d) => d.title)));
+  await flush();
+  const ws = env.ws();
+  ws.hello();
+  ws.push({ t: "db", sub: "s1", collection: "posts", op: "create", doc: null, doc_id: "p1" });
+  env.clock.tick(50);
+  await flush();
+  assert.equal(lists, 2);
+  assert.deepEqual(results, [["big"]]);
+  assert.deepEqual(docReads(env, "posts"), []);
+  stop();
 });
 
 test("watch: initial result, debounced refetch on changes, dedupe, stop()", async () => {

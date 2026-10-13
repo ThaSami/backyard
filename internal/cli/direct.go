@@ -409,8 +409,11 @@ func gcloudListValue(v string) string {
 
 // rsyncFilters translates patterns to rsync --exclude/--include flags.
 // rsync uses the first matching rule while gitignore uses the last, so the
-// rules are emitted in reverse order. Patterns with an inner "/" are
-// anchored to the transfer root with a leading "/", as in gitignore.
+// rules are emitted in reverse order: deploy.ProtectedIgnore, last in the
+// complete list (deploy.WithDefaultIgnore), comes first, ahead of any "!"
+// line that tries to re-include .git or the project files. Patterns with an
+// inner "/" are anchored to the transfer root with a leading "/", as in
+// gitignore.
 func rsyncFilters(patterns []string) []string {
 	rules := parseIgnoreRules(patterns)
 	var args []string
@@ -447,7 +450,8 @@ type excludes struct {
 }
 
 // localExcludes walks dir with the deploy matcher (the same rules the api
-// method applies) and summarizes the exclusions. nameOK (nil: any) limits
+// method applies, deploy.ProtectedIgnore included) and summarizes the
+// exclusions. nameOK (nil: any) limits
 // which single-segment name globs may stand for the files they match; the
 // files of the other names are listed one by one. A symlinked dir is
 // resolved first: the walk would not descend into it.

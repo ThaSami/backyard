@@ -92,8 +92,9 @@ subscriptions and rooms; presence is gossiped between instances through pub/sub.
 …/sites/<site>/deploys` (auth, ownership, limits, diff against the manifest) → signed deploy id
 and upload URLs bound to each file's size and SHA-256 (presigned bucket URLs, or the gateway's
 own signed `PUT …/uploads/<token>`) → parallel `PUT`s → `POST …/deploys/<id>/commit` (verify
-sizes — a mismatch deletes the object and fails with `409` —, write manifest and metadata,
-delete files not in the list) → the server purges its caches.
+sizes — a mismatch fails with `409`, and with Azure SAS uploads also deletes the object —,
+record the digests of the bytes actually stored, write manifest and metadata, delete files not
+in the list) → the server purges its caches.
 
 **A browser → CLI login:** `backyard login` listens on `127.0.0.1:<port>` and opens
 `/__backyard/auth/cli?redirect_uri=…&state=…` → the page is authenticated by the IdP or proxy →

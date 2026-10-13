@@ -4,6 +4,7 @@
 // by the runners, which back the aliases with conformance/mock/openai.mjs) or
 // when BACKYARD_CONFORMANCE_AI=live (real provider; costs tokens).
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { before, describe, test } from "node:test";
 import { canDeploy, deploySite } from "../lib/deploy.mjs";
 import { setup, uniqueSite } from "../lib/env.mjs";
@@ -155,6 +156,33 @@ describe("AI", { skip }, () => {
         assert.deepEqual(one.embeddings, [[4, 1, 0.5]]);
         assert.deepEqual(many.embeddings.map((v) => v[0]), [1, 2, 3]);
       }
+    });
+
+    test("an upload of the site is a chat image: read server-side and sent inline", async (t) => {
+      if (!models || !mock) return t.skip("runs against the mock provider only (it reports the images it received)");
+      const png = Buffer.from(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d2a5b20000000049454e44ae426082",
+        "hex",
+      );
+      const fd = new FormData();
+      // Declared as octet-stream: the media type comes from the bytes.
+      fd.append("file", new Blob([png], { type: "application/octet-stream" }), "dot.png");
+      const f = expectStatus(await client.fetch(api("/files"), { method: "POST", body: fd }), 201).json;
+      const inline = `mock: images image/png:${createHash("sha256").update(png).digest("hex")}`;
+      const ask = (url) => client.post(api("/ai/chat"), { messages: [{ role: "user", content: [{ type: "text", text: "MOCK_IMAGES" }, { type: "image", url }] }] });
+      // FileInfo.url as files.upload returns it (path mode: with /s/<site>), and
+      // the same file as an absolute URL on the site's origin.
+      for (const url of [f.url, new URL(f.url, env.siteURL(site)).href]) {
+        const r = expectStatus(await ask(url), 200, url).json;
+        assert.equal(r.content, inline, `the provider got the upload's bytes inline (${url})`);
+      }
+      // Not an upload of this site: rejected before the provider is called.
+      const other = uniqueSite("ai2");
+      await deploySite(client, env, other, { "index.html": "other" });
+      assertError(await ask(f.url.replace(/\/__backyard\/files\/[^/]+\//, "/__backyard/files/01J0000000000000000000000/")), 400, "bad_request", "unknown upload id");
+      assertError(await client.post(env.api(other, "/ai/chat"), { messages: [{ role: "user", content: [{ type: "text", text: "MOCK_IMAGES" }, { type: "image", url: f.url }] }] }), 400, "bad_request", "another site's upload");
+      expectStatus(await client.delete(api(`/files/${f.id}`)), 204);
+      assertError(await ask(f.url), 400, "bad_request", "a deleted upload");
     });
 
     test("images are stored as site files", async (t) => {

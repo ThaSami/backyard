@@ -378,6 +378,9 @@ func TestInvalidFileLists(t *testing.T) {
 		{"nul", []FileEntry{{Path: "a\x00b", Size: 1, SHA256: good}}},
 		{"newline", []FileEntry{{Path: "a\nb", Size: 1, SHA256: good}}},
 		{"too long", []FileEntry{{Path: strings.Repeat("a", 1025), Size: 1, SHA256: good}}},
+		{"git segment", []FileEntry{{Path: ".git/config", Size: 1, SHA256: good}}},
+		{"git segment any case", []FileEntry{{Path: "sub/.GiT/HEAD", Size: 1, SHA256: good}}},
+		{"bare git", []FileEntry{{Path: ".git", Size: 1, SHA256: good}}},
 		{"duplicate", []FileEntry{{Path: "a", Size: 1, SHA256: good}, {Path: "a", Size: 1, SHA256: good}}},
 		{"file and dir", []FileEntry{{Path: "a", Size: 1, SHA256: good}, {Path: "a/b", Size: 1, SHA256: good}}},
 		{"negative size", []FileEntry{{Path: "a", Size: -1, SHA256: good}}},
@@ -963,6 +966,24 @@ func TestFilesListingAndRead(t *testing.T) {
 	}
 	resp, body = e.do("GET", "/sites/files/files/__backyard/x", "bob", nil)
 	wantStatus(t, resp, body, 400, CodeBadRequest)
+	// Repository metadata is never served back, even when the store holds
+	// it (written before the rule, or by a direct sync); it is still listed
+	// so that clients can see and remove it.
+	e.store.Put(ctx, sites.SiteKey("files", ".git/config"), strings.NewReader("[core]"), 6, "")
+	e.store.Put(ctx, sites.SiteKey("files", "sub/.GIT/HEAD"), strings.NewReader("ref"), 3, "")
+	for _, p := range []string{".git/config", "sub/.GIT/HEAD", ".git"} {
+		resp, body = e.do("GET", "/sites/files/files/"+p, "bob", nil)
+		wantStatus(t, resp, body, 400, CodeBadRequest)
+		if !strings.Contains(string(body), `.git`) {
+			t.Errorf("GET %s: body %s does not name the .git rule", p, body)
+		}
+		if _, err := c.ReadFile(ctx, "files", p, 0); err == nil || !strings.Contains(err.Error(), `".git" segment`) {
+			t.Errorf("ReadFile(%q) = %v, want the client-side .git rule", p, err)
+		}
+	}
+	if list, err := c.SiteFiles(ctx, "files"); err != nil || !slices.ContainsFunc(list, func(f SiteFile) bool { return f.Path == ".git/config" }) {
+		t.Errorf("listing without .git/config: %v %+v", err, list)
+	}
 	resp, _ = e.do("HEAD", "/sites/files/files/index.html", "bob", nil)
 	if resp.StatusCode != 200 || resp.ContentLength != int64(len(tree["index.html"])) {
 		t.Errorf("HEAD = %d, length %d", resp.StatusCode, resp.ContentLength)

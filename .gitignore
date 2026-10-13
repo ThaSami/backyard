@@ -38,3 +38,6 @@ e2e/playwright-report/
 .idea/
 .vscode/
 *.swp
+
+# Terraform modules are reusable: consumers pin providers in their own lock files
+deploy/terraform/**/.terraform.lock.hcl

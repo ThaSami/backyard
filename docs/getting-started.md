@@ -59,7 +59,7 @@ backyard dev
 
 This serves the folder live at <http://lunch-vote.localhost:4321/> with a complete local
 backend (database, realtime, files) and opens the browser; edit a file and reload. Data is kept
-in `./.backyard-data` inside the site folder (a dotfolder, so it is never deployed). AI and the
+in `./.backyard-data` inside the site folder (a dotfolder, so deploys skip it). AI and the
 warehouse need providers: `backyard dev --config backyard.yaml` reads them from a server config
 (see [AI providers](ai-providers.md)).
 

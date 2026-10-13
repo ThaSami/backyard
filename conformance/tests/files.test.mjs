@@ -94,15 +94,24 @@ describe("files", { skip }, () => {
   });
 
   test("active content is sandboxed", async () => {
+    // Everything that is not known to be passive gets the sandbox (an
+    // allowlist, SPEC §3): markup, XSLT, any +xml and unknown types too.
     for (const [file, type] of [
       ["page.html", "text/html"],
       ["pic.svg", "image/svg+xml"],
       ["doc.xml", "application/xml"],
+      ["style.xsl", "text/xsl"],
+      ["clip.vid", "video/x+xml"],
+      ["blob.unknown", "application/x-unknown"],
     ]) {
-      const f = expectStatus(await upload(form("<b>x</b>", file, type)), 201).json;
+      const f = expectStatus(await upload(form("<b>x</b>", file, type)), 201, file).json;
       const r = expectStatus(await client.get(abs(f.url)), 200, file);
-      assert.match(r.header("content-security-policy") || "", /\bsandbox\b/, `${file} gets CSP sandbox`);
+      assert.match(r.header("content-security-policy") || "", /\bsandbox\b/, `${file} (${type}, served as ${r.header("content-type")}) gets CSP sandbox`);
     }
+    const txt = expectStatus(await upload(form("<b>x</b>", "note.txt", "text/plain")), 201).json;
+    const t = expectStatus(await client.get(abs(txt.url)), 200);
+    assert.match(t.header("content-type"), /^text\/plain\b/);
+    assert.equal(t.header("content-security-policy"), null, "plain text is not sandboxed");
     const png = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d2a5b20000000049454e44ae426082", "hex");
     const p = expectStatus(await upload(form(png, "dot.png", "image/png")), 201).json;
     assert.equal(p.content_type, "image/png");

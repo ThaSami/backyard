@@ -99,8 +99,15 @@ func TestDefaultIgnore(t *testing.T) {
 	}{
 		{".git", true, true},
 		{".git/config", false, true},
+		{".GIT/config", false, true},
+		{"sub/.Git", true, true},
+		{"mod/.git", false, true},
 		{".backyard.json", false, true},
+		{".Backyard.JSON", false, true},
 		{".backyardignore", false, true},
+		{"sub/.BACKYARDIGNORE", false, true},
+		{".well-known/.git/config", false, true},
+		{".well-known/.backyard.json", false, true},
 		{"node_modules", true, true},
 		{"web/node_modules/x.js", false, true},
 		{".claude/settings.json", false, true},
@@ -143,6 +150,99 @@ func TestValidatePath(t *testing.T) {
 		if why := ValidatePath(p); why == "" {
 			t.Errorf("ValidatePath(%q) = valid, want error", p)
 		}
+		if why := ValidatePathSyntax(p); why == "" {
+			t.Errorf("ValidatePathSyntax(%q) = valid, want error", p)
+		}
+	}
+	// No ".git" segment in any letter case (defense in depth: deploys never
+	// publish one and gateway reads never serve one); the syntax alone
+	// accepts them, and names merely containing ".git" stay valid.
+	for _, p := range []string{".git", ".git/config", ".GIT/HEAD", "a/.Git/objects/x", "sub/.gIT", ".well-known/.git/config"} {
+		if why := ValidatePath(p); why != `path may not contain a ".git" segment` {
+			t.Errorf("ValidatePath(%q) = %q, want the .git rule", p, why)
+		}
+		if why := ValidatePathSyntax(p); why != "" {
+			t.Errorf("ValidatePathSyntax(%q) = %q, want valid", p, why)
+		}
+		if !HasGitSegment(p) {
+			t.Errorf("HasGitSegment(%q) = false", p)
+		}
+	}
+	for _, p := range []string{".gitignore", ".github/x", "a.git", ".git.html", "git/x", "x/.gitkeep", "..git"} {
+		if why := ValidatePath(p); why != "" {
+			t.Errorf("ValidatePath(%q) = %q, want valid", p, why)
+		}
+		if HasGitSegment(p) {
+			t.Errorf("HasGitSegment(%q) = true", p)
+		}
+	}
+}
+
+// TestProtectedIgnoreCannotBeReincluded: "!" lines in .backyardignore or the
+// .backyard.json "ignore" list may re-include the overridable defaults
+// (dotfiles, node_modules/, agent files…) but never .git/ or the project
+// files, in any letter case and at any depth.
+func TestProtectedIgnoreCannotBeReincluded(t *testing.T) {
+	dir := t.TempDir()
+	writeTree(t, dir, map[string]string{
+		"index.html":               "x",
+		".git/config":              "[core]",
+		".git/HEAD":                "ref",
+		".GIT/config":              "[core]",
+		"sub/.Git/HEAD":            "ref",
+		"mod/.git":                 "gitdir: ../.git/modules/mod",
+		"mod/index.html":           "x",
+		".backyard.json":           `{"site":"x"}`,
+		".Backyard.json":           `{"site":"x"}`,
+		"sub/.backyard.json":       `{"site":"x"}`,
+		"sub/.backyardignore":      "!.*",
+		".env":                     "SECRET=1",
+		".htaccess":                "x",
+		"node_modules/a.js":        "x",
+		"CLAUDE.md":                "x",
+		".github/workflows/ci.yml": "x",
+		".well-known/.git/config":  "[core]",
+		".well-known/security.txt": "x",
+		IgnoreFile: "!.*\n!.git/\n!.git\n!.git/**\n!**/.git/**\n!/.git/config\n!.GIT/\n!.backyard.json\n!.Backyard.json\n" +
+			"!.backyardignore\n!*\n!**\n!node_modules/\n!CLAUDE.md\n!.github/\n",
+	})
+	files, err := CollectFiles(dir, []string{"!.git/", "!sub/.Git/HEAD", "!**/.backyard.json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, f := range files {
+		paths = append(paths, f.Path)
+	}
+	want := []string{".env", ".github/workflows/ci.yml", ".htaccess", ".well-known/security.txt", "CLAUDE.md", "index.html", "mod/index.html", "node_modules/a.js"}
+	if !slices.Equal(paths, want) {
+		t.Errorf("paths = %q\nwant    %q", paths, want)
+	}
+	pats, err := IgnorePatterns(dir, []string{"extra"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prot := ProtectedIgnore(); !slices.Equal(pats[len(pats)-len(prot):], prot) || pats[len(pats)-len(prot)-1] != "extra" {
+		t.Errorf("IgnorePatterns = %q, want the configured patterns followed by ProtectedIgnore", pats)
+	}
+	if got := ProtectedIgnore(); !slices.Equal(got, []string{".[gG][iI][tT]", ".[bB][aA][cC][kK][yY][aA][rR][dD].[jJ][sS][oO][nN]",
+		".[bB][aA][cC][kK][yY][aA][rR][dD][iI][gG][nN][oO][rR][eE]"}) {
+		t.Errorf("ProtectedIgnore = %q", got)
+	}
+	// Overridable defaults stay overridable one by one.
+	for _, tc := range []struct {
+		neg, path string
+	}{{"!.env", ".env"}, {"!node_modules/", "node_modules/x.js"}, {"!CLAUDE.md", "CLAUDE.md"}, {"!AGENTS.md", "docs/AGENTS.md"},
+		{"!.claude/", ".claude/skills/x.md"}, {"!.DS_Store", ".DS_Store"}} {
+		if NewMatcher(WithDefaultIgnore(nil)).Ignored(tc.path, false) != true {
+			t.Errorf("%s is not ignored by default", tc.path)
+		}
+		if NewMatcher(WithDefaultIgnore([]string{tc.neg})).Ignored(tc.path, false) {
+			t.Errorf("%q does not re-include %s", tc.neg, tc.path)
+		}
+	}
+	if !slices.Equal(DefaultIgnore(), WithDefaultIgnore(nil)) {
+		t.Error("DefaultIgnore differs from WithDefaultIgnore(nil)")
 	}
 }
 
@@ -197,7 +297,7 @@ func TestCollectFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(pats, "skip/") || pats[len(pats)-1] != "extra" || !slices.Contains(pats, ".*") {
+	if !slices.Contains(pats, "skip/") || pats[len(pats)-len(ProtectedIgnore())-1] != "extra" || !slices.Contains(pats, ".*") {
 		t.Errorf("IgnorePatterns = %v", pats)
 	}
 }

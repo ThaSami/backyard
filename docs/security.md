@@ -78,13 +78,40 @@ its visitor everywhere on the platform. Host mode is strongly recommended.
 | Cookie | Content | Lifetime |
 |---|---|---|
 | `backyard_session` (oidc mode) | AES-256-GCM-sealed `{user, exp}` | `auth.oidc.session_ttl` (12 h) |
-| `backyard_oauth` | signed login state (state, PKCE verifier, nonce, return URL) | 10 min |
+| `__Host-backyard_oauth` (https) / `backyard_oauth` (http), oidc mode | signed login state (state, PKCE verifier, nonce, return URL) | 10 min |
 | `backyard_anon` (none mode) | signed anonymous id | 1 year |
 
-All are `HttpOnly`, `SameSite=Lax`, `Path=/`, and `Secure` when `server.public_url` is https.
-In host mode they are scoped to `.<base_domain>` so one login covers every site; site
-JavaScript cannot read them. Because every site is "same-site" with the others, `SameSite`
-alone is not a CSRF defence — the custom header and Origin checks above are.
+All are `HttpOnly` and `SameSite=Lax`, and `Secure` when `server.public_url` is https. The
+session and guest cookies use `Path=/` and, in host mode, `Domain=.<base_domain>` so one login
+covers every site. The login state cookie is set by the hub alone: over https it is a
+`__Host-` cookie (`Secure`, `Path=/`, no `Domain`), which no site can set or overwrite; over
+http it is `backyard_oauth` at `Path=/__backyard/auth/`. Because every site is "same-site"
+with the others, `SameSite` alone is not a CSRF defence — the custom header and Origin checks
+above are.
+
+**Planted cookies.** Site JavaScript cannot read these cookies, but in host mode a site's page
+can *set* a cookie with the same name for the parent domain or a longer path, and browsers
+send it along with Backyard's own. A sealed session or a signed guest id is not tied to a
+browser, so a site author could try to plant their own session or guest cookie in visitors'
+browsers (session fixation), or their own login state (login CSRF). Backyard defends against
+both:
+
+- the login state cookie is a `__Host-` cookie over https, and a planted `backyard_oauth` is
+  ignored;
+- when a request carries valid `backyard_session` (or `backyard_anon`) cookies of **different**
+  users, Backyard never picks one: the request is unauthenticated (`401`, or the login
+  redirect), and every variant of the cookie that Backyard does not set itself (host-only,
+  parent domains, longer paths) is expired, so the next request normally works again. The
+  attempt is logged as an audit event. Where a planted cookie cannot be reached (a partitioned
+  cookie, a very deep path) requests keep failing closed, which is no worse than the sign-out
+  any site could already cause. One gap remains: a visitor with no session of their own and
+  only a planted one is signed in as its owner, because the sealed value is not tied to a
+  browser.
+
+The Cloudflare edition applies the same rule to its guest cookie and to Cloudflare Access's
+`CF_Authorization` cookie. Host mode over plain http cannot protect the login state (no
+`__Host-` without `Secure`); the server logs a warning at startup — use https outside local
+tests.
 
 ## Secrets, keys and tokens
 
@@ -95,9 +122,13 @@ alone is not a CSRF defence — the custom header and Origin checks above are.
   can never forge another.
   Store it in a secret manager; never in the config file.
 - **API tokens** are HS256 JWTs (issuer `backyard`, scope `api`) with the user's identity, valid
-  for `auth.token_ttl` (720 h by default, also the maximum). They are minted only for a person
-  authenticated by the IdP or proxy (a token cannot renew itself, guests and static tokens
-  cannot mint), and the CLI stores them in a `0600` file.
+  for `auth.token_ttl` (720 h by default, also the maximum). Guests and static tokens cannot
+  mint them. A token minted with an API token as the credential (`POST /__backyard/api/tokens`
+  with a bearer token, e.g. `backyard token create` after a browser login) expires no later
+  than that token, so a token cannot extend its own lifetime and access ends once the tokens
+  minted from the last real sign-in expire; tokens minted for a browser session, a proxy
+  identity or an IdP-issued JWT (device flow) get the full lifetime. The CLI stores tokens in a
+  `0600` file.
 - **Static tokens** are stored only as SHA-256 hashes (`auth.tokens`) and compared in constant
   time; rotate one by adding the new hash before removing the old one.
 - **IdP tokens** (device flow) are verified against the issuer's keys with issuer and audience
@@ -129,19 +160,55 @@ bodies are bounded too (queries and most bodies 1 MiB, AI chat 32 MiB). See
 ## Uploads and deployed files
 
 - Upload names are sanitized (base name only, no control, separator or bidi characters).
-- Uploaded files are served with `Content-Disposition: inline` and, for active content (HTML,
-  XHTML, SVG, XML), `Content-Security-Policy: sandbox` — an uploaded document can never run
-  script as the site. Deployed site files are served as-is, because pages are the product.
-- Deploy paths are validated (relative, no `..`, no leading `/`, nothing under `__backyard/`);
-  `/__backyard/` can never be shadowed by a site file.
+- Uploaded files are served with `Content-Disposition: inline`. The declared type comes from
+  the uploader, so only known **passive** types — raster images, audio and video, plain text,
+  CSV, PDF, JSON and `application/octet-stream` — are served as they are; everything else
+  (HTML, SVG, any XML including `text/xsl` and `+xml` types, scripts, unknown types) also gets
+  `Content-Security-Policy: sandbox`, so an uploaded document can never run script as the
+  site. Both editions use the same allowlist ([SPEC §3](spec/SPEC.md#3-static-serving)).
+  Deployed site files are served as-is, because pages are the product.
+- Deploy paths are validated (relative, no `..`, no leading `/`, nothing under `__backyard/`,
+  no `.git` segment in any letter case); `/__backyard/` can never be shadowed by a site file,
+  and repository metadata can neither be deployed nor read back through the gateway.
 - Uploads during a deploy are bound to the declared size and SHA-256 where the backend allows
   it (the gateway's own endpoint: both; S3: the size and, on AWS, the SHA-256; GCS: the size;
-  Azure SAS: neither). The commit verifies sizes before deleting anything, deletes a listed
-  object of the wrong size and fails with `409`, so no unverified object outlives a commit.
-  Deploy ids and upload URLs are HMAC-signed and expire after one hour, and only authorized
-  deployers get them (rate-limited, audited as `deploy.create`).
+  Azure SAS: neither). The commit verifies sizes before deleting anything and fails with `409`
+  when a listed file is missing or has the wrong size. With presigned Azure SAS uploads it also
+  deletes such a wrong-size object (unless it is the previously committed version), so no
+  unverified object outlives a commit; elsewhere a wrong-size object can only be another
+  deploy's verified upload and stays. The manifest records the digest of the bytes actually
+  stored, never just the one the client declared. Deploy ids and upload URLs are HMAC-signed
+  and expire after one hour, and only authorized deployers get them (rate-limited, audited as
+  `deploy.create`).
 - The `fs` store confines every operation to its root and refuses symlinks that escape their
   directory, so a racing `rsync` cannot redirect writes.
+- Direct-sync deployers in the Terraform modules (AWS, Google Cloud, Azure) and the systemd
+  rsync target may only write below `<prefix>sites/`, never `_meta/` or `uploads/` (on Azure the
+  role's container-level actions remain; container soft delete makes them recoverable).
+
+## The CLI and agents
+
+A site is written by whoever deployed it, so its files are untrusted on your machine:
+
+- `backyard pull` never writes what a deploy never publishes — `.git/`, other dotfiles and
+  dot-folders (`.claude/`, `.env`…; `.well-known/` is kept), `node_modules/`, `.backyard.json`,
+  `.backyardignore`, `CLAUDE.md`, `AGENTS.md` — even with `--force`, comparing names the way
+  case-insensitive and Windows file systems do. A pulled folder therefore cannot carry a
+  crafted `.git/config` (which git would act on), project settings or agent instructions; the
+  skipped paths are listed.
+- A `.backyard.json` `dir` must stay inside the project (no absolute paths, `..` or symlinks
+  leading out), so a cloned or pulled project file cannot point `backyard deploy` at an
+  unrelated folder. `.git/` and the project files are never uploaded, whatever the ignore
+  configuration says.
+- The CLI uses a profile's cached server info (bucket, rsync target) only for that profile's
+  server, and `backyard login` offers the Cloudflare `DEPLOY_TOKEN` saved by setup only to the
+  server or gateway URL it was saved for — never to a server that merely claims that Worker's
+  public URL.
+- Transport errors of `backyard deploy` never print signed upload URLs: their query strings
+  and upload capabilities are redacted, and storage error bodies are reduced to their code and
+  message.
+- `backyard mcp` keeps agents inside the project folder and away from credential folders, and
+  its results never contain tokens or signed URLs (see [agents](agents.md#mcp-server)).
 
 ## Outbound requests (SSRF)
 
@@ -170,7 +237,9 @@ Pages never see warehouse credentials. Use a **read-only role** for every source
 boundary), keep `warehouse.allow_raw_sql` off unless every employee may read everything that
 role can, prefer named queries, and cap BigQuery cost with `max_bytes_billed`. Postgres queries
 run in read-only, rolled-back transactions over the extended protocol; raw SQL must be a single
-`SELECT`/`WITH`. Details in [warehouse](warehouse.md#read-only-by-construction).
+`SELECT`/`WITH`. Results are capped at `warehouse.max_rows` and at 32 MiB of row data, enforced
+while rows are read, so one wide query cannot exhaust the server's memory. Details in
+[warehouse](warehouse.md#read-only-by-construction).
 
 ## Logging and audit
 
@@ -187,7 +256,10 @@ and the acting user and client IP; see [operations](operations.md#logs-and-audit
 - [ ] `server.trusted_proxies` set to exactly your load balancers / proxies.
 - [ ] `auth.allowed_domains` / `allowed_groups`, and `admins` / `admin_groups` for a small group.
 - [ ] Behind IAP/ALB: `auth.iap.audience` / `auth.alb.signer_arn` set, and Backyard reachable
-      only through the proxy (plus the proxy-exempt deploy route).
+      only through the proxy (plus the proxy-exempt routes for the deploy gateway and
+      bearer-token `POST /__backyard/api/tokens`).
+- [ ] `header` mode without `jwt_header`: `server.trusted_proxies` lists only the proxies (on
+      Kubernetes, enable the Helm chart's `networkPolicy`, which the chart requires otherwise).
 - [ ] Read-only warehouse roles; raw SQL off unless intended.
 - [ ] `sites.ownership: owner` if teams must not overwrite each other's sites.
 - [ ] Short `auth.token_ttl` for automation; static CI tokens rotated.
