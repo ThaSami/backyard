@@ -114,9 +114,9 @@ func TestSanitizeRedirectRejectsAuthFlowEndpoints(t *testing.T) {
 		"https://backyard.test/__backyard/auth/logout":    hub,
 		"https://foo.backyard.test/__backyard/auth/login": hub,
 		"/s/foo/__backyard/auth/logout":                   hub,
+		"/__backyard/authx/logout":                        "https://backyard.test/__backyard/authx/logout",
 		// The CLI handoff resumes after login.
 		"/__backyard/auth/cli?redirect_uri=http://127.0.0.1:9/cb&state=s": "https://backyard.test/__backyard/auth/cli?redirect_uri=http://127.0.0.1:9/cb&state=s",
-		"/__backyard/authx/logout":                                        "https://backyard.test/__backyard/authx/logout",
 	} {
 		if got := a.sanitizeRedirect(in); got != want {
 			t.Errorf("sanitizeRedirect(%q) = %q, want %q", in, got, want)

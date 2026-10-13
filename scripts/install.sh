@@ -164,7 +164,9 @@ mkdir -p "$tmp/x"
 tar -xzf "$tmp/$archive" -C "$tmp/x"
 bin="$tmp/x/backyard"
 [ -f "$bin" ] || bin="$(find "$tmp/x" -type f -name backyard | head -n 1)"
-[ -n "$bin" ] && [ -f "$bin" ] || fail "the archive does not contain a backyard binary"
+if [ -z "$bin" ] || [ ! -f "$bin" ]; then
+	fail "the archive does not contain a backyard binary"
+fi
 chmod 0755 "$bin"
 
 dir="$(choose_dir)"
