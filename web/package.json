@@ -1,0 +1,16 @@
+{
+  "name": "@backyard/web",
+  "private": true,
+  "description": "Backyard browser SDK and hub UI (no dependencies). The Go binary embeds these files.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node sdk/build.mjs",
+    "check": "node sdk/build.mjs --check",
+    "test": "node sdk/build.mjs --check && node --test 'sdk/test/*.test.mjs' 'test/*.test.mjs'",
+    "test:browser": "node --test test/browser.test.mjs",
+    "test:e2e": "node --test test/e2e.test.mjs"
+  }
+}

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KPI Dashboard</title>
+  <meta name="description" content="Daily KPIs from the data warehouse: stat tiles, a trend chart and the raw numbers.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📈</text></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div>
+      <p class="eyebrow" id="source">Warehouse</p>
+      <h1>KPI Dashboard</h1>
+    </div>
+    <div class="ranges" role="group" aria-label="Date range">
+      <button data-days="7">7 days</button>
+      <button data-days="30" class="active">30 days</button>
+      <button data-days="90">90 days</button>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="notice" id="notice" hidden>
+      <p id="notice-text"></p>
+      <details>
+        <summary>Connect your warehouse</summary>
+        <p>Add a named query to the Backyard server config (<code>backyard.yaml</code>). It should return one row per
+          day: a date column followed by numeric columns. Then reload this page.</p>
+        <pre><code>warehouse:
+  sources:
+    default:
+      type: postgres            # or bigquery / athena
+      dsn: ${ANALYTICS_DSN}
+  queries:
+    kpi_daily:
+      description: Orders and returns per day
+      params: [days]
+      sql: |
+        SELECT day, orders, returns
+        FROM analytics.daily_orders
+        WHERE day >= CURRENT_DATE - CAST(@days AS integer)
+        ORDER BY day</code></pre>
+        <p class="muted">Use another named query with <code>?query=&lt;name&gt;</code>.</p>
+      </details>
+    </section>
+
+    <section class="tiles" id="tiles" aria-live="polite"></section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2 id="chart-title">Daily trend</h2>
+        <div class="legend" id="legend"></div>
+      </div>
+      <div class="chart" id="chart">
+        <svg id="svg" role="img" aria-labelledby="chart-title" tabindex="0"></svg>
+        <div class="tip" id="tip" hidden></div>
+      </div>
+      <p class="empty" id="empty" hidden>No data for this period.</p>
+    </section>
+
+    <details class="card table-card">
+      <summary>Data table</summary>
+      <div class="table-wrap"><table id="table"></table></div>
+    </details>
+  </main>
+
+  <script src="/__backyard/backyard.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

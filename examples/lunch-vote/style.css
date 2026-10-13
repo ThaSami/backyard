@@ -1,0 +1,81 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f6f5f1;
+  --surface: #ffffff;
+  --ink: #1d1c1a;
+  --ink-2: #5f5d58;
+  --line: #e4e2dc;
+  --accent: #2a78d6;
+  --accent-soft: #2a78d61f;
+  --good: #0ca30c;
+  --danger: #d03b3b;
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #121211;
+    --surface: #1c1c1a;
+    --ink: #f0efec;
+    --ink-2: #a9a79f;
+    --line: #2e2d2a;
+    --accent: #4b93ea;
+    --accent-soft: #4b93ea26;
+  }
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink); padding: 0 16px 3rem; }
+button, input, select { font: inherit; color: inherit; }
+.muted { color: var(--ink-2); font-size: .9rem; }
+
+.top, main, footer { max-width: 680px; margin: 0 auto; }
+.top { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 1rem; padding: 3rem 0 1.5rem; }
+.eyebrow { margin: 0; font-size: .8rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-2); }
+h1 { margin: .25rem 0 0; font-size: clamp(1.8rem, 5vw, 2.5rem); letter-spacing: -.02em; line-height: 1.1; }
+
+.presence { display: flex; align-items: center; gap: .6rem; }
+.stack { display: flex; }
+.stack .avatar { margin-left: -8px; border: 2px solid var(--bg); }
+.stack .avatar:first-child { margin-left: 0; }
+.avatar { display: inline-grid; place-items: center; flex: none; border-radius: 50%; overflow: hidden; object-fit: cover;
+          background: var(--accent); color: #fff; font-weight: 650; position: relative; }
+.avatar.md { width: 34px; height: 34px; font-size: .75rem; }
+.avatar.sm { width: 22px; height: 22px; font-size: .6rem; }
+.avatar.voted { box-shadow: 0 0 0 2px var(--good); }
+
+.leader { margin-bottom: 1rem; padding: .8rem 1rem; border-radius: 12px; background: var(--accent-soft); font-weight: 600; }
+
+.spots { list-style: none; margin: 0; padding: 0; display: grid; gap: .6rem; }
+.spot { display: flex; align-items: stretch; gap: .4rem; animation: in .25s ease-out; }
+.vote { flex: 1; display: flex; align-items: center; gap: .9rem; min-width: 0; padding: .8rem 1rem; text-align: left; cursor: pointer;
+        background: var(--surface); border: 1px solid var(--line); border-radius: 14px; transition: border-color .15s, transform .1s; }
+.vote:hover { border-color: var(--accent); }
+.vote:active { transform: scale(.995); }
+.spot.mine .vote { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.emoji { font-size: 1.7rem; line-height: 1; }
+.info { flex: 1; min-width: 0; display: grid; gap: .35rem; }
+.name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spot.mine .name::after { content: "  ✓ your vote"; color: var(--accent); font-weight: 500; font-size: .85rem; }
+.bar { height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--ink) 8%, transparent); overflow: hidden; }
+.bar span { display: block; height: 100%; border-radius: 3px; background: var(--accent); transition: width .35s ease; }
+.voters { display: flex; gap: 2px; align-items: center; }
+.voters .more { font-size: .75rem; color: var(--ink-2); margin-left: 2px; }
+.count { min-width: 1.6rem; text-align: right; font-size: 1.25rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.remove { border: 0; background: none; color: var(--ink-2); cursor: pointer; padding: 0 .5rem; border-radius: 10px; }
+.remove:hover { color: var(--danger); }
+.remove.locked { visibility: hidden; }
+
+.add { display: flex; gap: .5rem; margin-top: 1.25rem; }
+.add select, .add input { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: .65rem .75rem; }
+.add input { flex: 1; min-width: 0; }
+.add input:focus, .add select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.add button { border: 0; border-radius: 12px; padding: .65rem 1.2rem; background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; }
+.add button:disabled { opacity: .6; }
+
+.empty { color: var(--ink-2); text-align: center; padding: 2rem 0 1rem; margin: 0; }
+.error { color: var(--danger); margin: .75rem 0 0; }
+footer { padding-top: 2rem; text-align: center; }
+
+@keyframes in { from { opacity: 0; transform: translateY(-4px); } }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }

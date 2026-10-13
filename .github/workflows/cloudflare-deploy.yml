@@ -1,0 +1,117 @@
+name: Deploy to Cloudflare
+
+# Deploys the Backyard Workers edition (deploy/cloudflare, SPEC §16) to your own
+# Cloudflare account on the free plan: one Worker plus SQLite-backed Durable
+# Objects, Workers AI and an optional R2 bucket. It is the CI counterpart of
+# `backyard cloudflare setup` / `make cloudflare-setup` (like OpenQuick's
+# `oquick setup`): fork the repository, add two secrets, run the workflow, and
+# Backyard runs on your account without any local tooling.
+#
+# One-time setup (Settings → Secrets and variables → Actions):
+#   secrets.CLOUDFLARE_API_TOKEN   API token from the "Edit Cloudflare Workers" template
+#                                  (+ "Workers R2 Storage: Edit" when you use R2)
+#   secrets.CLOUDFLARE_ACCOUNT_ID  your Cloudflare account id
+#   secrets.DEPLOY_TOKEN           recommended: the bearer token for `backyard login
+#                                  --token` (e.g. byd_$(openssl rand -hex 24)); without
+#                                  it (and AUTH_MODE=none) nobody can deploy sites
+#   secrets.BACKYARD_SECRET        optional (≥ 32 characters). Generated on the first
+#                                  deploy and kept on the Worker when unset; setting or
+#                                  changing it rotates it (revokes every API token)
+#   secrets.ANTHROPIC_API_KEY, secrets.OPENAI_API_KEY, secrets.WAREHOUSE_TOKEN
+#                                  optional (Workers AI needs no key)
+#   vars.BACKYARD_CF_WORKER_NAME   optional Worker name (default "backyard")
+#   vars.BACKYARD_CF_VARS          optional Worker variables as JSON, e.g.
+#                                  {"AUTH_MODE":"access","ACCESS_TEAM_DOMAIN":"acme","ACCESS_AUD":"…",
+#                                   "BASE_DOMAIN":"backyard.acme.com","LIMITS":{"ai_per_day":50}}
+#                                  (every deploy resets variables to wrangler.jsonc plus these,
+#                                  so keep them here rather than in the dashboard)
+#   vars.BACKYARD_CF_R2_BUCKET     optional R2 bucket for files above 5 MiB (created if missing)
+#   vars.BACKYARD_CF_DEPLOY_ARGS   optional extra `wrangler deploy` arguments
+#   vars.BACKYARD_CF_AUTO_DEPLOY   "true" to deploy on every push to main that changes
+#                                  the Worker, the SDK, the hub or the agent docs
+#
+# Then run it from the Actions tab ("Run workflow"). The job summary shows the
+# hub URL and the `backyard login` command. Everything is done by
+# scripts/cloudflare-ci.mjs, which works in other CI systems too.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Test and bundle only (wrangler deploy --dry-run)
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - deploy/cloudflare/**
+      - web/sdk/**
+      - web/hub/**
+      - skills/**
+      - scripts/cloudflare-ci.mjs
+      - .github/workflows/cloudflare-deploy.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy the Worker
+    # Forks get the workflow too: run on push only where it was switched on.
+    if: github.event_name == 'workflow_dispatch' || vars.BACKYARD_CF_AUTO_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # To require approvals or scope the secrets, add a GitHub environment here
+    # (environments need a paid plan for private repositories):
+    # environment:
+    #   name: cloudflare
+    #   url: ${{ steps.deploy.outputs.url }}
+    defaults:
+      run:
+        working-directory: deploy/cloudflare
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: deploy/cloudflare/package-lock.json
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Deploy
+        id: deploy
+        working-directory: .
+        env:
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BACKYARD_SECRET: ${{ secrets.BACKYARD_SECRET }}
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          WAREHOUSE_TOKEN: ${{ secrets.WAREHOUSE_TOKEN }}
+          BACKYARD_CF_WORKER_NAME: ${{ vars.BACKYARD_CF_WORKER_NAME }}
+          BACKYARD_CF_VARS: ${{ vars.BACKYARD_CF_VARS }}
+          BACKYARD_CF_R2_BUCKET: ${{ vars.BACKYARD_CF_R2_BUCKET }}
+          BACKYARD_CF_DEPLOY_ARGS: ${{ vars.BACKYARD_CF_DEPLOY_ARGS }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            node scripts/cloudflare-ci.mjs deploy --dry-run
+          else
+            node scripts/cloudflare-ci.mjs deploy
+          fi

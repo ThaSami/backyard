@@ -1,0 +1,294 @@
+# Deploying with Backyard
+
+How to publish sites with the `backyard` CLI (or the MCP tools), sign in under each
+authentication mode, configure what gets uploaded, and automate deploys from CI. The hub in
+these examples is `https://backyard.example.com`.
+
+Contents: [Install](#install-the-cli) · [Commands](#commands) · [Log in](#log-in) ·
+[Deploy](#deploy) · [Project files](#project-files) · [Deploy methods](#deploy-methods) ·
+[Host vs path mode](#host-mode-and-path-mode) · [Local preview](#local-preview) ·
+[Cloudflare edition](#cloudflare-edition-free-tier) · [CI](#ci-and-automation) ·
+[Agents](#agents-and-editors) · [Troubleshooting](#troubleshooting)
+
+## Install the CLI
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/thasami/backyard/main/scripts/install.sh | sh   # Linux, macOS
+go install github.com/thasami/backyard/cmd/backyard@latest                                  # with Go
+backyard version
+```
+
+Windows: download `backyard_<version>_windows_<arch>.zip` from the GitHub releases page. The
+same binary is the server (`backyard serve`), the CLI and the MCP server (`backyard mcp`).
+
+## Commands
+
+```
+backyard init    [site] [--dir d] [--agents claude,codex,cursor,copilot] [--template blank|app] [--force]
+backyard dev     [dir] [--port 4321] [--site s] [--config f] [--no-open]
+backyard deploy  [dir] [--site s] [--method auto|api|s3|gcs|azure|rsync] [--dry-run] [-y] [--message m] [--open]
+backyard login   [--server url] [--gateway url] [--device] [--token t|-] [--no-browser] [--profile p]
+backyard logout | whoami
+backyard sites   list [filter] [--json] | info <site> | delete <site> [-y]
+backyard open    [site]                      open a site (or the hub) in the browser
+backyard pull    <site> [dir]                download a site's deployed files
+backyard token   create [--name n] [--ttl 720h] | hash <token>
+backyard skill   install [--global|--project]
+backyard mcp                                 MCP server over stdio, for agents
+backyard config  example | validate [file]   server configuration
+backyard serve   [--config f] [--dev]        run the server
+backyard gateway [--config f]                run only the deploy gateway
+backyard cloudflare setup [--dir d] [--download] [--no-login] [-- setup-args…]   own server on Cloudflare's free plan
+backyard version
+```
+
+Global flags: `--server`, `--gateway`, `--token`, `--profile`, `--json` (machine-readable
+output, handy for agents and scripts), `-v`.
+
+## Log in
+
+`backyard login --server https://backyard.example.com` stores a personal API token in a
+profile in `~/.config/backyard/config.json` (`$XDG_CONFIG_HOME/backyard/config.json`, mode
+0600). Tokens last 30 days by default; run `backyard login` again when they expire.
+`backyard whoami` shows the current user, server and profile; `backyard logout` forgets the
+token.
+
+How the login completes depends on how the server authenticates people:
+
+| Server `auth.mode` | What `backyard login` does |
+|---|---|
+| `oidc` (Okta, Entra ID, Google, Auth0, Keycloak…) | Opens the browser at `/__backyard/auth/cli`; after company SSO the hub hands a token to the CLI on a `127.0.0.1` loopback port. `--device` uses the OAuth device flow instead (when the admin enabled it) — useful over SSH. |
+| `iap` (Google IAP), `alb` (AWS ALB OIDC), `header` (Cloudflare Access, oauth2-proxy, Pomerium, Azure Easy Auth…) | Same browser flow — the proxy signs you in. Deploy traffic must bypass the proxy: the server advertises a proxy-exempt gateway URL (picked up automatically), or pass it with `--gateway https://deploy.backyard.example.com`. |
+| `none` (labs, local) | Nothing to do when anonymous deploys are allowed; otherwise use a token. |
+| any | `--token <t>` (or `--token -` to read it from stdin) stores an existing token — personal (`backyard token create`) or a static CI token. |
+
+`--no-browser` prints a URL to open on any device; the page shows a token to paste back
+(headless machines). Several servers: `backyard login --profile staging --server …`, then
+`--profile staging` or `BACKYARD_PROFILE=staging`.
+
+Environment overrides (useful in CI): `BACKYARD_SERVER`, `BACKYARD_GATEWAY`, `BACKYARD_TOKEN`,
+`BACKYARD_PROFILE`, `BACKYARD_DEPLOY_METHOD`.
+
+> Agents cannot complete a browser login. If a deploy fails with "not logged in", ask the user
+> to run `backyard login` in their terminal, then retry.
+
+## Deploy
+
+```sh
+backyard deploy                       # folder = current project (.backyard.json) or "."
+backyard deploy dist --site sales-dash
+backyard deploy --dry-run             # show what would be uploaded / deleted
+backyard deploy -y --open             # no confirmation prompt, open the site afterwards
+```
+
+- **Site name:** `--site`, else `.backyard.json`'s `site`, else the folder name. Names are DNS
+  labels: `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`, not reserved (`www, api, admin, hub, auth,
+  static, assets, cdn, docs, mail, backyard, s`).
+- **Overwrite semantics (like `rsync --delete`):** the site becomes exactly the folder.
+  Unchanged files (same SHA-256) are skipped, changed and new files are uploaded, files missing
+  locally are deleted — deletions happen last, so a site is never empty mid-deploy. Deploys are
+  not atomic: visitors may briefly see a mix of old and new files.
+- **Data survives deploys:** database collections, uploaded files and rooms are not touched.
+- **Overwriting someone else's site** asks for confirmation (`-y` skips it). On servers with
+  `sites.ownership: owner`, only owners and admins can redeploy or delete a site
+  (`forbidden` otherwise); the first deployer becomes the owner.
+- **Limits** (defaults): 500 MiB per site, 10,000 files, 100 MiB per file, 60 deploys/hour.
+- The URL is printed at the end: `https://<site>.backyard.example.com/` (host mode) or
+  `https://backyard.example.com/s/<site>/` (path mode).
+
+Manage sites: `backyard sites list [filter]`, `backyard sites info <site>`,
+`backyard sites delete <site>`, `backyard pull <site> [dir]` (download to study, fork or
+back up), `backyard open <site>`.
+
+## Project files
+
+### `.backyard.json`
+
+Written by `backyard init`; found by searching the current folder and its parents.
+
+```json
+{ "site": "lunch-vote", "dir": ".", "method": "auto", "ignore": ["drafts/", "*.psd"] }
+```
+
+| Field | Meaning |
+|---|---|
+| `site` | Site name to deploy to. |
+| `dir` | Folder to deploy, relative to the file (e.g. `"dist"` for build output). Default `"."`. |
+| `method` | Preferred deploy method (`auto`, `api`, `s3`, `gcs`, `azure`, `rsync`). |
+| `ignore` | Extra gitignore-style patterns to exclude. |
+
+### `.backyardignore` and default ignores
+
+Never uploaded: `.git/`, `node_modules/`, `.claude/`, `.cursor/`, `.github/`, `CLAUDE.md`,
+`AGENTS.md`, `.backyard.json`, `.backyardignore`, `.DS_Store`, and every path segment starting
+with `.` (dotfiles such as `.env`) except `.well-known/`.
+
+Add more with a `.backyardignore` in the deployed folder (gitignore syntax: `#` comments, `!`
+negation, trailing `/` for directories, `**`, leading `/` anchors to the root):
+
+```gitignore
+drafts/
+*.psd
+/notes.md
+!keep.psd
+```
+
+## Deploy methods
+
+`--method` (or `.backyard.json` / `BACKYARD_DEPLOY_METHOD`) picks how files travel:
+
+| Method | How | Needs |
+|---|---|---|
+| `api` | Backyard deploy gateway protocol (diffed uploads to presigned URLs, then commit) | a login/token (or anonymous deploys) |
+| `s3` | `aws s3 sync <dir> s3://<bucket>/<prefix>sites/<site>/ --delete --exclude …` | AWS CLI + credentials for the bucket |
+| `gcs` | `gcloud storage rsync <dir> gs://<bucket>/<prefix>sites/<site> --recursive --delete-unmatched-destination-objects --exclude=…` (falls back to `gsutil -m rsync -r -d -x`) | gcloud + bucket access |
+| `azure` | `az storage blob sync --account-name <a> -c <container> -s <dir> -d <prefix>sites/<site> --delete-destination true --exclude-pattern …` | Azure CLI + storage access |
+| `rsync` | `rsync -az --delete --exclude … <dir>/ <rsync_target>/<site>/` | SSH access to the server's `deploy.rsync_target` |
+| `auto` (default) | `api` when the gateway is reachable and you are logged in (or anonymous deploys are allowed); otherwise the first direct method the server advertises whose tool is installed | |
+
+Bucket names, prefixes and the rsync target come from the server (`GET
+/__backyard/api/deploy/info`); you never type them. After a direct sync the CLI asks the server
+to refresh the site's metadata. Direct methods suit people who already have bucket access
+(platform teams, CI with cloud credentials); everyone else uses `api`.
+
+## Host mode and path mode
+
+| | Host mode (default) | Path mode |
+|---|---|---|
+| Site URL | `https://<site>.backyard.example.com/` | `https://backyard.example.com/s/<site>/` |
+| Needs | wildcard DNS + TLS (`*.backyard.example.com`) | one hostname |
+| Isolation | each site is its own origin (cookies, storage, service workers) | sites share one origin |
+
+Write pages that work in both: load the SDK from `/__backyard/backyard.js` (absolute) and
+everything of your own with relative URLs (`app.js`, `img/x.png`). `backyard.site.url`
+holds the site's absolute root URL, and `backyard.site.mode` the mode. Deep links work in both
+modes; a path-mode site at `/s/<site>` is redirected to `/s/<site>/`.
+
+## Local preview
+
+```sh
+backyard dev                       # http://<site>.localhost:4321/, opens the browser
+backyard dev dist --port 5000 --site demo --no-open
+backyard dev --config backyard.yaml   # use AI providers / warehouse sources from a server config
+```
+
+Serves the folder live (edit, then reload) with a complete local backend: database, realtime,
+files, and AI/warehouse when configured. Data is kept in `./.backyard-data` (dotfolder: never
+deployed; add it to `.gitignore`). Sign-in is anonymous ("Guest 1a2b"). `*.localhost`
+resolves to your machine in all modern browsers. Stop it with Ctrl+C.
+
+## Cloudflare edition (free tier)
+
+Backyard also runs entirely on **Cloudflare's free Workers plan**, in the spirit of
+[OpenQuick](https://github.com/topmass/openquick): no server, no bucket, no credit card. It
+implements the same public contract (URLs, SDK, site API, websockets, deploy gateway), so the
+CLI, this skill and the MCP server work unchanged — `backyard deploy` publishes straight to it.
+
+**1. Set it up once** (needs a Cloudflare account with a `workers.dev` subdomain, plus Node.js 20+):
+
+```sh
+backyard cloudflare setup                 # from a checkout of the Backyard repository
+backyard cloudflare setup --download      # no checkout: fetches the matching source release
+cd deploy/cloudflare && npm ci && npm run setup   # the same script, without the backyard CLI
+```
+
+The setup script opens the Cloudflare login in the browser (wrangler) when needed — an agent
+cannot complete that step, so ask the user to run it. It then deploys the Worker (one Worker plus
+SQLite Durable Objects), creates the secrets (`BACKYARD_SECRET` and a `DEPLOY_TOKEN`
+`byd_…`), optionally an R2 bucket (`-- --r2`), and prints the hub URL. `backyard cloudflare
+setup` also **logs the CLI in** to the new server with the deploy token (skip with
+`--no-login`). Re-run it any time to upgrade; earlier choices are remembered. Script options go
+after `--`: `--worker-name <name>`, `--r2`, `--var KEY:VALUE` (e.g. `--var AUTH_MODE:access`),
+`--rotate-token`.
+
+**2. Deploy sites** exactly as usual:
+
+```sh
+backyard init my-site && cd my-site
+backyard deploy                     # → https://backyard.<account>.workers.dev/s/my-site/
+```
+
+On another machine (or for a teammate who may publish), log in with the deploy token:
+`backyard login --server https://backyard.<account>.workers.dev --token byd_…` (or `--token -`
+to read it from stdin). Without a terminal: fork the repository and run the **Deploy to
+Cloudflare** GitHub Actions workflow (secrets `CLOUDFLARE_API_TOKEN` and
+`CLOUDFLARE_ACCOUNT_ID`, recommended `DEPLOY_TOKEN`; `BACKYARD_SECRET` is optional and generated
+when unset), or use the Terraform in `deploy/terraform/cloudflare`.
+
+| Topic | Cloudflare edition |
+|---|---|
+| URLs | Path mode on `https://<worker>.<account>.workers.dev/s/<site>/` by default; a custom domain (path mode) or host mode with a wildcard route `*.<domain>/*`. |
+| Who can open sites | `AUTH_MODE=none` (default): **anyone with the link** can open sites and use their APIs; visitors get anonymous guest identities (`me.anonymous === true`); only holders of the `DEPLOY_TOKEN` can deploy (unless `ALLOW_ANONYMOUS_DEPLOY`). `AUTH_MODE=access`: Cloudflare Access (free for up to 50 users; Okta, Entra ID, Google… as identity providers) protects the hub and every site, `backyard login` uses the browser flow and `/__backyard/api/deploy/*` must bypass Access. |
+| Database & realtime | Per-site Durable Object with SQLite — same query semantics; realtime runs in that object. |
+| Files | Up to 25 MiB per file (95 MiB with the optional R2 bucket); 200 MiB and 2,000 files per site. Files up to 5 MiB live in the Durable Object, bigger ones in R2. |
+| AI | Workers AI (free daily allowance) behind the aliases `smart`, `fast`, `image`, `embed` (configurable with `AI_MODELS`), plus optional Anthropic/OpenAI keys. `max_tokens` is capped at 4096. |
+| Warehouse | Not available (`unsupported`), unless `WAREHOUSE_URL` proxies to a Backyard Go server. |
+| Guardrails | Daily caps per user (per IP when anonymous): 200 AI calls, 30 images, 200 deploys, 500 uploads, 20,000 db writes per site; 500 sites per platform. Hitting a cap answers `rate_limited` until 00:00 UTC. Workers free-plan quotas apply too (100,000 requests/day). Admins tune them with `LIMITS`. |
+
+Write sites for both editions: degrade gracefully when `warehouse` or `ai` answer `unsupported`
+or `rate_limited`, and handle anonymous visitors (`me.anonymous`).
+
+## CI and automation
+
+Deploy from CI with a token in `BACKYARD_TOKEN`:
+
+- **Personal token** (acts as you): `backyard token create --name github-actions --ttl 2160h`.
+- **Static token** (acts as `token:<name>`, survives people leaving): generate a random string,
+  run `backyard token hash <token>` and give the admin the hash for `auth.tokens`
+  (`[{name: ci, sha256: <hash>}]`).
+
+```yaml
+# .github/workflows/deploy-site.yml
+name: Deploy site
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: curl -fsSL https://raw.githubusercontent.com/thasami/backyard/main/scripts/install.sh | sh
+      - run: backyard deploy ./site --site team-dashboard -y
+        env:
+          BACKYARD_SERVER: https://backyard.example.com
+          BACKYARD_TOKEN: ${{ secrets.BACKYARD_TOKEN }}
+          # BACKYARD_GATEWAY: https://deploy.backyard.example.com   # behind IAP/ALB/Access
+```
+
+GitLab CI or any other runner: the same two environment variables and
+`backyard deploy <dir> --site <name> -y`. Add `--json` to parse the result
+(`url`, uploaded/deleted counts). Use `--method s3|gcs|azure` when the runner already has
+bucket credentials and no Backyard token.
+
+## Agents and editors
+
+- **Claude Code plugin** (skill + `/backyard:new`, `/backyard:deploy`, `/backyard:docs` +
+  MCP server): `/plugin marketplace add thasami/backyard`, then
+  `/plugin install backyard@backyard`.
+- **Skill only:** `backyard skill install` (→ `~/.claude/skills/backyard`) or
+  `backyard skill install --project`; `backyard init` adds it to new projects.
+- **MCP server** for any MCP client: command `backyard`, args `["mcp"]`, e.g.
+  `claude mcp add backyard -- backyard mcp`, or in a JSON config:
+  `{"mcpServers": {"backyard": {"command": "backyard", "args": ["mcp"]}}}`. Tools:
+  `backyard_docs`, `backyard_init`, `backyard_deploy`, `backyard_list_sites`,
+  `backyard_site_files`, `backyard_read_site_file`, `backyard_whoami`, `backyard_open_url`.
+  It uses the CLI's login.
+- **Other agents:** `backyard init --agents claude,codex,cursor,copilot` writes `CLAUDE.md`,
+  `AGENTS.md`, `.cursor/rules/backyard.mdc` and `.github/copilot-instructions.md`.
+- **Docs for LLMs:** `https://backyard.example.com/llms.txt` and `/llms-full.txt`.
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `not logged in` / `401` | `backyard login` (the user must run it; tokens expire after 30 days by default). In CI set `BACKYARD_TOKEN`. |
+| Login hangs behind IAP/ALB/Access | Pass the proxy-exempt gateway: `backyard login --gateway https://deploy.backyard.example.com`. |
+| `forbidden` on deploy | The site is owned by someone else (ownership mode) or your account is not allowed — pick another name or ask an owner/admin. |
+| `invalid site name` | Lowercase letters, digits and `-` only, ≤ 63 chars, not reserved. |
+| `too_large` | A file or the site exceeds the limits — exclude sources/assets with `.backyardignore` or deploy the build folder. |
+| `rate_limited` | Too many deploys (default 60/h); wait. |
+| A file is missing on the site | It is ignored (dotfile, `.backyardignore`, default ignores) — check with `--dry-run`. |
+| Old version still showing | Hard-reload; sites are served with `Cache-Control: no-cache` and ETags, so a normal reload revalidates. |
+| `s3`/`gcs`/`azure` method fails | Install and authenticate the cloud CLI, or use `--method api`. |
+| `cannot reach server` | Check `--server` (VPN?), `backyard whoami`, and `https://backyard.example.com/__backyard/healthz`. |

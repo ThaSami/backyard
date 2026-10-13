@@ -1,0 +1,100 @@
+// Backyard — Cloudflare Workers edition (SPEC §16). Runs on the Workers free plan:
+// one Worker, SQLite-backed Durable Objects (one SiteDO per site + one RegistryDO),
+// Workers AI and an optional R2 bucket. `npm run setup` deploys it for you.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "backyard",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": { "enabled": true },
+  // Bundles the SDK, hub UI and agent docs of the repository into src/generated
+  // before every `wrangler dev` / `wrangler deploy` (also run by the npm scripts).
+  "build": {
+    "command": "node scripts/sync-assets.mjs",
+    "watch_dir": ["scripts", "../../web/sdk", "../../web/hub", "../../skills/backyard"]
+  },
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "SITE", "class_name": "SiteDO" },
+      { "name": "REGISTRY", "class_name": "RegistryDO" }
+    ]
+  },
+  // SQLite storage ("new_sqlite_classes") is what the free plan offers.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SiteDO", "RegistryDO"] }],
+
+  // Workers AI: the free plan includes a daily allowance (10k neurons/day). It
+  // always runs remotely, so `wrangler dev` needs a Cloudflare login; use
+  // `npm run dev:local` (the "local" environment below) to develop offline.
+  "ai": { "binding": "AI", "remote": true },
+
+  // Optional R2 bucket for files above FILE_INLINE_MAX (raises the per-file cap
+  // from 25 MiB to LIMITS.max_file_bytes, default 95 MiB). `npm run setup -- --r2`
+  // creates the bucket and deploys with this binding; or uncomment it yourself:
+  // "r2_buckets": [{ "binding": "R2", "bucket_name": "backyard-files" }],
+
+  "vars": {
+    // Hub host for host mode (sites at <site>.<BASE_DOMAIN>) or for a custom domain
+    // in path mode. Empty = the request host (e.g. backyard.<you>.workers.dev).
+    "BASE_DOMAIN": "",
+    // Optional absolute hub URL (default: https://<BASE_DOMAIN> or the request origin).
+    "PUBLIC_URL": "",
+    // "path": sites at /s/<site>/ (works on workers.dev); "host": <site>.<BASE_DOMAIN>
+    // (needs a wildcard DNS record + route, see deploy/terraform/cloudflare).
+    "URL_MODE": "path",
+    // "none": anonymous cookie identities (deploys need DEPLOY_TOKEN unless
+    // ALLOW_ANONYMOUS_DEPLOY); "access": Cloudflare Access (Zero Trust) in front.
+    "AUTH_MODE": "none",
+    // Cloudflare Access team ("acme" or "acme.cloudflareaccess.com") and the
+    // application AUD tag (Terraform output access_aud). Used when AUTH_MODE=access.
+    "ACCESS_TEAM_DOMAIN": "",
+    "ACCESS_AUD": "",
+    // "true" lets anyone deploy without a token (playground; guarded by LIMITS).
+    "ALLOW_ANONYMOUS_DEPLOY": "false",
+    // Comma-separated admin emails / Access group names (admins may delete any site).
+    "ADMINS": "",
+    "ADMIN_GROUPS": "",
+    // "none" (anyone may overwrite a site, the Quick way) or "owner".
+    "OWNERSHIP": "none",
+    // Name shown in the hub.
+    "SERVER_NAME": "Backyard",
+    // Model aliases: {"alias": {"provider": "workers-ai"|"anthropic"|"openai",
+    // "model": "...", "kind": "chat"|"image"|"embedding", "description": "..."}}.
+    // Empty = defaults (smart/fast/image/embed on Workers AI). See README.
+    "AI_MODELS": "",
+    // Guardrails merged over the defaults, e.g. {"ai_per_day":100,"max_sites":200}.
+    "LIMITS": "",
+    // Files larger than this (bytes) go to R2 when bound (default 5 MiB).
+    "FILE_INLINE_MAX": "5242880"
+  },
+
+  // Secrets (set by `npm run setup`, or `wrangler secret put NAME`):
+  //   BACKYARD_SECRET    ≥ 32 chars; signs cookies, API tokens, deploy ids, upload URLs
+  //   DEPLOY_TOKEN       static bearer token for deploys (backyard login --token …)
+  //   ANTHROPIC_API_KEY  optional, for "anthropic" model aliases
+  //   OPENAI_API_KEY     optional, for "openai" (or OpenAI-compatible) aliases
+
+  // `wrangler dev --env local` (npm run dev:local, CI): no Cloudflare login needed.
+  // Workers AI is left out (AI endpoints answer 501) and R2 is simulated locally.
+  // Bindings are not inherited by environments, hence the repetition; vars fall
+  // back to their defaults unless passed with --var.
+  "env": {
+    "local": {
+      "durable_objects": {
+        "bindings": [
+          { "name": "SITE", "class_name": "SiteDO" },
+          { "name": "REGISTRY", "class_name": "RegistryDO" }
+        ]
+      },
+      "r2_buckets": [{ "binding": "R2", "bucket_name": "backyard-local" }]
+    }
+  },
+
+  // Custom domain (path mode) or wildcard routes (host mode) — or use Terraform:
+  // "routes": [
+  //   { "pattern": "backyard.example.com", "custom_domain": true }
+  //   { "pattern": "*.backyard.example.com/*", "zone_name": "example.com" }
+  // ]
+}

@@ -1,0 +1,116 @@
+%{ if !gateway ~}
+# backyard.yaml rendered by Terraform (deploy/terraform/aws). Change the module
+# variables instead of editing this copy. Secrets are never written here: ECS
+# injects them from AWS Secrets Manager as environment variables that Backyard
+# expands at startup, and server.secret is read from BACKYARD_SECRET.
+%{ else ~}
+# Deploy gateway (AWS Lambda) configuration rendered by Terraform.
+# server.secret is read from BACKYARD_SECRET.
+%{ endif ~}
+server:
+  name: ${jsonencode(display_name)}
+  base_domain: ${jsonencode(domain)}
+  public_url: ${jsonencode(public_url)}
+  url_mode: ${url_mode}
+%{ if !gateway ~}
+  trusted_proxies: ${jsonencode(trusted_proxies)}
+  idle_timeout: ${idle_timeout}
+%{ endif ~}
+auth:
+  mode: ${auth_mode}
+%{ if length(admins) > 0 ~}
+  admins: ${jsonencode(admins)}
+%{ endif ~}
+%{ if length(admin_groups) > 0 ~}
+  admin_groups: ${jsonencode(admin_groups)}
+%{ endif ~}
+%{ if length(allowed_domains) > 0 ~}
+  allowed_domains: ${jsonencode(allowed_domains)}
+%{ endif ~}
+%{ if length(allowed_groups) > 0 ~}
+  allowed_groups: ${jsonencode(allowed_groups)}
+%{ endif ~}
+%{ if length(static_tokens) > 0 ~}
+  tokens:
+%{ for t in static_tokens ~}
+    - name: ${jsonencode(t.name)}
+      sha256: ${jsonencode(t.sha256)}
+      admin: ${t.admin ? "true" : "false"}
+%{ endfor ~}
+%{ endif ~}
+%{ if oidc != null ~}
+  oidc:
+    issuer: ${jsonencode(oidc.issuer)}
+%{ if oidc.client_id != "" ~}
+    client_id: ${jsonencode(oidc.client_id)}
+%{ endif ~}
+%{ if oidc.client_secret && !gateway ~}
+    client_secret: "$${OIDC_CLIENT_SECRET}"
+%{ endif ~}
+%{ if length(oidc.scopes) > 0 && !gateway ~}
+    scopes: ${jsonencode(oidc.scopes)}
+%{ endif ~}
+%{ if oidc.use_userinfo && !gateway ~}
+    use_userinfo: true
+%{ endif ~}
+%{ if oidc.device_client_id != "" ~}
+    device_client_id: ${jsonencode(oidc.device_client_id)}
+%{ endif ~}
+%{ endif ~}
+%{ if alb != null ~}
+  alb:
+    region: ${jsonencode(alb.region)}
+    signer_arn: ${jsonencode(alb.signer_arn)}
+%{ endif ~}
+storage:
+  type: s3
+  s3:
+    bucket: ${jsonencode(bucket)}
+    region: ${jsonencode(region)}
+%{ if kms_key_id != "" ~}
+    sse_kms_key_id: ${jsonencode(kms_key_id)}
+%{ endif ~}
+database:
+  type: ${database}
+%{ if database == "dynamodb" ~}
+  dynamodb:
+    table: ${jsonencode(dynamodb_table)}
+    region: ${jsonencode(region)}
+%{ endif ~}
+%{ if database == "postgres" ~}
+  postgres:
+    dsn: "$${DATABASE_URL}"
+    max_conns: ${db_max_conns}
+%{ endif ~}
+pubsub:
+  type: ${pubsub}
+%{ if pubsub == "redis" ~}
+  redis:
+    url: "$${REDIS_URL}"
+%{ endif ~}
+%{ if pubsub == "postgres" ~}
+  postgres:
+    dsn: "$${DATABASE_URL}"
+%{ endif ~}
+%{ if gateway_url != "" || allow_anonymous ~}
+deploy:
+%{ if gateway_url != "" ~}
+  gateway_url: ${jsonencode(gateway_url)}
+%{ endif ~}
+%{ if allow_anonymous ~}
+  allow_anonymous: true
+%{ endif ~}
+%{ endif ~}
+%{ if ai_yaml != "" ~}
+ai:
+  ${indent(2, ai_yaml)}
+%{ endif ~}
+telemetry:
+  log_level: ${log_level}
+  log_format: json
+%{ if access_log ~}
+  access_log: true
+%{ endif ~}
+%{ if overrides != "" ~}
+${overrides}
+%{ endif ~}

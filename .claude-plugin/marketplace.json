@@ -1,0 +1,17 @@
+{
+  "name": "backyard",
+  "description": "Backyard: drop a folder of HTML, get an internal URL with a zero-config backend (realtime database, files, AI, warehouse, websockets, identity). This marketplace ships the Backyard plugin for Claude Code.",
+  "owner": {
+    "name": "Backyard contributors",
+    "url": "https://github.com/thasami/backyard"
+  },
+  "plugins": [
+    {
+      "name": "backyard",
+      "source": "./",
+      "description": "Build and deploy internal web apps on Backyard: the Backyard skill, /backyard:new, /backyard:deploy and /backyard:docs, and the backyard MCP server.",
+      "category": "development",
+      "tags": ["hosting", "internal-tools", "static-sites", "realtime", "deploy", "mcp"]
+    }
+  ]
+}

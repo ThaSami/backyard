@@ -1,0 +1,303 @@
+/** Unit tests of the pure modules. */
+import { describe, expect, it } from "vitest";
+import { readSSE } from "../src/ai/sse";
+import { extractText } from "../src/ai/workersai";
+import { DEFAULT_LIMITS, normalizeTeam, parseConfig } from "../src/config";
+import { b64urlDecode, decodeAnyBase64 } from "../src/crypto";
+import { buildQuery, normalizeQuery, parseListParams } from "../src/db/query";
+import { formatMicros, MicroClock, parseRFC3339Micros } from "../src/db/time";
+import { newULID } from "../src/db/ulid";
+import type { Env } from "../src/env";
+import { validateLoopbackRedirect } from "../src/hub";
+import { contentTypeFor, detectContentType, isActiveContent, normalizeContentType } from "../src/mime";
+import { checkPreconditions, parseRange, serveObject, type Servable } from "../src/object";
+import { sanitizeFileName, validatePath } from "../src/paths";
+import { cleanPath, siteNameError } from "../src/router";
+import { contentDisposition, secondsToMidnight } from "../src/site-do";
+import { extractTitle } from "../src/title";
+
+describe("paths and names", () => {
+  it.each([
+    ["/a/b", "/a/b"],
+    ["/a//b", "/a/b"],
+    ["/a/./b/", "/a/b/"],
+    ["/a/../b", "/b"],
+    ["/../x", "/x"],
+    ["/", "/"],
+    ["", "/"],
+    ["/a/..", "/"],
+  ])("cleanPath(%s) = %s", (p, want) => expect(cleanPath(p)).toBe(want));
+
+  it("validates site names", () => {
+    expect(siteNameError("lunch-vote", [])).toBe("");
+    expect(siteNameError("a", [])).toBe("");
+    expect(siteNameError("-a", [])).not.toBe("");
+    expect(siteNameError("a-", [])).not.toBe("");
+    expect(siteNameError("A", [])).not.toBe("");
+    expect(siteNameError("a".repeat(64), [])).not.toBe("");
+    expect(siteNameError("api", ["api"])).toContain("reserved");
+  });
+
+  it.each([
+    ["index.html", ""],
+    ["a/b/c.js", ""],
+    ["", "empty path"],
+    ["/abs", "path must be relative (no leading /)"],
+    ["a//b", "path contains an empty segment"],
+    ["a/../b", 'path may not contain "." or ".." segments'],
+    ["./a", 'path may not contain "." or ".." segments'],
+    ["__backyard/x", 'path may not start with "__backyard/"'],
+    ["__backyard", 'path may not start with "__backyard/"'],
+    ["a\\b", 'path may not contain "\\"'],
+    ["a\nb", "path contains a control character"],
+    ["x".repeat(1025), "path longer than 1024 bytes"],
+  ])("validatePath(%j)", (p, want) => expect(validatePath(p)).toBe(want));
+
+  it("sanitizes upload names", () => {
+    expect(sanitizeFileName("../../etc/passwd")).toBe("passwd");
+    expect(sanitizeFileName("C:\\Users\\me\\photo.jpg")).toBe("photo.jpg");
+    expect(sanitizeFileName('a"b<c>d|e*f?g:h.txt')).toBe("a_b_c_d_e_f_g_h.txt");
+    expect(sanitizeFileName("  .hidden. ")).toBe("hidden");
+    expect(sanitizeFileName("")).toBe("file");
+    expect(sanitizeFileName("..")).toBe("file");
+    expect(sanitizeFileName("tab\there")).toBe("tab_here");
+    const long = sanitizeFileName("x".repeat(300) + ".png");
+    expect(long.endsWith(".png")).toBe(true);
+    expect(new TextEncoder().encode(long).length).toBeLessThanOrEqual(200);
+    expect(sanitizeFileName("résumé.pdf")).toBe("résumé.pdf");
+  });
+
+  it("validates CLI loopback redirects", () => {
+    expect(validateLoopbackRedirect("http://127.0.0.1:8080/cb").port).toBe("8080");
+    expect(validateLoopbackRedirect("http://localhost:1/").hostname).toBe("localhost");
+    expect(() => validateLoopbackRedirect("http://[::1]:9/x")).not.toThrow();
+    for (const bad of ["", "https://127.0.0.1:1/", "http://127.0.0.1/", "http://example.com:80/", "http://127.0.0.1:1/#x", "http://a@127.0.0.1:1/", "javascript:alert(1)"]) {
+      expect(() => validateLoopbackRedirect(bad), bad).toThrow();
+    }
+  });
+});
+
+describe("timestamps and ids", () => {
+  it("formats microseconds like Go's RFC3339Nano", () => {
+    expect(formatMicros(0)).toBe("1970-01-01T00:00:00Z");
+    expect(formatMicros(1_500_000)).toBe("1970-01-01T00:00:01.5Z");
+    expect(formatMicros(1_791_842_930_123_456)).toBe("2026-10-12T22:08:50.123456Z");
+    expect(formatMicros(1_791_842_930_120_000)).toBe("2026-10-12T22:08:50.12Z");
+  });
+
+  it("parses RFC 3339 with offsets and fractions", () => {
+    expect(parseRFC3339Micros("1970-01-01T00:00:01.5Z")).toBe(1_500_000);
+    expect(parseRFC3339Micros("1970-01-01T05:30:00+05:30")).toBe(0);
+    expect(parseRFC3339Micros("2026-10-12T22:08:50.1234567891Z")).toBe(1_791_842_930_123_456);
+    expect(parseRFC3339Micros("1000-01-01T00:00:00Z")).toBeLessThan(0);
+    expect(parseRFC3339Micros("9999-12-31T23:59:59.999999999Z")).toBeGreaterThan(0);
+    for (const bad of ["garbage", "2026-02-30T00:00:00Z", "2026-13-01T00:00:00Z", "2026-01-01 00:00:00Z", "2026-01-01T24:00:00Z", 123, null]) {
+      expect(parseRFC3339Micros(bad), String(bad)).toBeNull();
+    }
+    expect(parseRFC3339Micros("2024-02-29T00:00:00Z")).not.toBeNull();
+    expect(parseRFC3339Micros("2023-02-29T00:00:00Z")).toBeNull();
+  });
+
+  it("keeps a strictly increasing clock", () => {
+    const c = new MicroClock();
+    c.observe(Date.now() * 1000 + 5_000_000);
+    const a = c.now();
+    const b = c.now();
+    expect(b).toBeGreaterThan(a);
+  });
+
+  it("generates sortable ULIDs", () => {
+    const ids = Array.from({ length: 50 }, () => newULID(1_700_000_000_000));
+    expect(ids.every((id) => /^[0-9A-HJKMNP-TV-Z]{26}$/.test(id))).toBe(true);
+    expect([...ids].sort()).toEqual(ids);
+    expect(new Set(ids).size).toBe(50);
+    expect(newULID(1_700_000_000_001) > ids[49]!).toBe(true);
+    // A clock going backwards keeps ids increasing.
+    expect(newULID(0) > ids[49]!).toBe(true);
+  });
+});
+
+describe("queries", () => {
+  it("normalizes defaults and the id tiebreaker", () => {
+    expect(normalizeQuery({}, 1000)).toEqual({ where: [], orderBy: [{ field: "_meta.created_at", desc: false }, { field: "id", desc: false }], limit: 100, offset: 0 });
+    expect(normalizeQuery({ limit: 5000 }, 1000).limit).toBe(1000);
+    expect(normalizeQuery({ orderBy: [{ field: "id", dir: "DESC" }] }, 1000).orderBy).toEqual([{ field: "id", desc: true }]);
+    expect(() => normalizeQuery({ orderBy: Array.from({ length: 6 }, () => ({ field: "a" })) }, 10)).toThrow();
+  });
+
+  it("binds every value as a parameter (≤ 100 per query)", () => {
+    const where = Array.from({ length: 20 }, (_, i) => ({ field: "f" + i, op: "in", value: [...Array.from({ length: 15 }, (_, j) => j), ...Array.from({ length: 15 }, (_, j) => "s" + j)] }));
+    const { sql, params } = buildQuery("c", normalizeQuery({ where }, 1000));
+    expect(params.length).toBeLessThanOrEqual(100);
+    expect(sql).not.toContain("s14");
+    const evil = buildQuery("c", normalizeQuery({ where: [{ field: "a", op: "==", value: "'; DROP TABLE docs; --" }] }, 10));
+    expect(evil.sql).not.toContain("DROP");
+    expect(evil.params).toContain("'; DROP TABLE docs; --");
+  });
+
+  it("parses list parameters", () => {
+    expect(parseListParams(new URLSearchParams("limit=5&offset=2&order=a:desc,b"))).toEqual({ limit: 5, offset: 2, orderBy: [{ field: "a", dir: "desc" }, { field: "b", dir: "" }] });
+    expect(parseListParams(new URLSearchParams("orderBy=a,b&order=desc"))).toEqual({ orderBy: [{ field: "a", dir: "desc" }, { field: "b", dir: "desc" }] });
+    expect(() => parseListParams(new URLSearchParams("limit=x"))).toThrow();
+    expect(() => parseListParams(new URLSearchParams("order=a:up"))).toThrow();
+  });
+});
+
+describe("HTTP objects", () => {
+  const obj = (): Servable => ({ name: "a.txt", size: 10, etag: '"abc"', lastModified: Date.UTC(2026, 0, 1, 12, 0, 0, 500), contentType: "text/plain", data: new TextEncoder().encode("0123456789") });
+
+  it.each([
+    ["bytes=0-3", { kind: "ok", start: 0, length: 4 }],
+    ["bytes=5-", { kind: "ok", start: 5, length: 5 }],
+    ["bytes=-3", { kind: "ok", start: 7, length: 3 }],
+    ["bytes=-30", { kind: "ok", start: 0, length: 10 }],
+    ["bytes=8-100", { kind: "ok", start: 8, length: 2 }],
+    ["bytes=10-", { kind: "unsatisfiable" }],
+    ["bytes=-0", { kind: "unsatisfiable" }],
+    ["bytes=3-1", { kind: "ignore" }],
+    ["bytes=0-1,3-4", { kind: "ignore" }],
+    ["items=0-1", { kind: "ignore" }],
+    ["bytes=x-", { kind: "ignore" }],
+  ])("parseRange(%s)", (h, want) => expect(parseRange(h, 10)).toEqual(want));
+
+  it("evaluates preconditions", () => {
+    const o = obj();
+    const req = (h: Record<string, string>, method = "GET") => new Request("https://x/", { method, headers: h });
+    expect(checkPreconditions(req({ "If-None-Match": '"abc"' }), o)).toBe(304);
+    expect(checkPreconditions(req({ "If-None-Match": '"zzz", W/"abc"' }), o)).toBe(304);
+    expect(checkPreconditions(req({ "If-None-Match": "*" }), o)).toBe(304);
+    expect(checkPreconditions(req({ "If-None-Match": '"zzz"' }), o)).toBe(0);
+    expect(checkPreconditions(req({ "If-Match": '"zzz"' }), o)).toBe(412);
+    expect(checkPreconditions(req({ "If-Match": 'W/"abc"' }), o)).toBe(412);
+    expect(checkPreconditions(req({ "If-Modified-Since": "Thu, 01 Jan 2026 12:00:00 GMT" }), o)).toBe(304);
+    expect(checkPreconditions(req({ "If-Modified-Since": "Thu, 01 Jan 2026 11:59:59 GMT" }), o)).toBe(0);
+    expect(checkPreconditions(req({ "If-Unmodified-Since": "Thu, 01 Jan 2026 11:00:00 GMT" }), o)).toBe(412);
+    expect(checkPreconditions(req({ "If-None-Match": '"abc"' }, "POST"), o)).toBe(412);
+  });
+
+  it("serves ranges only when If-Range matches", async () => {
+    let res = serveObject(new Request("https://x/", { headers: { Range: "bytes=0-1", "If-Range": '"abc"' } }), obj());
+    expect(res.status).toBe(206);
+    res = serveObject(new Request("https://x/", { headers: { Range: "bytes=0-1", "If-Range": '"old"' } }), obj());
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("0123456789");
+    expect(() => serveObject(new Request("https://x/", { headers: { "If-Match": '"no"' } }), obj())).toThrow();
+  });
+
+  it("picks content types", () => {
+    expect(contentTypeFor("x.HTML")).toBe("text/html; charset=utf-8");
+    expect(contentTypeFor("x.ts")).toBe("text/plain; charset=utf-8");
+    expect(contentTypeFor("x.unknown")).toBe("application/octet-stream");
+    expect(contentTypeFor("x", "text/csv")).toBe("text/csv; charset=utf-8");
+    expect(contentTypeFor(".htaccess")).toBe("application/octet-stream");
+    expect(detectContentType("blob", new TextEncoder().encode("<!DOCTYPE html><p>"))).toBe("text/html; charset=utf-8");
+    expect(detectContentType("blob", new Uint8Array([0xff, 0xd8, 0xff, 0]))).toBe("image/jpeg");
+    expect(detectContentType("blob", new Uint8Array([0, 1, 2]))).toBe("application/octet-stream");
+    expect(normalizeContentType("Text/Plain; Charset=UTF-8")).toBe("text/plain; charset=UTF-8");
+    expect(normalizeContentType("garbage")).toBe("");
+    expect(isActiveContent("image/svg+xml")).toBe(true);
+    expect(isActiveContent("image/png")).toBe(false);
+    expect(contentDisposition("inline", "a b.txt")).toBe('inline; filename="a b.txt"');
+    expect(contentDisposition("inline", "naïve.txt")).toBe(`inline; filename="na_ve.txt"; filename*=UTF-8''na%C3%AFve.txt`);
+  });
+});
+
+describe("titles", () => {
+  it.each([
+    ["<title>Hello</title>", "Hello", ""],
+    ["<TITLE>  A &amp;\n B </TITLE>", "A & B", ""],
+    ['<meta name="description" content="Desc &lt;3"><title>T</title>', "T", "Desc <3"],
+    ["<!-- <title>No</title> --><title>Yes</title>", "Yes", ""],
+    ["<script>var s='<title>No</title>'</script><title>Yes</title>", "Yes", ""],
+    ["<svg><title>icon</title></svg><title>Page</title>", "Page", ""],
+    ["<titlex>no</titlex>", "", ""],
+    ["<title>unterminated", "unterminated", ""],
+    ["<meta name=Description content=unquoted>", "", "unquoted"],
+  ])("extractTitle(%j)", (html, title, description) => expect(extractTitle(html)).toEqual({ title, description }));
+});
+
+describe("config", () => {
+  const base = { BACKYARD_SECRET: "x".repeat(32) } as unknown as Env;
+
+  it("applies defaults", () => {
+    const c = parseConfig(base);
+    expect(c.urlMode).toBe("path");
+    expect(c.authMode).toBe("none");
+    expect(c.limits).toEqual(DEFAULT_LIMITS);
+    expect(c.fileInlineMax).toBe(5 * 1024 * 1024);
+    expect(c.tokenTTLSeconds).toBe(720 * 3600);
+    expect(c.ai.defaultChat).toBe("smart");
+    expect(c.ai.defaultImage).toBe("image");
+    expect(c.ai.defaultEmbedding).toBe("embed");
+    expect(c.problems).toEqual([]);
+  });
+
+  it("parses vars and reports problems", () => {
+    const c = parseConfig({
+      ...base,
+      URL_MODE: "host",
+      BASE_DOMAIN: "https://Backyard.Acme.com/",
+      AUTH_MODE: "access",
+      ACCESS_TEAM_DOMAIN: "acme",
+      ACCESS_AUD: "a1, a2",
+      ADMINS: "Root@Acme.com",
+      LIMITS: '{"ai_per_day": 5, "bogus": 1, "max_sites": -1}',
+      AI_MODELS: JSON.stringify({ claude: { provider: "anthropic", model: "claude-opus-5-5", effort: "high" }, bad: { provider: "x", model: "y" } }),
+    } as unknown as Env);
+    expect(c.urlMode).toBe("host");
+    expect(c.baseDomain).toBe("backyard.acme.com");
+    expect(c.accessTeam).toBe("acme.cloudflareaccess.com");
+    expect(c.accessAud).toEqual(["a1", "a2"]);
+    expect(c.admins).toEqual(["root@acme.com"]);
+    expect(c.limits.ai_per_day).toBe(5);
+    expect(c.limits.max_sites).toBe(DEFAULT_LIMITS.max_sites);
+    expect(c.ai.models).toEqual({ claude: { provider: "anthropic", model: "claude-opus-5-5", kind: "chat", effort: "high" } });
+    expect(c.ai.defaultChat).toBe("claude");
+    expect(c.problems.join("\n")).toContain("bogus");
+    expect(c.problems.join("\n")).toContain("AI_MODELS.bad");
+    expect(parseConfig({ ...base, URL_MODE: "host" } as unknown as Env).urlMode).toBe("path");
+    expect(parseConfig({} as Env).problems.join()).toContain("BACKYARD_SECRET");
+    expect(normalizeTeam("https://Team.cloudflareaccess.com/")).toBe("team.cloudflareaccess.com");
+  });
+});
+
+describe("misc", () => {
+  it("decodes base64 variants", () => {
+    expect(b64urlDecode("AQID")).toEqual(new Uint8Array([1, 2, 3]));
+    expect(b64urlDecode("A+B")).toBeNull();
+    expect(decodeAnyBase64("AQID")).toEqual(new Uint8Array([1, 2, 3]));
+    expect(decodeAnyBase64("AQ-_")).toEqual(new Uint8Array([1, 15, 191]));
+    expect(decodeAnyBase64("!!")).toBeNull();
+  });
+
+  it("parses server-sent events", async () => {
+    const enc = new TextEncoder();
+    const chunks = ["data: a\n", "\ndata: b\r\n", "data: c\r\n\r\n: comment\n\nevent: x\ndata: {\"y\":1}", "\n\n"];
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        for (const ch of chunks) c.enqueue(enc.encode(ch));
+        c.close();
+      },
+    });
+    const events: { event: string; data: string }[] = [];
+    await readSSE(body, (e) => {
+      events.push(e);
+    });
+    expect(events).toEqual([
+      { event: "message", data: "a" },
+      { event: "message", data: "b\nc" },
+      { event: "x", data: '{"y":1}' },
+    ]);
+  });
+
+  it("extracts text from Workers AI result shapes", () => {
+    expect(extractText({ response: "a" })).toBe("a");
+    expect(extractText({ choices: [{ message: { content: "b" } }] })).toBe("b");
+    expect(extractText({ output: [{ type: "reasoning" }, { type: "message", content: [{ type: "output_text", text: "c" }] }] })).toBe("c");
+    expect(extractText(null)).toBe("");
+  });
+
+  it("computes the time to the UTC midnight reset", () => {
+    expect(secondsToMidnight(Date.UTC(2026, 0, 1, 23, 59, 0))).toBe(60);
+  });
+});

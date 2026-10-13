@@ -1,0 +1,17 @@
+# AGENTS.md: {{.Title}} (Backyard site)
+
+{{template "intro" .}}
+
+{{template "rules" .}}
+
+{{template "commands" .}}
+
+{{template "api" .}}
+
+## Project layout
+
+- {{.IndexFiles}}: the site itself.
+- `.backyard.json`: the site name (`{{.Site}}`) used by `backyard deploy` and `backyard dev`.
+- `.backyardignore`: extra files to keep out of deploys.
+
+{{template "more" .}}

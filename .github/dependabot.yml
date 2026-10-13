@@ -1,0 +1,95 @@
+# Dependency update PRs (https://docs.github.com/code-security/dependabot).
+version: 2
+
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      aws:
+        patterns:
+          - "github.com/aws/*"
+      azure:
+        patterns:
+          - "github.com/Azure/*"
+      google-cloud:
+        patterns:
+          - "cloud.google.com/*"
+          - "google.golang.org/*"
+          - "golang.org/x/oauth2"
+      golang-x:
+        patterns:
+          - "golang.org/x/*"
+        exclude-patterns:
+          - "golang.org/x/oauth2"
+
+  - package-ecosystem: npm
+    directories:
+      - /web
+      - /deploy/cloudflare
+      - /conformance
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cloudflare:
+        patterns:
+          - "wrangler"
+          - "@cloudflare/*"
+      playwright:
+        patterns:
+          - "playwright"
+          - "@playwright/*"
+          - "playwright-core"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: docker-compose
+    directory: /deploy/docker-compose
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: terraform
+    directories:
+      - /deploy/terraform/aws
+      - /deploy/terraform/gcp
+      - /deploy/terraform/azure
+      - /deploy/terraform/cloudflare
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      terraform-providers:
+        patterns:
+          - "*"

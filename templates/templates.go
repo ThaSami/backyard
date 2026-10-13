@@ -1,7 +1,15 @@
-// Package templates renders the files written by `backyard init`.
+// Package templates renders the files written by `backyard init` (and the
+// MCP tool backyard_init): the starter page(s), .backyard.json,
+// .backyardignore, and the instructions for coding agents — CLAUDE.md plus
+// the embedded Backyard skill for Claude Code, AGENTS.md for Codex and other
+// AGENTS.md-aware agents, a Cursor project rule and GitHub Copilot
+// repository instructions.
+//
+// Template sources live in templates/files and are embedded in the binary.
+// Files ending in .tmpl are Go text/templates; the API cheat sheet, decision
+// table and limits in the agent files are extracted from the skill's
+// SKILL.md so they never drift from it.
 package templates
-
-// STUBS: replaced by the templates implementation.
 
 // InitOptions configure Render.
 type InitOptions struct {
@@ -17,7 +25,12 @@ type InitOptions struct {
 // and .claude/skills/backyard/** for "claude"; AGENTS.md for "codex";
 // .cursor/rules/backyard.mdc for "cursor"; .github/copilot-instructions.md for
 // "copilot". Callers must not overwrite existing files without consent.
-func Render(opts InitOptions) (map[string][]byte, error) { panic("templates: not implemented") }
+//
+// It also always includes a default .backyardignore. With the "app"
+// template the page is index.html, app.js and style.css; SkipIndex omits all
+// three. Invalid options (an unknown agent or template, a malformed site
+// name or server URL) are reported as errors.
+func Render(opts InitOptions) (map[string][]byte, error) { return render(opts) }
 
 // Templates returns the available template names.
-func Templates() []string { panic("templates: not implemented") }
+func Templates() []string { return []string{TemplateBlank, TemplateApp} }

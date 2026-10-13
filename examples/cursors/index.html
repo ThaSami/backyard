@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cursors</title>
+  <meta name="description" content="Multiplayer cursors, reactions and cursor chat: see everyone on the page in realtime.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🖱️</text></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="board" class="board" aria-label="Shared board"></div>
+
+  <aside class="people" aria-label="People here">
+    <div class="people-head"><b>Here now</b> <span class="status" id="status">connecting…</span></div>
+    <ul id="people"></ul>
+  </aside>
+
+  <div class="toolbar" role="toolbar" aria-label="Reactions">
+    <span class="hint">Click to react · press <kbd>/</kbd> to chat</span>
+    <div id="emojis" class="emojis"></div>
+  </div>
+
+  <input id="chat" class="chat" maxlength="60" placeholder="Say something…" autocomplete="off" hidden aria-label="Cursor chat">
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <script src="/__backyard/backyard.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

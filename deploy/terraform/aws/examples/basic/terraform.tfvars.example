@@ -1,0 +1,15 @@
+# Copy to terraform.tfvars (git-ignored) and adjust.
+
+region          = "us-east-1"
+domain          = "backyard.acme.com"
+route53_zone_id = "Z0123456789ABCDEFGHIJ"
+
+# Built-in OIDC login with Okta (see the module README for the Okta app setup).
+auth_mode          = "oidc"
+oidc_issuer        = "https://acme.okta.com/oauth2/default"
+oidc_client_id     = "0oa1example2web3client"
+oidc_client_secret = "replace-me" # or: export TF_VAR_oidc_client_secret=...
+# oidc_device_client_id = "0oa1example2native3cli"
+
+admin_groups  = ["backyard-admins"]
+allowed_cidrs = ["0.0.0.0/0"]

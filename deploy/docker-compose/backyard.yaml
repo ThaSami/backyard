@@ -1,0 +1,100 @@
+# Backyard server configuration for deploy/docker-compose.
+#
+# Sites and uploads are stored on the data volume (fs storage, no cloud bucket),
+# documents in PostgreSQL, realtime fan-out over PostgreSQL LISTEN/NOTIFY.
+# ${VARS} are expanded from the container environment, which docker-compose.yml
+# fills from .env. Expansion happens before YAML parsing, so free-form values
+# are quoted. The full schema with every option: `backyard config example`.
+# Check edits with: docker compose run --rm backyard config validate /etc/backyard/backyard.yaml
+
+server:
+  base_domain: ${BACKYARD_DOMAIN}
+  # The URL people open (Caddy terminates TLS). Defaults to https://<domain>
+  # in docker-compose.yml; include the port when HTTPS_PORT is not 443.
+  public_url: ${BACKYARD_PUBLIC_URL}
+  name: "${BACKYARD_NAME:-Backyard}"
+  # Only Caddy (on the private compose network) talks to Backyard, so trust
+  # X-Forwarded-For / -Proto / -Host from private addresses.
+  trusted_proxies:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+  # server.secret comes from BACKYARD_SECRET.
+
+auth:
+  # "none": no login; everyone who can reach the server is an anonymous guest
+  # (fine on a private network or behind a VPN). Use SSO below otherwise.
+  mode: none
+  # Deploys need a token (like OpenQuick's token-gated deploys): the static
+  # token created by ./init-env.sh, given to the CLI with
+  #   backyard login --server https://<domain> --token <token>
+  tokens:
+    - name: deploy
+      sha256: ${BACKYARD_DEPLOY_TOKEN_SHA256}
+      admin: true
+
+  # Single sign-on with your identity provider (Okta, Entra ID, Google,
+  # Keycloak, Auth0, ...). Register a web application with the redirect URL
+  # https://<domain>/__backyard/auth/callback, set OIDC_* in .env, then
+  # replace "mode: none" above with:
+  #
+  # mode: oidc
+  # oidc:
+  #   issuer: "${OIDC_ISSUER}"
+  #   client_id: "${OIDC_CLIENT_ID}"
+  #   client_secret: "${OIDC_CLIENT_SECRET}"
+  #   # Optional CLI device flow (a public/native client of the same IdP):
+  #   # device_client_id: 0oa...
+  # allowed_domains: [acme.com]
+  # admin_groups: [backyard-admins]
+  # (and set BACKYARD_ALLOW_ANONYMOUS_DEPLOY=false)
+
+storage:
+  type: fs
+  fs:
+    root: /var/lib/backyard
+
+database:
+  type: postgres
+  postgres:
+    # POSTGRES_PASSWORD must be URL-safe (init-env.sh generates hex).
+    dsn: postgres://backyard:${POSTGRES_PASSWORD}@postgres:5432/backyard?sslmode=disable
+
+pubsub:
+  # LISTEN/NOTIFY on the same database (lets you run several backyard replicas).
+  type: postgres
+
+deploy:
+  # api: the deploy gateway (CLI, hub drag-and-drop); rsync: `backyard deploy
+  # --method rsync` straight into the sites folder over SSH (README.md).
+  methods: [api, rsync]
+  # e.g. backyard@backyard.acme.com: (with rrsync) or
+  # backyard@backyard.acme.com:/srv/backyard/data/sites (plain SSH)
+  rsync_target: "${BACKYARD_RSYNC_TARGET}"
+  # true = anyone who can reach the server may deploy without a token
+  # (playground mode; only with auth.mode none).
+  allow_anonymous: ${BACKYARD_ALLOW_ANONYMOUS_DEPLOY:-false}
+
+# AI for backyard.ai (set the key in .env and uncomment):
+#
+# ai:
+#   providers:
+#     anthropic:
+#       type: anthropic
+#       api_key: "${ANTHROPIC_API_KEY}"
+#   models:
+#     smart:
+#       provider: anthropic
+#       model: claude-opus-5-5
+#       description: Most capable
+#     fast:
+#       provider: anthropic
+#       model: claude-haiku-5-5
+#       description: Quick and cheap
+#   default_model: smart
+
+telemetry:
+  log_format: json
+  # Prometheus metrics on backyard:9090/metrics inside the compose network.
+  metrics: true
+  metrics_listen: ":9090"

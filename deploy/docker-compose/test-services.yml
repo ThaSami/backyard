@@ -1,0 +1,58 @@
+# Backing services for Backyard's integration tests (contributors only, not
+# for production). All data is in memory and every port is bound to 127.0.0.1.
+#
+#   make services-up      # docker compose -f deploy/docker-compose/test-services.yml up -d --wait
+#   make test             # exports the BACKYARD_TEST_* variables below while these run
+#   make services-down
+#
+# Equivalent environment for running `go test` by hand:
+#   BACKYARD_TEST_POSTGRES_DSN='postgres://backyard:backyard@127.0.0.1:5432/backyard?sslmode=disable'
+#   BACKYARD_TEST_REDIS_URL='redis://127.0.0.1:6379/0'
+#   BACKYARD_TEST_DYNAMODB_ENDPOINT='http://127.0.0.1:8000'
+#   BACKYARD_TEST_AZURITE='DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;'
+#
+# Ports can be moved with BACKYARD_TEST_{POSTGRES,REDIS,DYNAMODB,AZURITE}_PORT
+# when something else uses them (then export the BACKYARD_TEST_* URLs yourself).
+name: backyard-test
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: backyard
+      POSTGRES_PASSWORD: backyard
+      POSTGRES_DB: backyard
+    command: ["postgres", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off", "-c", "max_connections=300"]
+    tmpfs:
+      - /var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${BACKYARD_TEST_POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U backyard -d backyard"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:${BACKYARD_TEST_REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    # -sharedDb: one database regardless of the (dummy) credentials and region.
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports:
+      - "127.0.0.1:${BACKYARD_TEST_DYNAMODB_PORT:-8000}:8000"
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    command: ["azurite-blob", "--blobHost", "0.0.0.0", "--blobPort", "10000", "--inMemoryPersistence", "--skipApiVersionCheck", "--loose"]
+    ports:
+      - "127.0.0.1:${BACKYARD_TEST_AZURITE_PORT:-10000}:10000"

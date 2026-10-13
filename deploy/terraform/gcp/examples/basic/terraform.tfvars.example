@@ -1,0 +1,8 @@
+project_id  = "acme-backyard"
+region      = "us-central1"
+domain      = "backyard.example.com"
+iap_members = ["domain:example.com"]
+admins      = ["alice@example.com"]
+
+# Cloud DNS zone that serves example.com (optional).
+# dns_zone_name = "example-com"

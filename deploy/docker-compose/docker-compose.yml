@@ -1,0 +1,101 @@
+# Backyard on one machine: backyard + PostgreSQL 16 + Caddy 2 (TLS, wildcard
+# subdomains). Sites and uploads live on a local volume (no cloud bucket).
+#
+#   ./init-env.sh localhost        # writes .env with fresh secrets and a deploy token
+#   docker compose up -d
+#   open https://localhost         # sites: https://<site>.localhost
+#
+# See README.md for production (real wildcard DNS + TLS), SSO, rsync deploys
+# and backups. Configuration: backyard.yaml (+ .env).
+name: backyard
+
+services:
+  backyard:
+    image: ${BACKYARD_IMAGE:-ghcr.io/thasami/backyard:latest}
+    # Build from this checkout instead of pulling the release image:
+    # build: ../..
+    command: ["serve", "--config", "/etc/backyard/backyard.yaml"]
+    restart: unless-stopped
+    environment:
+      BACKYARD_SECRET: ${BACKYARD_SECRET:?run ./init-env.sh (or set BACKYARD_SECRET in .env)}
+      BACKYARD_DOMAIN: ${BACKYARD_DOMAIN:-localhost}
+      BACKYARD_PUBLIC_URL: ${BACKYARD_PUBLIC_URL:-https://${BACKYARD_DOMAIN:-localhost}}
+      BACKYARD_NAME: ${BACKYARD_NAME:-Backyard}
+      BACKYARD_DEPLOY_TOKEN_SHA256: ${BACKYARD_DEPLOY_TOKEN_SHA256:?run ./init-env.sh (or set BACKYARD_DEPLOY_TOKEN_SHA256 in .env)}
+      BACKYARD_ALLOW_ANONYMOUS_DEPLOY: ${BACKYARD_ALLOW_ANONYMOUS_DEPLOY:-false}
+      BACKYARD_RSYNC_TARGET: ${BACKYARD_RSYNC_TARGET:-}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run ./init-env.sh (or set POSTGRES_PASSWORD in .env)}
+      # Single sign-on (see the oidc block in backyard.yaml).
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      # AI providers (see the ai block in backyard.yaml).
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - ./backyard.yaml:/etc/backyard/backyard.yaml:ro
+      # A named volume by default; set BACKYARD_DATA to a host path (e.g.
+      # /srv/backyard/data) for rsync deploys over SSH (README.md).
+      - ${BACKYARD_DATA:-backyard-data}:/var/lib/backyard
+    expose:
+      - "8080" # HTTP (Caddy proxies here)
+      - "9090" # Prometheus metrics (telemetry.metrics_listen), not published
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      # Scratch space (multipart uploads may spool here); RAM-backed, so capped.
+      - /tmp:size=1g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # No healthcheck: the distroless image has no shell or HTTP client. Caddy
+    # (and any monitoring) can use GET /__backyard/healthz and /__backyard/readyz.
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: backyard
+      POSTGRES_DB: backyard
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run ./init-env.sh (or set POSTGRES_PASSWORD in .env)}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U backyard -d backyard"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    security_opt:
+      - no-new-privileges:true
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp" # HTTP/3
+    environment:
+      BACKYARD_DOMAIN: ${BACKYARD_DOMAIN:-localhost}
+      BACKYARD_TLS: ${BACKYARD_TLS:-internal}
+      CADDY_GLOBAL_OPTIONS: ${CADDY_GLOBAL_OPTIONS:-}
+      # For BACKYARD_TLS=dns with a Caddy build that has the Cloudflare plugin:
+      # CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${CADDY_CERTS_DIR:-./certs}:/certs:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - backyard
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  backyard-data:
+  postgres-data:
+  caddy-data:
+  caddy-config:

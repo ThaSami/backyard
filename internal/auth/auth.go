@@ -25,7 +25,8 @@ var (
 // the request carries no usable credentials, (nil, ErrForbidden) when the user
 // is authenticated but rejected by allowed_domains/allowed_groups, or another
 // error for infrastructure failures. Bearer tokens (API, static, IdP JWT) are
-// accepted in every mode. In mode "none" Authenticate never fails: it returns
+// accepted in every mode. In mode "none" Authenticate only fails when an
+// invalid bearer token is presented (ErrUnauthenticated); otherwise it returns
 // an anonymous user and, when w is non-nil, sets the backyard_anon cookie.
 type Authenticator interface {
 	Authenticate(w http.ResponseWriter, r *http.Request) (*identity.User, error)

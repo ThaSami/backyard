@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>File Drop</title>
+  <meta name="description" content="Drop files to share them with your team: a live gallery of uploads.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📥</text></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>File Drop</h1>
+      <p class="muted">Share screenshots, decks and docs with everyone who has this link.</p>
+    </div>
+    <p class="muted" id="summary"></p>
+  </header>
+
+  <main>
+    <label class="zone" id="zone" tabindex="0">
+      <input type="file" id="picker" multiple>
+      <span class="big" aria-hidden="true">⬆</span>
+      <span><b>Drop files here</b>, paste, or <u>browse</u></span>
+      <span class="muted small" id="limit">Images, videos, decks, docs: any file up to the server's upload limit</span>
+    </label>
+
+    <ul class="queue" id="queue" aria-live="polite"></ul>
+
+    <div class="toolbar">
+      <div class="chips" role="tablist" aria-label="Filter by type">
+        <button class="chip active" data-kind="all">All</button>
+        <button class="chip" data-kind="image">Images</button>
+        <button class="chip" data-kind="video">Video</button>
+        <button class="chip" data-kind="doc">Documents</button>
+        <button class="chip" data-kind="other">Other</button>
+      </div>
+      <input type="search" id="search" placeholder="Search by name…" aria-label="Search files">
+    </div>
+
+    <section class="grid" id="grid"></section>
+    <p class="empty" id="empty" hidden>No files yet. Drop the first one above.</p>
+    <p class="empty" id="loading">Loading files…</p>
+  </main>
+
+  <dialog id="viewer" class="viewer">
+    <form method="dialog"><button class="close" aria-label="Close">✕</button></form>
+    <img id="viewer-img" alt="">
+    <p id="viewer-caption"></p>
+  </dialog>
+
+  <p class="toast" id="toast" role="status" hidden></p>
+
+  <script src="/__backyard/backyard.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

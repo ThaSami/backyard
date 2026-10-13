@@ -1,0 +1,273 @@
+# Default values for the Backyard chart. The defaults run a single replica
+# with fs storage + SQLite on a PersistentVolumeClaim (no cloud bucket, no
+# database server). values-production.yaml shows a multi-replica setup with
+# PostgreSQL, Redis, S3 and SSO.
+
+image:
+  repository: ghcr.io/thasami/backyard
+  # Defaults to the chart's appVersion.
+  tag: ""
+  # Pin by digest (sha256:...); takes precedence over the tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# More than one replica (or autoscaling) needs a shared database (postgres or
+# dynamodb), a cross-instance pubsub (redis or postgres) and shared storage
+# (s3/gcs/azure, or an fs PVC with ReadWriteMany). The chart refuses to render
+# configurations that would break with several replicas.
+replicaCount: 1
+
+# Deployment strategy. Empty = Recreate when a ReadWriteOnce volume holds the
+# data (a second pod could not mount it), RollingUpdate otherwise.
+strategy: {}
+
+# -----------------------------------------------------------------------------
+# config is rendered as backyard.yaml (ConfigMap) and loaded with strict
+# validation: unknown keys are fatal. Run `backyard config example` for every
+# option. ${VAR} references are expanded from the container environment
+# (secret.env, existingSecret, extraEnv), so keep credentials there:
+#   database.postgres.dsn: ${DATABASE_URL}
+#   auth.oidc.client_secret: "${OIDC_CLIENT_SECRET}"
+# The server listens on server.listen (default :8080 = ports.http) and serves
+# metrics on telemetry.metrics_listen (ports.metrics). Values pass through
+# `tpl`, so {{ .Release.Name }} and friends work too.
+config:
+  server:
+    # Hub at https://<base_domain>/, sites at https://<site>.<base_domain>/.
+    base_domain: backyard.example.com
+    # Defaults to https://<base_domain>.
+    # public_url: https://backyard.example.com
+    # "host" (wildcard subdomains) or "path" (https://<base_domain>/s/<site>/).
+    url_mode: host
+    # The ingress controller's pods; X-Forwarded-* is trusted from these.
+    trusted_proxies:
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+      - fc00::/7
+    # server.secret comes from the BACKYARD_SECRET environment variable (secret.*).
+  auth:
+    # none | oidc | iap | alb | header. See values-production.yaml for oidc.
+    mode: none
+  storage:
+    type: fs
+    fs:
+      # Must equal persistence.mountPath.
+      root: /var/lib/backyard
+  database:
+    # sqlite lives on the data volume (<storage.fs.root>/backyard.db by default).
+    type: sqlite
+  pubsub:
+    type: memory
+  telemetry:
+    log_format: json
+    metrics: true
+    metrics_listen: ":9090"
+
+# Container ports; they must match config.server.listen and
+# config.telemetry.metrics_listen.
+ports:
+  http: 8080
+  metrics: 9090
+
+# Arguments for the backyard entrypoint.
+args:
+  - serve
+  - --config
+  - /etc/backyard/backyard.yaml
+
+# -----------------------------------------------------------------------------
+# Secrets. Every key becomes an environment variable of the server.
+
+# Name of an existing Secret to use instead of the chart-managed one (keys
+# become environment variables; it must contain BACKYARD_SECRET, >= 32 chars).
+# Recommended with GitOps tools that render the chart without cluster access.
+existingSecret: ""
+
+secret:
+  # Create a Secret from the values below (ignored when existingSecret is set).
+  create: true
+  # Signs sessions, API tokens, deploy ids and upload URLs (>= 32 characters).
+  # Empty: a random value is generated on install and kept on upgrades.
+  # Rotating it signs everyone out and revokes every API token.
+  backyardSecret: ""
+  # Additional secret environment variables, e.g.
+  #   DATABASE_URL: postgres://backyard:...@postgres:5432/backyard?sslmode=require
+  #   OIDC_CLIENT_SECRET: ...
+  #   ANTHROPIC_API_KEY: sk-ant-...
+  env: {}
+  annotations: {}
+
+# Plain environment variables ([{name, value}] or valueFrom entries).
+extraEnv: []
+# envFrom entries (e.g. extra Secrets or ConfigMaps).
+extraEnvFrom: []
+
+# -----------------------------------------------------------------------------
+# Storage for fs storage and SQLite.
+
+persistence:
+  enabled: true
+  # Use an existing PVC instead of creating one.
+  existingClaim: ""
+  storageClass: ""
+  # ReadWriteMany (e.g. EFS, Filestore, Azure Files) allows several replicas
+  # with fs storage.
+  accessModes:
+    - ReadWriteOnce
+  size: 10Gi
+  annotations: {}
+  # Keep the PVC when the release is uninstalled (helm.sh/resource-policy: keep).
+  retain: true
+  # Where the data volume is mounted (= config.storage.fs.root).
+  mountPath: /var/lib/backyard
+
+# -----------------------------------------------------------------------------
+# Networking
+
+service:
+  type: ClusterIP
+  port: 80
+  annotations: {}
+  # Only for type LoadBalancer.
+  loadBalancerSourceRanges: []
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # ingress-nginx: websockets and streaming AI responses need long timeouts
+    # and no buffering; deploy uploads need a large body size.
+    # nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    # nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    # cert-manager (wildcards need a DNS-01 issuer):
+    # cert-manager.io/cluster-issuer: letsencrypt-dns
+  # Hostnames. Empty = config.server.base_domain and, in host mode,
+  # *.<base_domain>.
+  hosts: []
+  # TLS, e.g. one wildcard certificate:
+  #   - secretName: backyard-tls
+  #     hosts: [backyard.example.com, "*.backyard.example.com"]
+  tls: []
+
+# -----------------------------------------------------------------------------
+# Pod settings
+
+podAnnotations: {}
+# e.g. azure.workload.identity/use: "true" for Azure Workload Identity.
+podLabels: {}
+
+serviceAccount:
+  create: true
+  # Defaults to the release fullname.
+  name: ""
+  # Cloud identity for storage / databases / AI without static keys:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/backyard     (IRSA)
+  #   iam.gke.io/gcp-service-account: backyard@project.iam.gserviceaccount.com (GKE Workload Identity)
+  #   azure.workload.identity/client-id: 00000000-0000-0000-0000-000000000000 (Azure Workload Identity)
+  annotations: {}
+  # The server does not call the Kubernetes API. Cloud workload identities
+  # inject their own tokens independently of this setting.
+  automountServiceAccountToken: false
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 1Gi
+
+startupProbe:
+  httpGet:
+    path: /__backyard/healthz
+    port: http
+  periodSeconds: 2
+  failureThreshold: 60
+livenessProbe:
+  httpGet:
+    path: /__backyard/healthz
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 6
+readinessProbe:
+  httpGet:
+    path: /__backyard/readyz
+    port: http
+  periodSeconds: 5
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+# Longer than config.server.shutdown_timeout (default 20s).
+terminationGracePeriodSeconds: 30
+
+# /tmp (writable scratch space; the root filesystem is read-only). Multipart
+# uploads may spool here. medium: Memory counts against the memory limit.
+tmp:
+  medium: ""
+  sizeLimit: 2Gi
+
+# Set GOMEMLIMIT to the container's memory limit (helps the Go GC stay within
+# resources.limits.memory).
+goMemLimitFromResources: true
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+extraVolumes: []
+extraVolumeMounts: []
+initContainers: []
+extraContainers: []
+
+# -----------------------------------------------------------------------------
+# Scaling and availability
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: ""
+
+podDisruptionBudget:
+  enabled: false
+  # Set one of the two.
+  minAvailable: 1
+  maxUnavailable: ""
+
+# -----------------------------------------------------------------------------
+# Monitoring (Prometheus Operator). Needs config.telemetry.metrics: true and
+# metrics_listen on ports.metrics.
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+  relabelings: []
+  metricRelabelings: []

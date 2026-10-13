@@ -14,7 +14,12 @@ var ErrClosed = errors.New("pubsub: closed")
 
 // Handler receives a published payload. It is called sequentially per
 // subscription (never concurrently for the same subscription) and must not
-// block for long.
+// block for long. The payload may be shared with other subscriptions of the
+// same message and must be treated as read-only.
+//
+// Each subscription has a bounded queue: a handler that falls far behind does
+// not slow down publishers, but messages that overflow its queue are dropped
+// (and logged).
 type Handler func(payload []byte)
 
 // Broker publishes payloads to topics and delivers them to subscribers on all

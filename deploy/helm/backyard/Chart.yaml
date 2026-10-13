@@ -1,0 +1,29 @@
+apiVersion: v2
+name: backyard
+description: >-
+  Backyard - drop a folder of HTML, get an internal URL. Every site gets a
+  zero-config database with realtime, file uploads, AI, a data warehouse API,
+  websockets and identity.
+type: application
+# Chart version (SemVer); bump on every chart change.
+version: 0.1.0
+# Default image tag (image.tag overrides it).
+appVersion: "0.1.0"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/thasami/backyard
+sources:
+  - https://github.com/thasami/backyard
+keywords:
+  - backyard
+  - static-sites
+  - internal-tools
+  - realtime
+  - ai
+maintainers:
+  - name: Backyard maintainers
+    url: https://github.com/thasami/backyard
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://github.com/thasami/backyard/tree/main/deploy/helm/backyard

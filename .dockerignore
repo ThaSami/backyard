@@ -1,0 +1,41 @@
+# The image is built from the Go module only (cmd/, internal/, web/, skills/,
+# templates/, go.mod, go.sum). Keep everything else out of the build context.
+
+# VCS and CI
+.git
+.github
+
+# Build output, local data and caches
+bin/
+dist/
+/backyard
+/backyard-lambda
+.backyard-data/
+.backyard/
+*.db
+*.db-shm
+*.db-wal
+*.test
+*.out
+coverage.*
+
+# Infrastructure, examples, agent plugin files and JavaScript-only trees (not
+# part of the Go build)
+deploy/
+conformance/
+e2e/
+examples/
+commands/
+.claude-plugin/
+**/node_modules/
+**/.terraform/
+
+# Editors / OS
+**/.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# The Dockerfile itself
+Dockerfile
+.dockerignore

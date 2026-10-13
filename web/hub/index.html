@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="description" content="Internal sites: drop a folder of HTML, get a URL with a database, files, AI and realtime built in." />
+    <title>Backyard</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/hub.css" />
+    <script src="/hub.js" defer></script>
+  </head>
+  <body id="hub">
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/">
+          <img src="/favicon.svg" alt="" width="28" height="28" />
+          <span class="brand-name" data-server-name>Backyard</span>
+        </a>
+        <nav class="nav" aria-label="Main">
+          <a href="/" aria-current="page">Sites</a>
+          <a href="/docs">Docs</a>
+          <a href="/llms.txt" class="nav-optional">llms.txt</a>
+        </nav>
+        <div class="user" id="user" hidden>
+          <span class="avatar" id="user-avatar" aria-hidden="true"></span>
+          <span class="user-name" id="user-name"></span>
+          <span class="badge" id="user-admin" hidden>admin</span>
+          <a class="btn small ghost" id="logout" href="/__backyard/auth/logout" hidden>Sign out</a>
+        </div>
+      </div>
+    </header>
+
+    <main class="page" id="main" tabindex="-1">
+      <p class="banner" id="banner" role="status" hidden></p>
+
+      <div class="hero">
+        <section class="card deploy" aria-labelledby="deploy-title">
+          <h2 id="deploy-title">New site</h2>
+          <p class="muted">
+            Drop a folder with an <code>index.html</code> and get a URL in seconds. Every site can use the database,
+            file uploads, AI and realtime through <code>/__backyard/backyard.js</code>. Deploying to an existing name
+            replaces its files.
+          </p>
+
+          <form id="deploy-form" novalidate>
+            <label for="site-name">Site name</label>
+            <input
+              type="text"
+              id="site-name"
+              name="site"
+              placeholder="lunch-vote"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              maxlength="63"
+              aria-describedby="site-url site-hint"
+              required
+            />
+            <p class="url-preview" id="site-url" aria-live="polite"></p>
+            <p class="hint" id="site-hint" aria-live="polite">Lowercase letters, digits and dashes.</p>
+
+            <div class="dropzone" id="dropzone">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+                <path d="M12 10v6M9 13l3-3 3 3" />
+              </svg>
+              <strong>Drop a folder here</strong>
+              <span class="or">or</span>
+              <div class="dropzone-actions">
+                <button type="button" class="btn" id="pick-folder">Choose folder…</button>
+                <button type="button" class="btn ghost" id="pick-files">Choose files…</button>
+              </div>
+              <input type="file" id="folder-input" webkitdirectory directory multiple hidden />
+              <input type="file" id="files-input" multiple hidden />
+            </div>
+
+            <div class="selection" id="selection" hidden>
+              <div class="selection-row">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+                </svg>
+                <span class="grow" id="selection-summary"></span>
+                <button type="button" class="btn small ghost" id="clear-selection">Clear</button>
+              </div>
+              <details id="selection-files">
+                <summary>Files to deploy</summary>
+                <ul class="file-list" id="file-list"></ul>
+              </details>
+              <details id="selection-ignored" hidden>
+                <summary id="ignored-summary">Ignored</summary>
+                <ul class="file-list" id="ignored-list"></ul>
+              </details>
+            </div>
+
+            <details class="token-box" id="token-box" hidden>
+              <summary>Deploy token</summary>
+              <p class="hint" id="token-hint">
+                This server needs a deploy token for publishing (ask the admin, e.g. the output of the setup script).
+              </p>
+              <p class="hint">The token never leaves this browser except to authorize deploys and deletes.</p>
+              <label for="deploy-token">Token</label>
+              <div class="token-row">
+                <input type="password" id="deploy-token" autocomplete="off" spellcheck="false" placeholder="paste the deploy token" />
+                <button type="button" class="btn" id="forget-token">Forget</button>
+              </div>
+              <label class="check"><input type="checkbox" id="remember-token" /> Remember in this browser</label>
+              <p class="hint" id="remember-hint" hidden>
+                Sites on this server share the hub's origin (path mode), so scripts of any site you open could read a
+                remembered token. Only remember it on a server whose sites you trust.
+              </p>
+            </details>
+
+            <div class="deploy-actions">
+              <button type="submit" class="btn primary" id="deploy-btn" disabled>
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7" /></svg>
+                Deploy
+              </button>
+              <span class="muted small" id="deploy-note"></span>
+            </div>
+
+            <div class="progress" id="progress" hidden>
+              <div class="progress-track" role="progressbar" aria-labelledby="progress-text" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-bar">
+                <div class="progress-fill" id="progress-fill"></div>
+              </div>
+              <p class="progress-text" id="progress-text" aria-live="polite"></p>
+            </div>
+
+            <div class="result" id="result" hidden tabindex="-1">
+              <p class="result-title">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
+                <span id="result-title">Deployed!</span>
+              </p>
+              <a class="result-link" id="result-link" href="#" target="_blank" rel="noopener"></a>
+              <div class="result-actions">
+                <a class="btn primary small" id="result-open" href="#" target="_blank" rel="noopener">Open site</a>
+                <button type="button" class="btn small" id="result-copy">Copy link</button>
+              </div>
+            </div>
+
+            <div class="alert" id="deploy-error" role="alert" hidden></div>
+          </form>
+        </section>
+
+        <div class="side">
+          <section class="card" aria-labelledby="cli-title">
+            <h2 id="cli-title">Use the CLI</h2>
+            <p class="muted">Deploy from your terminal or CI with diffed uploads.</p>
+            <ol class="steps">
+              <li>
+                <span class="step-title">Install</span>
+                <div class="cmd"><pre><code id="cmd-install">curl -fsSL https://raw.githubusercontent.com/thasami/backyard/main/scripts/install.sh | sh</code></pre></div>
+                <p class="hint">Or with Go: <code id="cmd-install-go">go install github.com/thasami/backyard/cmd/backyard@latest</code></p>
+              </li>
+              <li>
+                <span class="step-title">Sign in</span>
+                <div class="cmd"><pre><code id="cmd-login">backyard login</code></pre></div>
+                <p class="hint" id="login-note"></p>
+              </li>
+              <li>
+                <span class="step-title">Create &amp; deploy a site</span>
+                <div class="cmd"><pre><code id="cmd-deploy">backyard init my-site &amp;&amp; cd my-site &amp;&amp; backyard deploy</code></pre></div>
+              </li>
+            </ol>
+            <p class="muted small">
+              Prebuilt binaries:
+              <a href="https://github.com/thasami/backyard/releases" rel="noopener">GitHub releases</a>.
+            </p>
+          </section>
+
+          <section class="card" aria-labelledby="agents-title">
+            <h2 id="agents-title">For agents</h2>
+            <p class="muted">
+              Coding agents can build and ship sites end to end. Point them at the docs, or install the Claude skill and
+              MCP server.
+            </p>
+            <div class="links">
+              <a class="btn small" href="/llms.txt">/llms.txt</a>
+              <a class="btn small" href="/llms-full.txt">/llms-full.txt</a>
+              <a class="btn small" href="/__backyard/backyard.d.ts">SDK typings</a>
+              <a class="btn small" href="/docs">API docs</a>
+            </div>
+            <span class="label">Install the Claude skill</span>
+            <div class="cmd"><pre><code id="cmd-skill">backyard skill install --global</code></pre></div>
+            <span class="label">Add the MCP server (Claude Code)</span>
+            <div class="cmd"><pre><code id="cmd-mcp">claude mcp add backyard -- backyard mcp</code></pre></div>
+          </section>
+        </div>
+      </div>
+
+      <section class="sites" aria-labelledby="sites-title">
+        <div class="sites-head">
+          <h2 id="sites-title">Sites <span class="count" id="site-count"></span></h2>
+          <div class="search">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
+            <label class="visually-hidden" for="search">Search sites</label>
+            <input type="search" id="search" placeholder="Search sites" autocomplete="off" spellcheck="false" />
+            <kbd aria-hidden="true">/</kbd>
+          </div>
+          <div class="view-toggle" role="group" aria-label="Layout">
+            <button type="button" class="icon-btn" id="view-grid" aria-pressed="true" title="Grid">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1" /><rect x="13" y="4" width="7" height="7" rx="1" /><rect x="4" y="13" width="7" height="7" rx="1" /><rect x="13" y="13" width="7" height="7" rx="1" /></svg>
+              <span class="visually-hidden">Grid</span>
+            </button>
+            <button type="button" class="icon-btn" id="view-list" aria-pressed="false" title="List">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01" /></svg>
+              <span class="visually-hidden">List</span>
+            </button>
+          </div>
+        </div>
+        <p class="visually-hidden" id="search-status" aria-live="polite"></p>
+        <ul class="site-list skeleton" id="site-list" aria-busy="true">
+          <li class="site"></li>
+          <li class="site"></li>
+          <li class="site"></li>
+        </ul>
+        <div class="empty" id="sites-empty" hidden></div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span id="footer-version">Backyard</span>
+      <a href="/docs">Docs</a>
+      <a href="/llms.txt">llms.txt</a>
+      <a href="https://github.com/thasami/backyard" rel="noopener">Source</a>
+    </footer>
+
+    <dialog id="delete-dialog" aria-labelledby="delete-title">
+      <form method="dialog" id="delete-form">
+        <h2 id="delete-title">Delete site</h2>
+        <p>
+          This permanently deletes <strong id="delete-name"></strong> and all of its files. Type the site name to
+          confirm.
+        </p>
+        <label for="delete-confirm" class="visually-hidden">Site name</label>
+        <input type="text" id="delete-confirm" autocomplete="off" spellcheck="false" />
+        <p class="hint error" id="delete-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn" id="delete-cancel">Cancel</button>
+          <button type="submit" class="btn danger solid" id="delete-submit" value="delete" disabled>Delete</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" hidden></div>
+  </body>
+</html>

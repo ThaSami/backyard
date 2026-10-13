@@ -1,0 +1,20 @@
+# Files `backyard deploy` must not upload (gitignore syntax: # comments,
+# ! negation, trailing / for folders, ** for any depth, leading / anchors).
+#
+# Never uploaded anyway: .git/, node_modules/, .claude/, .cursor/, .github/,
+# CLAUDE.md, AGENTS.md, .backyard.json, .backyardignore, .DS_Store and every
+# dotfile or dotfolder (.env, .backyard-data/…) except .well-known/.
+
+# Keys and certificates must never be published.
+*.pem
+*.key
+
+# Logs and editor leftovers.
+*.log
+*.swp
+Thumbs.db
+
+# Examples:
+# drafts/
+# *.psd
+# /README.md

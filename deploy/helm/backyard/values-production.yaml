@@ -1,0 +1,136 @@
+# Example production values: several replicas behind ingress-nginx with a
+# cert-manager wildcard certificate, SSO through Okta (any OIDC IdP), sites in
+# S3 via IRSA, documents in PostgreSQL, realtime over Redis, Claude on Bedrock.
+#
+#   kubectl create secret generic backyard-secrets -n backyard \
+#     --from-literal=BACKYARD_SECRET="$(openssl rand -hex 32)" \
+#     --from-literal=DATABASE_URL='postgres://backyard:...@backyard-db.xxxx.rds.amazonaws.com:5432/backyard?sslmode=require' \
+#     --from-literal=REDIS_URL='rediss://:...@backyard-cache.xxxx.cache.amazonaws.com:6379/0' \
+#     --from-literal=OIDC_CLIENT_SECRET='...'
+#   helm upgrade --install backyard deploy/helm/backyard -n backyard -f values-production.yaml
+#
+# On GKE use storage.type gcs + iam.gke.io/gcp-service-account, on AKS azure +
+# azure.workload.identity/client-id (and podLabels azure.workload.identity/use).
+
+image:
+  # Pin the version you run (or image.digest).
+  tag: "0.1.0"
+
+replicaCount: 3
+
+existingSecret: backyard-secrets
+
+config:
+  server:
+    base_domain: backyard.acme.com
+    public_url: https://backyard.acme.com
+    name: Acme Backyard
+    trusted_proxies:
+      - 10.0.0.0/8
+  auth:
+    mode: oidc
+    oidc:
+      issuer: https://acme.okta.com/oauth2/default
+      client_id: 0oa1b2c3d4e5f6g7h8i9
+      client_secret: "${OIDC_CLIENT_SECRET}"
+      # CLI logins without a browser redirect (Okta "native" app).
+      device_client_id: 0oa9i8h7g6f5e4d3c2b1
+    allowed_domains:
+      - acme.com
+    admin_groups:
+      - backyard-admins
+  identity:
+    claims:
+      team: department
+  storage:
+    type: s3
+    s3:
+      bucket: acme-backyard-sites
+      region: us-east-1
+  database:
+    type: postgres
+    postgres:
+      dsn: "${DATABASE_URL}"
+      max_conns: 20
+  pubsub:
+    type: redis
+    redis:
+      url: "${REDIS_URL}"
+  ai:
+    providers:
+      bedrock:
+        type: anthropic
+        platform: bedrock
+        region: us-east-1
+    models:
+      smart:
+        provider: bedrock
+        model: anthropic.claude-opus-5-5
+        description: Most capable
+      fast:
+        provider: bedrock
+        model: anthropic.claude-haiku-5-5
+        description: Quick and cheap
+    default_model: smart
+  sites:
+    ownership: owner
+  telemetry:
+    log_format: json
+    metrics: true
+    metrics_listen: ":9090"
+    access_log: true
+
+serviceAccount:
+  annotations:
+    # IAM role with access to the bucket and Bedrock (IRSA / EKS Pod Identity).
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/backyard
+
+# Sites live in S3 and documents in PostgreSQL: no volume needed.
+persistence:
+  enabled: false
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-dns
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+  tls:
+    - secretName: backyard-tls
+      hosts:
+        - backyard.acme.com
+        - "*.backyard.acme.com"
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 12
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: backyard
+        app.kubernetes.io/instance: "{{ .Release.Name }}"
+
+serviceMonitor:
+  enabled: true
+  labels:
+    release: kube-prometheus-stack
