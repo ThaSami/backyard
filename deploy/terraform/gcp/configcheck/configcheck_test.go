@@ -1,25 +1,20 @@
 package configcheck
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"errors"
-	"io"
-	"os"
-	"os/exec"
 	"path/filepath"
-	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/thasami/backyard/internal/config"
+	"github.com/thasami/backyard/scripts/tfrender"
 )
 
 const (
 	// Values of the Secret Manager-backed environment variables Cloud Run
-	// sets next to BACKYARD_CONFIG_YAML.
+	// sets next to BACKYARD_CONFIG_YAML (for the scenarios with detailed
+	// expectations).
 	testSecret     = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	testDSN        = "host=/cloudsql/acme-backyard:us-central1:backyard-pg-abc123 dbname=backyard user=backyard password=pw sslmode=disable application_name=backyard"
 	testOIDCSecret = "oidc-secret-from-env"
@@ -29,30 +24,18 @@ const (
 
 	// cloudRunBodyLimit mirrors local.cloud_run_body_limit in main.tf.
 	cloudRunBodyLimit = 31 << 20
-
-	testsDir = "configcheck"
 )
 
 // TestRenderedConfigLoads renders the scenarios of testdata/render.tftest.hcl
-// and checks that Backyard accepts each configuration as-is.
+// next to the module's own tests/module.tftest.hcl and checks that Backyard
+// accepts each configuration as-is: the scenarios with detailed expectations,
+// every module test run with the environment its Cloud Run container gets.
 func TestRenderedConfigLoads(t *testing.T) {
-	tf := terraformBinary(t)
-	moduleDir, err := filepath.Abs("..")
-	if err != nil {
-		t.Fatal(err)
-	}
-	work := copyModule(t, moduleDir)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
-	defer cancel()
-
-	env := terraformEnv(moduleDir)
-	if out, err := run(ctx, work, env, tf, "init", "-backend=false", "-input=false", "-no-color"); err != nil {
-		// Almost always the provider registry being unreachable.
-		t.Skipf("terraform init failed (providers unavailable?): %v\n%s", err, tail(out, 2000))
-	}
-
-	yamls := renderScenarios(ctx, t, work, env, tf)
+	tf := tfrender.Terraform(t)
+	runs := tfrender.Render(t, tf, tfrender.Options{
+		Module: "..",
+		Extra:  map[string]string{"tests/" + scenariosFile: filepath.Join("testdata", "render.tftest.hcl")},
+	})
 
 	checks := map[string]func(t *testing.T, c *config.Config){
 		"iap_vertex":      checkIAPVertex,
@@ -60,15 +43,25 @@ func TestRenderedConfigLoads(t *testing.T) {
 		"none_path":       checkNonePath,
 		"warehouse_extra": checkWarehouseExtra,
 	}
-	for name := range checks {
-		if _, ok := yamls[name]; !ok {
-			t.Errorf("run %q produced no backyard_config_yaml output", name)
-		}
+	names := make([]string, 0, len(runs))
+	for name := range runs {
+		names = append(names, name)
 	}
-	for name, raw := range yamls {
+	sort.Strings(names)
+	for _, name := range names {
+		run := runs[name]
+		if filepath.Base(run.File) != scenariosFile {
+			t.Run("module/"+name, func(t *testing.T) { checkCloudRun(t, run) })
+			continue
+		}
 		check, ok := checks[name]
 		if !ok {
-			t.Errorf("no expectations for run %q", name)
+			t.Errorf("no expectations for scenario %q", name)
+			continue
+		}
+		raw, ok := run.Output("backyard_config_yaml")
+		if !ok {
+			t.Errorf("scenario %q produced no backyard_config_yaml output", name)
 			continue
 		}
 		t.Run(name, func(t *testing.T) {
@@ -77,31 +70,68 @@ func TestRenderedConfigLoads(t *testing.T) {
 			check(t, cfg)
 		})
 	}
+	for name := range checks {
+		if run := runs[name]; run == nil || filepath.Base(run.File) != scenariosFile {
+			t.Errorf("scenario %q did not run", name)
+		}
+	}
+}
+
+// scenariosFile is the name testdata/render.tftest.hcl gets in the copy.
+const scenariosFile = "configcheck.tftest.hcl"
+
+// checkCloudRun loads BACKYARD_CONFIG_YAML of the Cloud Run container with
+// its plain and Secret Manager-backed environment variables.
+func checkCloudRun(t *testing.T, run *tfrender.Run) {
+	svc := run.Resource("google_cloud_run_v2_service.backyard")
+	if svc == nil {
+		t.Fatal("no google_cloud_run_v2_service.backyard in the state")
+	}
+	vars, _ := tfrender.Get(svc, "template", 0, "containers", 0, "env").([]any)
+	env := map[string]string{"PORT": "8080"} // set by Cloud Run
+	for _, v := range vars {
+		name, _ := tfrender.Get(v, "name").(string)
+		value, _ := tfrender.Get(v, "value").(string)
+		if tfrender.Get(v, "value_source", 0, "secret_key_ref", 0) != nil {
+			value = tfrender.Placeholder(name)
+		}
+		env[name] = value
+	}
+	raw := env["BACKYARD_CONFIG_YAML"]
+	delete(env, "BACKYARD_CONFIG_YAML")
+	if raw == "" {
+		t.Fatal("the container has no BACKYARD_CONFIG_YAML")
+	}
+	if out, _ := run.Output("backyard_config_yaml"); out != raw {
+		t.Error("output backyard_config_yaml differs from the container's BACKYARD_CONFIG_YAML")
+	}
+	if missing := tfrender.Missing(raw, env); len(missing) > 0 {
+		t.Errorf("backyard.yaml references %v, which the container does not set", missing)
+	}
+	cfg, err := tfrender.Load(t, raw, env)
+	if err != nil {
+		t.Fatalf("config.Load rejected the Cloud Run config: %v\n--- backyard.yaml ---\n%s", err, raw)
+	}
+	if cfg.Server.Secret != tfrender.PlaceholderSecret {
+		t.Error("server.secret does not come from the BACKYARD_SECRET secret")
+	}
+	if bucket, _ := run.Output("bucket"); cfg.Storage.Type != "gcs" || cfg.Storage.GCS.Bucket != bucket {
+		t.Errorf("storage = %s/%s, want gcs/%s", cfg.Storage.Type, cfg.Storage.GCS.Bucket, bucket)
+	}
 }
 
 // load reads raw with config.Load in a Cloud Run-like environment.
 func load(t *testing.T, raw string) *config.Config {
 	t.Helper()
-	for k, v := range map[string]string{
-		"BACKYARD_CONFIG_YAML": "", // Load(path) reads the file, but keep the env clean
-		"BACKYARD_CONFIG":      "",
-		"BACKYARD_BASE_DOMAIN": "",
-		"BACKYARD_PUBLIC_URL":  "",
-		"BACKYARD_SECRET":      testSecret,
-		"DATABASE_URL":         testDSN,
-		"OIDC_CLIENT_SECRET":   testOIDCSecret,
-		"ANTHROPIC_API_KEY":    testAnthropic,
-		"OPENAI_API_KEY":       testOpenAI,
-		"DIRECTORY_PATH":       testDirectory,
-		"PORT":                 "8080",
-	} {
-		t.Setenv(k, v)
-	}
-	path := filepath.Join(t.TempDir(), "backyard.yaml")
-	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := config.Load(path, false)
+	cfg, err := tfrender.Load(t, raw, map[string]string{
+		"BACKYARD_SECRET":    testSecret,
+		"DATABASE_URL":       testDSN,
+		"OIDC_CLIENT_SECRET": testOIDCSecret,
+		"ANTHROPIC_API_KEY":  testAnthropic,
+		"OPENAI_API_KEY":     testOpenAI,
+		"DIRECTORY_PATH":     testDirectory,
+		"PORT":               "8080",
+	})
 	if err != nil {
 		t.Fatalf("config.Load rejected the rendered config: %v\n--- backyard.yaml ---\n%s", err, raw)
 	}
@@ -236,164 +266,6 @@ func checkWarehouseExtra(t *testing.T, c *config.Config) {
 	eq(t, "sites.ownership", c.Sites.Ownership, "owner")
 	eq(t, "sites.max_file_bytes", c.Sites.MaxFileBytes, int64(10<<20))
 	eq(t, "ratelimit.ai_per_minute", c.RateLimit.AIPerMinute, 5)
-}
-
-// renderScenarios runs the scenarios and returns each run's rendered YAML.
-func renderScenarios(ctx context.Context, t *testing.T, work string, env []string, tf string) map[string]string {
-	t.Helper()
-	cmd := exec.CommandContext(ctx, tf, "test", "-test-directory="+testsDir, "-json", "-verbose", "-no-color")
-	cmd.Dir = work
-	cmd.Env = env
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("terraform test: %v", err)
-	}
-
-	// Each line is one JSON message; verbose state messages embed the
-	// provider schemas and can be tens of megabytes, so decode as a stream.
-	type message struct {
-		Type    string `json:"type"`
-		Message string `json:"@message"`
-		Run     string `json:"@testrun"`
-		TestRun *struct {
-			Status string `json:"status"`
-		} `json:"test_run"`
-		TestState *struct {
-			Outputs map[string]struct {
-				Value json.RawMessage `json:"value"`
-			} `json:"outputs"`
-		} `json:"test_state"`
-		Diagnostic *struct {
-			Severity string `json:"severity"`
-			Summary  string `json:"summary"`
-			Detail   string `json:"detail"`
-		} `json:"diagnostic"`
-	}
-	yamls := map[string]string{}
-	dec := json.NewDecoder(stdout)
-	for {
-		var m message
-		if err := dec.Decode(&m); err != nil {
-			if !errors.Is(err, io.EOF) {
-				t.Errorf("decode terraform test output: %v", err)
-			}
-			break
-		}
-		switch {
-		case m.Diagnostic != nil && m.Diagnostic.Severity == "error":
-			t.Errorf("terraform test %s: %s: %s", m.Run, m.Diagnostic.Summary, m.Diagnostic.Detail)
-		case m.TestRun != nil && (m.TestRun.Status == "fail" || m.TestRun.Status == "error"):
-			t.Errorf("terraform test run %q: %s", m.Run, m.TestRun.Status)
-		case m.TestState != nil:
-			out, ok := m.TestState.Outputs["backyard_config_yaml"]
-			if !ok {
-				continue
-			}
-			var s string
-			if err := json.Unmarshal(out.Value, &s); err != nil {
-				t.Errorf("run %q: backyard_config_yaml is not a string: %v", m.Run, err)
-				continue
-			}
-			yamls[m.Run] = s
-		}
-	}
-	_, _ = io.Copy(io.Discard, stdout)
-	if err := cmd.Wait(); err != nil {
-		t.Fatalf("terraform test: %v\n%s", err, tail(stderr.String(), 4000))
-	}
-	return yamls
-}
-
-// terraformBinary returns the terraform to use or skips the test.
-func terraformBinary(t *testing.T) string {
-	t.Helper()
-	v := strings.TrimSpace(os.Getenv("BACKYARD_TEST_TERRAFORM"))
-	switch strings.ToLower(v) {
-	case "", "0", "false", "no":
-		t.Skip("set BACKYARD_TEST_TERRAFORM=1 (or the path of a terraform binary) to render the GCP module's config")
-	case "1", "true", "yes":
-		v = "terraform"
-	}
-	p, err := exec.LookPath(v)
-	if err != nil {
-		t.Skipf("terraform not found: %v", err)
-	}
-	return p
-}
-
-// terraformEnv is the environment for terraform commands: non-interactive,
-// and reusing the module's own provider installation as a plugin cache when
-// no cache is configured (its layout matches TF_PLUGIN_CACHE_DIR's).
-func terraformEnv(moduleDir string) []string {
-	env := append(os.Environ(), "TF_IN_AUTOMATION=1", "TF_INPUT=0", "CHECKPOINT_DISABLE=1")
-	if os.Getenv("TF_PLUGIN_CACHE_DIR") == "" {
-		cache := filepath.Join(moduleDir, ".terraform", "providers")
-		if fi, err := os.Stat(cache); err == nil && fi.IsDir() {
-			env = append(env, "TF_PLUGIN_CACHE_DIR="+cache)
-		}
-	}
-	return env
-}
-
-// copyModule copies the module's configuration (not its .terraform state)
-// and the scenarios into a temporary directory.
-func copyModule(t *testing.T, moduleDir string) string {
-	t.Helper()
-	work := t.TempDir()
-	var files []string
-	for _, pattern := range []string{"*.tf", ".terraform.lock.hcl", "templates/*"} {
-		m, err := filepath.Glob(filepath.Join(moduleDir, pattern))
-		if err != nil {
-			t.Fatal(err)
-		}
-		files = append(files, m...)
-	}
-	if !slices.ContainsFunc(files, func(f string) bool { return filepath.Base(f) == "main.tf" }) {
-		t.Fatalf("no Terraform module in %s", moduleDir)
-	}
-	for _, src := range files {
-		rel, err := filepath.Rel(moduleDir, src)
-		if err != nil {
-			t.Fatal(err)
-		}
-		copyFile(t, src, filepath.Join(work, rel))
-	}
-	copyFile(t, filepath.Join("testdata", "render.tftest.hcl"), filepath.Join(work, testsDir, "render.tftest.hcl"))
-	return work
-}
-
-func copyFile(t *testing.T, src, dst string) {
-	t.Helper()
-	b, err := os.ReadFile(src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dst, b, 0o644); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func run(ctx context.Context, dir string, env []string, name string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Dir = dir
-	cmd.Env = env
-	out, err := cmd.CombinedOutput()
-	return string(out), err
-}
-
-func tail(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return "…" + s[len(s)-n:]
 }
 
 func eq[T comparable](t *testing.T, what string, got, want T) {

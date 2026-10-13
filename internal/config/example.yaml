@@ -88,7 +88,7 @@ database:
   #   region: us-east-1
   #   create_table: true
   # max_doc_bytes: 262144
-  # max_docs_per_site: 100000
+  # max_docs_per_site: 100000       # 0 = default; negative = unlimited
 
 pubsub:
   # memory (single instance) | postgres (LISTEN/NOTIFY) | redis
@@ -168,8 +168,9 @@ deploy:
   # gateway_url: https://abc123.lambda-url.us-east-1.on.aws
 
 ratelimit:
+  # Per user and instance. 0 (or unset) = the default; negative = unlimited.
   ai_per_minute: 20
-  ai_tokens_per_day: 2000000
+  ai_tokens_per_day: 2000000        # input + output tokens per UTC day
 
 telemetry:
   log_level: info

@@ -41,6 +41,7 @@ type oidcLogin struct {
 	endSession   string
 	stateKey     []byte
 	callbackPath string
+	stateCookie  string
 	statePath    string
 	useUserInfo  bool
 	sessionTTL   time.Duration
@@ -89,6 +90,7 @@ func (a *authenticator) newOIDCLogin(p *idpProvider) (*oidcLogin, error) {
 		},
 		stateKey:     keys.Derive(a.cfg.Server.Secret, keys.OAuthState),
 		callbackPath: ru.Path,
+		stateCookie:  OAuthCookie,
 		statePath:    "/",
 		useUserInfo:  o.UseUserInfo,
 		sessionTTL:   ttl,
@@ -98,8 +100,21 @@ func (a *authenticator) newOIDCLogin(p *idpProvider) (*oidcLogin, error) {
 			"issuer", p.issuer)
 		l.useUserInfo = false
 	}
-	if strings.HasPrefix(ru.Path, PathPrefix) {
+	switch {
+	case a.secure:
+		// In host mode every site's page can set cookies for the cookie
+		// domain, which the hub receives too. A "__Host-" cookie can only be
+		// set by the hub itself, so no site can plant its author's login
+		// state to sign visitors in as the author (login CSRF). The prefix
+		// requires Secure, Path=/ and no Domain.
+		l.stateCookie = OAuthHostCookie
+	case strings.HasPrefix(ru.Path, PathPrefix):
 		l.statePath = PathPrefix
+	}
+	if !a.secure && a.cookieDomain != "" {
+		a.log.Warn("auth: server.public_url is not https, so the login state cookie cannot use the __Host- prefix and "+
+			"a page on one site could plant it to sign visitors in to another account; use https outside local tests",
+			"public_url", a.hub.String())
 	}
 	var meta struct {
 		EndSession string `json:"end_session_endpoint"`
@@ -128,7 +143,7 @@ func (l *oidcLogin) login(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusInternalServerError, "Sign-in failed", "Could not start the sign-in flow.", "", "")
 		return
 	}
-	http.SetCookie(w, a.newCookie(OAuthCookie, v, "", l.statePath, oauthStateTTL))
+	http.SetCookie(w, a.newCookie(l.stateCookie, v, "", l.statePath, oauthStateTTL))
 	target := l.oauth.AuthCodeURL(st.State, oauth2.S256ChallengeOption(st.Verifier), oidc.Nonce(st.Nonce))
 	noStore(w)
 	http.Redirect(w, r, target, http.StatusFound)
@@ -140,7 +155,7 @@ func (l *oidcLogin) callback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	st, stErr := l.readState(r)
 	// The state cookie is single-use.
-	http.SetCookie(w, a.newCookie(OAuthCookie, "", "", l.statePath, 0))
+	http.SetCookie(w, a.newCookie(l.stateCookie, "", "", l.statePath, 0))
 
 	retry := a.LoginURL(a.hubURL())
 	if st != nil {
@@ -291,11 +306,12 @@ func checkAuthorizedParty(aud []string, claims map[string]any, clientID string) 
 	return nil
 }
 
-// readState returns the verified login state from the backyard_oauth cookie.
+// readState returns the verified login state from the login state cookie
+// (__Host-backyard_oauth over https, backyard_oauth over http).
 func (l *oidcLogin) readState(r *http.Request) (*oauthState, error) {
 	lastErr := errors.New("no login state cookie")
 	for _, c := range r.Cookies() {
-		if c.Name != OAuthCookie {
+		if c.Name != l.stateCookie {
 			continue
 		}
 		st, err := decodeState(l.stateKey, c.Value, l.a.now())

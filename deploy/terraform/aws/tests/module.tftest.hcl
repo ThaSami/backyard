@@ -1,7 +1,11 @@
 # Offline tests for the AWS module: `terraform test` (Terraform >= 1.7).
 # Every provider is mocked, so no AWS credentials are needed and nothing is
 # created. The runs check resource selection (database, pub/sub, auth modes,
-# networking) and the rendered backyard.yaml against Backyard's config schema.
+# networking) and the rendered backyard.yaml. configcheck/ loads every
+# configuration these runs render (ECS service and Lambda gateway) with
+# Backyard's own config loader (BACKYARD_TEST_TERRAFORM=1 go test
+# ./deploy/terraform/aws/configcheck/), which catches keys the schema no
+# longer accepts.
 
 mock_provider "aws" {
   mock_data "aws_caller_identity" {
@@ -174,28 +178,6 @@ variables {
   lambda_zip_path = "versions.tf"
   # auth_mode defaults to none; keep the public_without_authentication check quiet.
   allowed_cidrs = ["198.51.100.0/24"]
-
-  # Keys Backyard's config schema (internal/config/config.go) accepts at the
-  # top level and in the sections the module generates; unknown keys are
-  # fatal there. (A test-only variable, not a module input.)
-  schema = {
-    top      = ["server", "auth", "identity", "storage", "database", "pubsub", "ai", "warehouse", "sites", "files", "deploy", "ratelimit", "realtime", "telemetry"]
-    server   = ["listen", "base_domain", "public_url", "url_mode", "secret", "trusted_proxies", "dev", "name", "read_timeout", "write_timeout", "idle_timeout", "shutdown_timeout"]
-    auth     = ["mode", "admins", "admin_groups", "allowed_domains", "allowed_groups", "token_ttl", "tokens", "oidc", "iap", "alb", "header"]
-    oidc     = ["issuer", "client_id", "client_secret", "scopes", "redirect_url", "session_ttl", "use_userinfo", "device_client_id", "device_scopes", "api_audiences", "insecure_skip_issuer_check"]
-    alb      = ["region", "signer_arn", "key_url"]
-    storage  = ["type", "fs", "s3", "gcs", "azure", "cache_bytes", "cache_ttl"]
-    s3       = ["bucket", "region", "prefix", "endpoint", "force_path_style", "access_key_id", "secret_access_key", "sse_kms_key_id"]
-    database = ["type", "sqlite", "postgres", "dynamodb", "max_doc_bytes", "max_list", "max_docs_per_site"]
-    dynamodb = ["table", "region", "endpoint", "create_table", "max_scan"]
-    postgres = ["dsn", "max_conns", "schema", "auto_migrate"]
-    pubsub   = ["type", "redis", "postgres"]
-    deploy   = ["methods", "rsync_target", "gateway_url", "allow_anonymous", "presign", "expose_storage", "embedded_gateway"]
-    ai       = ["enabled", "default_model", "default_image_model", "default_embedding_model", "providers", "models", "allow_raw_models", "expose_model_ids", "max_tokens", "request_timeout", "system_prompt"]
-    provider = ["type", "api_key", "base_url", "headers", "platform", "refusal_fallback", "effort", "organization", "openai_project", "endpoint", "api_version", "use_azure_ad", "region", "project_id", "location"]
-    model    = ["provider", "model", "kind", "description", "max_tokens", "effort"]
-    tele     = ["log_level", "log_format", "metrics", "metrics_listen", "access_log"]
-  }
 }
 
 # -----------------------------------------------------------------------------
@@ -234,16 +216,6 @@ run "defaults_dynamodb_with_redis" {
   }
 
   assert {
-    condition = alltrue([
-      for k, v in yamldecode(output.backyard_config_yaml) : contains(var.schema.top, k) && (
-        !contains(["server", "auth", "storage", "database", "pubsub", "deploy", "ai", "telemetry"], k) ||
-        alltrue([for kk in keys(v) : contains(lookup(var.schema, k == "telemetry" ? "tele" : k, []), kk)])
-      )
-    ])
-    error_message = "The rendered config has keys outside Backyard's schema."
-  }
-
-  assert {
     condition = (
       yamldecode(output.backyard_config_yaml).server.base_domain == "backyard.acme.com" &&
       yamldecode(output.backyard_config_yaml).server.public_url == "https://backyard.acme.com" &&
@@ -277,9 +249,7 @@ run "defaults_dynamodb_with_redis" {
       yamldecode(output.backyard_config_yaml).ai.providers.claude.region == "us-east-1" &&
       yamldecode(output.backyard_config_yaml).ai.models.smart.model == "anthropic.claude-opus-5-5" &&
       yamldecode(output.backyard_config_yaml).ai.models.embed.kind == "embedding" &&
-      yamldecode(output.backyard_config_yaml).ai.models.image.model == "amazon.nova-canvas-v1:0" &&
-      alltrue([for p in values(yamldecode(output.backyard_config_yaml).ai.providers) : alltrue([for k in keys(p) : contains(var.schema.provider, k)])]) &&
-      alltrue([for m in values(yamldecode(output.backyard_config_yaml).ai.models) : alltrue([for k in keys(m) : contains(var.schema.model, k)])])
+      yamldecode(output.backyard_config_yaml).ai.models.image.model == "amazon.nova-canvas-v1:0"
     )
     error_message = "Unexpected default Bedrock AI configuration."
   }
@@ -297,6 +267,36 @@ run "defaults_dynamodb_with_redis" {
   assert {
     condition     = [for s in jsondecode(aws_ecs_task_definition.this.container_definitions)[0].secrets : s.name] == ["BACKYARD_SECRET", "REDIS_URL"]
     error_message = "The container receives BACKYARD_SECRET and REDIS_URL as ECS secrets."
+  }
+
+  assert {
+    condition = (
+      sort(keys(aws_lambda_function.gateway[0].environment[0].variables)) == tolist(["BACKYARD_CONFIG_YAML", "BACKYARD_SECRET_ARN", "BACKYARD_SECRET_VERSION_ID"]) &&
+      aws_lambda_function.gateway[0].environment[0].variables.BACKYARD_SECRET_ARN == aws_secretsmanager_secret.backyard_secret.arn &&
+      aws_lambda_function.gateway[0].environment[0].variables.BACKYARD_SECRET_VERSION_ID == aws_secretsmanager_secret_version.backyard_secret.version_id &&
+      !strcontains(jsonencode(aws_lambda_function.gateway[0].environment[0].variables), nonsensitive(random_password.backyard_secret.result)) &&
+      !can(yamldecode(aws_lambda_function.gateway[0].environment[0].variables.BACKYARD_CONFIG_YAML).server.secret)
+    )
+    error_message = "The Lambda gateway gets the secret's ARN (BACKYARD_SECRET_ARN), never the secret itself (BACKYARD_SECRET or server.secret: cmd/backyard-lambda refuses both at once)."
+  }
+
+  assert {
+    condition = (
+      sort(flatten([for st in data.aws_iam_policy_document.gateway[0].statement : st.resources if st.sid == "ServerSecret"])) == tolist([aws_secretsmanager_secret.backyard_secret.arn]) &&
+      sort(flatten([for st in data.aws_iam_policy_document.gateway[0].statement : st.actions if st.sid == "ServerSecret"])) == tolist(["secretsmanager:GetSecretValue"]) &&
+      length([for st in data.aws_iam_policy_document.gateway[0].statement : st if st.sid == "ServerSecretKms"]) == 0
+    )
+    error_message = "The gateway role may read the server secret (and needs no KMS grant without kms_key_arn)."
+  }
+
+  assert {
+    # The headers a presigned S3 upload may carry (internal/blob/s3 PresignPut).
+    condition = alltrue([
+      for h in ["content-type", "content-md5", "x-amz-checksum-sha256", "x-amz-sdk-checksum-algorithm", "x-amz-server-side-encryption", "x-amz-server-side-encryption-aws-kms-key-id"] :
+      contains(one(aws_s3_bucket_cors_configuration.this.cors_rule).allowed_headers, "*") ||
+      contains([for a in one(aws_s3_bucket_cors_configuration.this.cors_rule).allowed_headers : lower(a)], h)
+    ]) && contains(one(aws_s3_bucket_cors_configuration.this.cors_rule).allowed_methods, "PUT")
+    error_message = "The bucket CORS rule must allow presigned PUTs with their signed headers."
   }
 
   assert {
@@ -453,8 +453,7 @@ run "oidc_mode" {
       yamldecode(output.backyard_config_yaml).auth.admin_groups == ["backyard-admins"] &&
       yamldecode(output.backyard_config_yaml).auth.allowed_domains == ["acme.com"] &&
       yamldecode(output.backyard_config_yaml).auth.tokens[0].name == "ci" &&
-      yamldecode(output.backyard_config_yaml).auth.tokens[0].admin == true &&
-      alltrue([for k in keys(yamldecode(output.backyard_config_yaml).auth.oidc) : contains(var.schema.oidc, k)])
+      yamldecode(output.backyard_config_yaml).auth.tokens[0].admin == true
     )
     error_message = "Unexpected oidc auth section."
   }
@@ -497,6 +496,17 @@ run "alb_mode" {
   assert {
     condition     = aws_lb_listener_rule.deploy[0].action[0].authenticate_oidc[0].on_unauthenticated_request == "allow" && aws_lb_listener_rule.public[0].action[0].type == "forward"
     error_message = "Deploy paths pass unauthenticated requests through; probes are never authenticated."
+  }
+
+  assert {
+    # `backyard token create` posts to the token API with a Backyard bearer
+    # token and has no ALB session cookie.
+    condition = (
+      contains(one(aws_lb_listener_rule.deploy[0].condition).path_pattern[0].values, "/__backyard/api/tokens") &&
+      contains(one(aws_lb_listener_rule.deploy[0].condition).path_pattern[0].values, "/__backyard/api/deploy/*") &&
+      length(one(aws_lb_listener_rule.deploy[0].condition).path_pattern[0].values) <= 5
+    )
+    error_message = "The pass-through rule must cover the deploy gateway and POST /__backyard/api/tokens (at most 5 path values per ALB rule)."
   }
 
   assert {
@@ -698,6 +708,15 @@ run "hardened_options" {
   assert {
     condition     = length(aws_wafv2_web_acl_association.this) == 1
     error_message = "The WAF web ACL is associated with the ALB."
+  }
+
+  assert {
+    condition = (
+      sort(flatten([for st in data.aws_iam_policy_document.gateway[0].statement : st.resources if st.sid == "ServerSecretKms"])) == tolist(["arn:aws:kms:us-east-1:123456789012:key/11111111-2222-3333-4444-555555555555"]) &&
+      sort(flatten([for st in data.aws_iam_policy_document.gateway[0].statement : st.actions if st.sid == "ServerSecretKms"])) == tolist(["kms:Decrypt"]) &&
+      sort(flatten([for st in data.aws_iam_policy_document.gateway[0].statement : [for c in st.condition : c.values if c.variable == "kms:ViaService"] if st.sid == "ServerSecretKms"])) == tolist(["secretsmanager.us-east-1.amazonaws.com"])
+    )
+    error_message = "With a customer-managed key the gateway role may decrypt the server secret through Secrets Manager."
   }
 }
 

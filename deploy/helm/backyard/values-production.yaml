@@ -104,6 +104,20 @@ ingress:
         - backyard.acme.com
         - "*.backyard.acme.com"
 
+# Only the ingress controller may reach Backyard, and only Prometheus its
+# metrics port (the namespaces ingress-nginx and kube-prometheus-stack are
+# commonly installed in; adjust to yours). Needs a CNI enforcing NetworkPolicy.
+networkPolicy:
+  enabled: true
+  from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+  metricsFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+
 resources:
   requests:
     cpu: 250m

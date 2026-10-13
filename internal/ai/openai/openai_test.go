@@ -1088,3 +1088,39 @@ func TestResponseBodiesClosed(t *testing.T) {
 		t.Fatalf("response bodies: %d opened, %d closed", o, c)
 	}
 }
+
+// TestThrottledRetryAfter: a throttled response's retry-after-ms /
+// Retry-After / rate-limit reset headers reach the *ai.UpstreamError for
+// chat, streaming chat and embeddings.
+func TestThrottledRetryAfter(t *testing.T) {
+	_, srv := newServer(t, func(w http.ResponseWriter, r *http.Request, body map[string]any) {
+		switch body["model"] {
+		case "ms":
+			w.Header().Set("Retry-After-Ms", "750")
+		case "reset":
+			w.Header().Set("X-Ratelimit-Remaining-Tokens", "0")
+			w.Header().Set("X-Ratelimit-Reset-Tokens", "1m30s")
+			w.Header().Set("X-Ratelimit-Remaining-Requests", "99")
+			w.Header().Set("X-Ratelimit-Reset-Requests", "20ms")
+		default:
+			w.Header().Set("Retry-After", "11")
+		}
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": map[string]any{"message": "Rate limit reached", "type": "requests"}})
+	})
+	p := mustNew(t, config.ProviderConfig{BaseURL: srv.URL, APIKey: "k"}, Options{})
+	ctx := context.Background()
+	msgs := []ai.Message{{Role: "user", Content: []ai.Part{{Type: "text", Text: "x"}}}}
+	check := func(name string, err error, want time.Duration) {
+		t.Helper()
+		var ue *ai.UpstreamError
+		if !errors.As(err, &ue) || ue.Status != http.StatusTooManyRequests || ue.RetryAfter() != want {
+			t.Errorf("%s: got %#v, want RetryAfter %v", name, err, want)
+		}
+	}
+	_, err := p.Chat(ctx, ai.ChatRequest{Model: "ms", Messages: msgs})
+	check("chat retry-after-ms", err, 750*time.Millisecond)
+	_, err = p.ChatStream(ctx, ai.ChatRequest{Model: "reset", Messages: msgs}, nil)
+	check("stream reset headers", err, 90*time.Second)
+	_, err = p.Embed(ctx, ai.EmbedRequest{Model: "e", Input: []string{"x"}})
+	check("embed retry-after", err, 11*time.Second)
+}

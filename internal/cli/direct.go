@@ -83,13 +83,23 @@ func storagePrefix(st *blob.Description) string {
 
 // buildSyncCommand returns the command for t. tool selects the executable
 // for methods with alternatives (gcs: gcloud or gsutil).
+//
+// The folder is resolved through symlinks first, as deploy.CollectFiles
+// does: the excludes are computed by walking it (which does not descend
+// into a symlinked root), and aws s3 sync --no-follow-symlinks would skip a
+// symlinked root entirely — and then delete the whole site.
 func buildSyncCommand(t syncTarget, tool string) (Command, error) {
 	if why := directReady(t.Method, &deploy.Info{Storage: t.Storage, RsyncTarget: t.RsyncTarget}); why != "" {
 		return Command{}, errors.New(why)
 	}
+	dir, err := resolveSyncDir(t.Dir)
+	if err != nil {
+		return Command{}, err
+	}
+	t.Dir = dir
 	switch t.Method {
 	case clientconfig.MethodS3:
-		return buildS3Command(t), nil
+		return buildS3Command(t)
 	case clientconfig.MethodGCS:
 		return buildGCSCommand(t, tool == "gsutil")
 	case clientconfig.MethodAzure:
@@ -100,33 +110,75 @@ func buildSyncCommand(t syncTarget, tool string) (Command, error) {
 	return Command{}, fmt.Errorf("unknown direct method %q", t.Method)
 }
 
+// resolveSyncDir returns the absolute deploy folder with symlinks resolved.
+func resolveSyncDir(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("deploy folder %s: %w", dir, err)
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("deploy folder %s: %w", dir, err)
+	}
+	return real, nil
+}
+
+// s3Dest returns s3://<bucket>/<prefix>sites/<site>/.
+func s3Dest(t syncTarget) string {
+	return "s3://" + t.Storage.Bucket + "/" + storagePrefix(t.Storage) + "sites/" + t.Site + "/"
+}
+
+// s3Location returns the --region and --endpoint-url flags.
+func s3Location(st *blob.Description) []string {
+	var args []string
+	if st.Region != "" {
+		args = append(args, "--region", st.Region)
+	}
+	if st.Endpoint != "" {
+		args = append(args, "--endpoint-url", st.Endpoint)
+	}
+	return args
+}
+
 // buildS3Command: aws s3 sync <dir> s3://<bucket>/<prefix>sites/<site>/
-// --delete [--region r] [--endpoint-url e] --exclude/--include …
-func buildS3Command(t syncTarget) Command {
-	dest := "s3://" + t.Storage.Bucket + "/" + storagePrefix(t.Storage) + "sites/" + t.Site + "/"
-	args := []string{"s3", "sync", t.Dir, dest, "--delete"}
-	if t.Storage.Region != "" {
-		args = append(args, "--region", t.Storage.Region)
+// --delete --no-follow-symlinks [--region r] [--endpoint-url e] --exclude ….
+//
+// The AWS CLI matches filters with Python's fnmatch against the whole path,
+// where "*" and "?" cross "/", and lets a later --include re-include a file
+// inside an excluded directory: it cannot express gitignore semantics. So
+// the excludes are derived from walking the folder with deploy.Matcher (the
+// rules the api method applies): every excluded directory ("dir/*") and
+// file by its exact, escaped path, plus the single-segment names whose glob
+// means the same in fnmatch (literal names and "*suffix", at any depth).
+//
+// --no-follow-symlinks: CollectFiles never follows a symlinked directory or
+// a link leading outside the folder; the AWS CLI follows both by default.
+func buildS3Command(t syncTarget) (Command, error) {
+	ex, err := localExcludes(t.Dir, t.Patterns, fnmatchSafeName)
+	if err != nil {
+		return Command{}, err
 	}
-	if t.Storage.Endpoint != "" {
-		args = append(args, "--endpoint-url", t.Storage.Endpoint)
+	args := []string{"s3", "sync", t.Dir, s3Dest(t), "--delete", "--no-follow-symlinks"}
+	args = append(args, s3Location(t.Storage)...)
+	for _, g := range ex.fnmatchGlobs() {
+		args = append(args, "--exclude", g)
 	}
-	args = append(args, s3Filters(t.Patterns)...)
-	return Command{Name: "aws", Args: args}
+	return Command{Name: "aws", Args: args}, nil
 }
 
 // buildGCSCommand: gcloud storage rsync <dir> gs://<bucket>/<prefix>sites/<site>
 // --recursive --delete-unmatched-destination-objects --exclude=<regex>, or
-// gsutil -m rsync -r -d -x <regex> <dir> gs://… when gcloud is missing.
+// gsutil -m rsync -r -d -e -x <regex> <dir> gs://… when gcloud is missing.
+// gcloud skips symlinks by default; gsutil follows file symlinks unless -e.
 func buildGCSCommand(t syncTarget, gsutil bool) (Command, error) {
-	dest := "gs://" + t.Storage.Bucket + "/" + storagePrefix(t.Storage) + "sites/" + t.Site
-	ex, err := localExcludes(t.Dir, t.Patterns)
+	dest := gcsDest(t)
+	ex, err := localExcludes(t.Dir, t.Patterns, nil)
 	if err != nil {
 		return Command{}, err
 	}
 	re := ex.pythonRegex()
 	if gsutil {
-		args := []string{"-m", "rsync", "-r", "-d"}
+		args := []string{"-m", "rsync", "-r", "-d", "-e"}
 		if re != "" {
 			args = append(args, "-x", re)
 		}
@@ -150,7 +202,7 @@ func buildAzureCommand(t syncTarget) (Command, error) {
 		"-d", storagePrefix(t.Storage) + "sites/" + t.Site,
 		"--delete-destination", "true",
 	}
-	ex, err := localExcludes(t.Dir, t.Patterns)
+	ex, err := localExcludes(t.Dir, t.Patterns, nil)
 	if err != nil {
 		return Command{}, err
 	}
@@ -163,13 +215,72 @@ func buildAzureCommand(t syncTarget) (Command, error) {
 	return Command{Name: "az", Args: args}, nil
 }
 
-// buildRsyncCommand: rsync -az --delete <filters> <dir>/ <rsync_target>/<site>/.
+// gcsDest returns gs://<bucket>/<prefix>sites/<site>.
+func gcsDest(t syncTarget) string {
+	return "gs://" + t.Storage.Bucket + "/" + storagePrefix(t.Storage) + "sites/" + t.Site
+}
+
+// fsTempPattern matches the fs store's in-flight files (internal/blob/fs).
+const fsTempPattern = ".backyard-tmp-*"
+
+// buildRsyncCommand: rsync -az --delete --delete-excluded <filters> <dir>/
+// <rsync_target>/<site>/. --delete-excluded removes files the ignore rules
+// exclude from the server too (as the api method's commit does); the
+// receiver-side protect rule keeps the fs store's in-flight
+// ".backyard-tmp-*" files, which the default ".*" rule matches.
 func buildRsyncCommand(t syncTarget) Command {
-	args := []string{"-az", "--delete"}
+	args := []string{"-az", "--delete", "--delete-excluded", "--filter=P " + fsTempPattern}
 	args = append(args, rsyncFilters(t.Patterns)...)
 	target := strings.TrimRight(strings.TrimSpace(t.RsyncTarget), "/")
 	src := strings.TrimRight(t.Dir, "/") + "/"
 	return Command{Name: "rsync", Args: append(args, src, target+"/"+t.Site+"/")}
+}
+
+// buildPruneCommands returns the commands deleting site files (paths
+// relative to the site) from the storage. The direct-sync tools never delete
+// destination files their excludes match, so files published earlier that
+// the ignore rules now exclude are removed this way, as the api method's
+// commit removes them. Paths the tool cannot name literally are returned in
+// skipped. (rsync needs none of this: it runs with --delete-excluded.)
+func buildPruneCommands(t syncTarget, tool string, paths []string) (cmds []Command, skipped []string) {
+	switch t.Method {
+	case clientconfig.MethodS3:
+		// One listing of the site, deleting exactly the escaped paths.
+		args := []string{"s3", "rm", s3Dest(t), "--recursive"}
+		args = append(args, s3Location(t.Storage)...)
+		args = append(args, "--exclude", "*")
+		for _, p := range paths {
+			args = append(args, "--include", fnmatchEscape(p))
+		}
+		return []Command{{Name: "aws", Args: args}}, nil
+	case clientconfig.MethodGCS:
+		// gcloud and gsutil expand wildcards in URLs and read "#<n>" as a
+		// generation; such names cannot be addressed literally.
+		var urls []string
+		for _, p := range paths {
+			if strings.ContainsAny(p, "*?[]#") {
+				skipped = append(skipped, p)
+				continue
+			}
+			urls = append(urls, gcsDest(t)+"/"+p)
+		}
+		for chunk := range slices.Chunk(urls, 100) {
+			if tool == "gsutil" {
+				cmds = append(cmds, Command{Name: "gsutil", Args: append([]string{"-m", "rm"}, chunk...)})
+			} else {
+				cmds = append(cmds, Command{Name: "gcloud", Args: append([]string{"storage", "rm"}, chunk...)})
+			}
+		}
+		return cmds, skipped
+	case clientconfig.MethodAzure:
+		for _, p := range paths {
+			cmds = append(cmds, Command{Name: "az", Args: []string{"storage", "blob", "delete",
+				"--account-name", t.Storage.Account, "-c", t.Storage.Container,
+				"-n", storagePrefix(t.Storage) + "sites/" + t.Site + "/" + p}})
+		}
+		return cmds, nil
+	}
+	return nil, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -235,77 +346,6 @@ func parseIgnoreRules(patterns []string) []ignoreRule {
 		rules = append(rules, r)
 	}
 	return rules
-}
-
-// s3Filters translates patterns to aws s3 sync --exclude/--include flags.
-// AWS globs match the whole path relative to the source and "*" crosses
-// "/", so each pattern p becomes "p" and "p/*" (the path and everything
-// inside it), plus "*/p" and "*/p/*" when it is not anchored to the root.
-// Negations become --include; later filters take precedence in the AWS CLI,
-// matching gitignore's last-match-wins order.
-//
-// An --include for a directory re-includes everything below it, while in
-// gitignore the earlier rules still apply to the files inside a
-// re-included directory ("!.well-known/" must not publish
-// ".well-known/.htaccess", which ".*" ignores). So after each directory
-// negation ("!dir/") the earlier unanchored rules are re-applied below the
-// re-included directory.
-func s3Filters(patterns []string) []string {
-	rules := parseIgnoreRules(patterns)
-	var args []string
-	emit := func(r ignoreRule, globs ...string) {
-		flag := "--exclude"
-		if r.negate {
-			flag = "--include"
-		}
-		for _, g := range globs {
-			args = append(args, flag, g)
-		}
-	}
-	for i, r := range rules {
-		p := s3Glob(r)
-		emit(r, s3Globs(p, !r.anchored)...)
-		if !r.negate || !r.dirOnly {
-			continue
-		}
-		prefixes := []string{p}
-		if !r.anchored {
-			prefixes = append(prefixes, "*/"+p)
-		}
-		for _, q := range rules[:i] {
-			if q.anchored {
-				continue
-			}
-			qp := s3Glob(q)
-			for _, pre := range prefixes {
-				emit(q, pre+"/"+qp, pre+"/"+qp+"/*", pre+"/*/"+qp, pre+"/*/"+qp+"/*")
-			}
-		}
-	}
-	return args
-}
-
-// s3Glob joins a rule's segments into an AWS glob ("**" becomes "*", which
-// crosses "/" in AWS globs anyway).
-func s3Glob(r ignoreRule) string {
-	segs := make([]string, len(r.segs))
-	for i, s := range r.segs {
-		if s == "**" {
-			s = "*"
-		}
-		segs[i] = s
-	}
-	return strings.Join(segs, "/")
-}
-
-// s3Globs returns the globs matching path glob p and everything inside it,
-// at the root or (unanchored) at any depth.
-func s3Globs(p string, anyDepth bool) []string {
-	globs := []string{p, p + "/*"}
-	if anyDepth {
-		globs = append(globs, "*/"+p, "*/"+p+"/*")
-	}
-	return globs
 }
 
 // globToRegex translates one path-segment glob ("*", "?", "[…]", "\x") to a
@@ -407,8 +447,11 @@ type excludes struct {
 }
 
 // localExcludes walks dir with the deploy matcher (the same rules the api
-// method applies) and summarizes the exclusions.
-func localExcludes(dir string, patterns []string) (*excludes, error) {
+// method applies) and summarizes the exclusions. nameOK (nil: any) limits
+// which single-segment name globs may stand for the files they match; the
+// files of the other names are listed one by one. A symlinked dir is
+// resolved first: the walk would not descend into it.
+func localExcludes(dir string, patterns []string, nameOK func(string) bool) (*excludes, error) {
 	ex := &excludes{}
 	useNames := true
 	rules := parseIgnoreRules(patterns)
@@ -420,14 +463,17 @@ func localExcludes(dir string, patterns []string) (*excludes, error) {
 	if useNames {
 		for _, r := range rules {
 			if !r.negate && !r.dirOnly && !r.anchored && len(r.segs) == 1 && !strings.ContainsAny(r.segs[0], `\[`) &&
-				!slices.Contains(ex.names, r.segs[0]) {
+				(nameOK == nil || nameOK(r.segs[0])) && !slices.Contains(ex.names, r.segs[0]) {
 				ex.names = append(ex.names, r.segs[0])
 			}
 		}
 	}
 	m := deploy.NewMatcher(patterns)
-	root := filepath.Clean(dir)
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	root, err := resolveSyncDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -461,6 +507,45 @@ func localExcludes(dir string, patterns []string) (*excludes, error) {
 		return nil, fmt.Errorf("scan %s: %w", dir, err)
 	}
 	return ex, nil
+}
+
+// fnmatchSafeName reports whether the name glob n matches the same paths in
+// Python's fnmatch (used by the AWS CLI's filters, where "*" and "?" also
+// match "/") as a gitignore name at any depth does, when emitted as "n" and
+// "*/n": a literal name, or "*" followed by a literal suffix.
+func fnmatchSafeName(n string) bool {
+	return n != "" && !strings.ContainsAny(strings.TrimPrefix(n, "*"), `*?[]\`)
+}
+
+// fnmatchEscape quotes the fnmatch metacharacters of a literal path.
+func fnmatchEscape(p string) string {
+	var b strings.Builder
+	for _, r := range p {
+		switch r {
+		case '*', '?', '[':
+			b.WriteString("[" + string(r) + "]")
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// fnmatchGlobs returns the exclusions as fnmatch globs relative to the
+// folder (aws s3 --exclude): each name at the root and at any depth, each
+// excluded directory's contents and each excluded file.
+func (e *excludes) fnmatchGlobs() []string {
+	var out []string
+	for _, n := range e.names {
+		out = append(out, n, "*/"+n)
+	}
+	for _, d := range e.dirs {
+		out = append(out, fnmatchEscape(d)+"/*")
+	}
+	for _, f := range e.files {
+		out = append(out, fnmatchEscape(f))
+	}
+	return out
 }
 
 // pathPrefixes returns the excluded directories (with a trailing "/") and

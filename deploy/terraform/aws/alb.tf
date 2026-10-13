@@ -15,10 +15,12 @@ locals {
 
   # Paths that bypass ALB authentication entirely (probes).
   alb_public_paths = ["/__backyard/healthz", "/__backyard/readyz"]
-  # Deploy gateway paths: authenticated if the browser has an ALB session (the
-  # hub's drag-and-drop deploy), otherwise passed through so CLIs and CI can
-  # deploy with Backyard bearer tokens, which Backyard verifies itself.
-  alb_deploy_paths = ["/__backyard/api/deploy", "/__backyard/api/deploy/*"]
+  # Deploy gateway paths and the token API: authenticated if the browser has
+  # an ALB session (the hub's drag-and-drop deploy and token page), otherwise
+  # passed through so CLIs and CI can deploy and run `backyard token create`
+  # with Backyard bearer tokens, which Backyard verifies itself (a token minted
+  # with a token never outlives it).
+  alb_deploy_paths = ["/__backyard/api/deploy", "/__backyard/api/deploy/*", "/__backyard/api/tokens"]
 }
 
 data "http" "oidc_discovery" {
@@ -225,8 +227,9 @@ resource "aws_lb_listener_rule" "public" {
   tags = local.tags
 }
 
-# ALB mode: the embedded deploy gateway accepts bearer tokens from CLIs, and the
-# browser's ALB session when present (on_unauthenticated_request = "allow").
+# ALB mode: the embedded deploy gateway and the token API accept bearer tokens
+# from CLIs, and the browser's ALB session when present
+# (on_unauthenticated_request = "allow").
 resource "aws_lb_listener_rule" "deploy" {
   count = local.alb_auth ? 1 : 0
 

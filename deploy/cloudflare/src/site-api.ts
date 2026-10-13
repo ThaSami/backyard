@@ -5,17 +5,18 @@
  */
 import { AIService } from "./ai/service";
 import type { ChatRequest, Message, Part } from "./ai/types";
-import { textOf } from "./ai/types";
+import { aiFailure, isTimeout, textOf } from "./ai/types";
 import { serveSDK } from "./assets";
-import { accessLoginURL, authenticate, rateKey } from "./auth";
+import { accessLoginURL, authenticate, isCookieConflict, rateKey } from "./auth";
 import { maxUploadBytes } from "./config";
-import { decodeAnyBase64 } from "./crypto";
+import { base64Head, base64Size, normalizeBase64 } from "./crypto";
 import { collectionError, decodeQueryBody, docIDError, DOC_ID_RE, normalizeQuery, parseListParams, type RawQuery } from "./db/query";
 import { newULID } from "./db/ulid";
 import { canonicalDoc } from "./db/values";
 import {
   HttpError,
   badRequest,
+  concat,
   forbidden,
   isPlainObject,
   json,
@@ -23,15 +24,19 @@ import {
   notFound,
   readJSON,
   readObject,
+  requestID,
   tooLarge,
+  truncate,
   unsupported,
   unwrap,
+  type ErrorCode,
 } from "./http";
 import { cleanUser, normalizeEmail, type User } from "./identity";
 import { sniff } from "./mime";
 import { R2_KEY_HEADER, resolveR2Body } from "./object";
 import { pageNotFound, siteNotFound } from "./pages";
 import { decodePath, parseOrigin, redirect, siteNameError, siteRoot, siteURL, type RequestContext } from "./router";
+import type { Charge } from "./registry-do";
 import { MULTIPART_OVERHEAD, type UploadRow } from "./site-do";
 import { chargeOrThrow, registry, siteStub } from "./stubs";
 import { siteMetaJSON } from "./sitemeta";
@@ -70,7 +75,7 @@ async function authenticatePage(ctx: RequestContext): Promise<User> {
   try {
     return await authenticate(ctx);
   } catch (e) {
-    if (e instanceof HttpError && e.status === 401 && ctx.cfg.authMode === "access") {
+    if (e instanceof HttpError && e.status === 401 && ctx.cfg.authMode === "access" && !isCookieConflict(e)) {
       throw new HttpError(401, "unauthenticated", "This Backyard is protected by Cloudflare Access, but this request did not come through it. Open the site through its protected address.", {
         title: "Sign in required",
       });
@@ -528,41 +533,77 @@ function aiService(ctx: RequestContext): AIService {
   return ai;
 }
 
-/** Charges the daily AI caps (per user/IP and platform-wide). */
-async function chargeAI(ctx: RequestContext, u: User, image: boolean): Promise<void> {
+/**
+ * Charges the daily AI caps (per user/IP and platform-wide): one AI call, and
+ * for image generation the number of images requested (the image caps count
+ * images, not requests).
+ */
+async function chargeAI(ctx: RequestContext, u: User, images = 0): Promise<void> {
   const who = rateKey(ctx, u);
   const lim = ctx.cfg.limits;
-  const charges = [
+  const charges: Charge[] = [
     { key: `ai|${who}`, limit: lim.ai_per_day },
     { key: "ai_platform|all", limit: lim.ai_platform_per_day },
   ];
-  if (image) {
-    charges.push({ key: `ai_image|${who}`, limit: lim.ai_images_per_day }, { key: "ai_image_platform|all", limit: lim.ai_images_platform_per_day });
+  if (images > 0) {
+    charges.push(
+      { key: `ai_image|${who}`, limit: lim.ai_images_per_day, amount: images },
+      { key: "ai_image_platform|all", limit: lim.ai_images_platform_per_day, amount: images },
+    );
   }
   await chargeOrThrow(ctx.env, charges);
 }
 
 const MEDIA_EXT: Record<string, string> = { "image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "image/gif": ".gif" };
 
-/** Parses a data: URL with base64 payload. */
-function parseDataURL(s: string): { data: Uint8Array; mediaType: string } | null {
+/** Largest inline image of a chat message (SPEC §5.4; Go's router.MaxImageBytes). */
+export const MAX_INLINE_IMAGE_BYTES = 20 << 20;
+
+/**
+ * Parses a data: URL with a base64 payload into its (standard, padded)
+ * base64 text and media type, without decoding it.
+ */
+function parseDataURL(s: string): { b64: string; mediaType: string } | null {
   if (!s.startsWith("data:")) return null;
   const comma = s.indexOf(",");
   if (comma < 0) return null;
   const meta = s.slice(5, comma).split(";");
   if (meta.length < 2 || meta[meta.length - 1]!.toLowerCase() !== "base64") return null;
-  const data = decodeAnyBase64(s.slice(comma + 1).trim());
-  return data ? { data, mediaType: (meta[0] ?? "").trim().toLowerCase() } : null;
+  const b64 = normalizeBase64(s.slice(comma + 1).trim());
+  return b64 !== null ? { b64, mediaType: (meta[0] ?? "").trim().toLowerCase() } : null;
+}
+
+/** An inline image part: the base64 text is checked and measured, never decoded as a whole. */
+function inlineImage(i: number, j: number, b64: string, mediaType: string): Part {
+  const size = base64Size(b64);
+  if (size === 0) throw badRequest(`message ${i} part ${j}: image needs data or url`);
+  if (size > MAX_INLINE_IMAGE_BYTES) throw badRequest(`message ${i} part ${j}: image exceeds ${MAX_INLINE_IMAGE_BYTES >> 20} MiB`);
+  return { type: "image", b64, media_type: mediaType };
 }
 
 /** Longest image URL passed on to a provider (the Go server's limit). */
 const MAX_IMAGE_URL = 8192;
+/** Bytes of images loaded from URLs per chat request (SPEC §5.4; Go's router.MaxRemoteImageBytes). */
+export const MAX_URL_IMAGE_BYTES = 64 << 20;
+/** Path prefix of a site's uploaded files. */
+const FILES_PREFIX = "/__backyard/files/";
+/** Media types of images loaded from uploads (detected from their bytes). */
+const UPLOAD_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+
+/** Whether s is a site-relative URL reference ("/path"; not "//host/path", which names a host). */
+function siteRelative(s: string): boolean {
+  return s.startsWith("/") && !s.startsWith("//") && !s.startsWith("/\\");
+}
+
+/** A site-relative URL that may name one of the site's uploads (checked when it is loaded). */
+const UPLOAD_PATH_RE = /^(?:\/s\/[^/?#]*)?\/__backyard\/files\//;
 
 /**
  * Whether an image URL may be passed on to a provider (SPEC §5.4): an
- * absolute http(s) URL with a host. Site-relative URLs such as
- * /__backyard/files/… are rejected, as are other schemes (a data: URL that is
- * not valid base64 included).
+ * absolute http(s) URL with a host. Other schemes are rejected (a data: URL
+ * that is not valid base64 included); site-relative URLs are not URLs a
+ * provider could load (an upload of the site is read by the Worker instead,
+ * see resolveUploadImages).
  */
 export function isAbsoluteHTTPURL(s: string): boolean {
   if (s.length > MAX_IMAGE_URL || !/^https?:\/\//i.test(s)) return false;
@@ -574,7 +615,14 @@ export function isAbsoluteHTTPURL(s: string): boolean {
   }
 }
 
-function parseContent(i: number, raw: unknown): Part[] {
+/** An image part that names a URL the Worker may load itself (an upload of the site), with its client position. */
+export interface ImageRef {
+  url: string;
+  msg: number;
+  part: number;
+}
+
+function parseContent(i: number, raw: unknown, refs: ImageRef[]): Part[] {
   if (raw === undefined || raw === null) throw badRequest(`message ${i}: content is required`);
   if (typeof raw === "string") return [{ type: "text", text: raw }];
   if (!Array.isArray(raw)) throw badRequest(`message ${i}: content must be a string or an array of parts`);
@@ -590,15 +638,23 @@ function parseContent(i: number, raw: unknown): Part[] {
       if (!url && isPlainObject(p.image_url) && typeof p.image_url.url === "string") url = p.image_url.url;
       if (dataStr) {
         const du = parseDataURL(dataStr);
-        const data = du ? du.data : decodeAnyBase64(dataStr);
-        if (!data) throw badRequest(`message ${i} part ${j}: image data must be base64`);
-        if (!mt) mt = du?.mediaType || sniff(data.subarray(0, 64)) || "application/octet-stream";
-        return { type: "image", data, media_type: mt } as Part;
+        const b64 = du ? du.b64 : normalizeBase64(dataStr);
+        if (b64 === null) throw badRequest(`message ${i} part ${j}: image data must be base64`);
+        if (!mt) mt = du?.mediaType || sniff(base64Head(b64, 64)) || "application/octet-stream";
+        return inlineImage(i, j, b64, mt);
       }
       if (url) {
         const du = parseDataURL(url);
-        if (du) return { type: "image", data: du.data, media_type: mt || du.mediaType } as Part;
-        if (!isAbsoluteHTTPURL(url)) throw badRequest(`message ${i} part ${j}: image url must be an absolute http(s) URL`);
+        if (du) return inlineImage(i, j, du.b64, mt || du.mediaType);
+        if (url.length <= MAX_IMAGE_URL && siteRelative(url) && UPLOAD_PATH_RE.test(url)) {
+          refs.push({ url, msg: i, part: j });
+          return { type: "image", url, media_type: mt } as Part;
+        }
+        if (!isAbsoluteHTTPURL(url)) {
+          throw badRequest(`message ${i} part ${j}: image url must be an absolute http(s) URL or an upload of this site (/__backyard/files/…)`);
+        }
+        // An upload of the site under its absolute URL is loaded by the Worker too.
+        refs.push({ url, msg: i, part: j });
         return { type: "image", url, media_type: mt } as Part;
       }
       throw badRequest(`message ${i} part ${j}: image needs data or url`);
@@ -612,6 +668,8 @@ interface ParsedChat {
   maxTokens: number;
   alias: string;
   stream: boolean;
+  /** Image URLs that may name uploads of the site (see resolveUploadImages). */
+  imageRefs: ImageRef[];
 }
 
 /** Converts the wire request (SPEC §5.4) into a provider-neutral request. */
@@ -624,10 +682,11 @@ export function parseChat(body: Record<string, unknown>, systemPrompt: string): 
   if (systemPrompt.trim()) system.push(systemPrompt.trim());
   if (typeof body.system === "string" && body.system.trim()) system.push(body.system.trim());
   const messages: Message[] = [];
+  const imageRefs: ImageRef[] = [];
   body.messages.forEach((m, i) => {
     if (!isPlainObject(m)) throw badRequest(`message ${i}: must be an object`);
     const role = String(m.role ?? "").trim().toLowerCase();
-    const parts = parseContent(i, m.content);
+    const parts = parseContent(i, m.content, imageRefs);
     if (role === "system") {
       if (parts.some((p) => p.type !== "text")) throw badRequest(`message ${i}: system messages may only contain text`);
       const t = textOf(parts).trim();
@@ -642,7 +701,116 @@ export function parseChat(body: Record<string, unknown>, systemPrompt: string): 
   const temperature = typeof body.temperature === "number" && Number.isFinite(body.temperature) ? body.temperature : undefined;
   const req: ParsedChat["req"] = { system: system.join("\n\n"), messages, json: body.json === true, user: "" };
   if (temperature !== undefined) req.temperature = temperature;
-  return { req, maxTokens, alias: typeof body.model === "string" ? body.model : "", stream: body.stream === true };
+  return { req, maxTokens, alias: typeof body.model === "string" ? body.model : "", stream: body.stream === true, imageRefs };
+}
+
+/** What loading an image URL yields: its bytes, or "remote" (not this site's upload: the provider loads it). */
+type LoadedImage = { data: Uint8Array; mediaType: string } | "remote";
+
+/**
+ * Loads one image URL that may name an upload of the current site (port of
+ * the Go server's siteImageResolver): a site-relative
+ * /__backyard/files/{id}/{name} (path mode: optionally below /s/{site}), or
+ * the same path as an absolute URL on the request's origin. An absolute URL
+ * on another origin, or a same-origin one outside /__backyard/files/, is
+ * "remote". Another site's URL, any other site-relative URL, an unknown file,
+ * one above limit bytes or one that is not a png, jpeg, gif or webp image is a
+ * bad request (thrown without the part's position). Files are looked up in
+ * the site's own Durable Object, so another site's upload is never read.
+ */
+async function loadUploadImage(ctx: RequestContext, raw: string, limit: number): Promise<LoadedImage> {
+  const relative = siteRelative(raw);
+  let u: URL;
+  try {
+    u = new URL(raw, ctx.origin + "/");
+  } catch {
+    if (relative) throw badRequest("invalid image url");
+    return "remote";
+  }
+  if (!relative && ((u.protocol !== "http:" && u.protocol !== "https:") || `${u.protocol}//${u.host}`.toLowerCase() !== ctx.origin)) return "remote";
+  let p: string;
+  try {
+    p = decodePath(u.pathname);
+  } catch {
+    throw badRequest("invalid image url");
+  }
+  if (ctx.mode === "path" && ctx.prefix && p.startsWith("/s/")) {
+    const rest = p.slice(3);
+    const slash = rest.indexOf("/");
+    if ((slash < 0 ? rest : rest.slice(0, slash)) !== ctx.site) throw badRequest("image is not a file of this site");
+    p = slash < 0 ? "/" : rest.slice(slash);
+  }
+  if (!p.startsWith(FILES_PREFIX)) {
+    if (relative) throw badRequest("image url must be an upload of this site (/__backyard/files/…)");
+    return "remote";
+  }
+  const id = p.slice(FILES_PREFIX.length).split("/")[0] ?? "";
+  if (!DOC_ID_RE.test(id)) throw badRequest("image file not found");
+  const stub = siteStub(ctx.env, ctx.site);
+  const meta = await stub.getUpload(id);
+  if (!meta.ok) {
+    if (meta.error.status === 404) throw badRequest("image file not found");
+    unwrap(meta);
+  }
+  const tooBig = () => (limit < MAX_INLINE_IMAGE_BYTES ? badRequest(`images loaded from URLs exceed ${MAX_URL_IMAGE_BYTES >> 20} MiB per request`) : badRequest(`image exceeds ${MAX_INLINE_IMAGE_BYTES >> 20} MiB`));
+  if (meta.ok && meta.value.size > limit) throw tooBig();
+  const res = await stub.fetch(`https://site/upload-file?id=${encodeURIComponent(id)}`, { method: "GET" });
+  if (res.headers.get("x-backyard-not-found")) throw badRequest("image file not found");
+  const body = await finishObject(ctx, res);
+  if (!body.ok || !body.body) throw badRequest("image file not found");
+  // Bounded read: the stored size was checked, the bytes are checked again.
+  const chunks: Uint8Array[] = [];
+  let n = 0;
+  const reader = body.body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    n += value.byteLength;
+    if (n > limit) {
+      await reader.cancel().catch(() => {});
+      throw tooBig();
+    }
+    chunks.push(value);
+  }
+  if (n === 0) throw badRequest("image is empty");
+  const data = concat(chunks, n);
+  // Detection recognises every allowed format: the stored (client-declared) type is not used.
+  const mediaType = sniff(data.subarray(0, 64));
+  if (!UPLOAD_IMAGE_TYPES.has(mediaType)) throw badRequest("file is not a png, jpeg, gif or webp image");
+  return { data, mediaType };
+}
+
+/**
+ * Replaces the image parts of a chat request that name uploads of the site
+ * with their bytes (SPEC §5.4), so no provider has to fetch a URL it could
+ * not reach (site-relative, or behind Cloudflare Access). Each distinct URL
+ * is loaded once, in request order; loaded bytes count against 64 MiB per
+ * request and 20 MiB per image. Other URLs stay for the provider.
+ */
+export async function resolveUploadImages(ctx: RequestContext, messages: Message[], refs: ImageRef[]): Promise<void> {
+  if (refs.length === 0) return;
+  const loaded = new Map<string, LoadedImage>();
+  let used = 0;
+  for (const ref of refs) {
+    if (loaded.has(ref.url)) continue;
+    const limit = Math.min(MAX_INLINE_IMAGE_BYTES, MAX_URL_IMAGE_BYTES - used);
+    if (limit <= 0) throw badRequest(`message ${ref.msg} part ${ref.part}: images loaded from URLs exceed ${MAX_URL_IMAGE_BYTES >> 20} MiB per request`);
+    let img: LoadedImage;
+    try {
+      img = await loadUploadImage(ctx, ref.url, limit);
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 400) throw badRequest(`message ${ref.msg} part ${ref.part}: ${e.message}`);
+      throw e;
+    }
+    if (img !== "remote") used += img.data.length;
+    loaded.set(ref.url, img);
+  }
+  for (const m of messages) {
+    m.content = m.content.map((p) => {
+      const img = p.type === "image" && p.url ? loaded.get(p.url) : undefined;
+      return img && img !== "remote" ? { type: "image", data: img.data, media_type: img.mediaType } : p;
+    });
+  }
 }
 
 async function aiChat(ctx: RequestContext, u: User): Promise<Response> {
@@ -651,20 +819,35 @@ async function aiChat(ctx: RequestContext, u: User): Promise<Response> {
   const parsed = parseChat(body, ctx.cfg.ai.systemPrompt);
   if (!ai.known(parsed.alias)) throw notFound(`unknown model ${JSON.stringify(parsed.alias)}`);
   const r = ai.resolve(parsed.alias, "chat");
-  await chargeAI(ctx, u, false);
+  await chargeAI(ctx, u);
+  await resolveUploadImages(ctx, parsed.req.messages, parsed.imageRefs);
   const cap = Math.min(ctx.cfg.limits.ai_max_tokens || 4096, r.config?.max_tokens || Infinity);
   const req: ChatRequest = { ...parsed.req, model: r.model, maxTokens: parsed.maxTokens > 0 ? Math.min(parsed.maxTokens, cap) : cap, user: u.id };
   if (r.config?.effort) req.effort = r.config.effort;
   if (!parsed.stream) {
-    const resp = await r.provider.chat(req);
+    const resp = await callAI(r.provider.name, () => r.provider.chat(req));
     return json({ content: resp.content, model: r.alias, stop_reason: resp.stop_reason, usage: resp.usage });
   }
-  return streamChat(ctx, r.alias, (onText) => r.provider.stream(req, onText));
+  return streamChat(ctx, r.provider.name, r.alias, (onText) => r.provider.stream(req, onText));
+}
+
+/**
+ * Runs a provider call; failures that are not API errors yet become one like
+ * the Go server's aiError (a timeout → 504, anything else → 502 "AI request
+ * failed"), not a 500.
+ */
+async function callAI<T>(provider: string, f: () => Promise<T>): Promise<T> {
+  try {
+    return await f();
+  } catch (e) {
+    throw aiFailure(e, provider);
+  }
 }
 
 /** Runs a streaming completion as text/event-stream (SPEC §5.4). */
 function streamChat(
   ctx: RequestContext,
+  provider: string,
   alias: string,
   run: (onText: (t: string) => Promise<void>) => Promise<{ stop_reason: string; usage: unknown }>,
 ): Response {
@@ -687,8 +870,7 @@ function streamChat(
       const resp = await run((text) => (text ? event({ type: "text", text }) : Promise.resolve()));
       await event({ type: "done", model: alias, stop_reason: resp.stop_reason, usage: resp.usage });
     } catch (e) {
-      const he = e instanceof HttpError ? e : new HttpError(502, "upstream_error", "AI request failed");
-      if (!(e instanceof HttpError)) console.warn(`backyard: AI stream failed: ${(e as Error)?.message ?? e}`);
+      const he = aiFailure(e, provider);
       await event({ type: "error", error: { code: he.code, message: he.message } }).catch(() => {});
     } finally {
       clearInterval(timer);
@@ -716,8 +898,10 @@ async function aiImage(ctx: RequestContext, u: User): Promise<Response> {
   const alias = typeof body.model === "string" ? body.model : "";
   if (!ai.known(alias)) throw notFound(`unknown model ${JSON.stringify(alias)}`);
   const r = ai.resolve(alias, "image");
-  await chargeAI(ctx, u, true);
-  const images = await r.provider.image({ model: r.model, prompt, size: typeof body.size === "string" ? body.size : "", n, user: u.id });
+  await chargeAI(ctx, u, n);
+  const images = await callAI(r.provider.name, () =>
+    r.provider.image({ model: r.model, prompt, size: typeof body.size === "string" ? body.size : "", n, user: u.id }),
+  );
   const out = [];
   for (let i = 0; i < images.length; i++) {
     const img = images[i]!;
@@ -745,8 +929,8 @@ async function aiEmbed(ctx: RequestContext, u: User): Promise<Response> {
   const alias = typeof body.model === "string" ? body.model : "";
   if (!ai.known(alias)) throw notFound(`unknown model ${JSON.stringify(alias)}`);
   const r = ai.resolve(alias, "embedding");
-  await chargeAI(ctx, u, false);
-  const resp = await r.provider.embed({ model: r.model, input: inputs, user: u.id });
+  await chargeAI(ctx, u);
+  const resp = await callAI(r.provider.name, () => r.provider.embed({ model: r.model, input: inputs, user: u.id }));
   return json({ model: r.alias, embeddings: resp.embeddings, usage: resp.usage });
 }
 
@@ -762,19 +946,77 @@ async function warehouse(ctx: RequestContext, _u: User): Promise<Response> {
     throw unsupported("the data warehouse is not available on the Cloudflare edition (set WAREHOUSE_URL to proxy a Backyard server)");
   }
   const sub = ctx.path.slice("/__backyard/api".length);
-  const init: RequestInit = { method: ctx.req.method, headers: { Accept: "application/json", "X-Backyard": "1" } };
-  if (ctx.env.WAREHOUSE_TOKEN) (init.headers as Record<string, string>).Authorization = `Bearer ${ctx.env.WAREHOUSE_TOKEN}`;
+  const rid = requestID(ctx.req);
+  // The upstream Backyard server adopts X-Request-Id, so both logs share it.
+  const headers: Record<string, string> = { Accept: "application/json", "X-Backyard": "1", "X-Request-Id": rid };
+  if (ctx.env.WAREHOUSE_TOKEN) headers.Authorization = `Bearer ${ctx.env.WAREHOUSE_TOKEN}`;
+  const init: RequestInit = { method: ctx.req.method, headers, redirect: "manual" };
   if (ctx.req.method === "POST") {
     init.body = JSON.stringify(await readJSON(ctx.req, SMALL_BODY));
-    (init.headers as Record<string, string>)["Content-Type"] = "application/json";
+    headers["Content-Type"] = "application/json";
   }
   let res: Response;
   try {
-    res = await fetch(base + sub, { ...init, signal: AbortSignal.timeout(90_000) });
+    res = await fetch(base + sub, { ...init, signal: AbortSignal.timeout(WAREHOUSE_TIMEOUT_MS) });
   } catch (e) {
-    throw new HttpError(502, "upstream_error", `warehouse proxy failed: ${(e as Error).message}`);
+    throw warehouseFailure(rid, isTimeout(e) ? 504 : 0, `request failed: ${(e as Error)?.message ?? String(e)}`);
   }
-  return new Response(res.body, { status: res.status, headers: { "Content-Type": res.headers.get("Content-Type") ?? "application/json", "Cache-Control": "no-store" } });
+  const ct = res.headers.get("Content-Type") ?? "";
+  const isJSON = /^application\/json\b/i.test(ct);
+  if (res.ok && isJSON) return new Response(res.body, { status: res.status, headers: { "Content-Type": ct, "Cache-Control": "no-store" } });
+  let text = "";
+  try {
+    text = (await res.text()).slice(0, 64 << 10);
+  } catch {
+    /* keep the status */
+  }
+  const relayed = isJSON ? relayedWarehouseError(res, text) : null;
+  if (relayed) throw relayed;
+  throw warehouseFailure(rid, res.status, `HTTP ${res.status} ${ct}: ${text.slice(0, 1000)}`);
+}
+
+/** Bound of a proxied warehouse request (the Go server's warehouse.timeout is 60 s by default). */
+const WAREHOUSE_TIMEOUT_MS = 90_000;
+
+/** Upstream statuses whose JSON errors describe the caller's query (or its limits) and are passed on. */
+const RELAYED_WAREHOUSE_STATUS = new Set([400, 403, 404, 409, 413, 429]);
+const ERROR_CODES = new Set<string>(["bad_request", "forbidden", "not_found", "conflict", "too_large", "rate_limited", "unsupported"]);
+
+/**
+ * The upstream's own API error when it is the caller's to see (SPEC §5.5,
+ * like the Go server's warehouseError: query errors, forbidden statements,
+ * unknown sources or queries, rate limits with their Retry-After, and "not
+ * configured"), else null. A 401 is never relayed: it rejected
+ * WAREHOUSE_TOKEN, not the user (and would send the page to a login).
+ */
+function relayedWarehouseError(res: Response, text: string): HttpError | null {
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  const e = isPlainObject(body) && isPlainObject(body.error) ? body.error : null;
+  if (!e || typeof e.code !== "string" || typeof e.message !== "string" || !ERROR_CODES.has(e.code)) return null;
+  const relay = RELAYED_WAREHOUSE_STATUS.has(res.status) || (res.status === 501 && e.code === "unsupported");
+  if (!relay) return null;
+  const ra = Number(res.headers.get("Retry-After"));
+  const opts = res.status === 429 && Number.isFinite(ra) && ra > 0 ? { retryAfter: ra } : {};
+  return new HttpError(res.status, e.code as ErrorCode, truncate(e.message, 1000), opts);
+}
+
+/**
+ * A warehouse failure for the client, like the Go server's warehouseError:
+ * a timeout is 504 "warehouse query timed out"; anything else (an
+ * unreachable upstream, its 5xx, a rejected WAREHOUSE_TOKEN, a redirect or a
+ * response that is not JSON) is 502 with a generic message naming the
+ * request id, because the details can reveal hosts and credentials. They are
+ * logged with the same id.
+ */
+function warehouseFailure(rid: string, status: number, detail: string): HttpError {
+  console.error(`backyard: warehouse proxy failed (request id ${rid}): ${detail}`);
+  if (status === 504) return new HttpError(504, "upstream_error", "warehouse query timed out");
+  return new HttpError(502, "upstream_error", `the warehouse could not run the query; the details are in the server log (request id ${rid})`);
 }
 
 // --- websocket (SPEC §6) -------------------------------------------------------

@@ -52,8 +52,16 @@ its visitor everywhere on the platform. Host mode is strongly recommended.
   for signed upload URLs.
 - **Websockets** check `Origin` against the site's origin (path mode: the hub); cross-site
   connections need `realtime.allow_cross_site_ws`.
-- **Redirects.** The login `rd` parameter only accepts the hub, a site host or a relative path;
-  the CLI hand-off only redirects to loopback addresses.
+- **Redirects.** The login `rd` parameter only accepts the hub, a site host or a relative path
+  (in every mode, including the proxy modes where `/__backyard/auth/login` just redirects to
+  it); the CLI hand-off only redirects to loopback addresses.
+- **CLI login.** Any web page can navigate a signed-in browser to `/__backyard/auth/cli`. A
+  request that arrives as such a cross-site navigation therefore gets a confirmation step on
+  Backyard's own page before a token is minted and handed to a loopback port (or shown, with
+  `mode=display`); only the URL the CLI opens itself proceeds directly. The confirmation form
+  posts back with a CSRF token that is bound to the user (and the sign-in session) and expires
+  after 10 minutes, and the page's CSP lets the form go only to Backyard and the CLI's loopback
+  address.
 - **Host routing.** Only the hub host and single-label subdomains of `server.base_domain` are
   served; anything else is `404`. Forwarded headers (`X-Forwarded-Host`, `-Proto`, `-For`) are
   honoured only from `server.trusted_proxies`. In dev mode, unknown host names stay `404` so a
@@ -83,7 +91,8 @@ alone is not a CSRF defence — the custom header and Origin checks above are.
 - **`server.secret`** (≥ 32 characters) is the root of every key. Each use derives its own
   32-byte key with HKDF-SHA256 (salt `backyard`, info `backyard/session/v1`,
   `backyard/oauth-state/v1`, `backyard/api-token/v1`, `backyard/deploy/v1`,
-  `backyard/upload/v1`, `backyard/anon/v1`), so a key for one purpose can never forge another.
+  `backyard/upload/v1`, `backyard/anon/v1`, `backyard/cli-confirm/v1`), so a key for one purpose
+  can never forge another.
   Store it in a secret manager; never in the config file.
 - **API tokens** are HS256 JWTs (issuer `backyard`, scope `api`) with the user's identity, valid
   for `auth.token_ttl` (720 h by default, also the maximum). They are minted only for a person
@@ -126,8 +135,11 @@ bodies are bounded too (queries and most bodies 1 MiB, AI chat 32 MiB). See
 - Deploy paths are validated (relative, no `..`, no leading `/`, nothing under `__backyard/`);
   `/__backyard/` can never be shadowed by a site file.
 - Uploads during a deploy are bound to the declared size and SHA-256 where the backend allows
-  it, and the commit verifies sizes before deleting anything; deploy ids and upload URLs are
-  HMAC-signed and expire after one hour.
+  it (the gateway's own endpoint: both; S3: the size and, on AWS, the SHA-256; GCS: the size;
+  Azure SAS: neither). The commit verifies sizes before deleting anything, deletes a listed
+  object of the wrong size and fails with `409`, so no unverified object outlives a commit.
+  Deploy ids and upload URLs are HMAC-signed and expire after one hour, and only authorized
+  deployers get them (rate-limited, audited as `deploy.create`).
 - The `fs` store confines every operation to its root and refuses symlinks that escape their
   directory, so a racing `rsync` cannot redirect writes.
 
@@ -138,7 +150,19 @@ messages, for providers that need bytes. That fetcher only allows http(s), refus
 private, link-local, multicast and other non-public addresses **on the dialled IP** (so DNS
 rebinding cannot bypass it), caps each image at 20 MiB and each request at 64 MiB, and never
 echoes URL credentials or query strings in errors. Provider error messages are sanitized before
-they reach clients. Site-relative upload URLs are rejected rather than fetched.
+they reach clients. An image URL of one of the site's own uploads (what `files.upload` returns,
+site-relative or on the site's own origin) is never fetched: the server reads that file from
+storage, and only from the requesting site's uploads — another site's file, an unknown file or
+any other site-relative URL is rejected (`400`). Its type is detected from the bytes (png,
+jpeg, gif or webp), and it counts against the same 20 MiB and 64 MiB limits.
+
+## Error messages
+
+Server-side failures do not reveal infrastructure: storage and database errors and warehouse
+engine and connection errors (which can name hosts, users and databases) reach the page as
+generic messages, and the server logs the cause with the request id that every response
+carries as `X-Request-Id` (warehouse failures name it in the message too). AI provider messages
+are sanitized and mapped to stable status codes.
 
 ## Warehouse
 

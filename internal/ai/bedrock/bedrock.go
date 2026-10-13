@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
@@ -678,8 +679,9 @@ func (p *Provider) convertErr(ctx context.Context, err error) error {
 	}
 	ue := &ai.UpstreamError{Provider: p.name}
 	var re *awshttp.ResponseError
-	if errors.As(err, &re) {
+	if errors.As(err, &re) && re.ResponseError != nil && re.Response != nil && re.Response.Response != nil {
 		ue.Status = re.HTTPStatusCode()
+		ue.RetryDelay = httpx.RetryAfter(ue.Status, re.Response.Header, time.Now())
 	}
 	var ae smithy.APIError
 	if errors.As(err, &ae) {

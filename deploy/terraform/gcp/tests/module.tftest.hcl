@@ -89,8 +89,32 @@ run "iap_defaults" {
   }
 
   assert {
-    condition     = length(google_compute_url_map.https.path_matcher[0].route_rules) == 4 && google_compute_url_map.https.path_matcher[0].route_rules[3].match_rules[0].header_matches[0].header_name == "Authorization"
+    condition     = length(google_compute_url_map.https.path_matcher[0].route_rules) == 5 && google_compute_url_map.https.path_matcher[0].route_rules[3].match_rules[0].header_matches[0].header_name == "Authorization"
     error_message = "Deploy routes must send bearer-token gateway calls to the deploy backend."
+  }
+
+  assert {
+    # `backyard token create` (POST /__backyard/api/tokens with a Backyard
+    # bearer token) cannot pass IAP; browser calls without Authorization stay
+    # behind it.
+    condition = anytrue([
+      for r in google_compute_url_map.https.path_matcher[0].route_rules :
+      r.service == google_compute_backend_service.deploy[0].id &&
+      r.match_rules[0].full_path_match == "/__backyard/api/tokens" &&
+      length(r.match_rules[0].header_matches) == 1 &&
+      r.match_rules[0].header_matches[0].header_name == "Authorization" &&
+      r.match_rules[0].header_matches[0].present_match &&
+      r.header_action[0].request_headers_to_remove == tolist(["X-Goog-IAP-JWT-Assertion", "X-Goog-Authenticated-User-Email", "X-Goog-Authenticated-User-Id"])
+    ])
+    error_message = "POST /__backyard/api/tokens with an Authorization header must reach the deploy backend (no IAP) with the IAP headers stripped."
+  }
+
+  assert {
+    condition = alltrue([
+      for r in google_compute_url_map.https.path_matcher[0].route_rules :
+      length(r.match_rules[0].header_matches) == 1 if r.match_rules[0].full_path_match == "/__backyard/api/tokens" || r.match_rules[0].prefix_match == "/__backyard/api/deploy/"
+    ])
+    error_message = "Only requests with an Authorization header may bypass IAP on the token API and the gateway."
   }
 
   assert {
@@ -187,6 +211,14 @@ run "hardening" {
   assert {
     condition     = google_storage_bucket.sites.public_access_prevention == "enforced" && google_storage_bucket.sites.uniform_bucket_level_access && google_storage_bucket.sites.cors[0].origin == tolist(["https://backyard.example.com"])
     error_message = "The bucket must be private with CORS for the hub origin only."
+  }
+
+  assert {
+    condition = (
+      contains(google_storage_bucket.sites.cors[0].method, "PUT") &&
+      alltrue([for h in ["content-type", "x-goog-content-length-range"] : contains([for r in google_storage_bucket.sites.cors[0].response_header : lower(r)], h)])
+    )
+    error_message = "The bucket CORS rule must allow the headers of a signed upload (Content-Type, x-goog-content-length-range), or browser uploads fail their preflight."
   }
 
   assert {
@@ -335,6 +367,27 @@ run "bigquery_and_dns" {
   }
 
   assert {
+    # Direct-sync deployers write sites/ only: _meta/ (site owners, used by
+    # sites.ownership = owner) and uploads/ stay with the server.
+    condition = (
+      google_storage_bucket_iam_member.writers["group:eng@example.com"].role == "roles/storage.objectUser" &&
+      length(google_storage_bucket_iam_member.writers["group:eng@example.com"].condition) == 1 &&
+      google_storage_bucket_iam_member.writers["group:eng@example.com"].condition[0].expression == "resource.name.startsWith(\"projects/_/buckets/${google_storage_bucket.sites.name}/objects/sites/\")"
+    )
+    error_message = "Bucket writers must be limited to objects below sites/ by an IAM condition."
+  }
+
+  assert {
+    condition = (
+      google_storage_bucket_iam_member.writers_list["group:eng@example.com"].role == "roles/storage.objectViewer" &&
+      google_storage_bucket_iam_member.writers_list["group:eng@example.com"].condition[0].expression == "resource.type == \"storage.googleapis.com/Bucket\"" &&
+      length([for b in google_storage_bucket_iam_member.writers_list : b if length(b.condition) == 0]) == 0 &&
+      length(google_storage_bucket_iam_member.writers) == 1 && length(google_storage_bucket_iam_member.writers_list) == 1
+    )
+    error_message = "Bucket writers may list the bucket (rsync), but never read objects outside sites/."
+  }
+
+  assert {
     condition     = yamldecode(output.backyard_config_yaml).sites.max_file_bytes == 10485760 && yamldecode(output.backyard_config_yaml).files.max_upload_bytes == 32505856
     error_message = "A sites section in extra_config_yaml replaces the module's; files keeps the module cap."
   }
@@ -358,6 +411,9 @@ run "escapes_literal_dollar_braces" {
       tagged = { sql = "SELECT '$${x}' AS t" }
     }
     extra_config_yaml = "identity:\n  directory:\n    type: csv\n    path: $${DIRECTORY_PATH}\n"
+    # What the reference above expands to (configcheck loads the config with
+    # the container's environment).
+    extra_env = { DIRECTORY_PATH = "/etc/backyard/people.csv" }
   }
 
   # Backyard reads "$$${" as a literal "$${"; the intended references stay.
@@ -526,6 +582,23 @@ run "rejects_certificate_map_url" {
   }
 
   expect_failures = [var.certificate_map]
+}
+
+run "bucket_writers_with_storage_prefix" {
+  command = plan
+
+  variables {
+    storage_prefix        = "/team-a/"
+    bucket_writer_members = ["serviceAccount:ci@acme-backyard.iam.gserviceaccount.com", "group:eng@example.com"]
+  }
+
+  assert {
+    condition = alltrue([
+      for b in google_storage_bucket_iam_member.writers :
+      b.condition[0].expression == "resource.name.startsWith(\"projects/_/buckets/${google_storage_bucket.sites.name}/objects/team-a/sites/\")"
+    ]) && length(google_storage_bucket_iam_member.writers) == 2
+    error_message = "The writers' condition must use the normalised storage prefix (team-a/sites/), like Backyard's object keys."
+  }
 }
 
 run "rejects_storage_prefix_traversal" {

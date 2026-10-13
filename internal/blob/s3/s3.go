@@ -22,13 +22,18 @@
 // checksums are enabled (AWS S3 by default; custom endpoints only when
 // AWS_REQUEST_CHECKSUM_CALCULATION asks for them, since many S3-compatible
 // stores reject the headers), a declared SHA-256 is also signed as
-// x-amz-checksum-sha256, which S3 verifies against the body.
+// x-amz-checksum-sha256, which S3 verifies against the body and keeps with
+// the object; StatSHA256 (blob.DigestReporter) reads it back with a
+// HeadObject, so callers learn the digest of such an object without reading
+// it.
 package s3
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -392,6 +397,10 @@ func (s *Store) Stat(ctx context.Context, key string) (*blob.ObjectInfo, error) 
 		}
 		return nil, s.wrap("stat", key, err)
 	}
+	return headInfo(key, out), nil
+}
+
+func headInfo(key string, out *awss3.HeadObjectOutput) *blob.ObjectInfo {
 	size := deref(out.ContentLength)
 	mod := deref(out.LastModified)
 	return &blob.ObjectInfo{
@@ -400,7 +409,50 @@ func (s *Store) Stat(ctx context.Context, key string) (*blob.ObjectInfo, error) 
 		ETag:        blobutil.ETagOr(deref(out.ETag), size, mod),
 		ContentType: deref(out.ContentType),
 		ModTime:     mod.UTC(),
-	}, nil
+	}
+}
+
+var _ blob.DigestReporter = (*Store)(nil)
+
+// StatSHA256 implements blob.DigestReporter: a HeadObject with checksum mode
+// enabled returns the full-object SHA-256 that S3 verified when the object
+// was uploaded with x-amz-checksum-sha256 (presigned uploads with a declared
+// digest), and "" for any other object (no SHA-256 checksum, or a composite
+// checksum of a multipart upload). It returns blob.ErrNotSupported when
+// flexible checksums are disabled (custom endpoints by default), since many
+// S3-compatible stores reject the checksum-mode header.
+func (s *Store) StatSHA256(ctx context.Context, key string) (*blob.ObjectInfo, string, error) {
+	if err := s.checkKey(key); err != nil {
+		return nil, "", err
+	}
+	if !s.checksums {
+		return nil, "", blob.ErrNotSupported
+	}
+	out, err := s.client.HeadObject(ctx, &awss3.HeadObjectInput{
+		Bucket:       aws.String(s.bucket),
+		Key:          aws.String(s.fullKey(key)),
+		ChecksumMode: types.ChecksumModeEnabled,
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, "", ctx.Err()
+		}
+		return nil, "", s.wrap("stat", key, err)
+	}
+	return headInfo(key, out), fullObjectSHA256(out), nil
+}
+
+// fullObjectSHA256 returns the hex full-object SHA-256 checksum of a
+// HeadObject response, or "" when there is none.
+func fullObjectSHA256(out *awss3.HeadObjectOutput) string {
+	if out.ChecksumType == types.ChecksumTypeComposite {
+		return ""
+	}
+	sum, err := base64.StdEncoding.DecodeString(deref(out.ChecksumSHA256))
+	if err != nil || len(sum) != sha256.Size {
+		return "" // absent, or a composite "<base64>-<parts>" value
+	}
+	return hex.EncodeToString(sum)
 }
 
 // Put writes an object. Bodies up to the part size are sent with a single

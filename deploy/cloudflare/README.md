@@ -101,7 +101,9 @@ You can re-run it at any time to upgrade. Each run:
    tries again. `--no-r2` turns this off for good.
 5. Works out the secrets: what the Worker already has is kept, what is missing is generated
    - `BACKYARD_SECRET`: 32 random bytes, created once. Never printed.
-   - `DEPLOY_TOKEN`: `byd_…`, created once and remembered.
+   - `DEPLOY_TOKEN`: `byd_…`, created once and remembered. A Worker that already has one keeps
+     it, also when this machine has no saved state (another machine, a teammate, CI): pass
+     `DEPLOY_TOKEN=…` to remember it here, or `--rotate-token` to replace it.
 
    Only wrangler's explicit "Worker not found" counts as a first deploy. If the secrets can't
    be listed (an authentication, permission or network problem, or output that isn't the
@@ -119,7 +121,9 @@ You can re-run it at any time to upgrade. Each run:
 State (the deploy token, URL, account, R2 choice and `--var` overrides) is saved to
 `~/.config/backyard/cloudflare/<worker>.json` (mode 0600, honors `XDG_CONFIG_HOME`), so a plain
 `npm run setup` keeps every earlier choice. A state file that isn't valid JSON stops the setup
-rather than silently issuing a new deploy token.
+rather than silently issuing a new deploy token. On a machine without the state file, `--var`
+overrides from earlier runs elsewhere (such as `AUTH_MODE:access`) are not known: setup warns,
+and the deploy uses `wrangler.jsonc` plus that run's `--var` flags, so pass them again.
 
 | Option | Effect |
 | --- | --- |
@@ -157,11 +161,13 @@ The Cloudflare free-plan quotas that matter most are listed below, as of this wr
 When a quota runs out, Cloudflare returns errors until the daily reset (00:00 UTC). Backyard
 adds its own **guardrails**, so one person or one runaway page can't drain the account (and
 page requests for site names that were never deployed are answered without creating a Durable
-Object, so probing random names costs no storage writes). The
+Object, and other requests that only read a never-used site store nothing: a site's tables are
+created by its first write, so probing random names costs no storage writes). The
 guardrails are daily counters per user (per IP when anonymous) plus platform-wide caps, kept
 in `RegistryDO`. When a cap is hit, the API answers `429` with `Retry-After` (seconds until
 00:00 UTC). Tune them with the `LIMITS` variable (JSON, merged over the defaults; `0` means
-unlimited for the daily counters):
+unlimited for the daily counters). Write it as a string, or as a JSON object when you set it
+as a JSON value in `wrangler.jsonc` or the dashboard:
 
 ```sh
 npm run setup -- --var 'LIMITS:{"ai_per_day":50,"max_sites":100}'
@@ -178,9 +184,9 @@ npm run setup -- --var 'LIMITS:{"ai_per_day":50,"max_sites":100}'
 | `max_docs_per_site` | 100,000 | Documents per site. |
 | `max_list` | 1000 | Largest `limit` of a query. |
 | `ai_per_day` | 200 | AI calls per user/IP per day. |
-| `ai_images_per_day` | 30 | Generated images per user/IP per day. |
+| `ai_images_per_day` | 30 | Generated images per user/IP per day (a request for `n` images counts `n`). |
 | `ai_platform_per_day` | 2000 | AI calls per day, whole platform. This guards your neuron allowance. |
-| `ai_images_platform_per_day` | 300 | Generated images per day, whole platform. |
+| `ai_images_platform_per_day` | 300 | Generated images per day, whole platform (each image counts). |
 | `ai_max_tokens` | 4096 | Upper bound for `max_tokens` of a chat. |
 | `deploys_per_day` | 200 | Deploys per user/IP per day. |
 | `uploads_per_day` | 500 | File uploads per user/IP per day. |
@@ -230,10 +236,20 @@ application's AUD tag. Because of that check, the Worker stays protected even if
 reaches it through `workers.dev`. User names and groups come from Access' `get-identity`
 endpoint, and `ADMIN_GROUPS` can name IdP groups.
 
-The deploy gateway (`/__backyard/api/deploy/*`) and the health checks must **bypass** Access.
-The CLI authenticates there with bearer tokens (`DEPLOY_TOKEN`, or API tokens minted in the
-browser by `backyard login`), and upload URLs are signed. Everything else stays behind
-Access.
+The deploy gateway (`/__backyard/api/deploy/*`), token minting (`/__backyard/api/tokens`, for
+`backyard token create`) and the health checks must **bypass** Access. The CLI authenticates
+there with bearer tokens (`DEPLOY_TOKEN`, or API tokens minted in the browser by
+`backyard login`), and upload URLs are signed. A token minted with an API token never expires
+later than that token: a token cannot renew itself, so chaining tokens never keeps access past
+the lifetime of the token that `backyard login` minted through Access. The hub's own requests to these paths carry the `CF_Authorization` cookie, whose
+Access JWT the Worker verifies itself; if a browser sends cookies of two different users (in
+host mode a site's page could plant its author's), the Worker refuses the request (`401`)
+instead of picking one. Everything else stays behind Access.
+
+`backyard login` opens `/__backyard/auth/cli` in the browser. As on the Go server, a request
+for it that another site may have started (`Sec-Fetch-Site` other than `none` or `same-origin`,
+or a foreign `Referer`) gets a confirmation page first: the token is handed to the CLI's
+loopback address only after you click **Allow**.
 
 ### With Terraform (recommended)
 
@@ -292,8 +308,8 @@ Entra ID, Google Workspace and the others work the same way. Add the identity pr
    `backyard.example.com` (in host mode, also `*.backyard.example.com`), with a policy that
    allows your users. Copy the **Application Audience (AUD) tag**.
 3. Add a second self-hosted application for `backyard.example.com/__backyard/api/deploy`,
-   `…/__backyard/api/deploy/*`, `…/__backyard/healthz` and `…/__backyard/readyz`, with a
-   **Bypass** policy that includes *Everyone*.
+   `…/__backyard/api/deploy/*`, `…/__backyard/api/tokens`, `…/__backyard/healthz` and
+   `…/__backyard/readyz`, with a **Bypass** policy that includes *Everyone*.
 4. `npm run setup -- --var AUTH_MODE:access --var ACCESS_TEAM_DOMAIN:<team> --var ACCESS_AUD:<aud> --var BASE_DOMAIN:backyard.example.com`
 
 Optional: once the custom domain works, set `"workers_dev": false` in `wrangler.jsonc` to turn
@@ -340,8 +356,13 @@ can use Workers AI, Anthropic, or any OpenAI-compatible API:
 - `AI_ALLOW_RAW_MODELS=true` also accepts `@cf/…` and `provider/model` names from sites.
   `AI_EXPOSE_MODEL_IDS=true` shows model ids in `/ai/models`. `AI_SYSTEM_PROMPT` is prepended
   to every chat.
-- Every AI call counts against `ai_per_day` and `ai_platform_per_day`. Images also count
-  against the image caps.
+- Every AI call counts against `ai_per_day` and `ai_platform_per_day`. Each generated image
+  also counts against the image caps (`n: 4` counts 4).
+- Chat images: inline base64 (`data`, or a `data:` URL; at most 20 MiB each) is passed on to
+  the provider as sent, without decoding it in the Worker. An image `url` that names one of the
+  site's own uploads (what `files.upload` returns, site-relative or absolute on the site's
+  origin) is read from the site's storage (png, jpeg, gif or webp; 64 MiB per request); other
+  absolute URLs are handed to the provider.
 
 ## Configuration reference
 
@@ -352,9 +373,9 @@ or with `wrangler deploy --var KEY:VALUE` (that deploy only). Secrets go through
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `BASE_DOMAIN` | request host | Hub host. Required for host mode and custom domains. |
-| `PUBLIC_URL` | `https://<BASE_DOMAIN>` or request origin | Absolute hub URL (origin only). |
+| `PUBLIC_URL` | `https://<BASE_DOMAIN>` or request origin | Absolute hub URL: `scheme://host[:port]`, no path, user info or query; lowercased like the Go server's `server.public_url`. |
 | `URL_MODE` | `path` | `path` or `host` (host needs `BASE_DOMAIN`). |
-| `AUTH_MODE` | `none` | `none` (anonymous cookies) or `access` (Cloudflare Access). |
+| `AUTH_MODE` | `none` | `none` (anonymous cookies) or `access` (Cloudflare Access). Any other value (`oidc`, `okta`, a typo) fails closed: every request but the health checks answers `503` until it is fixed. |
 | `ACCESS_TEAM_DOMAIN` | — | `acme` or `acme.cloudflareaccess.com`. |
 | `ACCESS_AUD` | — | Application AUD tag (comma-separated for several). |
 | `ACCESS_GET_IDENTITY` | `true` | Fetch name and groups from Access `get-identity`. |
@@ -363,11 +384,11 @@ or with `wrangler deploy --var KEY:VALUE` (that deploy only). Secrets go through
 | `OWNERSHIP` | `none` | `none` (anyone may overwrite a site, the Quick way) or `owner` (only owners and admins). |
 | `SERVER_NAME` | `Backyard` | Name shown in the hub. |
 | `RESERVED_SITES` | — | Extra reserved site names (comma-separated). |
-| `LIMITS` | see above | Guardrails (JSON). |
+| `LIMITS` | see above | Guardrails (JSON: a string, or an object). |
 | `FILE_INLINE_MAX` | `5242880` | Files above this size go to R2 when bound (max 25 MiB). |
 | `TOKEN_TTL_HOURS` | `720` | Longest lifetime of an API token. |
 | `AI_*`, `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL` | — | See [AI](#ai). |
-| `WAREHOUSE_URL` | — | Optional: proxy `/warehouse/*` to a Backyard Go server's site API (secret `WAREHOUSE_TOKEN`). |
+| `WAREHOUSE_URL` | — | Optional: proxy `/warehouse/*` to a Backyard Go server's site API (secret `WAREHOUSE_TOKEN`). Its query errors (400/403/404/429/501) pass through; other failures answer `502`/`504 upstream_error` with a generic message naming the request id (details in the Worker log). |
 
 | Secret | Meaning |
 | --- | --- |
@@ -375,8 +396,9 @@ or with `wrangler deploy --var KEY:VALUE` (that deploy only). Secrets go through
 | `DEPLOY_TOKEN` | Static bearer token with admin rights for the CLI and CI (deploy, list, delete). Like the Go server's static tokens, it can't mint API tokens. |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | Optional AI providers. |
 
-Configuration problems (bad JSON, unknown `LIMITS` keys, missing Access settings) are logged.
-Watch them with `npx wrangler tail`.
+Configuration problems (bad JSON, unknown `LIMITS` keys, missing Access settings, a variable of
+the wrong JSON type) are logged. Watch them with `npx wrangler tail`. Variables written as JSON
+values (`"FILE_INLINE_MAX": 1000`, `"LIMITS": {…}`) are taken like their text.
 
 ## Deploying from GitHub Actions
 
@@ -472,6 +494,7 @@ tokens, keys).
 | Warehouse | BigQuery, Athena, Postgres | `501 unsupported`, unless `WAREHOUSE_URL` proxies a Go server. |
 | AI providers | Anthropic, OpenAI, Bedrock, Gemini | Workers AI (default, free), Anthropic, and OpenAI-compatible APIs. |
 | Rate limits | Per-minute token buckets plus quotas | Daily caps per user/IP and platform-wide (`LIMITS`). Document write caps are counted in each site's Durable Object and reset if it's evicted. |
+| Query pages | Up to `limit` documents | Up to `limit` documents and about 8 MiB of stored JSON: a page travels from the site's Durable Object as one RPC result (32 MiB at most). A page cut short says `has_more`; page with `offset` advanced by the number of documents received. |
 | File size | Configurable | 25 MiB per file without R2, 95 MiB with R2 (100 MB request limit). |
 | Deploy methods | `api`, plus direct sync (`s3`, `gcs`, `azure`, `rsync`) | `api` only (the HTTP gateway protocol). `/__backyard/api/info` reports `"edition": "cloudflare"`. |
 | Realtime | In memory, or Redis/Postgres pub/sub across replicas | Each site's websocket hub runs in its own Durable Object (hibernation). Same protocol. The server sends no keep-alive pings (they would wake hibernated objects): the SDK's `{"t":"ping"}` every 25 s is answered with `{"t":"pong"}` by the runtime without waking the object, and closed connections are detected by the runtime. |
@@ -501,6 +524,8 @@ other), `/llms.txt` and `/docs`.
 | --- | --- |
 | `register a workers.dev subdomain first` | Open **Workers & Pages** in the dashboard once, pick a subdomain, and re-run `npm run setup`. |
 | `503` "BACKYARD_SECRET is not set" | `npm run setup -- --skip-deploy`, or `npx wrangler secret put BACKYARD_SECRET` (≥ 32 chars). |
+| `503` "not configured correctly (AUTH_MODE must be …)" | `AUTH_MODE` is neither `none` nor `access`. Fix it: `npm run setup -- --var AUTH_MODE:access` (or `none`). |
+| `401` "sign-in cookies of more than one account" | The browser holds cookies of two users for this domain (a site's page may have set one). Reload; if it persists, clear the domain's cookies. |
 | `npm run dev`: "Failed to start the remote proxy session" | Workers AI only runs remotely. Run `npx wrangler login`, or use `npm run dev:local`. |
 | `backyard login`/`deploy` gets an HTML login page or `302` | Access is protecting the deploy gateway. Add the bypass application (the Terraform module does). |
 | `401` "Cloudflare Access token" errors in the browser | `ACCESS_AUD` or `ACCESS_TEAM_DOMAIN` don't match the Access application (`terraform output`). |

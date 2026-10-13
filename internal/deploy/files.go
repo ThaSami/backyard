@@ -31,6 +31,9 @@ type LocalFile struct {
 // maxIgnoreFileBytes bounds .backyardignore.
 const maxIgnoreFileBytes = 1 << 20
 
+// utf8BOM is the UTF-8 encoding of U+FEFF, the byte order mark.
+const utf8BOM = "\uFEFF"
+
 // IgnorePatterns returns the complete pattern list CollectFiles applies to
 // dir: DefaultIgnore, then the lines of dir/.backyardignore (if present),
 // then extra. Direct-sync methods use it to build exclude flags.
@@ -42,8 +45,16 @@ func IgnorePatterns(dir string, extra []string) ([]string, error) {
 		defer f.Close()
 		sc := bufio.NewScanner(io.LimitReader(f, maxIgnoreFileBytes))
 		sc.Buffer(make([]byte, 0, 4096), maxIgnoreFileBytes)
-		for sc.Scan() {
-			patterns = append(patterns, sc.Text())
+		for first := true; sc.Scan(); first = false {
+			line := sc.Text()
+			if first {
+				// Editors on Windows (PowerShell 5's -Encoding utf8, older
+				// Notepad) start the file with a UTF-8 byte order mark,
+				// which git ignores too; kept, it would make the first rule
+				// match nothing.
+				line = strings.TrimPrefix(line, utf8BOM)
+			}
+			patterns = append(patterns, line)
 		}
 		if err := sc.Err(); err != nil {
 			return nil, fmt.Errorf("deploy: read %s: %w", IgnoreFile, err)

@@ -120,7 +120,9 @@ func DecodeJSON(provider string, resp *http.Response, out any) error {
 }
 
 // ErrorFromResponse reads (a bounded prefix of) an error response body and
-// returns it as an *ai.UpstreamError. It does not close the body.
+// returns it as an *ai.UpstreamError. It does not close the body. The
+// error's RetryDelay comes from the response headers (see RetryAfter) or,
+// when they give none, from a google.rpc.RetryInfo detail in the body.
 func ErrorFromResponse(provider string, resp *http.Response) *ai.UpstreamError {
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBytes))
 	msg := ErrorMessage(b)
@@ -130,7 +132,11 @@ func ErrorFromResponse(provider string, resp *http.Response) *ai.UpstreamError {
 	if msg == "" {
 		msg = fmt.Sprintf("HTTP %d", resp.StatusCode)
 	}
-	return &ai.UpstreamError{Provider: provider, Status: resp.StatusCode, Message: msg}
+	retry := RetryAfter(resp.StatusCode, resp.Header, time.Now())
+	if retry == 0 {
+		retry = RetryInfoDelay(b)
+	}
+	return &ai.UpstreamError{Provider: provider, Status: resp.StatusCode, Message: msg, RetryDelay: retry}
 }
 
 // ErrorDetail is the structured part of common provider error bodies.

@@ -1,8 +1,10 @@
 package server
 
 import (
+	"encoding/base64"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"regexp"
 	"slices"
@@ -208,6 +210,128 @@ func TestHubTokens(t *testing.T) {
 	n := newHarness(t, func(h *harness, d *Deps) { d.Tokens = nil })
 	n.srv.deps.Tokens = nil
 	expectError(t, n.api("POST", u, map[string]any{}), 501, "unsupported")
+}
+
+// TestHubTokensCannotRenewThemselves: with the real authenticator, a token
+// minted by a request that presents a Backyard API token never outlives that
+// token (no self-renewal, also not by chaining), while a proxy identity (a
+// fresh IdP authentication) still gets the full auth.token_ttl.
+func TestHubTokensCannotRenewThemselves(t *testing.T) {
+	h := newHarness(t, func(h *harness, d *Deps) {
+		h.cfg.Auth.Mode = "header"
+		h.cfg.Auth.Header.EmailHeader = "X-Email"
+		h.cfg.Auth.AdminGroups = []string{"backyard-admins"}
+		h.cfg.Server.TrustedProxies = []string{"192.0.2.0/24"} // httptest's RemoteAddr
+		a, err := auth.New(t.Context(), h.cfg, auth.Options{})
+		if err != nil {
+			t.Fatalf("auth.New: %v", err)
+		}
+		d.Auth = a
+	})
+	tokens := auth.NewTokens(h.cfg.Server.Secret, 0)
+	const u = "https://backyard.test/__backyard/api/tokens"
+	type minted struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	mint := func(body any, hdr ...string) minted {
+		t.Helper()
+		w := h.api("POST", u, body, hdr...)
+		expectStatus(t, w, 200)
+		var m minted
+		mustJSON(t, w.Body.Bytes(), &m)
+		if _, err := tokens.Verify(m.Token); err != nil {
+			t.Fatalf("minted token does not verify: %v", err)
+		}
+		return m
+	}
+
+	// A proxy identity is authenticated by the IdP: full lifetime.
+	full := mint(map[string]any{}, "X-Email", "alice@acme.com")
+	if d := time.Until(full.ExpiresAt); d < 719*time.Hour {
+		t.Fatalf("proxy identity: token expires in %v, want the full 720h", d)
+	}
+
+	// A one-hour token, carrying a group that grants admin.
+	short, shortExp, err := tokens.Issue(&identity.User{ID: "alice@acme.com", Email: "alice@acme.com", Name: "Alice",
+		Groups: []string{"backyard-admins"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []any{map[string]any{}, map[string]any{"ttl_hours": 720}, map[string]any{"ttl_hours": 24}} {
+		m := mint(body, "Authorization", "Bearer "+short)
+		if m.ExpiresAt.After(shortExp) || time.Until(m.ExpiresAt) < 55*time.Minute {
+			t.Fatalf("%v: minted token expires %v, presented token %v", body, m.ExpiresAt, shortExp)
+		}
+		// Chaining does not extend it either.
+		next := mint(map[string]any{}, "Authorization", "Bearer "+m.Token)
+		if next.ExpiresAt.After(shortExp) {
+			t.Fatalf("chained token expires %v, after the original %v", next.ExpiresAt, shortExp)
+		}
+	}
+	// A shorter request is honoured as is.
+	if m := mint(map[string]any{"ttl_hours": 0.5}, "Authorization", "Bearer "+short); time.Until(m.ExpiresAt) > 31*time.Minute {
+		t.Fatalf("ttl_hours 0.5: expires in %v", time.Until(m.ExpiresAt))
+	}
+	// The bearer token is the request's credential even when proxy headers
+	// are present too.
+	if m := mint(map[string]any{}, "Authorization", "Bearer "+short, "X-Email", "alice@acme.com"); m.ExpiresAt.After(shortExp) {
+		t.Fatalf("bearer + proxy headers: expires %v, after %v", m.ExpiresAt, shortExp)
+	}
+
+	// A token about to expire cannot mint at all.
+	dying, _, err := tokens.Issue(alice, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectError(t, h.api("POST", u, map[string]any{}, "Authorization", "Bearer "+dying), 401, "unauthenticated")
+
+	waitBackground(t, h)
+	if !strings.Contains(h.logText(), "from_api_token=true") {
+		t.Fatalf("audit does not record the bounded issue: %s", h.logText())
+	}
+}
+
+func TestPresentedAPIToken(t *testing.T) {
+	tokens := auth.NewTokens(testSecret, 0)
+	tok, exp, err := tokens.Issue(alice, 2*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwt := func(claims string) string {
+		enc := base64.RawURLEncoding.EncodeToString
+		return enc([]byte(`{"alg":"RS256"}`)) + "." + enc([]byte(claims)) + ".sig"
+	}
+	tests := []struct {
+		name    string
+		authz   string
+		user    *identity.User
+		bounded bool
+		exp     time.Time
+	}{
+		{"api token", "Bearer " + tok, alice, true, exp},
+		{"scheme case", "bearer  " + tok + " ", alice, true, exp},
+		{"other user", "Bearer " + tok, &identity.User{ID: "bob@acme.com"}, false, time.Time{}},
+		{"no header", "", alice, false, time.Time{}},
+		{"basic auth", "Basic " + tok, alice, false, time.Time{}},
+		{"idp jwt", "Bearer " + jwt(`{"iss":"https://idp.example","sub":"alice@acme.com","exp":4102444800}`), alice, false, time.Time{}},
+		{"static token", "Bearer s3cr3t-static", alice, false, time.Time{}},
+		{"garbage payload", "Bearer a.%%%.c", alice, false, time.Time{}},
+		{"no exp", "Bearer " + jwt(`{"iss":"backyard","sub":"alice@acme.com"}`), alice, true, time.Unix(0, 0)},
+		{"nil user", "Bearer " + tok, nil, false, time.Time{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest("POST", "https://backyard.test/__backyard/api/tokens", nil)
+			if tt.authz != "" {
+				r.Header.Set("Authorization", tt.authz)
+			}
+			got, ok := presentedAPIToken(r, tt.user)
+			if ok != tt.bounded || !got.Equal(tt.exp) {
+				t.Fatalf("presentedAPIToken = %v, %v; want %v, %v", got, ok, tt.exp, tt.bounded)
+			}
+		})
+	}
 }
 
 // useDocs substitutes the embedded skill documents for one test.

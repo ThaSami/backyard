@@ -9,6 +9,7 @@ import (
 
 	"github.com/thasami/backyard/internal/cli/scaffold"
 	"github.com/thasami/backyard/internal/clientconfig"
+	"github.com/thasami/backyard/internal/deploy"
 )
 
 func (a *cliApp) newInitCommand() *cobra.Command {
@@ -50,11 +51,15 @@ current folder is initialized and its name becomes the site name.`,
 					return fmt.Errorf("cannot derive a site name from %s; pass one: backyard init <site>", target)
 				}
 			}
-			server := a.currentServer()
-			res, err := scaffold.Init(scaffold.Options{
+			server, info := a.currentServer()
+			opts := scaffold.Options{
 				Dir: target, Site: site, Server: server, Agents: agents, Template: template,
 				Force: force, Render: a.deps.render,
-			})
+			}
+			if info != nil {
+				opts.BaseDomain, opts.URLMode = info.BaseDomain, info.URLMode
+			}
+			res, err := scaffold.Init(opts)
 			if err != nil {
 				return err
 			}
@@ -73,21 +78,22 @@ current folder is initialized and its name becomes the site name.`,
 	return cmd
 }
 
-// currentServer returns the hub URL of the active profile ("" if none).
-func (a *cliApp) currentServer() string {
+// currentServer returns the hub URL of the active profile ("" if none) and
+// the server info cached for it (nil if unknown).
+func (a *cliApp) currentServer() (string, *deploy.Info) {
 	path, err := a.configPath()
 	if err != nil {
-		return ""
+		return "", nil
 	}
 	f, err := clientconfig.Load(path)
 	if err != nil {
-		return ""
+		return "", nil
 	}
 	r, err := f.Resolve(a.overrides())
 	if err != nil {
-		return ""
+		return "", nil
 	}
-	return r.Server
+	return r.Server, r.CachedInfo()
 }
 
 func (a *cliApp) printInitResult(cwd string, res *scaffold.Result, server string) {

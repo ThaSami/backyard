@@ -160,9 +160,9 @@ Backyard API tokens:
    `--device` is not available in IAP mode. On headless machines, open
    `/__backyard/auth/cli?mode=display` and paste the token with
    `backyard login --token …`.
-3. Gateway calls such as `/__backyard/api/deploy/*` that carry an
-   `Authorization` header are routed to the **deploy backend, which bypasses
-   IAP**. Backyard itself rejects any call without a valid token. Uploads use
+3. Gateway calls such as `/__backyard/api/deploy/*`, and token requests to
+   `/__backyard/api/tokens`, that carry an `Authorization` header are routed to
+   the **deploy backend, which bypasses IAP**. Backyard itself rejects any call without a valid token. Uploads use
    signed GCS URLs, so file bytes never pass through the load balancer.
    `/__backyard/api/deploy/info`, `/__backyard/api/deploy/uploads/*` (signed,
    expiring upload URLs) and `/__backyard/healthz` also bypass IAP. Client-supplied
@@ -171,7 +171,12 @@ Backyard API tokens:
    behind IAP and uses your IAP identity.
 5. For CI, either mint a token with `backyard token create`, or add a static token
    to `static_tokens` (store only its SHA-256, from `backyard token hash`) and set
-   `BACKYARD_TOKEN` in the pipeline.
+   `BACKYARD_TOKEN` in the pipeline. `backyard token create` posts to
+   `/__backyard/api/tokens` with your API token, so that path also goes to the
+   deploy backend when it carries an `Authorization` header. A token minted this
+   way never outlives the token that minted it, so removing someone from
+   `iap_members` still cuts them off when their last browser-issued token
+   expires (30 days by default).
 
 The site APIs (`backyard.db`, `ai`, websockets and so on) always go through IAP:
 they are meant for browsers.
@@ -259,9 +264,16 @@ source IPs. Deploys still need a token (`static_tokens`).
   true`, and keep `bigquery_datasets` narrow if you do. The BigQuery API must be
   enabled in `bigquery_project_id`.
 - **Direct bucket deploys.** Principals in `bucket_writer_members` get
-  `roles/storage.objectUser` on the bucket. The `gcs` method
-  (`gcloud storage rsync`) is then advertised to CLIs, and the bucket name is shown
-  in `/info`.
+  `roles/storage.objectUser` on the bucket with an IAM condition that limits it to
+  objects below `<storage_prefix>sites/`, plus `roles/storage.objectViewer`
+  limited to the bucket itself (listing only, as rsync needs). They can therefore
+  publish any site's files, but cannot read or change `_meta/` (site owners,
+  manifests) or anyone's uploads; the server rebuilds `_meta` when the CLI calls
+  the refresh endpoint after the sync. The `gcs` method (`gcloud storage rsync`)
+  is then advertised to CLIs, and the bucket name is shown in `/info`. gcloud's
+  parallel composite uploads keep temporary objects outside `sites/`, so they are
+  refused: if a very large file fails to upload, run
+  `gcloud config set storage/parallel_composite_upload_enabled False`.
 - **Client IPs.** `trusted_proxies` is empty on purpose. Google's front ends pass a
   client-supplied `X-Forwarded-Host` through, and Backyard trusts X-Forwarded-Host
   and X-Forwarded-For together, so trusting the platform would let a page spoof the
@@ -341,10 +353,13 @@ terraform init -backend=false
 terraform validate
 terraform test        # offline, Google providers mocked (Terraform >= 1.7)
 
-# Render several configurations and load each with Backyard's own config
-# loader (strict keys, ${ENV} expansion, defaults, validation):
+# Render the configurations of configcheck/testdata and of every run in
+# tests/, and load each with Backyard's own config loader (strict keys,
+# ${ENV} expansion, defaults, validation) in the container's environment:
 cd ../../.. && BACKYARD_TEST_TERRAFORM=1 go test ./deploy/terraform/gcp/configcheck/
 ```
+
+CI runs both (`make tf-configcheck` runs the configcheck tests of every module).
 
 ## Main inputs
 

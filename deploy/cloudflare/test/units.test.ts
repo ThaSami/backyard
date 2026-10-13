@@ -1,9 +1,11 @@
 /** Unit tests of the pure modules. */
 import { describe, expect, it } from "vitest";
 import { readSSE } from "../src/ai/sse";
+import { retryHint, safeUpstreamMessage } from "../src/ai/types";
 import { extractText } from "../src/ai/workersai";
 import { DEFAULT_LIMITS, normalizeTeam, parseConfig } from "../src/config";
-import { b64urlDecode, decodeAnyBase64 } from "../src/crypto";
+import { cookiePathPrefixes } from "../src/auth";
+import { b64urlDecode, base64Decode, base64Encode, base64Head, base64Size, decodeAnyBase64, normalizeBase64 } from "../src/crypto";
 import { buildQuery, normalizeQuery, parseListParams } from "../src/db/query";
 import { formatMicros, formatMillisFixed, MicroClock, parseRFC3339Micros, toFixedMillis } from "../src/db/time";
 import { canonicalDoc, MAX_NESTING_DEPTH } from "../src/db/values";
@@ -243,6 +245,45 @@ describe("HTTP objects", () => {
   });
 });
 
+describe("upload sandboxing (an allowlist of passive types, like Go's activeContent)", () => {
+  it.each([
+    "text/html",
+    "text/html; charset=utf-8",
+    "application/xhtml+xml",
+    "image/svg+xml",
+    "text/xml",
+    "application/xml",
+    "text/xsl",
+    "application/xslt+xml",
+    "application/rss+xml",
+    "text/markdown",
+    "text/javascript",
+    "application/x-unknown",
+    "video/x+xml",
+    "audio/svg+xml",
+    "multipart/x-mixed-replace",
+    "garbage",
+    "",
+    "text/",
+  ])("sandboxes %j", (ct) => expect(isActiveContent(ct)).toBe(true));
+  it.each([
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/avif",
+    "image/x-icon",
+    "text/plain; charset=utf-8",
+    "text/csv",
+    "application/pdf",
+    "application/json",
+    "application/octet-stream",
+    "audio/mpeg",
+    "video/mp4",
+    "Video/WebM",
+  ])("serves %j as is", (ct) => expect(isActiveContent(ct)).toBe(false));
+});
+
 describe("titles", () => {
   it.each([
     ["<title>Hello</title>", "Hello", ""],
@@ -254,6 +295,8 @@ describe("titles", () => {
     ["<titlex>no</titlex>", "", ""],
     ["<title>unterminated", "unterminated", ""],
     ["<meta name=Description content=unquoted>", "", "unquoted"],
+    ["<title>&constructor; &toString; &amp;</title>", "&constructor; &toString; &", ""],
+    ['<meta constructor="x" name="description" content="d">', "", "d"],
   ])("extractTitle(%j)", (html, title, description) => expect(extractTitle(html)).toEqual({ title, description }));
 });
 
@@ -300,9 +343,102 @@ describe("config", () => {
     expect(parseConfig({} as Env).problems.join()).toContain("BACKYARD_SECRET");
     expect(normalizeTeam("https://Team.cloudflareaccess.com/")).toBe("team.cloudflareaccess.com");
   });
+
+  it("fails closed for an AUTH_MODE other than none or access", () => {
+    for (const mode of ["oidc", "okta", "cf-access", "cloudflare-access", "acess", "iap", "true"]) {
+      const c = parseConfig({ ...base, AUTH_MODE: mode } as unknown as Env);
+      expect(c.fatal, mode).toContain('AUTH_MODE must be "none" or "access"');
+      expect(c.problems.join(), mode).toContain("503");
+    }
+    // Not a string at all (a JSON variable) is no mode either.
+    for (const v of [true, 1, { mode: "access" }, ["access"]]) {
+      expect(parseConfig({ ...base, AUTH_MODE: v } as unknown as Env).fatal, JSON.stringify(v)).not.toBe("");
+    }
+    for (const mode of ["", " none ", "NONE", "access", " Access "]) {
+      expect(parseConfig({ ...base, AUTH_MODE: mode, ACCESS_TEAM_DOMAIN: "a", ACCESS_AUD: "b" } as unknown as Env).fatal, mode).toBe("");
+    }
+    expect(parseConfig(base).fatal).toBe("");
+  });
+
+  it("takes LIMITS and AI_MODELS given as JSON variables (objects), and reports other value types", () => {
+    const c = parseConfig({
+      ...base,
+      LIMITS: { ai_per_day: 5, max_sites: 3 },
+      AI_MODELS: { mini: { provider: "workers-ai", model: "@cf/x/y", kind: "chat" } },
+      FILE_INLINE_MAX: 1000,
+      ALLOW_ANONYMOUS_DEPLOY: true,
+      TOKEN_TTL_HOURS: 2,
+    } as unknown as Env);
+    expect(c.limits.ai_per_day).toBe(5);
+    expect(c.limits.max_sites).toBe(3);
+    expect(Object.keys(c.ai.models)).toEqual(["mini"]);
+    expect(c.ai.defaultChat).toBe("mini");
+    expect(c.fileInlineMax).toBe(1000);
+    expect(c.allowAnonymousDeploy).toBe(true);
+    expect(c.tokenTTLSeconds).toBe(7200);
+    expect(c.problems).toEqual([]);
+    const bad = parseConfig({ ...base, LIMITS: 5, AI_MODELS: ["x"], SERVER_NAME: { a: 1 } } as unknown as Env);
+    expect(bad.limits).toEqual(DEFAULT_LIMITS);
+    const problems = bad.problems.join("\n");
+    expect(problems).toContain("LIMITS");
+    expect(problems).toContain("AI_MODELS must be a string or a JSON object (got an array)");
+    expect(problems).toContain("SERVER_NAME must be a string (got a object)");
+    expect(bad.serverName).toBe("Backyard");
+    // LIMITS keys are own keys of the defaults, never members of Object.prototype.
+    const proto = parseConfig({ ...base, LIMITS: '{"constructor": 5, "toString": 1}' } as unknown as Env);
+    expect(proto.problems.join()).toContain('unknown key "constructor"');
+    expect(Object.hasOwn(proto.limits, "constructor")).toBe(false);
+  });
+
+  it("normalizes PUBLIC_URL like the Go server's public URL", () => {
+    const pub = (v: string) => parseConfig({ ...base, PUBLIC_URL: v } as unknown as Env);
+    // scheme://host[:port], lowercased; an explicit port is kept.
+    expect(pub(" HTTPS://Hub.Acme.COM:443/ ").publicURL).toBe("https://hub.acme.com:443");
+    expect(pub("http://hub.local:8787").publicURL).toBe("http://hub.local:8787");
+    for (const bad of ["https://user@hub.acme.com", "https://hub.acme.com?x=1", "https://hub.acme.com#f", "https://hub.acme.com/backyard", "hub.acme.com", "ftp://hub"]) {
+      const c = pub(bad);
+      expect(c.publicURL, bad).toBe("");
+      expect(c.problems.join(), bad).toContain("PUBLIC_URL must be an absolute origin");
+    }
+  });
 });
 
 describe("misc", () => {
+  it("normalizes base64 without decoding it", () => {
+    const std = btoa("hello world!?");
+    expect(normalizeBase64(std)).toBe(std); // already canonical: the same string
+    expect(normalizeBase64("aGVsbG8")).toBe("aGVsbG8=");
+    expect(normalizeBase64("aGVs bG8=\n")).toBe("aGVsbG8=");
+    expect(normalizeBase64("-_8")).toBe("+/8=");
+    expect(normalizeBase64("")).toBe("");
+    for (const bad of ["!!!", "a", "aGVsbG8=x", "data:image/png;base64,AAAA", "a=b="]) expect(normalizeBase64(bad), bad).toBeNull();
+    for (const n of [0, 1, 2, 3, 4, 5, 100]) {
+      const b = base64Encode(new Uint8Array(n).map((_, i) => i * 7));
+      expect(base64Size(b), String(n)).toBe(n);
+      expect(base64Decode(b)).toEqual(new Uint8Array(n).map((_, i) => i * 7));
+    }
+    expect(base64Head(base64Encode(new Uint8Array(200).map((_, i) => i)), 64)).toEqual(new Uint8Array(64).map((_, i) => i));
+    // Large inputs (chunked encoding) round-trip.
+    const big = new Uint8Array(100_000).map((_, i) => (i * 31 + (i >> 8)) & 0xff);
+    expect(base64Decode(base64Encode(big))).toEqual(big);
+  });
+
+  it("lists the cookie paths that match a request path (RFC 6265 path-match)", () => {
+    expect(cookiePathPrefixes("/")).toEqual(["/"]);
+    expect(cookiePathPrefixes("/__backyard/api/deploy/me")).toEqual([
+      "/",
+      "/__backyard",
+      "/__backyard/",
+      "/__backyard/api",
+      "/__backyard/api/",
+      "/__backyard/api/deploy",
+      "/__backyard/api/deploy/",
+      "/__backyard/api/deploy/me",
+    ]);
+    expect(cookiePathPrefixes("/a/").length).toBe(3);
+    expect(cookiePathPrefixes("/" + "x/".repeat(20)).length).toBe(17);
+  });
+
   it("decodes base64 variants", () => {
     expect(b64urlDecode("AQID")).toEqual(new Uint8Array([1, 2, 3]));
     expect(b64urlDecode("A+B")).toBeNull();
@@ -435,6 +571,52 @@ describe("agent docs", () => {
     expect(baseURL("")).toBe("");
   });
 
+  it("matches skills.Localize byte for byte, including the hub URL's spelling", () => {
+    // [document, public URL, skills.Localize output] computed by the Go
+    // implementation. Go keeps the host's case and an explicit default port
+    // (WHATWG URL would lowercase and drop them), drops user info, a query
+    // and a fragment, and derives site hosts only for a non-IP host.
+    const cases: [string, string, string][] = [
+      [
+        "See https://backyard.example.com/s/demo/ or https://demo.backyard.example.com/ (*.backyard.example.com).",
+        "HTTPS://Hub.Acme.COM:443/",
+        "See https://Hub.Acme.COM:443/s/demo/ or https://demo.Hub.Acme.COM:443/ (*.Hub.Acme.COM:443).",
+      ],
+      [
+        "https://<site>.backyard.example.com/x and https://backyard.example.com",
+        "https://u:p@hub.acme.com:8443/?q=1#f",
+        "https://<site>.hub.acme.com:8443/x and https://hub.acme.com:8443",
+      ],
+      [
+        "https://demo.backyard.example.com/ https://backyard.example.com/docs",
+        "https://10.0.0.1:8443",
+        "https://demo.backyard.example.com/ https://10.0.0.1:8443/docs",
+      ],
+      [
+        "https://demo.backyard.example.com/ https://backyard.example.com/docs",
+        "https://01.2.3.4",
+        "https://demo.01.2.3.4/ https://01.2.3.4/docs",
+      ],
+      [
+        "https://demo.backyard.example.com/ https://backyard.example.com/docs",
+        "http://[::1]:8787",
+        "https://demo.backyard.example.com/ http://[::1]:8787/docs",
+      ],
+      [
+        "a.backyard.example.com.b.backyard.example.com c.backyard.example.com.evil.org https://backyard.example.com.evil",
+        "https://hub.acme.com",
+        "a.backyard.example.com.b.hub.acme.com c.backyard.example.com.evil.org https://backyard.example.com.evil",
+      ],
+      [
+        "x.backyard.example.com-y.backyard.example.com <a<b>.backyard.example.com <Site>.backyard.example.com",
+        "http://hub.local:8787",
+        "x.backyard.example.com-y.hub.local:8787 <a<b>.hub.local:8787 <Site>.backyard.example.com",
+      ],
+    ];
+    for (const [md, url, want] of cases) expect(localize(md, url), `${md} @ ${url}`).toBe(want);
+    expect(baseURL("HTTPS://Hub.Acme.COM:443/")).toBe("https://Hub.Acme.COM:443");
+  });
+
   it("serves SKILL.md and references by name, with an optional references/ prefix", () => {
     expect(docMarkdown("skill", HUB)).toBe(localize(SKILL_MD, HUB));
     expect(docMarkdown("SKILL", HUB)).toBe(localize(SKILL_MD, HUB));
@@ -450,5 +632,32 @@ describe("agent docs", () => {
     for (const bad of ["", "nope", "../api", "references/../api", "references/references/api", "api.md", "a/b", "constructor", "__proto__", "toString"]) {
       expect(docMarkdown(bad, HUB), bad).toBe("");
     }
+  });
+});
+
+describe("AI provider messages (Go's safeUpstreamMessage and retryHint)", () => {
+  it("sanitizes and bounds provider messages", () => {
+    expect(safeUpstreamMessage("see https://x.internal:8443/v1?k=1 key sk-proj-abcdefghijklmnop Bearer abcdefgh12345678", 400)).toBe(
+      "see [url] key [redacted] [redacted]",
+    );
+    expect(safeUpstreamMessage("a\u0000b‮c\n\n d e", 0)).toBe("a b c d e");
+    // A leading BOM is not white space for Go (unicode.IsSpace) and survives a cut.
+    const long = "﻿" + "é".repeat(400);
+    const out = safeUpstreamMessage(long, 500);
+    expect(out.startsWith("﻿é")).toBe(true);
+    expect(out.endsWith("…")).toBe(true);
+    expect(new TextEncoder().encode(out).length).toBe(299 + 3);
+    expect(safeUpstreamMessage("\udc00x", 0)).toBe("�x");
+    expect(safeUpstreamMessage("", 400)).toBe("bad request");
+    expect(safeUpstreamMessage("  ", 529)).toBe("request failed");
+  });
+
+  it("parses retry hints", () => {
+    expect(retryHint("Please try again in 1.5s.")).toBe(1.5);
+    expect(retryHint("Please try again in 350ms.")).toBe(0.35);
+    expect(retryHint("Please retry after 6 seconds.")).toBe(6);
+    expect(retryHint("try again in 2 minutes")).toBe(120);
+    expect(retryHint("retry after 3")).toBe(3);
+    expect(retryHint("please wait")).toBe(0);
   });
 });

@@ -101,3 +101,52 @@ func TestPresignedUploadsEnforceSizeAndDigest(t *testing.T) {
 		}
 	}
 }
+
+// With SetReportDigests, StatSHA256 reports the digest verified by a strict
+// presigned upload, and never one for objects written otherwise.
+func TestStatSHA256(t *testing.T) {
+	s := NewMemStore()
+	ctx := context.Background()
+	if _, _, err := s.StatSHA256(ctx, "a.txt"); !errors.Is(err, blob.ErrNotSupported) {
+		t.Fatalf("StatSHA256 before SetReportDigests err = %v", err)
+	}
+	s.SetReportDigests(true)
+	if _, _, err := s.StatSHA256(ctx, "a.txt"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("StatSHA256(missing) err = %v", err)
+	}
+	ts := httptest.NewServer(s.PresignHandler())
+	defer ts.Close()
+	s.EnablePresign(ts.URL)
+	data := []byte("declared")
+	pr, err := s.PresignPut(ctx, "a.txt", blob.PresignPutOptions{Size: int64(len(data)), SHA256: sha256Hex(data)}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := put(t, pr, data); got != http.StatusOK {
+		t.Fatalf("upload status %d", got)
+	}
+	info, sum, err := s.StatSHA256(ctx, "a.txt")
+	if err != nil || sum != sha256Hex(data) || info.Size != int64(len(data)) {
+		t.Errorf("StatSHA256 after a verified upload = %+v, %q, %v", info, sum, err)
+	}
+	if _, err := s.Put(ctx, "a.txt", bytes.NewReader([]byte("DECLARED")), 8, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, sum, _ := s.StatSHA256(ctx, "a.txt"); sum != "" {
+		t.Errorf("StatSHA256 after an overwrite by Put = %q, want none", sum)
+	}
+	s.SetLaxPresign(true)
+	if got := put(t, pr, data); got != http.StatusOK {
+		t.Fatalf("lax upload status %d", got)
+	}
+	if _, sum, _ := s.StatSHA256(ctx, "a.txt"); sum != "" {
+		t.Errorf("StatSHA256 after a lax (unverified) upload = %q, want none", sum)
+	}
+	before := s.GetCount()
+	if _, _, err := s.Get(ctx, "a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if s.GetCount() != before+1 {
+		t.Errorf("GetCount = %d, want %d", s.GetCount(), before+1)
+	}
+}

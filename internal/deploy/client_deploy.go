@@ -372,6 +372,7 @@ func (e *permanentError) Unwrap() error { return e.err }
 func (c *Client) resolve(raw string) (*url.URL, error) {
 	ref, err := url.Parse(raw)
 	if err != nil {
+		redactURLError(err)
 		return nil, fmt.Errorf("deploy: invalid upload URL: %w", err)
 	}
 	if ref.IsAbs() {

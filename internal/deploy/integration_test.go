@@ -8,13 +8,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
@@ -107,14 +108,30 @@ func runBackendE2E(t *testing.T, store blob.Store, wantPresigned bool) {
 	} else {
 		// Storage that cannot bind the declared size (Azure SAS, or a fake
 		// that does not verify signatures) accepts a larger body; the
-		// commit must then fail and delete it.
+		// commit must then fail. On Azure, where nothing could have
+		// verified it, the object is deleted; elsewhere a wrong-size object
+		// is another deploy's verified upload (real S3 rejects this body),
+		// so it is kept like any concurrent upload.
 		files := map[string]string{"oversized.txt": "small"}
 		cr := e.createDeploy("alice", "e2e", files)
+		unbound := store.Describe().Type == "azure"
 		if code := e.upload(cr.Uploads[0], strings.Repeat("x", 4096)); code < 300 {
 			resp, body := e.commit("alice", "e2e", cr.DeployID, entriesFor(files))
 			wantStatus(t, resp, body, 409, CodeConflict)
-			if !strings.Contains(string(body), "oversized.txt (4096 bytes in storage, expected 5; deleted)") {
+			want := "oversized.txt (4096 bytes in storage, expected 5)"
+			if unbound {
+				want = "oversized.txt (4096 bytes in storage, expected 5; deleted)"
+			}
+			if !strings.Contains(string(body), want) || (!unbound && strings.Contains(string(body), "deleted")) {
 				t.Errorf("commit after an oversized upload: %s", body)
+			}
+			if !unbound {
+				if b := e.object("e2e", "oversized.txt"); len(b) != 4096 {
+					t.Errorf("oversized object = %d bytes, want it kept", len(b))
+				}
+				if err := store.Delete(ctx, "sites/e2e/oversized.txt"); err != nil {
+					t.Fatal(err)
+				}
 			}
 		}
 		if b := e.object("e2e", "oversized.txt"); b != nil {
@@ -179,31 +196,52 @@ func TestIntegrationFSStore(t *testing.T) {
 }
 
 func TestIntegrationS3PresignedFake(t *testing.T) {
-	if n := testIntegrationS3PresignedFake(t); n != 0 {
-		t.Errorf("%d checksum headers sent to an S3-compatible endpoint", n)
+	n := testIntegrationS3PresignedFake(t)
+	if n.presignedChecksums != 0 || n.checksumMode != 0 {
+		t.Errorf("checksum headers sent to an S3-compatible endpoint: %+v", n)
 	}
 }
 
 // With flexible checksums (the AWS default), presigned uploads also carry
-// a signed x-amz-checksum-sha256 that the client must send.
+// a signed x-amz-checksum-sha256 that the client must send, and the commit
+// reads the digests S3 verified back with HeadObject instead of the files.
 func TestIntegrationS3PresignedFakeChecksums(t *testing.T) {
 	t.Setenv("AWS_REQUEST_CHECKSUM_CALCULATION", "when_supported")
 	t.Setenv("AWS_RESPONSE_CHECKSUM_VALIDATION", "when_supported")
-	if n := testIntegrationS3PresignedFake(t); n == 0 {
+	n := testIntegrationS3PresignedFake(t)
+	if n.presignedChecksums == 0 {
 		t.Error("no presigned upload carried x-amz-checksum-sha256")
+	}
+	if n.reported == 0 {
+		t.Errorf("no commit used a digest verified by S3: %+v", n)
 	}
 }
 
-// testIntegrationS3PresignedFake runs the backend e2e against gofakes3 and
-// returns how many presigned PUTs carried x-amz-checksum-sha256 (each one
-// verified against its body, as S3 does).
-func testIntegrationS3PresignedFake(t *testing.T) int {
+// s3FakeCounts counts checksum traffic seen by the S3 fake.
+type s3FakeCounts struct {
+	presignedChecksums int // presigned PUTs with x-amz-checksum-sha256
+	checksumMode       int // GET/HEAD requests in checksum mode
+	reported           int // of those, answered with a SHA-256 checksum
+}
+
+// testIntegrationS3PresignedFake runs the backend e2e against gofakes3,
+// which it makes treat SHA-256 checksums like S3: a presigned PUT's
+// x-amz-checksum-sha256 is verified against the body and kept for that
+// object version, and returned (type FULL_OBJECT) only to requests in
+// checksum mode. gofakes3 itself echoes every x-amz-* header of the request
+// that created an object, even across overwrites; those are dropped.
+func testIntegrationS3PresignedFake(t *testing.T) s3FakeCounts {
 	backend := s3mem.New()
 	fake := gofakes3.New(backend, gofakes3.WithLogger(gofakes3.DiscardLog())).Server()
-	var checksums atomic.Int64
+	var (
+		mu     sync.Mutex
+		counts s3FakeCounts
+		kept   = map[string][2]string{} // path → {sha256 (base64), etag}
+	)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if want := r.Header.Get("X-Amz-Checksum-Sha256"); want != "" && r.URL.Query().Has("X-Amz-Signature") {
-			checksums.Add(1)
+		rec := httptest.NewRecorder()
+		want := r.Header.Get("X-Amz-Checksum-Sha256")
+		if want != "" && r.URL.Query().Has("X-Amz-Signature") {
 			body, err := io.ReadAll(r.Body)
 			sum := sha256.Sum256(body)
 			if err != nil || base64.StdEncoding.EncodeToString(sum[:]) != want {
@@ -211,8 +249,36 @@ func testIntegrationS3PresignedFake(t *testing.T) int {
 				return
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
+			mu.Lock()
+			counts.presignedChecksums++
+			mu.Unlock()
 		}
-		fake.ServeHTTP(w, r)
+		fake.ServeHTTP(rec, r)
+		mu.Lock()
+		switch r.Method {
+		case http.MethodPut:
+			if want != "" && rec.Code == http.StatusOK {
+				kept[r.URL.Path] = [2]string{want, rec.Header().Get("ETag")}
+			}
+		case http.MethodGet, http.MethodHead:
+			for k := range rec.Header() {
+				if strings.HasPrefix(strings.ToLower(k), "x-amz-checksum-") {
+					rec.Header().Del(k)
+				}
+			}
+			if strings.EqualFold(r.Header.Get("X-Amz-Checksum-Mode"), "ENABLED") {
+				counts.checksumMode++
+				if c, ok := kept[r.URL.Path]; ok && rec.Code == http.StatusOK && rec.Header().Get("ETag") == c[1] && r.Header.Get("Range") == "" {
+					rec.Header().Set("X-Amz-Checksum-Sha256", c[0])
+					rec.Header().Set("X-Amz-Checksum-Type", "FULL_OBJECT")
+					counts.reported++
+				}
+			}
+		}
+		mu.Unlock()
+		maps.Copy(w.Header(), rec.Header())
+		w.WriteHeader(rec.Code)
+		_, _ = w.Write(rec.Body.Bytes())
 	}))
 	t.Cleanup(ts.Close)
 	if err := backend.CreateBucket("deploy-test"); err != nil {
@@ -232,7 +298,9 @@ func testIntegrationS3PresignedFake(t *testing.T) int {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	runBackendE2E(t, store, true)
-	return int(checksums.Load())
+	mu.Lock()
+	defer mu.Unlock()
+	return counts
 }
 
 func TestIntegrationAzuritePresigned(t *testing.T) {

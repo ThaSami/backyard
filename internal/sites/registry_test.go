@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
@@ -492,5 +494,59 @@ func TestRegistryFSStore(t *testing.T) {
 	res, err := store.List(ctx, "uploads/", "")
 	if err != nil || len(res.Objects) != 0 {
 		t.Errorf("uploads left: %+v, %v", res, err)
+	}
+}
+
+// FileDigest describes the bytes stored now: hashed when the store has no
+// verified digest, taken from the store (without reading) when it has one.
+func TestFileDigest(t *testing.T) {
+	ctx := context.Background()
+	ms := sitestest.NewMemStore()
+	reg := sites.NewRegistry(ms, testConfig(t, "none"))
+	info := put(t, ms, sites.SiteKey("dig", "a/b.txt"), "hello")
+	mf, err := reg.FileDigest(ctx, "dig", "a/b.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *mf != (sites.ManifestFile{Path: "a/b.txt", Size: 5, SHA256: sha("hello"), ETag: info.ETag}) {
+		t.Errorf("FileDigest = %+v", *mf)
+	}
+	if _, err := reg.FileDigest(ctx, "dig", "missing.txt"); !errors.Is(err, blob.ErrNotFound) {
+		t.Errorf("FileDigest(missing) err = %v", err)
+	}
+	if _, err := reg.FileDigest(ctx, "Bad Name", "a.txt"); err == nil {
+		t.Error("FileDigest accepted an invalid site name")
+	}
+
+	// A store that reports verified digests is not read.
+	ms.SetReportDigests(true)
+	ps := httptest.NewServer(ms.PresignHandler())
+	defer ps.Close()
+	ms.EnablePresign(ps.URL)
+	pr, err := ms.PresignPut(ctx, sites.SiteKey("dig", "v.txt"), blob.PresignPutOptions{Size: 8, SHA256: sha("verified")}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(pr.Method, pr.URL, strings.NewReader("verified"))
+	for k, v := range pr.Headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("presigned upload: %v %v", resp, err)
+	}
+	resp.Body.Close()
+	gets := ms.GetCount()
+	mf, err = reg.FileDigest(ctx, "dig", "v.txt")
+	if err != nil || mf.SHA256 != sha("verified") || mf.Size != 8 {
+		t.Errorf("FileDigest(verified) = %+v, %v", mf, err)
+	}
+	if ms.GetCount() != gets {
+		t.Error("FileDigest read an object whose digest the store reported")
+	}
+	// Without a reported digest it still reads.
+	mf, err = reg.FileDigest(ctx, "dig", "a/b.txt")
+	if err != nil || mf.SHA256 != sha("hello") || ms.GetCount() != gets+1 {
+		t.Errorf("FileDigest(unverified) = %+v, %v (gets %d → %d)", mf, err, gets, ms.GetCount())
 	}
 }

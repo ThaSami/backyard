@@ -156,6 +156,13 @@ func TestListTools(t *testing.T) {
 				t.Errorf("docs schema lacks the topic enum: %s", b)
 			}
 		}
+		if tool.Name == "backyard_deploy" {
+			// dir is optional: without it the current project is published.
+			b, _ := json.Marshal(tool.InputSchema)
+			if strings.Contains(string(b), `"required"`) {
+				t.Errorf("deploy schema requires an argument: %s", b)
+			}
+		}
 		if tool.Name == "backyard_read_site_file" {
 			b, _ := json.Marshal(tool.InputSchema)
 			if !strings.Contains(string(b), `"required":["site","path"]`) {
@@ -301,6 +308,66 @@ func TestInitAndDeploy(t *testing.T) {
 		if res := e.call("backyard_deploy", tt.args); !res.IsError || !strings.Contains(text(res), tt.want) {
 			t.Errorf("%v: %q", tt.args, text(res))
 		}
+	}
+}
+
+// TestDeployUsesTheProjectsDir: like `backyard deploy`, backyard_deploy
+// without a dir publishes the folder .backyard.json names ("dir": "dist"),
+// and naming such a project's root is refused instead of publishing the
+// sources (and deleting the site's real files).
+func TestDeployUsesTheProjectsDir(t *testing.T) {
+	e := newEnv(t, true, nil)
+	proj := filepath.Join(e.cwd, "app")
+	mkdir(t, filepath.Join(proj, "src"), "main.ts")
+	mkdir(t, filepath.Join(proj, "dist"), "index.html")
+	mkdir(t, proj, "package.json")
+	if err := os.WriteFile(filepath.Join(proj, ".backyard.json"), []byte(`{"site":"app","dir":"dist"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{"app", proj, "app/"} {
+		res := e.call("backyard_deploy", map[string]any{"dir": dir})
+		if !res.IsError || !strings.Contains(text(res), `"dist"`) || !strings.Contains(text(res), "without") {
+			t.Fatalf("deploy %q: error=%v %q", dir, res.IsError, text(res))
+		}
+	}
+	if e.g.SiteFiles("app") != nil {
+		t.Fatalf("project root published: %v", e.g.SiteFiles("app"))
+	}
+	// Without dir, from inside the project (or a subfolder of it).
+	for _, cwd := range []string{proj, filepath.Join(proj, "src")} {
+		e.cwd = cwd
+		var out DeployOutput
+		decode(t, e.call("backyard_deploy", map[string]any{"dry_run": true}), &out)
+		if out.Dir != filepath.Join(proj, "dist") || out.Site != "app" || out.Files != 1 {
+			t.Fatalf("dry run from %s = %+v", cwd, out)
+		}
+	}
+	var out DeployOutput
+	decode(t, e.call("backyard_deploy", map[string]any{}), &out)
+	if files := e.g.SiteFiles("app"); len(files) != 1 || files["index.html"] == "" || out.Dir != filepath.Join(proj, "dist") {
+		t.Fatalf("deploy = %+v, files %v", out, files)
+	}
+	// Naming the build folder explicitly works too (site name from the project).
+	e.cwd = filepath.Dir(proj)
+	decode(t, e.call("backyard_deploy", map[string]any{"dir": "app/dist", "dry_run": true}), &out)
+	if out.Site != "app" || out.Dir != filepath.Join(proj, "dist") {
+		t.Fatalf("explicit dist = %+v", out)
+	}
+	// A project dir leading out of the project is refused.
+	if err := os.WriteFile(filepath.Join(proj, ".backyard.json"), []byte(`{"site":"app","dir":"../.."}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.cwd = proj
+	if res := e.call("backyard_deploy", map[string]any{}); !res.IsError || !strings.Contains(text(res), "inside") {
+		t.Fatalf("escaping project dir: %q", text(res))
+	}
+	// Without a project file the working directory is published.
+	plain := filepath.Join(filepath.Dir(proj), "plain")
+	mkdir(t, plain, "index.html")
+	e.cwd = plain
+	decode(t, e.call("backyard_deploy", map[string]any{"dry_run": true}), &out)
+	if out.Dir != plain || out.Site != "plain" {
+		t.Fatalf("plain = %+v", out)
 	}
 }
 

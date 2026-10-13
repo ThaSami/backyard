@@ -135,16 +135,46 @@ export function normalizeContentType(ct: string | null | undefined): string {
   return mt;
 }
 
-/** Content types a browser may execute (served with CSP sandbox when uploaded). */
+/**
+ * The media types an upload is served as without a sandbox (Go's
+ * passiveUploadTypes): types browsers only display (raster images, plain
+ * text, PDF, JSON) or download. audio/* and video/* are passive too (see
+ * isActiveContent).
+ */
+const PASSIVE_UPLOAD_TYPES = new Set([
+  "image/png",
+  "image/apng",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "image/avif",
+  "image/bmp",
+  "image/x-icon",
+  "image/vnd.microsoft.icon",
+  "text/plain",
+  "text/csv",
+  "application/pdf",
+  "application/json",
+  "application/octet-stream",
+]);
+
+/**
+ * Whether an upload of type ct is served with "Content-Security-Policy:
+ * sandbox" (SPEC §5.3). An allowlist, like the Go server's activeContent:
+ * every type not known to be passive is sandboxed. That covers HTML, SVG and
+ * XML in all its forms (text/xsl, any "+xml" type, …), which browsers render as
+ * documents that run script with the site's origin, and any other type a
+ * browser might treat that way; the type comes from the uploading client and
+ * cannot be trusted. audio/* and video/* subtypes are passive unless they
+ * carry a structured-syntax suffix ("video/x+xml" renders as XML).
+ */
 export function isActiveContent(ct: string): boolean {
   const mt = ct.split(";")[0]!.trim().toLowerCase();
-  if (!mt.includes("/")) return true;
-  return (
-    mt === "text/html" ||
-    mt === "application/xhtml+xml" ||
-    mt === "image/svg+xml" ||
-    mt === "text/xml" ||
-    mt === "application/xml" ||
-    mt.endsWith("+xml")
-  );
+  const slash = mt.indexOf("/");
+  if (slash <= 0 || slash === mt.length - 1) return true;
+  if (PASSIVE_UPLOAD_TYPES.has(mt)) return false;
+  const kind = mt.slice(0, slash);
+  const sub = mt.slice(slash + 1);
+  if ((kind === "audio" || kind === "video") && !sub.includes("+")) return false;
+  return true;
 }

@@ -120,6 +120,41 @@ test("parseSecretList and isMissingWorker", () => {
   assert.equal(isMissingWorker("fetch failed: getaddrinfo ENOTFOUND api.cloudflare.com"), false);
 });
 
+test("parseSecretList accepts only a JSON list of {name} objects", () => {
+  const list = JSON.stringify([{ name: "BACKYARD_SECRET", type: "secret_text" }, { name: "DEPLOY_TOKEN", type: "secret_text" }], null, 2);
+  const names = (out) => [...parseSecretList(out)].sort();
+  const both = ["BACKYARD_SECRET", "DEPLOY_TOKEN"];
+  assert.deepEqual(names(list), both);
+  assert.deepEqual(names(`${list}\r\n`), both);
+  assert.deepEqual(names(`[WARNING] a notice [x]\n${list}\n`), both);
+  assert.deepEqual(names(`${list}\n▲ [WARNING] after the list [x]\n`), both);
+  assert.deepEqual(names("▲ [WARNING] Proxy environment variables detected\n[]\n"), []);
+  // A stray "[]" line never hides the real list (an empty list would
+  // regenerate, i.e. rotate, BACKYARD_SECRET).
+  assert.deepEqual(names(`[]\n${list}\n`), both);
+  assert.deepEqual(names(`${list}\n[]\n`), both);
+  assert.deepEqual(names(`[]\n▲ [WARNING] notice\n${list}`), both);
+  for (const bad of [
+    "",
+    "garbage",
+    "{}",
+    "x []",
+    "[] trailing",
+    "[1, 2]",
+    '["BACKYARD_SECRET"]',
+    '[{"type":"secret_text"}]',
+    '[{"name":""}]',
+    '[{"name":7}]',
+    "[null]",
+    "[[]]",
+    // "[]" next to a list in an unknown format is ambiguous: never "no secrets".
+    '[]\n["BACKYARD_SECRET"]\n',
+    '[{"Name":"BACKYARD_SECRET"}]\n[]\n',
+  ]) {
+    assert.throws(() => parseSecretList(bad), CIError, JSON.stringify(bad));
+  }
+});
+
 test("planSecrets", async (t) => {
   const random = () => "r".repeat(64);
   const long = "s".repeat(40);
@@ -168,7 +203,9 @@ if (args[0] === "secret" && args[1] === "list") {
   save();
   if (state.listError) { console.error(state.listError); process.exit(1); }
   if (!state.exists) { console.error('✘ [ERROR] Worker "' + args[args.indexOf("--name") + 1] + '" not found.'); process.exit(1); }
-  console.log(JSON.stringify(state.secrets.map((name) => ({ name, type: "secret_text" }))));
+  const list = JSON.stringify(state.secrets.map((name) => ({ name, type: "secret_text" })), null, 2);
+  if (state.listStdout !== undefined) { process.stdout.write(state.listStdout.replace("%LIST%", list)); process.exit(0); }
+  console.log(list);
   process.exit(0);
 }
 if (args[0] === "r2") { save(); if (state.r2Error) { console.error(state.r2Error); process.exit(1); } process.exit(0); }
@@ -288,6 +325,22 @@ test("deploy: a failing secret listing never rotates BACKYARD_SECRET", async () 
   const f = fixture({ exists: true, listError: "✘ [ERROR] Authentication error [code: 10000]" });
   await assert.rejects(deploy({ env: f.env, log: quiet }), /could not list the secrets/);
   assert.equal(f.state().calls.some((c) => c.args[0] === "deploy"), false);
+});
+
+test("deploy: a stray [] in the secret listing never rotates BACKYARD_SECRET", async () => {
+  const f = fixture({ exists: true, secrets: ["BACKYARD_SECRET", "DEPLOY_TOKEN"], listStdout: "[]\n▲ [WARNING] Proxy environment variables detected\n%LIST%\n" });
+  await deploy({ env: f.env, log: quiet });
+  const s = f.state();
+  assert.ok(s.calls.some((c) => c.args[0] === "deploy"), "wrangler deploy ran");
+  assert.equal(s.uploaded, undefined, "no secret is uploaded (BACKYARD_SECRET is kept)");
+});
+
+test("deploy: a secret listing in an unknown format fails without deploying", async () => {
+  for (const listStdout of ['["BACKYARD_SECRET","DEPLOY_TOKEN"]\n', '[]\n[{"secret":"BACKYARD_SECRET"}]\n', "[] (no secrets)\n"]) {
+    const f = fixture({ exists: true, secrets: ["BACKYARD_SECRET"], listStdout });
+    await assert.rejects(deploy({ env: f.env, log: quiet }), CIError, listStdout);
+    assert.equal(f.state().calls.some((c) => c.args[0] === "deploy"), false, listStdout);
+  }
 });
 
 test("deploy: requires CLOUDFLARE_API_TOKEN unless dry run", async () => {

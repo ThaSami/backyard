@@ -4,7 +4,8 @@ import { HUB_FILES } from "../src/generated/hub";
 import { SDK_DTS, SDK_JS, SDK_MJS } from "../src/generated/sdk";
 import { REFERENCES, SKILL_MD } from "../src/generated/skills";
 import { HUB_URL_PLACEHOLDER, localize } from "../src/llms";
-import { call, ORIGIN } from "./helpers";
+import { issueAPIToken } from "../src/jwt";
+import { apiHeaders, call, deploy, ORIGIN, SECRET, tokenHeaders, uniqueSite } from "./helpers";
 
 describe("hub", () => {
   it("serves the SDK with the per-request preamble, byte-identical otherwise", async () => {
@@ -66,6 +67,17 @@ describe("hub", () => {
     expect((await call("/docs/constructor.md")).status).toBe(404);
     expect((await call("/docs/../etc.md")).status).toBe(404);
     expect((await call("/docs/nope.md")).status).toBe(404);
+    // %2F decodes to "/" like Go's r.URL.Path, so it names the same document.
+    res = await call("/docs/references%2Fapi.md");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(localize(REFERENCES.api!, ORIGIN));
+    // Like the Go hub: "no such document: <rel>" truncated to 80 bytes + "…".
+    const long = "x".repeat(100);
+    res = await call(`/docs/${long}.md`, { headers: { Accept: "application/json" } });
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe(`no such document: ${"x".repeat(80)}…`);
+    res = await call("/docs/references/nope.md", { headers: { Accept: "application/json" } });
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe("no such document: references/nope");
     expect((await call("/nope.html")).status).toBe(404);
     expect((await call("/__backyard/nothing")).status).toBe(404);
     expect((await call("/__backyard/api/nothing")).status).toBe(404);
@@ -86,6 +98,25 @@ describe("hub", () => {
     expect(full).not.toMatch(/^---\nname:/);
   });
 
+  it("localizes docs for PUBLIC_URL as the Go server would (lowercased, port kept)", async () => {
+    const env = { PUBLIC_URL: "HTTPS://Hub.Example.COM:8443/" };
+    const hub = "https://hub.example.com:8443";
+    for (const path of ["/docs/skill.md", "/docs/references/deploy.md"]) {
+      const res = await call(path, {}, env);
+      expect(res.status, path).toBe(200);
+      const md = await res.text();
+      const src = path.endsWith("skill.md") ? SKILL_MD : REFERENCES.deploy!;
+      expect(md).toBe(localize(src, hub));
+      if (src.includes(HUB_URL_PLACEHOLDER + "/")) expect(md).toContain(hub + "/");
+      // Example site hosts become subdomains of the hub host, with its port.
+      if (src.includes("://demo.backyard.example.com")) expect(md).toContain("://demo.hub.example.com:8443");
+      expect(md).not.toContain("Hub.Example.COM");
+    }
+    const txt = await (await call("/llms.txt", {}, env)).text();
+    expect(txt).toContain(`- [Overview and rules](${hub}/docs/skill.md)`);
+    expect(txt).toContain("`https://<site>.hub.example.com:8443/` (host mode)");
+  });
+
   it("answers health checks on every host without auth", async () => {
     expect(await (await call("/__backyard/healthz")).text()).toBe("ok\n");
     expect((await call("/s/demo/__backyard/healthz")).status).toBe(200);
@@ -97,6 +128,41 @@ describe("hub", () => {
     const res = await call("/__backyard/api/me", {}, { BACKYARD_SECRET: "" });
     expect(res.status).toBe(503);
     expect(((await res.json()) as { error: { message: string } }).error.message).toContain("BACKYARD_SECRET");
+  });
+
+  it("refuses every request but the health checks when AUTH_MODE is not none or access (fail closed)", async () => {
+    const site = uniqueSite("failclosed");
+    await deploy(site, { "index.html": "secret page" });
+    for (const mode of ["oidc", "okta", "cf-access", "cloudflare-access", "acess", "true"]) {
+      const env = { AUTH_MODE: mode, ACCESS_TEAM_DOMAIN: "acme", ACCESS_AUD: "aud" };
+      for (const [path, init] of [
+        [`/s/${site}/`, {}],
+        ["/", {}],
+        [`/s/${site}/__backyard/api/me`, {}],
+        [`/s/${site}/__backyard/api/db/posts`, { method: "POST", headers: apiHeaders(), body: '{"x":1}' }],
+        ["/__backyard/api/deploy/sites", { headers: tokenHeaders() }],
+        ["/__backyard/api/info", {}],
+        ["/__backyard/auth/cli?mode=display", {}],
+      ] as const) {
+        const res = await call(path, init as RequestInit, env);
+        expect(res.status, `${mode} ${path}`).toBe(503);
+        expect(await res.text(), `${mode} ${path}`).not.toContain("secret page");
+      }
+      expect((await call("/__backyard/healthz", {}, env)).status, mode).toBe(200);
+      const ready = await call("/__backyard/readyz", {}, env);
+      expect(ready.status, mode).toBe(503);
+      expect(await ready.text()).toContain("AUTH_MODE");
+    }
+    // Case and blanks are forgiven; "none" and "" stay the documented default.
+    expect((await call(`/s/${site}/`, {}, { AUTH_MODE: " None " })).status).toBe(200);
+    expect((await call(`/s/${site}/`, {}, { AUTH_MODE: "" })).status).toBe(200);
+    expect((await call(`/s/${site}/`, {}, { AUTH_MODE: " Access ", ACCESS_TEAM_DOMAIN: "acme", ACCESS_AUD: "aud" })).status).toBe(401);
+  });
+
+  it("serves no hub file for names of Object.prototype", async () => {
+    for (const name of ["constructor", "toString", "__proto__", "hasOwnProperty", "valueOf"]) {
+      expect((await call(`/${name}`)).status, name).toBe(404);
+    }
   });
 
   it("canonicalizes paths", async () => {
@@ -115,5 +181,40 @@ describe("hub", () => {
     res = await call("/s/Not_A_Site/");
     expect(res.status).toBe(404);
     expect(await res.text()).toContain("Site not found");
+  });
+});
+
+describe("POST /__backyard/api/tokens", () => {
+  const user = { id: "carol@acme.com", email: "carol@acme.com", name: "Carol", anonymous: false, admin: false };
+  const mint = (bearer: string, body: unknown = {}) =>
+    call("/__backyard/api/tokens", { method: "POST", headers: { Authorization: `Bearer ${bearer}`, "X-Backyard": "1", "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const claimsOf = (tok: string) => JSON.parse(atob(tok.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/"))) as { exp: number; iat: number; sub: string };
+
+  it("never mints a token that outlives the API token it was asked with (a token cannot renew itself)", async () => {
+    const short = await issueAPIToken(SECRET, user, 3600);
+    let res = await mint(short.token);
+    expect(res.status).toBe(200);
+    const first = (await res.json()) as { token: string; expires_at: string };
+    const c1 = claimsOf(first.token);
+    expect(c1.sub).toBe("carol@acme.com");
+    expect(c1.exp).toBeLessThanOrEqual(short.expiresAt);
+    expect(c1.exp).toBeGreaterThan(short.expiresAt - 10);
+    expect(first.expires_at).toBe(new Date(c1.exp * 1000).toISOString().replace(".000Z", "Z"));
+    // Asking for longer, or chaining minted tokens, extends nothing.
+    for (const tok of [short.token, first.token]) {
+      res = await mint(tok, { ttl_hours: 24 });
+      expect(res.status).toBe(200);
+      expect(claimsOf(((await res.json()) as { token: string }).token).exp).toBeLessThanOrEqual(short.expiresAt);
+    }
+    // A shorter lifetime is still honoured.
+    res = await mint(short.token, { ttl_hours: 0.1 });
+    const c3 = claimsOf(((await res.json()) as { token: string }).token);
+    expect(c3.exp - c3.iat).toBe(360);
+    // A token that is (about to be) expired, within the verification leeway, cannot mint at all.
+    for (const ending of [await issueAPIToken(SECRET, user, 1), await issueAPIToken(SECRET, user, 60, Math.floor(Date.now() / 1000) - 70)]) {
+      res = await mint(ending.token);
+      expect(res.status).toBe(401);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe("unauthenticated");
+    }
   });
 });

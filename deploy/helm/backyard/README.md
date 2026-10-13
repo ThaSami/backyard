@@ -68,7 +68,8 @@ Keep credentials out of `config`: reference environment variables instead
 
 The chart refuses to render combinations that would break at runtime: several replicas with
 SQLite, in-memory pub/sub or a ReadWriteOnce volume, `storage.fs.root` different from
-`persistence.mountPath`, or a missing `base_domain`.
+`persistence.mountPath`, or a missing `base_domain`. It also refuses `auth.mode: header` set up
+so that any pod could sign in as anyone (see [Identity-aware proxies](#identity-aware-proxies)).
 
 ## Values
 
@@ -91,6 +92,8 @@ SQLite, in-memory pub/sub or a ReadWriteOnce volume, `storage.fs.root` different
 | `ingress.enabled` / `className` / `annotations` | `false` / `""` / `{}` | Ingress |
 | `ingress.hosts` | `[]` | Empty: `<base_domain>` and `*.<base_domain>` (host mode) |
 | `ingress.tls` | `[]` | TLS sections (one wildcard certificate covers everything) |
+| `networkPolicy.enabled` | `false` | NetworkPolicy admitting only `networkPolicy.from` to the HTTP port (needs an enforcing CNI) |
+| `networkPolicy.from` / `metricsFrom` | the `ingress-nginx` namespace / `[]` | Peers allowed to reach the HTTP / metrics port |
 | `serviceAccount.create` / `annotations` | `true` / `{}` | IRSA, GKE / Azure Workload Identity annotations |
 | `serviceAccount.automountServiceAccountToken` | `false` | The server does not use the Kubernetes API |
 | `podSecurityContext` / `securityContext` | non-root 65532, read-only root, no capabilities, RuntimeDefault seccomp | Pod hardening |
@@ -126,12 +129,57 @@ ingress:
 ```
 
 Without wildcard DNS/TLS, set `config.server.url_mode: path` (sites at `/s/<site>/`); the
-ingress then only needs the base domain. Keep `config.server.trusted_proxies` matching your
-ingress controller's pod network so client IPs and `X-Forwarded-Proto` are honored.
+ingress then only needs the base domain. `config.server.trusted_proxies` (default: the private
+ranges, i.e. any pod) is where `X-Forwarded-For`, `-Proto` and `-Host` are honored from, so client
+IPs in logs and per-IP rate limits are the real ones. Narrow it to your ingress controller's pod
+network if you can.
+
+## Identity-aware proxies
 
 With an identity-aware proxy in front (Google IAP, AWS ALB OIDC, oauth2-proxy, Pomerium,
 Cloudflare Access) use `auth.mode: iap | alb | header` instead of OIDC; the deploy gateway path
-`/__backyard/api/deploy/*` must then be reachable by CLIs (see the main documentation).
+`/__backyard/api/deploy/*` (and `/__backyard/api/tokens` with an `Authorization` header, for
+`backyard token create`) must then be reachable by CLIs (see the main documentation).
+
+`iap`, `alb` and `header` with `auth.header.jwt_header` verify a signed assertion, so no peer can
+forge an identity just by sending headers. Plain `header` mode (for example oauth2-proxy's
+`X-Forwarded-Email` without `jwt_header`) trusts the identity headers of **every peer in
+`config.server.trusted_proxies`**:
+with the default private ranges, any pod in the cluster (and any host that can route to pod IPs)
+could send `X-Forwarded-Email: admin@acme.com` straight to the Service and be signed in as that
+admin. The chart therefore refuses to render header mode without `jwt_header` unless one of these
+holds:
+
+* **`networkPolicy.enabled: true`** (recommended), with `networkPolicy.from` admitting only the
+  peers that set the identity headers: the ingress controller (oauth2-proxy through
+  `auth-url` / `auth-response-headers`) or the oauth2-proxy / Pomerium pods when they proxy
+  upstream. Every route through those peers must set or strip the identity headers itself; the
+  NetworkPolicy only keeps everyone else out. It needs a CNI that enforces NetworkPolicy, and it
+  never blocks a pod's own node (the kubelet, `hostNetwork` pods), so prefer a `trusted_proxies`
+  range that covers the pod network but not the nodes' addresses.
+* `config.server.trusted_proxies` lists only the proxy's own addresses: single IPs, IPv4 ranges of
+  /24 or longer, IPv6 ranges of /120 or longer (for example a proxy outside the cluster).
+* Or verify a signed JWT instead: `auth.header.jwt_header` + `jwks_url` (Pomerium, Cloudflare
+  Access and other proxies that forward a signed assertion; see
+  [authentication](../../../docs/authentication.md#header-trusted-identity-headers)).
+
+```yaml
+config:
+  auth:
+    mode: header
+    header:
+      email_header: X-Forwarded-Email
+      groups_header: X-Forwarded-Groups
+networkPolicy:
+  enabled: true
+  from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+```
 
 ## Cloud storage without keys
 
@@ -157,6 +205,7 @@ With bucket storage, set `persistence.enabled: false`. The Terraform modules in
 ## Development
 
 ```sh
-make helm-lint                    # helm lint --strict + template (default and production values)
+make helm-lint                    # helm lint --strict + template, and the chart's guard tests
 make validate-configs             # renders the ConfigMaps and checks them against the config schema
+go test ./deploy/helm/...         # the guard and NetworkPolicy tests alone (skipped without helm)
 ```

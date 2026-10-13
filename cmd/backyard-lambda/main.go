@@ -7,7 +7,11 @@
 // BACKYARD_SECRET_ARN names an AWS Secrets Manager secret, from that secret
 // at cold start (see secret.go; setting both is an error).
 // Storage is normally S3, so uploads go straight to presigned S3 URLs and
-// the 6 MB Lambda payload limit only applies to gateway responses.
+// the 6 MB Lambda payload limit only applies to gateway responses: large
+// JSON responses (the upload list of a deploy of thousands of files) are
+// gzipped for clients that accept it, and a response that still does not
+// fit (e.g. reading back a large binary file) is a 413 pointing to the
+// server's embedded gateway (see deploy.LambdaHandler).
 // BACKYARD_GATEWAY_URL (or deploy.gateway_url) sets the URL advertised to
 // CLIs; when unset it is derived from each request's host.
 //

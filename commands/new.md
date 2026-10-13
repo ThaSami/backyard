@@ -32,7 +32,11 @@ rules and patterns; its `references/recipes.md` has complete apps to start from 
      `textContent`; no secrets and no external CDNs.
 5. **Check.** Re-read the code against `references/api.md` (method names, argument shapes,
    query operators, document id rules). When possible, start `backyard dev --no-open` in the
-   background, fetch `http://<name>.localhost:4321/` to make sure it serves, then stop it.
+   background, check that it serves the site with
+   `curl -s -H 'Host: <name>.localhost:4321' http://127.0.0.1:4321/` (the response must be your
+   page, not the dev hub), then stop it. Use curl: outside browsers, `*.localhost` names often
+   do not resolve (Node `fetch`, wget and Python fail with "not found" in containers and CI),
+   and `http://localhost:4321/` is the dev hub, not the site.
 6. **Deploy.** Run `backyard deploy` in the site folder (or the `backyard_deploy` tool). If it
    reports that you are not logged in, stop and ask the user to run
    `backyard login --server <their Backyard URL>` in a terminal, then retry. If the user has no

@@ -17,6 +17,10 @@ var (
 	ErrUnauthenticated = errors.New("auth: unauthenticated")
 	// ErrForbidden: authenticated but not allowed (domain/group gate).
 	ErrForbidden = errors.New("auth: forbidden")
+	// ErrCookieConflict: the browser sent valid session (or guest) cookies
+	// of different users, e.g. one planted by a site's page. It is always
+	// wrapped together with ErrUnauthenticated.
+	ErrCookieConflict = errors.New("auth: the browser sent sign-in cookies of different users")
 )
 
 // Authenticator resolves the user behind a request.
@@ -26,8 +30,11 @@ var (
 // is authenticated but rejected by allowed_domains/allowed_groups, or another
 // error for infrastructure failures. Bearer tokens (API, static, IdP JWT) are
 // accepted in every mode. In mode "none" Authenticate only fails when an
-// invalid bearer token is presented (ErrUnauthenticated); otherwise it returns
-// an anonymous user and, when w is non-nil, sets the backyard_anon cookie.
+// invalid bearer token is presented, or when the browser sends valid guest
+// cookies of different guests (ErrUnauthenticated, with ErrCookieConflict);
+// otherwise it returns an anonymous user and, when w is non-nil, sets the
+// backyard_anon cookie. On a cookie conflict Authenticate expires the cookies
+// Backyard did not set itself when w is non-nil.
 type Authenticator interface {
 	Authenticate(w http.ResponseWriter, r *http.Request) (*identity.User, error)
 	// LoginURL returns the URL a browser should be redirected to in order to

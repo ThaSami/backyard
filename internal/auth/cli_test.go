@@ -118,10 +118,17 @@ func TestCLIValidation(t *testing.T) {
 			}
 		})
 	}
-	for _, m := range []string{"POST", "HEAD"} {
-		if res := serve(e.a.Handler(), req(m, cliURL("http://127.0.0.1:5555/cb", "s"), sess)); res.StatusCode != http.StatusMethodNotAllowed {
-			t.Fatalf("%s = %d", m, res.StatusCode)
+	for _, m := range []string{"HEAD", "PUT", "DELETE"} {
+		res := serve(e.a.Handler(), req(m, cliURL("http://127.0.0.1:5555/cb", "s"), sess))
+		if res.StatusCode != http.StatusMethodNotAllowed || res.Header.Get("Allow") != "GET, POST" {
+			t.Fatalf("%s = %d (Allow %q)", m, res.StatusCode, res.Header.Get("Allow"))
 		}
+	}
+	// POST is only the confirmation form: without its CSRF token nothing is
+	// minted, even with the parameters in the query string.
+	res := serve(e.a.Handler(), req("POST", cliURL("http://127.0.0.1:5555/cb", "s"), sess))
+	if res.StatusCode != http.StatusBadRequest || res.Header.Get("Location") != "" {
+		t.Fatalf("POST without form = %d %q", res.StatusCode, res.Header.Get("Location"))
 	}
 }
 
@@ -155,10 +162,15 @@ func TestCLIForbiddenAndProxyModes(t *testing.T) {
 	if a.LoginURL("x") != "" {
 		t.Fatal("proxy modes have no login URL")
 	}
-	for _, p := range []string{LoginPath, CallbackPath, LogoutPath} {
+	for _, p := range []string{CallbackPath, LogoutPath} {
 		if res := serve(a.Handler(), req("GET", "https://backyard.test"+p)); res.StatusCode != http.StatusNotFound {
 			t.Errorf("%s = %d", p, res.StatusCode)
 		}
+	}
+	// /login just goes to the target: the proxy signs the browser in.
+	if res := serve(a.Handler(), req("GET", "https://backyard.test"+LoginPath)); res.StatusCode != http.StatusFound ||
+		res.Header.Get("Location") != "https://backyard.test/" {
+		t.Errorf("login = %d %q", res.StatusCode, res.Header.Get("Location"))
 	}
 }
 

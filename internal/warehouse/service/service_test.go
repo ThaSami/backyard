@@ -10,6 +10,7 @@ import (
 	"math"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/thasami/backyard/internal/config"
 	"github.com/thasami/backyard/internal/warehouse"
+	"github.com/thasami/backyard/internal/warehouse/internal/conv"
 )
 
 // fakeSource records calls and returns canned results.
@@ -35,12 +37,14 @@ type fakeCall struct {
 	sql         string
 	args        []any
 	maxRows     int
+	maxBytes    int
 	hasDeadline bool
 	deadline    time.Duration
 }
 
-func (f *fakeSource) Query(ctx context.Context, sql string, args []any, maxRows int) (*warehouse.Result, error) {
-	call := fakeCall{sql: sql, args: args, maxRows: maxRows}
+func (f *fakeSource) Query(ctx context.Context, sql string, args []any, lim warehouse.Limits) (*warehouse.Result, error) {
+	maxRows := lim.MaxRows
+	call := fakeCall{sql: sql, args: args, maxRows: maxRows, maxBytes: lim.MaxBytes}
 	if dl, ok := ctx.Deadline(); ok {
 		call.hasDeadline = true
 		call.deadline = time.Until(dl)
@@ -202,8 +206,8 @@ func TestRawSQLTranslation(t *testing.T) {
 		if len(call.args) != len(c.wantArgs) || (len(c.wantArgs) > 0 && !reflect.DeepEqual(call.args, c.wantArgs)) {
 			t.Errorf("args = %#v, want %#v", call.args, c.wantArgs)
 		}
-		if call.maxRows != 100 {
-			t.Errorf("maxRows = %d", call.maxRows)
+		if call.maxRows != 100 || call.maxBytes != warehouse.DefaultMaxResultBytes {
+			t.Errorf("limits = %d rows, %d bytes", call.maxRows, call.maxBytes)
 		}
 		if !call.hasDeadline || call.deadline > 5*time.Second || call.deadline < 4*time.Second {
 			t.Errorf("deadline = %v (%v)", call.deadline, call.hasDeadline)
@@ -403,6 +407,62 @@ func TestSourceSelection(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.fake(t, "logs")
+}
+
+// TestMaxResultBytes: the size cap is passed to the source, and a result
+// over it is cut after the last row that fits even when the source ignores
+// the cap.
+func TestMaxResultBytes(t *testing.T) {
+	wide := func(i, n int) map[string]any {
+		return map[string]any{"i": int64(i), "pad": strings.Repeat("x", n)}
+	}
+	per := conv.Size(wide(0, 1000)) + 1
+	f := &fakeSource{typ: "postgres", query: func(ctx context.Context, sql string, args []any, maxRows int) (*warehouse.Result, error) {
+		n := 1000
+		if sql == "SELECT huge" {
+			n = 10 * per
+		}
+		rows := make([]map[string]any, 10)
+		for i := range rows {
+			rows[i] = wide(i, n)
+		}
+		return &warehouse.Result{Columns: []warehouse.Column{{Name: "i"}, {Name: "pad"}}, Rows: rows, RowCount: len(rows)}, nil
+	}}
+	svc, err := NewWithOptions(context.Background(), baseConfig(), Options{
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxResultBytes: 3*per + per/2,
+		Open: func(context.Context, string, config.WarehouseSource) (warehouse.Source, error) {
+			return f, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+	ctx := context.Background()
+
+	res, err := svc.Query(ctx, warehouse.QueryRequest{SQL: "SELECT wide"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 3 || res.RowCount != 3 || !res.Truncated || res.Rows[2]["i"] != int64(2) {
+		t.Fatalf("rows = %d row_count = %d truncated = %v", len(res.Rows), res.RowCount, res.Truncated)
+	}
+	if b, _ := json.Marshal(res.Rows); len(b) > 3*per+per/2 {
+		t.Errorf("JSON rows are %d bytes, cap %d", len(b), 3*per+per/2)
+	}
+	if call := f.lastCall(t); call.maxBytes != 3*per+per/2 || call.maxRows != 100 {
+		t.Errorf("limits passed = %d rows, %d bytes", call.maxRows, call.maxBytes)
+	}
+
+	// A first row larger than the cap leaves no rows.
+	res, err = svc.Query(ctx, warehouse.QueryRequest{SQL: "SELECT huge"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 0 || res.RowCount != 0 || !res.Truncated || res.Rows == nil {
+		t.Fatalf("huge: %+v", res)
+	}
 }
 
 func TestMaxRows(t *testing.T) {

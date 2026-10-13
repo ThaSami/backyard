@@ -122,9 +122,15 @@ Pages should convert big numbers with `Number()` before charting.
 | No warehouse configured | `501 unsupported` |
 | Raw SQL disabled, or the statement guard rejects it | `403 forbidden` |
 | Unknown source or named query | `404 not_found` |
-| Missing / unknown parameters, placeholder count mismatch | `400 bad_request` |
-| Query failed or timed out at the engine | `502` / `504 upstream_error` |
+| Missing / unknown parameters, placeholder count mismatch, an error in the query itself (syntax, unknown column) | `400 bad_request` with the engine's message |
+| Query timed out (`warehouse.timeout`) | `504 upstream_error` |
+| Engine or connection failure | `502 upstream_error` with a generic message naming the request id |
 | Over `warehouse_per_minute` | `429 rate_limited` |
+
+Server-side failures never show the engine's message to the page: connection and engine errors
+can reveal host, user and database names. The message names the request id instead (also in
+the response's `X-Request-Id`), and the server logs the cause under that id
+(`"request_id": "…"`). The Cloudflare edition's warehouse proxy answers the same way.
 
 `GET /__backyard/api/warehouse` lists sources (name, type, description) and named queries
 (name, description, params, source) — never SQL or credentials. Metrics:

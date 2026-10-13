@@ -905,6 +905,10 @@ dialog::backdrop {
 dialog h2 {
   margin: 0 0 8px;
   font-size: 18px;
+  overflow-wrap: anywhere;
+}
+dialog p {
+  overflow-wrap: anywhere;
 }
 .dialog-actions {
   display: flex;

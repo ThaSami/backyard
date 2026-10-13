@@ -20,12 +20,26 @@
 //     an Azure SAS URL cannot restrict the body at all.
 //
 // The commit is the second line of defence: every listed file must exist
-// with its declared size. A stored object of the wrong size that is not the
-// version the previous manifest recorded is deleted, and the commit fails
-// with 409 conflict naming the paths, so no unverified object of the wrong
-// size outlives a commit attempt (a previously committed version is kept:
-// that file was merely not replaced). Digests are not re-read at commit,
-// which would mean downloading every changed file.
+// with its declared size, or the commit fails with 409 conflict naming the
+// paths. A stored object of the wrong size is left alone where every upload
+// URL binds the size (the gateway's endpoint, S3, GCS): it can only be
+// another deploy's verified upload or a direct sync, which rsync semantics
+// keep. Only where presigned uploads cannot bind the size (Azure SAS) is a
+// wrong-size object that is not the version the previous manifest recorded
+// deleted, so no unverified object of the wrong size outlives a commit
+// attempt there.
+//
+// # Overlapping deploys
+//
+// Deploys of a site may overlap (two CI runs): their uploads write the same
+// paths and the last write wins per file, as with rsync. The commit
+// therefore never trusts a declared digest for a stored object the previous
+// manifest does not describe (this deploy's upload, or whatever replaced it
+// since): it records the digest of the bytes stored now with their etag,
+// taken from the store where it verified one itself (S3 checksums of
+// presigned uploads, blob.DigestReporter) and otherwise hashed from the
+// object, which costs a read of the uploaded bytes. A later deploy of
+// content that was overwritten is then never wrongly "unchanged".
 //
 // # Uncommitted uploads
 //

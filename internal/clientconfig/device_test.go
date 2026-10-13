@@ -12,6 +12,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/thasami/backyard/internal/blob"
+	"github.com/thasami/backyard/internal/deploy"
 )
 
 // fakeIdP is a minimal OIDC provider supporting the device grant.
@@ -341,6 +344,67 @@ func TestSessionUpdateProfileAndCacheInfo(t *testing.T) {
 	s, _ = OpenSession(context.Background(), SessionOptions{ConfigPath: path, Overrides: Overrides{Profile: "p1"}})
 	if !s.Exists || s.Server != "https://b.example.com" {
 		t.Fatalf("session = %+v", s.Resolved)
+	}
+}
+
+// TestCachedInfoOnlyForTheProfilesServer: the server info cached in a profile
+// (storage bucket, URLs, methods) is used only while the invocation targets
+// that profile's server and gateway. With --server/BACKYARD_SERVER (or a
+// gateway override) pointing elsewhere it describes another server, and a
+// direct-sync deploy using it would write into the wrong bucket.
+func TestCachedInfoOnlyForTheProfilesServer(t *testing.T) {
+	clearEnv(t)
+	path := filepath.Join(t.TempDir(), "config.json")
+	f := &File{}
+	cached := &deploy.Info{PublicURL: "https://backyard.prod.example.com",
+		Storage: &blob.Description{Type: "s3", Bucket: "prod-bucket"}}
+	f.Set("default", &Profile{Server: "https://backyard.prod.example.com", Token: "t", Info: cached})
+	f.Current = "default"
+	if err := f.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	open := func(o Overrides) *Session {
+		t.Helper()
+		s, err := OpenSession(context.Background(), SessionOptions{ConfigPath: path, Overrides: o})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	for name, o := range map[string]Overrides{
+		"profile":              {},
+		"same server flag":     {Server: "https://backyard.prod.example.com/"},
+		"same server, no case": {Server: "HTTPS://BACKYARD.PROD.EXAMPLE.COM"},
+	} {
+		if s := open(o); s.CachedInfo() == nil || s.CachedInfo().Storage.Bucket != "prod-bucket" {
+			t.Errorf("%s: CachedInfo = %+v", name, s.CachedInfo())
+		}
+	}
+	for name, o := range map[string]Overrides{
+		"other server flag":  {Server: "https://backyard.staging.example.com"},
+		"other gateway flag": {Gateway: "https://deploy.staging.example.com"},
+		"other profile":      {Profile: "staging"},
+	} {
+		if s := open(o); s.CachedInfo() != nil {
+			t.Errorf("%s: CachedInfo = %+v, want nil", name, s.CachedInfo())
+		}
+	}
+	t.Setenv(EnvServer, "https://backyard.staging.example.com")
+	s := open(Overrides{})
+	if s.CachedInfo() != nil {
+		t.Fatalf("BACKYARD_SERVER: CachedInfo = %+v, want nil", s.CachedInfo())
+	}
+	// Nor is the other server's info written into the profile's cache.
+	s.CacheInfo(&deploy.Info{PublicURL: "https://backyard.staging.example.com"})
+	t.Setenv(EnvServer, "")
+	if got := open(Overrides{}).CachedInfo(); got == nil || got.PublicURL != "https://backyard.prod.example.com" {
+		t.Fatalf("cache overwritten by another server's info: %+v", got)
+	}
+	// The profile's own server refreshes it.
+	s = open(Overrides{})
+	s.CacheInfo(&deploy.Info{PublicURL: "https://backyard.prod.example.com", Name: "fresh"})
+	if got := open(Overrides{}).CachedInfo(); got == nil || got.Name != "fresh" {
+		t.Fatalf("cache not refreshed: %+v", got)
 	}
 }
 

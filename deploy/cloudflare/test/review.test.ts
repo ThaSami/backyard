@@ -4,7 +4,7 @@
  * commit, "__proto__" data keys, AI provider availability, streamed multipart
  * uploads and post-login redirects.
  */
-import { listDurableObjectIds } from "cloudflare:test";
+import { listDurableObjectIds, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { Env } from "../src/env";
@@ -150,6 +150,39 @@ describe("platform site cap", () => {
   });
 });
 
+describe("platform site cap under concurrency", () => {
+  it("lets exactly the free slots' worth of parallel first commits through", async () => {
+    const files = [{ path: "index.html", size: 1, sha256: await sha256Hex("x") }];
+    const sites = ((await (await call("/__backyard/api/deploy/sites", { headers: tokenHeaders() })).json()) as { sites: unknown[] }).sites.length;
+    const capEnv = { LIMITS: JSON.stringify({ max_sites: sites + 1 }) };
+    // Three deploys of new sites, all created while one slot is free.
+    const pending: { site: string; id: string }[] = [];
+    for (let i = 0; i < 3; i++) {
+      const site = uniqueSite(`race${i}`);
+      const res = await call(`/__backyard/api/deploy/sites/${site}/deploys`, { method: "POST", headers: tokenHeaders(), body: JSON.stringify({ files }) }, capEnv);
+      expect(res.status).toBe(200);
+      const created = (await res.json()) as { deploy_id: string; uploads: { url: string; headers: Record<string, string> }[] };
+      for (const up of created.uploads) {
+        const r = await call(up.url, { method: "PUT", headers: { ...up.headers, "Content-Length": "1" }, body: "x" }, capEnv);
+        expect(r.status).toBe(200);
+      }
+      pending.push({ site, id: created.deploy_id });
+    }
+    const results = await Promise.all(
+      pending.map(({ site, id }) =>
+        call(`/__backyard/api/deploy/sites/${site}/deploys/${encodeURIComponent(id)}/commit`, { method: "POST", headers: tokenHeaders(), body: JSON.stringify({ files }) }, capEnv),
+      ),
+    );
+    expect(results.map((r) => r.status).sort()).toEqual([200, 413, 413]);
+    const after = ((await (await call("/__backyard/api/deploy/sites", { headers: tokenHeaders() })).json()) as { sites: unknown[] }).sites.length;
+    expect(after).toBe(sites + 1);
+    // A refused commit gave its slot back; the sites that lost stay unserved.
+    for (const [i, r] of results.entries()) {
+      expect((await call(`/s/${pending[i]!.site}/`)).status).toBe(r.status === 200 ? 200 : 404);
+    }
+  });
+});
+
 describe("static probes of unknown sites", () => {
   it("answer 'site not found' without creating the site's Durable Object", async () => {
     const e = env as unknown as Env;
@@ -168,6 +201,52 @@ describe("static probes of unknown sites", () => {
     const gone = await call(`/s/${site}/`);
     expect(gone.status).toBe(404);
     expect(await gone.text()).toContain("Site not found");
+  });
+
+  it("leave no storage behind for uploaded-file URLs and API reads of unknown sites", async () => {
+    const e = env as unknown as Env;
+    const site = uniqueSite("probe-api");
+    const api = (p: string) => `/s/${site}/__backyard/api${p}`;
+    for (const [path, status] of [
+      [`/s/${site}/__backyard/files/01ABCDEFGHJKMNPQRSTVWXYZ00/x.png`, 404],
+      [api("/db"), 200],
+      [api("/db/posts"), 200],
+      [api("/db/posts/p1"), 404],
+      [api("/files"), 200],
+      [api("/files/01ABCDEFGHJKMNPQRSTVWXYZ00"), 404],
+    ] as const) {
+      const res = await call(path);
+      expect(res.status, path).toBe(status);
+    }
+    for (const [path, body] of [
+      [api("/db/posts/query"), '{"where":[{"field":"a","op":"==","value":1}]}'],
+      [api("/db/posts/p1"), undefined],
+    ] as const) {
+      const method = body ? "POST" : "DELETE";
+      const res = await call(path, { method, headers: apiHeaders(), body });
+      expect(res.status, `${method} ${path}`).toBeLessThan(300);
+    }
+    expect((await call(`/__backyard/api/deploy/sites/${site}/files`, { headers: tokenHeaders() })).status).toBe(404);
+    // The object ran, but it wrote nothing: no tables, an empty database.
+    const storage = () =>
+      runInDurableObject(e.SITE.get(e.SITE.idFromName(site)), (_o, st) => ({
+        bytes: st.storage.sql.databaseSize,
+        tables: (st.storage.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table'").toArray() as { name: string }[]).map((r) => r.name),
+      }));
+    let s = await storage();
+    expect(s.tables).toEqual([]);
+    expect(s.bytes).toBeLessThanOrEqual(4096);
+    // The first write creates the tables, like on the Go server (API use needs no deploy).
+    const res = await call(api("/db/posts"), { method: "POST", headers: apiHeaders(), body: '{"id":"p1","a":1}' });
+    expect(res.status).toBe(201);
+    s = await storage();
+    expect(s.tables).toContain("docs");
+    expect(((await (await call(api("/db/posts/p1"))).json()) as { a: number }).a).toBe(1);
+    // Deleting the site leaves no tables behind either.
+    await deploy(site, { "index.html": "x" });
+    expect((await call(`/__backyard/api/deploy/sites/${site}`, { method: "DELETE", headers: tokenHeaders() })).status).toBe(204);
+    expect((await storage()).tables).toEqual([]);
+    expect((await call(api("/db/posts/p1"))).status).toBe(404);
   });
 });
 
@@ -448,5 +527,37 @@ describe("post-login redirects", () => {
     const host = ctxFor({ URL_MODE: "host", BASE_DOMAIN: "backyard.test" });
     expect(safeReturnTo(host, "https://foo.backyard.test/x")).toBe("https://foo.backyard.test/x");
     expect(safeReturnTo(host, "https://a.b.backyard.test/")).toBe(hub);
+  });
+
+  it("follows the Go server's sanitizeRedirect on edge cases", () => {
+    const ctx = ctxFor({});
+    const hub = "https://backyard.test/";
+    // Each became the hub URL in Go (auth.sanitizeRedirect) but not here before.
+    for (const bad of [
+      "https://@backyard.test/", // empty user info is still user info
+      "https://backyard.test:0443/x", // the raw port must match
+      "https:backyard.test/x", // opaque: no "//" authority
+      "https:/backyard.test/x",
+      "https://backyard%2Etest/", // escapes in the host
+      "https://ｂackyard.test/", // not the hub host as written (WHATWG would map it)
+      "/__backyard/auth/callback", // every login-flow endpoint, cleaned and decoded
+      "/__backyard/auth/login/",
+      "/__backyard/auth//login",
+      "/__backyard/auth/%6cogin",
+      "/s/%2e%2e/__backyard/auth/login",
+      "https://backyard.test/s/x/__backyard/auth/callback?x",
+      "/%zz", // invalid escapes in the path or fragment
+      "/ok#%zz",
+      "/\u0085x", // C1 control characters
+    ]) {
+      expect(safeReturnTo(ctx, bad), bad).toBe(hub);
+    }
+    // Accepted by Go too (spaces are not control characters; queries are not validated).
+    expect(safeReturnTo(ctx, "/a b")).toBe("https://backyard.test/a%20b");
+    expect(safeReturnTo(ctx, "/ok?q=%zz")).toBe("https://backyard.test/ok?q=%zz");
+    expect(safeReturnTo(ctx, "/ok#%41")).toBe("https://backyard.test/ok#%41");
+    expect(safeReturnTo(ctx, "HTTPS://BACKYARD.TEST/x")).toBe("https://backyard.test/x");
+    expect(safeReturnTo(ctx, "https://backyard.test:443/x")).toBe("https://backyard.test/x");
+    expect(safeReturnTo(ctx, "https://backyard.test./x")).toBe("https://backyard.test./x");
   });
 });

@@ -48,11 +48,17 @@ storage-native one — `rsync` for fs storage once `deploy.rsync_target` is set)
 
 - **Diffed:** a file is skipped when the server's manifest has the same SHA-256 and the stored
   object still matches the manifest (so a change made by a direct sync is noticed).
-- **Verified:** uploads are bound to the size and SHA-256 the plan declared (verified by the
-  gateway's own upload endpoint and by S3; GCS pins the size), and the commit checks every
-  file's size before it deletes anything.
+- **Verified:** uploads are bound to the size and SHA-256 the plan declared as far as the store
+  can enforce it (the gateway's own upload endpoint checks both, S3 the size and — on AWS — the
+  SHA-256, GCS the size; an Azure SAS URL cannot restrict the body — see
+  [upload integrity](storage-and-databases.md#upload-integrity)). The commit checks every
+  file's size before it deletes anything; a file stored with the wrong size is deleted and the
+  commit fails with `409 conflict` naming it — run the deploy again.
 - **Not atomic:** like rsync, visitors may briefly see a mix of old and new files; deletions
-  happen last, so a site is never empty mid-deploy.
+  happen last, so a site is never empty mid-deploy. Uploads of a deploy that never commits stay
+  in storage (new paths are served but not part of the site's manifest) until the next
+  successful deploy removes them. The Cloudflare edition is the exception: its commit switches
+  the whole site at once.
 - **Limits** (`sites.*`): 500 MiB per site, 10,000 files, 100 MiB per file by default;
   `ratelimit.deploys_per_hour` (60) per person.
 
@@ -201,6 +207,7 @@ The [AWS Terraform module](../deploy/terraform/aws/README.md) deploys it
 | `forbidden` | Ownership mode and you are not an owner, or the gates (`allowed_domains`/`allowed_groups`) exclude you. |
 | `invalid site name` | Lowercase letters, digits and `-`, ≤ 63 characters, not reserved. |
 | `too_large` | A file or the whole site is over the limits — deploy the build folder, ignore sources. |
+| `conflict: N file(s) were not uploaded correctly` | An upload went missing or arrived with another size (an interrupted upload, a file changed while deploying, a proxy rewriting bodies); objects of the wrong size were deleted. Deploy again. |
 | `rate_limited` | More than `deploys_per_hour`; wait. |
 | A file is missing on the site | It is ignored (dotfile, default ignore, `.backyardignore`) — check with `--dry-run`. |
 | Old content still shows | Reload: sites are served with `Cache-Control: no-cache` and ETags. With several instances, caches expire after `storage.cache_ttl` (5 s). |

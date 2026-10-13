@@ -18,3 +18,18 @@ func TestSignVerify(t *testing.T) {
 		t.Fatal("tampered value must fail")
 	}
 }
+
+func TestLabelsAreDistinct(t *testing.T) {
+	const secret = "s3cret-s3cret-s3cret-s3cret-s3cret"
+	seen := map[string]string{}
+	for _, label := range []string{Session, OAuthState, APIToken, Deploy, Upload, Anon, CLIConfirm} {
+		k := string(Derive(secret, label))
+		if prev, dup := seen[k]; dup {
+			t.Fatalf("labels %q and %q derive the same key", prev, label)
+		}
+		seen[k] = label
+	}
+	if len(seen) != 7 {
+		t.Fatalf("labels = %d", len(seen))
+	}
+}

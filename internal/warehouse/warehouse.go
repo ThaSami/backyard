@@ -1,7 +1,7 @@
 // Package warehouse provides read-only analytics queries (backyard.warehouse)
 // against BigQuery, Postgres-compatible databases (incl. Redshift) and Athena.
 // Sources live in sub-packages; service.Service enforces policy (raw SQL
-// gating, statement guard, named queries, row caps, timeouts).
+// gating, statement guard, named queries, row and size caps, timeouts).
 package warehouse
 
 import (
@@ -27,7 +27,9 @@ type Column struct {
 }
 
 // Result is a query result. Values are JSON-friendly: strings, float64/int64,
-// bool, nil, RFC3339 strings for timestamps, ISO dates for dates.
+// bool, nil, RFC3339 strings for timestamps, ISO dates for dates. Truncated
+// reports that the query had more rows than the result holds (row or size
+// cap).
 type Result struct {
 	Columns   []Column         `json:"columns"`
 	Rows      []map[string]any `json:"rows"`
@@ -35,12 +37,41 @@ type Result struct {
 	Truncated bool             `json:"truncated"`
 }
 
+// DefaultMaxResultBytes is the default result-size cap (Limits.MaxBytes):
+// 32 MiB of estimated row data.
+const DefaultMaxResultBytes = 32 << 20
+
+// Limits bound the result of Source.Query.
+type Limits struct {
+	// MaxRows is the maximum number of rows returned (values <= 0 mean 1).
+	MaxRows int
+	// MaxBytes caps the estimated size of the returned rows: their JSON
+	// encoding plus a fixed per-value overhead for holding them in memory
+	// (values <= 0 mean DefaultMaxResultBytes). Sources stop at the first
+	// row that does not fit and never buffer a row much larger than what
+	// is left, so one query cannot make the server hold an arbitrarily
+	// large result.
+	MaxBytes int
+}
+
+// WithDefaults returns l with its zero or negative fields replaced by their
+// defaults.
+func (l Limits) WithDefaults() Limits {
+	if l.MaxRows <= 0 {
+		l.MaxRows = 1
+	}
+	if l.MaxBytes <= 0 {
+		l.MaxBytes = DefaultMaxResultBytes
+	}
+	return l
+}
+
 // Source executes SQL against one engine. sql uses the engine's native
 // placeholder syntax already (the service translates "?" / "@name").
 type Source interface {
-	// Query runs sql with positional args, returning at most maxRows rows
-	// (Truncated=true if more were available).
-	Query(ctx context.Context, sql string, args []any, maxRows int) (*Result, error)
+	// Query runs sql with positional args and returns the rows that fit
+	// within lim (Truncated=true if more were available).
+	Query(ctx context.Context, sql string, args []any, lim Limits) (*Result, error)
 	// Placeholder returns the engine's positional placeholder for argument i
 	// (0-based): "$1" for postgres, "?" for bigquery/athena.
 	Placeholder(i int) string

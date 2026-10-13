@@ -8,12 +8,16 @@
 # Backyard API tokens, static tokens and (with an OIDC issuer) IdP-issued
 # device-flow JWTs itself. It never accepts anonymous deploys.
 #
-# BACKYARD_SECRET: the gateway binary reads its configuration from the
-# environment only, so the secret is passed as a Lambda environment variable
-# (encrypted at rest with KMS, var.kms_key_arn when set). It is the same value
-# that is stored in Secrets Manager for the ECS service; anyone allowed to call
-# lambda:GetFunctionConfiguration on this function can read it, so restrict
-# that permission accordingly.
+# server.secret: the function never receives the secret itself. Its
+# environment names the Secrets Manager secret the ECS service also reads
+# (BACKYARD_SECRET_ARN), and cmd/backyard-lambda fetches the value at cold
+# start with the gateway role, which may call secretsmanager:GetSecretValue on
+# that secret only (plus kms:Decrypt through Secrets Manager with
+# var.kms_key_arn). BACKYARD_SECRET must not be set as well: the binary refuses
+# to start when both are. BACKYARD_SECRET_VERSION_ID is not read by the binary;
+# it changes the function configuration whenever the secret gets a new value
+# (rotation with -replace=random_password.backyard_secret), so that every warm
+# instance is replaced and the next cold start reads the new value.
 
 locals {
   lambda_zip_path = var.lambda_zip_path != null ? var.lambda_zip_path : "${path.module}/../../../dist/backyard-lambda.zip"
@@ -22,8 +26,9 @@ locals {
   lambda_gateway_url = var.enable_lambda_gateway ? trimsuffix(aws_lambda_function_url.gateway[0].function_url, "/") : ""
 
   gateway_environment = {
-    BACKYARD_CONFIG_YAML = local.gateway_config_yaml
-    BACKYARD_SECRET      = random_password.backyard_secret.result
+    BACKYARD_CONFIG_YAML       = local.gateway_config_yaml
+    BACKYARD_SECRET_ARN        = aws_secretsmanager_secret.backyard_secret.arn
+    BACKYARD_SECRET_VERSION_ID = aws_secretsmanager_secret_version.backyard_secret.version_id
   }
 }
 

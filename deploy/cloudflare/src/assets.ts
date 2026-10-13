@@ -67,7 +67,8 @@ const hubBytes = new Map<string, Uint8Array>();
 export function hubFile(name: string): Uint8Array | null {
   const cached = hubBytes.get(name);
   if (cached) return cached;
-  const f = HUB_FILES[name];
+  // name comes from the request path: own entries only ("constructor" is no file).
+  const f = Object.hasOwn(HUB_FILES, name) ? HUB_FILES[name] : undefined;
   if (!f) return null;
   let data: Uint8Array;
   if (f.text !== undefined) data = enc.encode(f.text);

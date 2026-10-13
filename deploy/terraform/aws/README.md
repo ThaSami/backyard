@@ -22,7 +22,8 @@ deploy gateway.
                                          │
  browsers ──HTTPS──▶ Application Load Balancer (ACM cert, HTTP→HTTPS, optional WAF)
                        │  auth_mode = alb: authenticate-oidc (Okta) on every request,
-                       │  except /__backyard/healthz|readyz and /__backyard/api/deploy/*
+                       │  except /__backyard/healthz|readyz, /__backyard/api/deploy/*
+                       │  and /__backyard/api/tokens
                        ▼
                ECS Fargate service "backyard serve" (private subnets, autoscaling)
                  │          │              │                 │
@@ -47,7 +48,7 @@ deploy gateway.
 | AI | Optional Bedrock permissions and a default AI config: `smart` = Claude Opus 5.5, `fast` = Claude Haiku 5.5, `embed` = Titan Text Embeddings v2, `image` = Nova Canvas (where available) |
 | Deploy gateway | Optional Lambda (`provided.al2023`, arm64) with a function URL, advertised to CLIs as `deploy.gateway_url` |
 | Logs | CloudWatch log groups with retention for the service and the gateway |
-| IAM | Least-privilege task role (bucket, table, Bedrock), execution role (logs, the module's secrets), gateway role (bucket, logs), optional `*-deployer` policy for `aws s3 sync` deploys |
+| IAM | Least-privilege task role (bucket, table, Bedrock), execution role (logs, the module's secrets), gateway role (bucket, logs, reading the `BACKYARD_SECRET` secret), optional `*-deployer` policy for `aws s3 sync` deploys |
 
 Backyard's configuration (`backyard.yaml`) is rendered from
 [`templates/backyard.yaml.tftpl`](templates/backyard.yaml.tftpl) and passed as
@@ -147,9 +148,11 @@ allowed_domains    = ["acme.com"]
 **`auth_mode = "alb"`** — the load balancer authenticates every request with
 `authenticate-oidc` and Backyard verifies the signed `X-Amzn-Oidc-Data` header
 (`auth.alb.signer_arn` is pinned to this ALB). Health probes bypass
-authentication; `/__backyard/api/deploy/*` is authenticated only when the browser
-already has an ALB session (hub drag-and-drop deploys) and otherwise passed through
-so CLIs and CI can deploy with Backyard bearer tokens.
+authentication; `/__backyard/api/deploy/*` and `/__backyard/api/tokens` are
+authenticated only when the browser already has an ALB session (hub drag-and-drop
+deploys) and otherwise passed through so CLIs and CI can deploy and run
+`backyard token create` with Backyard bearer tokens, which Backyard verifies (a
+token minted with a token never outlives it).
 
 ```hcl
 domain             = "backyard.acme.com"
@@ -350,9 +353,12 @@ instance's `max_connections` (about 80 on `db.t4g.micro`), or pick a larger
 * **Terraform state contains secrets** (the generated `BACKYARD_SECRET`, database
   and Valkey passwords, the OIDC client secret in ALB mode, AI keys). Use an
   encrypted remote backend with restricted access.
-* The Lambda gateway receives `BACKYARD_SECRET` as an environment variable (the
-  gateway binary reads configuration from the environment only). It is encrypted
-  at rest; restrict `lambda:GetFunctionConfiguration` on the function.
+* The Lambda gateway never receives `BACKYARD_SECRET` itself: its environment
+  holds `BACKYARD_SECRET_ARN`, the ARN of the Secrets Manager secret the ECS
+  service reads, and the function fetches the value at cold start with the gateway
+  role (`secretsmanager:GetSecretValue` on that secret only, plus `kms:Decrypt`
+  through Secrets Manager with `kms_key_arn`). The function makes that call to the
+  regional Secrets Manager endpoint over the internet (it runs outside the VPC).
 * The Lambda function URL is public (`authorization_type = NONE` plus the
   resource-based policy granting `lambda:InvokeFunctionUrl` and
   `lambda:InvokeFunction` via the URL) because Backyard verifies bearer tokens
@@ -365,7 +371,8 @@ instance's `max_connections` (about 80 on `db.t4g.micro`), or pick a larger
   the ALB when mapping hosts to sites. Set `reject_forwarded_host_header = false`
   only if a proxy in front of the ALB sets it deliberately.
 * Rotating `BACKYARD_SECRET` (`terraform apply -replace=module.backyard.random_password.backyard_secret`)
-  invalidates sessions and API tokens. The Lambda gateway is updated by the apply;
+  invalidates sessions and API tokens. The apply also updates the Lambda gateway's
+  configuration (`BACKYARD_SECRET_VERSION_ID`), so its next cold start reads the new value;
   ECS tasks read the secret when they start, so redeploy the service afterwards
   (`aws ecs update-service --cluster <name> --service <name> --force-new-deployment`).
 * With Bedrock, the first invocation of a third-party model (Claude) subscribes the
@@ -427,7 +434,15 @@ $45–50 per month, mostly the ALB.
 terraform fmt -recursive -check
 terraform init -backend=false && terraform validate
 terraform test          # offline: every provider is mocked (Terraform >= 1.7)
+
+# Load the backyard.yaml every run renders (ECS service and Lambda gateway)
+# with Backyard's own config loader, in the task's or function's environment:
+cd ../../.. && BACKYARD_TEST_TERRAFORM=1 go test ./deploy/terraform/aws/configcheck/
 ```
+
+CI runs both (`make tf-configcheck` runs the configcheck tests of every
+module), so a key that `internal/config` no longer accepts fails CI instead of
+leaving an ECS task that never starts.
 
 With Terraform 1.6 (no mock providers) use
 `terraform init -backend=false -test-directory=none && terraform validate -no-tests`.

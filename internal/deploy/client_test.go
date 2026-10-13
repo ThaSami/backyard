@@ -78,6 +78,13 @@ func TestClientErrorParsing(t *testing.T) {
 		{"html 413", 413, "<html><body>Too big</body></html>", "too_large", "HTTP 413: <html><body>Too big</body></html>", "", 413},
 		{"unknown 418", 418, "teapot", "bad_request", "HTTP 418: teapot", "", 418},
 		{"500", 500, `{"error":{"code":"internal","message":"internal error"}}`, "internal", "internal error", "", 500},
+		// A storage signature error echoes the signed request (credential
+		// scope, security token): only its code and message are kept.
+		{"storage xml", 403, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated\n does not match.</Message>" +
+			"<AWSAccessKeyId>ASIAEXAMPLE</AWSAccessKeyId><StringToSign>AWS4-HMAC-SHA256 20261013T120000Z</StringToSign>" +
+			"<CanonicalRequest>PUT /b/k X-Amz-Security-Token=SECRET</CanonicalRequest></Error>",
+			"forbidden", "HTTP 403: SignatureDoesNotMatch: The request signature we calculated does not match.", "", 403},
+		{"storage xml without a code", 400, "<Error><Message>m</Message></Error>", "bad_request", "HTTP 400: <Error><Message>m</Message></Error>", "", 400},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -169,6 +176,53 @@ func TestClientNetworkErrorAndCancel(t *testing.T) {
 	cancel2()
 	if _, err := NewClient(url, "").Info(ctx2); !errors.Is(err, context.Canceled) {
 		t.Errorf("cancelled context: %v", err)
+	}
+}
+
+// A transport failure reports the request URL; for an upload that is a
+// credential (a presigned storage URL's query, a gateway upload token),
+// which must not reach the terminal or CI logs.
+func TestUploadErrorsRedactCredentials(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	dead := srv.URL
+	srv.Close() // connection refused from now on
+	dir := t.TempDir()
+	writeTree(t, dir, map[string]string{"a.txt": "a"})
+	files, err := CollectFiles(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := NewClient(dead+"/gw", "tok")
+	secrets := []string{"SECRETTOKEN", "deadbeef", "AKIAEXAMPLE", "SIGNEDCAPABILITY"}
+	for _, up := range []Upload{
+		{Path: "a.txt", Method: http.MethodPut, URL: dead + "/sites/s/a.txt?X-Amz-Credential=AKIAEXAMPLE%2Fscope&X-Amz-Security-Token=SECRETTOKEN&X-Amz-Signature=deadbeef"},
+		{Path: "a.txt", Method: http.MethodPut, URL: dead + "/gw/uploads/SIGNEDCAPABILITY.deadbeef"},
+		{Path: "a.txt", URL: "uploads/SIGNEDCAPABILITY.deadbeef"},            // relative to the gateway
+		{Path: "a.txt", URL: "https://user:SECRETTOKEN@[::1/x?sig=deadbeef"}, // unparseable
+	} {
+		err := c.upload(context.Background(), up, &files[0])
+		if err == nil {
+			t.Fatalf("upload to %s succeeded", up.URL)
+		}
+		for _, s := range secrets {
+			if strings.Contains(err.Error(), s) {
+				t.Errorf("error leaks %q: %v", s, err)
+			}
+		}
+		if strings.HasPrefix(up.URL, dead) && !strings.Contains(err.Error(), strings.TrimPrefix(dead, "http://")) {
+			t.Errorf("error does not name the host: %v", err)
+		}
+	}
+	for raw, want := range map[string]string{
+		"https://b.s3.amazonaws.com/sites/s/a.txt?X-Amz-Signature=x": "https://b.s3.amazonaws.com/sites/s/a.txt?[redacted]",
+		"https://gw.example/api/deploy/uploads/tok.sig":              "https://gw.example/api/deploy/uploads/[redacted]",
+		"https://gw.example/uploads/tok.sig":                         "https://gw.example/uploads/[redacted]",
+		"https://u:p@h.example/x#frag":                               "https://h.example/x",
+		"https://h.example/plain":                                    "https://h.example/plain",
+	} {
+		if got := redactURL(raw); got != want {
+			t.Errorf("redactURL(%q) = %q, want %q", raw, got, want)
+		}
 	}
 }
 

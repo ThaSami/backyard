@@ -293,6 +293,20 @@ jobs:
           else
             echo "no tests in $dir/tests"
           fi
+      # Every backyard.yaml the module's test scenarios render (and, on AWS,
+      # the Lambda gateway's) must load with internal/config, the strict
+      # loader `backyard serve` uses at startup: a key the server no longer
+      # accepts fails here, not as a container that never becomes ready.
+      - uses: actions/setup-go@v7
+        if: steps.module.outputs.dir != '' && hashFiles(format('deploy/terraform/{0}/configcheck/*_test.go', matrix.module)) != ''
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+      - name: Rendered backyard.yaml loads with the server's config loader (configcheck)
+        if: steps.module.outputs.dir != '' && hashFiles(format('deploy/terraform/{0}/configcheck/*_test.go', matrix.module)) != ''
+        env:
+          BACKYARD_TEST_TERRAFORM: "1"
+        run: go test -count=1 "./${{ steps.module.outputs.dir }}/configcheck/"
 
   helm:
     name: Helm chart (helm ${{ matrix.helm }})
@@ -336,6 +350,12 @@ jobs:
             go run ./scripts/checkconfig -configmap "$RUNNER_TEMP/rendered.yaml"
             echo "::endgroup::"
           done
+      # The chart's guards (e.g. auth.mode header must not trust identity
+      # headers from the whole pod network) and its NetworkPolicy.
+      - name: Chart tests (go test ./deploy/helm/...)
+        env:
+          BACKYARD_TEST_HELM: "1"
+        run: go test -count=1 ./deploy/helm/...
 
   deploy-kits:
     name: docker-compose, systemd, scripts, workflows

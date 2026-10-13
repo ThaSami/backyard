@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -361,36 +362,42 @@ func (g *Gateway) handleCommit(w http.ResponseWriter, r *http.Request) {
 	var problems []commitProblem
 	man := &sites.Manifest{Site: site, UpdatedAt: g.now().UTC(), Files: make([]sites.ManifestFile, 0, len(req.Files))}
 	listed := make(map[string]bool, len(req.Files))
+	var changed []int // man.Files entries whose stored object the previous manifest does not describe
 	for _, f := range req.Files {
 		listed[f.Path] = true
 		o, ok := stored[f.Path]
+		prev, known := recorded[f.Path]
+		kept := known && ok && prev.ETag == o.ETag && prev.Size == o.Size
 		switch {
 		case !ok:
 			problems = append(problems, commitProblem{path: f.Path, detail: "missing"})
+			continue
 		case o.Size != f.Size:
-			// Unless storage still holds the version the previous manifest
-			// verified (this deploy just did not replace it), the object
-			// came from an upload that bypassed the declared size (Azure
-			// SAS URLs cannot bind it, a URL from another deploy, ...):
-			// delete it rather than leave unverified bytes in the site.
-			prev, known := recorded[f.Path]
-			problems = append(problems, commitProblem{
-				path:      f.Path,
-				detail:    fmt.Sprintf("%d bytes in storage, expected %d", o.Size, f.Size),
-				untrusted: !known || prev.ETag != o.ETag || prev.Size != o.Size,
-			})
+			problems = append(problems, g.wrongSize(f, o.Size, kept))
+			continue
 		}
-		sha := f.SHA256
-		if prev, ok := recorded[f.Path]; ok && prev.ETag == o.ETag && prev.Size == o.Size {
+		mf := sites.ManifestFile{Path: f.Path, Size: f.Size, SHA256: f.SHA256, ETag: o.ETag}
+		if kept {
 			// Storage still holds the object the previous manifest
 			// described, so its recorded digest is the truth. A different
 			// declared digest means this client skipped an upload (a
 			// concurrent deploy changed the file after its plan, or a
 			// buggy client): recording the claim would make later deploys
 			// of that content wrongly "unchanged".
-			sha = prev.SHA256
+			mf.SHA256 = prev.SHA256
+		} else {
+			changed = append(changed, len(man.Files))
 		}
-		man.Files = append(man.Files, sites.ManifestFile{Path: f.Path, Size: f.Size, SHA256: sha, ETag: o.ETag})
+		man.Files = append(man.Files, mf)
+	}
+	if len(problems) > 0 {
+		g.rejectCommit(w, r, u, site, claims, problems)
+		return
+	}
+	superseded, problems, err := g.verifyDigests(ctx, site, man.Files, changed)
+	if err != nil {
+		writeError(w, r, g.log, internalErr(err))
+		return
 	}
 	if len(problems) > 0 {
 		g.rejectCommit(w, r, u, site, claims, problems)
@@ -443,7 +450,8 @@ func (g *Gateway) handleCommit(w http.ResponseWriter, r *http.Request) {
 	deleted := len(stale)
 
 	g.audit(r, u, "deploy.commit", site,
-		"deploy_id", meta.DeployID, "files", meta.FileCount, "bytes", meta.Bytes, "deleted", deleted)
+		"deploy_id", meta.DeployID, "files", meta.FileCount, "bytes", meta.Bytes, "deleted", deleted,
+		"verified", len(changed), "superseded", superseded)
 	meta.URL = g.cfg.SiteURL(site)
 	if meta.Owners == nil {
 		meta.Owners = []string{}
@@ -455,10 +463,93 @@ func (g *Gateway) handleCommit(w http.ResponseWriter, r *http.Request) {
 type commitProblem struct {
 	path   string
 	detail string
-	// untrusted marks a stored object of the wrong size that is not the
-	// version the previous manifest recorded: it must not stay live.
+	// untrusted marks a stored object of the wrong size that may be an
+	// unverified upload (see wrongSize): it must not stay live.
 	untrusted bool
 	deleted   bool
+}
+
+// uploadsBindSize reports whether every upload URL the gateway hands out
+// binds the declared size: its own upload endpoint verifies size and
+// digest, and S3 and GCS presigned URLs sign the size, but an Azure SAS URL
+// cannot restrict the body at all.
+func (g *Gateway) uploadsBindSize() bool {
+	presign := g.cfg.Deploy.Presign == nil || *g.cfg.Deploy.Presign
+	return !presign || g.store.Describe().Type != "azure"
+}
+
+// wrongSize describes a listed file stored with another size than this
+// deploy declared; kept means storage still holds the version the previous
+// manifest recorded (this deploy did not replace it).
+//
+// Where upload URLs bind the size, any other object at the path is the
+// verified upload of another deploy of the site (deploys may overlap, see
+// the package doc) or a direct sync: it stays, as rsync would leave it,
+// and only this commit fails. Where they cannot (presigned Azure SAS URLs),
+// an object other than the recorded version may be an upload of any size
+// that nothing verified, so it is deleted.
+func (g *Gateway) wrongSize(f FileEntry, size int64, kept bool) commitProblem {
+	return commitProblem{
+		path:      f.Path,
+		detail:    fmt.Sprintf("%d bytes in storage, expected %d", size, f.Size),
+		untrusted: !kept && !g.uploadsBindSize(),
+	}
+}
+
+// verifyParallelism bounds concurrent digest lookups during a commit.
+const verifyParallelism = 16
+
+// verifyDigests sets the digest and etag of files[i], for each i in idx
+// (listed files whose stored object the previous manifest does not
+// describe), to those of the bytes stored now: a digest the store verified
+// itself where it reports one, otherwise the hash of the object as read.
+//
+// The declared digest only says what this deploy uploaded. Another deploy
+// of the site may have replaced the object since (same size, other
+// bytes); pairing the declared digest with that object's etag would make
+// later deploys of the declared content wrongly "unchanged". It returns how
+// many files hold other bytes than declared, and problems for files that
+// vanished or changed size since the listing.
+func (g *Gateway) verifyDigests(ctx context.Context, site string, files []sites.ManifestFile, idx []int) (int, []commitProblem, error) {
+	var (
+		mu         sync.Mutex
+		problems   []commitProblem
+		superseded []string
+	)
+	err := parallel(ctx, len(idx), verifyParallelism, func(ctx context.Context, i int) error {
+		mf := &files[idx[i]]
+		got, err := g.reg.FileDigest(ctx, site, mf.Path)
+		switch {
+		case errors.Is(err, blob.ErrNotFound):
+			mu.Lock()
+			problems = append(problems, commitProblem{path: mf.Path, detail: "missing"})
+			mu.Unlock()
+			return nil
+		case err != nil:
+			return fmt.Errorf("verify %q: %w", mf.Path, err)
+		case got.Size != mf.Size:
+			mu.Lock()
+			problems = append(problems, g.wrongSize(FileEntry{Path: mf.Path, Size: mf.Size}, got.Size, false))
+			mu.Unlock()
+			return nil
+		case got.SHA256 != mf.SHA256:
+			mu.Lock()
+			superseded = append(superseded, mf.Path)
+			mu.Unlock()
+		}
+		mf.SHA256, mf.ETag = got.SHA256, got.ETag
+		return nil
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+	slices.SortFunc(problems, func(a, b commitProblem) int { return strings.Compare(a.path, b.path) })
+	if len(superseded) > 0 {
+		slices.Sort(superseded)
+		g.log.WarnContext(ctx, "deploy: files hold other content than this deploy declared (replaced by another deploy or a sync since the upload); the manifest records the stored content",
+			"site", site, "files", len(superseded), "paths", superseded[:min(len(superseded), maxReportedProblems)])
+	}
+	return len(superseded), problems, nil
 }
 
 // maxReportedProblems bounds the paths named in a failed commit's message.
@@ -466,9 +557,9 @@ const maxReportedProblems = 10
 
 // rejectCommit fails a commit whose files are missing or of the wrong size
 // with 409, naming the paths. Untrusted objects of the wrong size are
-// deleted first, so a commit never leaves partially-trusted state behind
-// (objects not listed are only removed by a successful commit, see the
-// package doc).
+// deleted first, so a commit never leaves unverified bytes of the wrong
+// size behind (objects not listed are only removed by a successful commit,
+// see the package doc).
 func (g *Gateway) rejectCommit(w http.ResponseWriter, r *http.Request, u *identity.User, site string, claims *deployClaims, problems []commitProblem) {
 	ctx := r.Context()
 	var untrusted []int

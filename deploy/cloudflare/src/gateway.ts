@@ -4,7 +4,7 @@
  * refresh, owners and delete. Deploy ids and upload URLs are HMAC-signed with
  * the same keys and encoding as the Go gateway.
  */
-import { anonCookieUser, authenticate, authenticateBearer, guestFromIP, hasBearer, rateKey, secretMissing } from "./auth";
+import { anonCookieUser, authenticate, authenticateBearer, guestFromIP, hasBearer, isCookieConflict, rateKey, secretMissing } from "./auth";
 import { maxFileBytes, MAX_INLINE_FILE } from "./config";
 import { KeyLabel, randomHex, signClaims, verifyClaims } from "./crypto";
 import { formatMicros } from "./db/time";
@@ -29,7 +29,7 @@ import { resolveR2Body, R2_KEY_HEADER } from "./object";
 import { normalizeOwners, validatePath } from "./paths";
 import type { SiteRecord } from "./registry-do";
 import { gatewayURL, siteNameError, siteURL, type RequestContext } from "./router";
-import type { DeployFile } from "./site-do";
+import type { CommitResult, DeployFile } from "./site-do";
 import { fixedLength } from "./site-api";
 import { isOwner, siteMetaJSON } from "./sitemeta";
 import { chargeOrThrow, registry, siteStub, VERSION } from "./stubs";
@@ -37,6 +37,8 @@ import { extractTitle, TITLE_SCAN_BYTES } from "./title";
 
 /** How long a deploy id (and its upload URLs) stays valid. */
 const DEPLOY_TTL_SECONDS = 3600;
+/** How long a first commit holds its slot of max_sites before the site is recorded. */
+const SITE_RESERVATION_MS = 10 * 60 * 1000;
 const MAX_OWNERS = 100;
 
 type Access = "read" | "deploy" | "manage";
@@ -133,7 +135,7 @@ async function gatewayUser(ctx: RequestContext, need: Access): Promise<User> {
     try {
       u = await authenticate(ctx, { bearer: false });
     } catch (e) {
-      if (e instanceof HttpError && e.status === 401) throw gatewayUnauthenticated(ctx, "authentication required (run: backyard login)");
+      if (e instanceof HttpError && e.status === 401 && !isCookieConflict(e)) throw gatewayUnauthenticated(ctx, "authentication required (run: backyard login)");
       throw e;
     }
   } else {
@@ -366,13 +368,21 @@ async function handleCommit(ctx: RequestContext, [s, id]: string[]): Promise<Res
   if (!isPlainObject(body)) throw badRequest("request body must be a JSON object");
   const { files, total } = validateFiles(ctx, body.files);
   const prev = await authorizeSite(ctx, u, site);
+  const reg = registry(ctx.env);
   if (!prev) {
-    // A new site: check the platform cap again, as other first deploys may
-    // have committed since this deploy was created.
-    const cap = unwrap(await registry(ctx.env).canCreateSite(site, ctx.cfg.limits.max_sites));
+    // A new site: take a slot of the platform cap atomically (other first
+    // deploys may have committed since this deploy was created, or be
+    // committing right now), before the site's files are switched.
+    const cap = unwrap(await reg.reserveSite(site, ctx.cfg.limits.max_sites, SITE_RESERVATION_MS));
     if (!cap.allowed) throw tooLarge(`this Backyard has reached its limit of ${ctx.cfg.limits.max_sites} sites`);
   }
-  const r = unwrap(await siteStub(ctx.env, site).deployCommit(files));
+  let r: CommitResult;
+  try {
+    r = unwrap(await siteStub(ctx.env, site).deployCommit(files));
+  } catch (e) {
+    if (!prev) ctx.waitUntil(reg.releaseSite(site).catch(() => {}));
+    throw e;
+  }
   let { title, description } = r;
   if (r.titleR2Key && ctx.env.R2) {
     const obj = await ctx.env.R2.get(r.titleR2Key, { range: { offset: 0, length: TITLE_SCAN_BYTES } });
@@ -393,7 +403,7 @@ async function handleCommit(ctx: RequestContext, [s, id]: string[]): Promise<Res
   if (title) meta.title = title;
   if (description) meta.description = description;
   if (ctx.cfg.ownership === "owner" && meta.owners.length === 0 && !u.anonymous) meta.owners = [u.id];
-  unwrap(await registry(ctx.env).putSite(meta));
+  unwrap(await reg.putSite(meta));
   if (r.r2Garbage.length && ctx.env.R2) ctx.waitUntil(deleteR2(ctx.env.R2, r.r2Garbage));
   console.log(JSON.stringify({ audit: true, action: "deploy.commit", actor: u.id, site, files: files.length, bytes: total, deleted: r.deleted }));
   const url = siteURL(ctx, site);

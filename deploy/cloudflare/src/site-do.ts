@@ -38,8 +38,21 @@ export const R2_PART_BYTES = 10 << 20;
 export const MULTIPART_OVERHEAD = 1 << 20;
 /** Unreferenced or unfinished blobs older than this are garbage collected. */
 const BLOB_GRACE_MS = 60 * 60 * 1000;
-/** Attachments above this size spill to SQLite (the runtime limit is 16 KiB). */
+/**
+ * Connection state whose JSON is longer than this spills to SQLite. The
+ * runtime limits the serialized attachment to 16 KiB, which can be up to
+ * about 2.25 times the JSON length (two-byte strings, numbers), so a state
+ * below this can still be too large: save() falls back to the spill then.
+ */
 const ATTACHMENT_MAX = 15_000;
+/**
+ * Stored JSON (in UTF-16 code units) one query page carries at most. A page
+ * travels to the Worker as one RPC result, which is limited to 32 MiB of
+ * structured-clone data (a parsed document can take about 2.25 times its JSON
+ * length: numbers), and the object has 128 MB of memory. A page always holds
+ * at least one document; a page cut short says has_more.
+ */
+export const QUERY_PAGE_BUDGET = 8 << 20;
 
 const ROOM_RE = /^[A-Za-z0-9_\-:.]{1,128}$/;
 const CID_RE = /^c_[0-9a-f]{1,64}$/;
@@ -139,8 +152,29 @@ interface ConnState {
    * Room → presence. joined_at is fixed-width RFC 3339 with milliseconds
    * (formatMillisFixed), so it orders chronologically as a string; joined_us
    * is kept for connection state saved by older versions and is not used.
+   * An object without prototype (see dict): room names are client input, and
+   * "__proto__", "constructor" or "toString" must be rooms like any other,
+   * never members of Object.prototype. Membership is tested with inRoom.
    */
-  rooms: Record<string, { state: Record<string, unknown>; joined_at: string; joined_us?: number }>;
+  rooms: Record<string, RoomEntry>;
+}
+
+interface RoomEntry {
+  state: Record<string, unknown>;
+  joined_at: string;
+  joined_us?: number;
+}
+
+/** A copy of o's own entries in an object without prototype. */
+function dict<T>(o: unknown): Record<string, T> {
+  const out = Object.create(null) as Record<string, T>;
+  if (o && typeof o === "object") for (const [k, v] of Object.entries(o)) out[k] = v as T;
+  return out;
+}
+
+/** Whether the connection is a member of room (own entries only). */
+function inRoom(st: ConnState, room: string): boolean {
+  return Object.hasOwn(st.rooms, room);
 }
 
 interface Bucket {
@@ -148,6 +182,9 @@ interface Bucket {
   at: number;
   lastLimited: number;
 }
+
+/** Tables of SCHEMA (an object with none of them has never stored anything). */
+const TABLES = ["meta", "blobs", "chunks", "files", "docs", "uploads", "ws_spill"];
 
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`,
@@ -193,19 +230,36 @@ export class SiteDO extends DurableObject<Env> {
   private readonly writes = new Map<string, { day: string; n: number }>();
   private readonly conns = new WeakMap<WebSocket, ConnState>();
   private readonly buckets = new Map<string, Bucket>();
+  /**
+   * Whether the tables exist. They are created by the object's first write,
+   * not when it starts: reads of a site name that was never deployed or used
+   * (probes of random names, typos) answer "empty" and leave no storage
+   * behind, so they cost none of the free plan's daily rows written or its
+   * storage. Every read checks this flag; every write calls ensureSchema().
+   */
+  private ready = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.migrate();
+    const placeholders = TABLES.map(() => "?").join(", ");
+    if (this.sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name IN (${placeholders}) LIMIT 1`, ...TABLES).toArray().length > 0) {
+      this.migrate();
+    }
     // Answered by the runtime without waking the object (keeps hibernation cheap).
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"t":"ping"}', '{"t":"pong"}'));
   }
 
   private migrate(): void {
     for (const stmt of SCHEMA) this.sql.exec(stmt);
+    this.ready = true;
     const row = this.sql.exec("SELECT MAX(updated_at) AS m FROM docs").toArray()[0] as { m: number | null } | undefined;
     if (row?.m) this.clock.observe(row.m);
+  }
+
+  /** Creates the tables before the first write. */
+  private ensureSchema(): void {
+    if (!this.ready) this.migrate();
   }
 
   private get cfg(): Config {
@@ -243,6 +297,7 @@ export class SiteDO extends DurableObject<Env> {
   // --- blobs -------------------------------------------------------------
 
   private blob(key: string): BlobRow | undefined {
+    if (!this.ready) return undefined;
     return this.sql.exec("SELECT key, size, sha256, storage, r2_key, complete, created_at FROM blobs WHERE key = ?", key).toArray()[0] as
       | BlobRow
       | undefined;
@@ -309,6 +364,7 @@ export class SiteDO extends DurableObject<Env> {
     if (!/^[su]:[A-Za-z0-9]{1,128}$/.test(key) || !Number.isSafeInteger(size) || size < 0) {
       return errorResponse(new HttpError(400, "bad_request", "invalid blob parameters"));
     }
+    this.ensureSchema();
     const tmp = "t:" + randomHex(16);
     const now = Date.now();
     this.sql.exec("INSERT INTO blobs (key, size, sha256, storage, complete, created_at) VALUES (?, ?, '', 'inline', 0, ?)", tmp, size, now);
@@ -454,6 +510,7 @@ export class SiteDO extends DurableObject<Env> {
       return errorResponse(badRequest(`invalid multipart body: ${(e as Error).message}`));
     }
     if (!req.body) return errorResponse(badRequest('missing "file" field'));
+    this.ensureSchema();
     // The whole body is bounded too (fields other than "file" are skipped, not stored).
     let total = 0;
     const bounded = req.body.pipeThrough(
@@ -639,6 +696,7 @@ export class SiteDO extends DurableObject<Env> {
    */
   async registerR2Blob(key: string, size: number, sha256: string, r2Key: string): Promise<Result<{ stored: boolean }>> {
     try {
+      this.ensureSchema();
       const existing = this.blob(key);
       if (existing?.complete) return ok({ stored: false });
       let garbage: string[] = [];
@@ -663,6 +721,7 @@ export class SiteDO extends DurableObject<Env> {
   // --- static files (SPEC §3) --------------------------------------------
 
   private fileObject(path: string): Servable | null {
+    if (!this.ready) return null;
     const row = this.sql.exec("SELECT path, sha256, size, content_type, updated_at FROM files WHERE path = ?", path).toArray()[0] as
       | { path: string; sha256: string; size: number; content_type: string; updated_at: number }
       | undefined;
@@ -705,7 +764,7 @@ export class SiteDO extends DurableObject<Env> {
     if (spa) return serveObject(req, spa);
     const nf = this.fileObject("404.html");
     if (nf) return serveObject(req, nf, { status: 404, cacheControl: "no-store" });
-    const any = this.sql.exec("SELECT 1 FROM files LIMIT 1").toArray().length > 0;
+    const any = this.ready && this.sql.exec("SELECT 1 FROM files LIMIT 1").toArray().length > 0;
     return new Response(null, { status: 404, headers: { "x-backyard-not-found": any ? "page" : "site" } });
   }
 
@@ -726,6 +785,7 @@ export class SiteDO extends DurableObject<Env> {
   async deployPlan(files: DeployFile[]): Promise<Result<{ unchanged: string[] }>> {
     try {
       const unchanged: string[] = [];
+      if (!this.ready) return ok({ unchanged });
       for (const f of files) {
         const row = this.sql.exec("SELECT sha256, size FROM files WHERE path = ?", f.path).toArray()[0] as
           | { sha256: string; size: number }
@@ -748,6 +808,7 @@ export class SiteDO extends DurableObject<Env> {
   async deployCommit(files: DeployFile[]): Promise<Result<CommitResult>> {
     try {
       const problems: string[] = [];
+      this.ensureSchema();
       for (const f of files) {
         const b = this.blob("s:" + f.sha256);
         if (!b || !b.complete) problems.push(`${f.path.slice(0, 200)} (missing)`);
@@ -835,6 +896,7 @@ export class SiteDO extends DurableObject<Env> {
   /** File count, bytes, title and description of the current manifest (refresh). */
   async siteInfo(): Promise<Result<{ fileCount: number; bytes: number; title: string; description: string; titleR2Key: string; updatedAt: number }>> {
     try {
+      if (!this.ready) return ok({ fileCount: 0, bytes: 0, title: "", description: "", titleR2Key: "", updatedAt: 0 });
       const updated = this.sql.exec("SELECT v FROM meta WHERE k = 'updated_at'").toArray()[0] as { v: string } | undefined;
       return ok({ ...this.stats(), ...this.titleInfo(), updatedAt: updated ? Number(updated.v) : 0 });
     } catch (e) {
@@ -845,6 +907,7 @@ export class SiteDO extends DurableObject<Env> {
   /** The manifest: GET G/sites/{site}/files. */
   async listFiles(): Promise<Result<{ path: string; size: number; sha256: string; updated_at: string }[]>> {
     try {
+      if (!this.ready) return ok([]);
       const rows = this.sql.exec("SELECT path, size, sha256, updated_at FROM files ORDER BY path").toArray() as {
         path: string;
         size: number;
@@ -860,10 +923,12 @@ export class SiteDO extends DurableObject<Env> {
   /** Deletes everything of this site; returns the R2 keys to delete. */
   async destroy(): Promise<Result<{ r2Keys: string[] }>> {
     try {
-      const r2Keys = [
-        ...(this.sql.exec("SELECT r2_key FROM blobs WHERE storage = 'r2' AND r2_key <> ''").toArray() as { r2_key: string }[]).map((r) => r.r2_key),
-        ...(this.sql.exec("SELECT r2_key FROM uploads WHERE storage = 'r2' AND r2_key <> ''").toArray() as { r2_key: string }[]).map((r) => r.r2_key),
-      ];
+      const r2Keys = this.ready
+        ? [
+            ...(this.sql.exec("SELECT r2_key FROM blobs WHERE storage = 'r2' AND r2_key <> ''").toArray() as { r2_key: string }[]).map((r) => r.r2_key),
+            ...(this.sql.exec("SELECT r2_key FROM uploads WHERE storage = 'r2' AND r2_key <> ''").toArray() as { r2_key: string }[]).map((r) => r.r2_key),
+          ]
+        : [];
       for (const ws of this.ctx.getWebSockets()) {
         try {
           ws.close(1001, "site deleted");
@@ -874,7 +939,8 @@ export class SiteDO extends DurableObject<Env> {
       await this.ctx.storage.deleteAll();
       this.docCount = null;
       this.writes.clear();
-      this.migrate();
+      // The tables are created again by the next write: a deleted site keeps no storage.
+      this.ready = false;
       return ok({ r2Keys });
     } catch (e) {
       return failure(e, "deleting the site");
@@ -900,6 +966,7 @@ export class SiteDO extends DurableObject<Env> {
   }
 
   private docRow(collection: string, id: string): DocRow | undefined {
+    if (!this.ready) return undefined;
     return this.sql.exec(`SELECT ${DOC_COLUMNS} FROM docs WHERE collection = ? AND id = ?`, collection, id).toArray()[0] as DocRow | undefined;
   }
 
@@ -948,6 +1015,7 @@ export class SiteDO extends DurableObject<Env> {
   /** GET /db: non-system collections with documents, sorted. */
   async dbCollections(): Promise<Result<string[]>> {
     try {
+      if (!this.ready) return ok([]);
       const rows = this.sql.exec("SELECT DISTINCT collection FROM docs ORDER BY collection").toArray() as { collection: string }[];
       return ok(rows.map((r) => r.collection).filter((c) => !c.startsWith("_")));
     } catch (e) {
@@ -959,6 +1027,7 @@ export class SiteDO extends DurableObject<Env> {
   async dbCreate(collection: string, id: string, data: Record<string, unknown>, opts: WriteOptions): Promise<Result<DocWire>> {
     try {
       const text = this.encodeDoc(data);
+      this.ensureSchema();
       if (id && this.docRow(collection, id)) return fail(conflict("a document with this id already exists"));
       this.checkQuota();
       this.chargeWrite(opts.writer);
@@ -997,6 +1066,7 @@ export class SiteDO extends DurableObject<Env> {
   async dbPut(collection: string, id: string, data: Record<string, unknown>, opts: WriteOptions): Promise<Result<{ doc: DocWire; created: boolean }>> {
     try {
       const text = this.encodeDoc(data);
+      this.ensureSchema();
       const cur = this.docRow(collection, id);
       if (!cur) this.checkQuota();
       this.chargeWrite(opts.writer);
@@ -1065,6 +1135,7 @@ export class SiteDO extends DurableObject<Env> {
   async dbDelete(collection: string, id: string, opts: WriteOptions): Promise<Result<boolean>> {
     try {
       this.chargeWrite(opts.writer);
+      if (!this.ready) return ok(false);
       const res = this.sql.exec("DELETE FROM docs WHERE collection = ? AND id = ?", collection, id);
       const deleted = res.rowsWritten > 0;
       if (deleted) {
@@ -1081,9 +1152,23 @@ export class SiteDO extends DurableObject<Env> {
   async dbQuery(collection: string, q: Query): Promise<Result<{ docs: DocWire[]; has_more: boolean }>> {
     try {
       const { sql, params } = buildQuery(collection, q);
-      const rows = this.sql.exec(sql, ...params).toArray() as unknown as DocRow[];
-      const hasMore = rows.length > q.limit;
-      return ok({ docs: rows.slice(0, q.limit).map((r) => this.docWire(r)), has_more: hasMore });
+      const docs: DocWire[] = [];
+      if (!this.ready) return ok({ docs, has_more: false });
+      // Rows are read one at a time and the page stops at its byte budget
+      // (QUERY_PAGE_BUDGET): limit × max_doc_bytes can far exceed what one
+      // RPC result and the object's memory can hold.
+      let used = 0;
+      let hasMore = false;
+      for (const row of this.sql.exec(sql, ...params)) {
+        const r = row as unknown as DocRow;
+        if (docs.length >= q.limit || (docs.length > 0 && used + r.data.length > QUERY_PAGE_BUDGET)) {
+          hasMore = true;
+          break;
+        }
+        used += r.data.length;
+        docs.push(this.docWire(r));
+      }
+      return ok({ docs, has_more: hasMore });
     } catch (e) {
       return failure(e, "querying documents");
     }
@@ -1093,6 +1178,7 @@ export class SiteDO extends DurableObject<Env> {
   // Uploads (SPEC §5.3)
 
   private uploadRow(id: string): UploadRow | null {
+    if (!this.ready) return null;
     const r = this.sql.exec("SELECT id, name, size, content_type, storage, r2_key, created_at, created_by FROM uploads WHERE id = ?", id).toArray()[0] as
       | (Omit<UploadRow, "created_at"> & { created_at: number })
       | undefined;
@@ -1105,6 +1191,7 @@ export class SiteDO extends DurableObject<Env> {
    */
   async recordUpload(u: { id: string; name: string; size: number; content_type: string; created_by: string; r2_key?: string }): Promise<Result<UploadRow>> {
     try {
+      this.ensureSchema();
       if (u.r2_key) {
         this.sql.exec(
           "INSERT INTO uploads (id, name, size, content_type, storage, r2_key, created_at, created_by) VALUES (?, ?, ?, ?, 'r2', ?, ?, ?)",
@@ -1138,6 +1225,7 @@ export class SiteDO extends DurableObject<Env> {
   /** GET /files: newest first. */
   async listUploads(limit: number, offset: number): Promise<Result<{ files: UploadRow[]; has_more: boolean }>> {
     try {
+      if (!this.ready) return ok({ files: [], has_more: false });
       const rows = this.sql
         .exec(
           "SELECT id, name, size, content_type, storage, r2_key, created_at, created_by FROM uploads ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -1219,7 +1307,7 @@ export class SiteDO extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
     this.ctx.acceptWebSocket(server);
-    const st: ConnState = { cid: "c_" + randomHex(10), user, summary: summarize(user), subs: {}, rooms: {} };
+    const st: ConnState = { cid: "c_" + randomHex(10), user, summary: summarize(user), subs: dict({}), rooms: dict({}) };
     this.save(server, st);
     server.send(JSON.stringify({ t: "hello", cid: st.cid, user }));
     return new Response(null, { status: 101, webSocket: client });
@@ -1238,28 +1326,44 @@ export class SiteDO extends DurableObject<Env> {
     if (!att || typeof att !== "object") return null;
     let st = att as ConnState & { spill?: boolean };
     if (st.spill) {
+      if (!this.ready) return null;
       const row = this.sql.exec("SELECT data FROM ws_spill WHERE cid = ?", st.cid).toArray()[0] as { data: string } | undefined;
       if (!row) return null;
       st = JSON.parse(row.data) as ConnState;
     }
+    // Rebuilt state is made of ordinary objects: rooms and subscriptions
+    // become objects without prototype again.
+    st.rooms = dict<RoomEntry>(st.rooms);
+    st.subs = dict(st.subs);
     // State saved by an older version may carry a variable-width joined_at.
-    for (const r of Object.values(st.rooms ?? {})) {
+    for (const r of Object.values(st.rooms)) {
       if (r && typeof r.joined_at === "string") r.joined_at = toFixedMillis(r.joined_at);
     }
     this.conns.set(ws, st);
     return st;
   }
 
+  /**
+   * Persists a connection's state: in the socket attachment when it fits,
+   * else in ws_spill. The JSON length only estimates the serialized size
+   * (two-byte strings and numbers take more), so an attachment the runtime
+   * rejects spills too.
+   */
   private save(ws: WebSocket, st: ConnState): void {
     this.conns.set(ws, st);
     const text = JSON.stringify(st);
     if (text.length <= ATTACHMENT_MAX) {
-      ws.serializeAttachment(st);
-      this.sql.exec("DELETE FROM ws_spill WHERE cid = ?", st.cid);
-    } else {
-      this.sql.exec("INSERT OR REPLACE INTO ws_spill (cid, data) VALUES (?, ?)", st.cid, text);
-      ws.serializeAttachment({ cid: st.cid, spill: true });
+      try {
+        ws.serializeAttachment(st);
+        if (this.ready) this.sql.exec("DELETE FROM ws_spill WHERE cid = ?", st.cid);
+        return;
+      } catch {
+        /* larger than the runtime's attachment limit once serialized: spill */
+      }
     }
+    this.ensureSchema();
+    this.sql.exec("INSERT OR REPLACE INTO ws_spill (cid, data) VALUES (?, ?)", st.cid, text);
+    ws.serializeAttachment({ cid: st.cid, spill: true });
   }
 
   private send(ws: WebSocket, frame: unknown): void {
@@ -1308,6 +1412,7 @@ export class SiteDO extends DurableObject<Env> {
 
   private member(st: ConnState, room: string) {
     const r = st.rooms[room]!;
+    // Callers check inRoom first.
     return { cid: st.cid, user: st.summary, state: r.state, joined_at: r.joined_at };
   }
 
@@ -1317,7 +1422,7 @@ export class SiteDO extends DurableObject<Env> {
    */
   private others(room: string, cid: string) {
     return this.sockets()
-      .filter((x) => x.st.cid !== cid && x.st.rooms[room])
+      .filter((x) => x.st.cid !== cid && inRoom(x.st, room))
       .sort((a, b) => compareMembers(a.st.rooms[room]!.joined_at, a.st.cid, b.st.rooms[room]!.joined_at, b.st.cid))
       .map((x) => this.member(x.st, room));
   }
@@ -1325,7 +1430,7 @@ export class SiteDO extends DurableObject<Env> {
   private broadcastPresence(room: string, op: "join" | "leave" | "update", member: unknown, exceptCid: string): void {
     let frame: string | null = null;
     for (const { ws, st } of this.sockets()) {
-      if (st.cid === exceptCid || !st.rooms[room]) continue;
+      if (st.cid === exceptCid || !inRoom(st, room)) continue;
       frame ??= JSON.stringify({ t: "presence", room, op, member });
       this.send(ws, frame);
     }
@@ -1384,6 +1489,20 @@ export class SiteDO extends DurableObject<Env> {
       }
       id = f.id;
     }
+    try {
+      this.handleFrame(ws, st, id, f);
+    } catch (e) {
+      // Handlers change the connection's state before they save it: drop the
+      // cached copy, so that the state is rebuilt from what was last saved
+      // and memory never disagrees with what survives hibernation. Errors
+      // never close the connection (SPEC §6).
+      this.conns.delete(ws);
+      console.error(`backyard: site: websocket frame ${JSON.stringify(String(f.t).slice(0, 32))} failed: ${(e as Error)?.message ?? e}`);
+      this.sendError(ws, id, "internal", "the frame could not be processed");
+    }
+  }
+
+  private handleFrame(ws: WebSocket, st: ConnState, id: string | number | undefined, f: Record<string, unknown>): void {
     switch (f.t) {
       case "ping":
         this.send(ws, '{"t":"pong"}');
@@ -1458,7 +1577,7 @@ export class SiteDO extends DurableObject<Env> {
       const he = e as HttpError;
       return this.sendError(ws, id, he.code, he.message);
     }
-    const cur = st.rooms[room];
+    const cur = inRoom(st, room) ? st.rooms[room] : undefined;
     if (cur) {
       const changed = JSON.stringify(cur.state) !== JSON.stringify(state);
       cur.state = state;
@@ -1479,7 +1598,7 @@ export class SiteDO extends DurableObject<Env> {
   }
 
   private leaveRoom(ws: WebSocket, st: ConnState, room: string): void {
-    if (!st.rooms[room]) return;
+    if (!inRoom(st, room)) return;
     const me = this.member(st, room);
     delete st.rooms[room];
     this.save(ws, st);
@@ -1487,7 +1606,7 @@ export class SiteDO extends DurableObject<Env> {
   }
 
   private onState(ws: WebSocket, st: ConnState, id: string | number | undefined, room: unknown, rawState: unknown): void {
-    if (typeof room !== "string" || !st.rooms[room]) {
+    if (typeof room !== "string" || !inRoom(st, room)) {
       return this.sendError(ws, id, "not_found", `not a member of room ${JSON.stringify(String(room ?? "").slice(0, 128))}`);
     }
     let state: Record<string, unknown>;
@@ -1509,12 +1628,12 @@ export class SiteDO extends DurableObject<Env> {
 
   private onSend(ws: WebSocket, st: ConnState, id: string | number | undefined, f: Record<string, unknown>): void {
     const room = f.room;
-    if (typeof room !== "string" || !st.rooms[room]) {
+    if (typeof room !== "string" || !inRoom(st, room)) {
       return this.sendError(ws, id, "not_found", `not a member of room ${JSON.stringify(String(room ?? "").slice(0, 128))}`);
     }
     const to = typeof f.to === "string" ? f.to : "";
     const echo = f.echo === true;
-    const members = this.sockets().filter((x) => x.st.rooms[room]);
+    const members = this.sockets().filter((x) => inRoom(x.st, room));
     if (to) {
       if (!CID_RE.test(to)) return this.sendError(ws, id, "bad_request", "invalid recipient connection id");
       if (!members.some((x) => x.st.cid === to)) return this.sendError(ws, id, "not_found", `no member ${JSON.stringify(to)} in room ${JSON.stringify(room)}`);
@@ -1538,10 +1657,10 @@ export class SiteDO extends DurableObject<Env> {
       delete st.rooms[room];
       this.broadcastPresence(room, "leave", me, st.cid);
     }
-    st.subs = {};
+    st.subs = dict({});
     this.conns.delete(ws);
     this.buckets.delete(st.cid);
-    this.sql.exec("DELETE FROM ws_spill WHERE cid = ?", st.cid);
+    if (this.ready) this.sql.exec("DELETE FROM ws_spill WHERE cid = ?", st.cid);
     try {
       ws.serializeAttachment(null);
     } catch {

@@ -6,6 +6,7 @@ package ai
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 var (
@@ -17,6 +18,10 @@ var (
 	ErrDisabled = errors.New("ai: disabled")
 	// ErrBadRequest: invalid request (empty messages, bad image, …).
 	ErrBadRequest = errors.New("ai: bad request")
+	// ErrNotLocal is returned by an ImageResolver for an absolute URL that
+	// does not point at content the server holds itself; the URL is then
+	// handled like any other remote image URL.
+	ErrNotLocal = errors.New("ai: not a local image")
 )
 
 // UpstreamError wraps an error returned by a provider API.
@@ -24,10 +29,24 @@ type UpstreamError struct {
 	Provider string
 	Status   int // HTTP status from the provider, 0 if not applicable
 	Message  string
+	// RetryDelay is how long the provider asked callers to wait before
+	// retrying (its Retry-After, retry-after-ms or rate-limit reset
+	// headers, or Google's RetryInfo), 0 when it did not say.
+	RetryDelay time.Duration
 }
 
 func (e *UpstreamError) Error() string {
 	return "ai: " + e.Provider + " error: " + e.Message
+}
+
+// RetryAfter returns RetryDelay (0 when the provider gave no retry time).
+// The HTTP layer looks for this method on any error in a chain to set the
+// Retry-After of a throttled (429) response.
+func (e *UpstreamError) RetryAfter() time.Duration {
+	if e == nil || e.RetryDelay < 0 {
+		return 0
+	}
+	return e.RetryDelay
 }
 
 // Part is one piece of message content.
@@ -56,7 +75,36 @@ type ChatRequest struct {
 	JSON        bool   // ask for a single JSON object response
 	Effort      string // optional reasoning effort hint (anthropic)
 	User        string // end-user id for provider abuse monitoring (optional)
+
+	// ResolveImage, when set, loads images the request references by a URL
+	// of the calling site's own content (see ImageResolver). It is used by
+	// the Service (router) before the request reaches a provider; providers
+	// never see it and ignore it if set.
+	ResolveImage ImageResolver
 }
+
+// ImageResolver loads an image that a chat request references by URL when
+// that URL points at content the server holds itself — typically the
+// calling site's uploads (/__backyard/files/{id}/{name}, which is what
+// backyard.files.upload returns). The HTTP layer builds one per request,
+// bound to the request's site, user and origin; the router calls it:
+//
+//   - for every site-relative URL ("/…", but not "//host/…"); without a
+//     resolver such URLs are rejected as bad requests;
+//   - for every absolute http(s) URL; the resolver returns ErrNotLocal for
+//     URLs it does not serve (another origin), which are then passed to
+//     providers or downloaded by the SSRF-guarded fetcher as before.
+//
+// ref is the URL exactly as the client sent it (trimmed). maxBytes is the
+// most the router accepts for this image (the per-image limit, lowered by
+// what is left of the request's image byte budget); the resolver should
+// check the stored size before reading and must not return more. Errors
+// wrapping ErrBadRequest (unknown file, another site's file, too large)
+// become 400 responses; context errors are passed through; any other error
+// (a storage failure) is returned to the caller wrapped. The media type is
+// detected from the bytes (png, jpeg, gif or webp; anything else is a bad
+// request), so a stored content type is neither needed nor trusted.
+type ImageResolver func(ctx context.Context, ref string, maxBytes int64) ([]byte, error)
 
 // Usage reports token consumption.
 type Usage struct {

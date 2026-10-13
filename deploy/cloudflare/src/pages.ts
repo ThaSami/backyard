@@ -11,7 +11,7 @@ h1{font-size:22px;margin:8px 0 12px}
 p{margin:0 0 20px;color:var(--muted);overflow-wrap:anywhere}
 .actions{display:flex;gap:12px;flex-wrap:wrap}
 a.btn,button.btn{display:inline-block;padding:8px 16px;border-radius:8px;text-decoration:none;border:1px solid var(--line);color:var(--fg);background:none;font:inherit;cursor:pointer}
-a.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+a.btn.primary,button.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
 pre{white-space:pre-wrap;word-break:break-all;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px;font:13px/1.4 ui-monospace,Menlo,monospace;margin:0 0 16px}`;
 
 /** Data of the generic page. */
@@ -106,15 +106,70 @@ export function pageNotFound(): HttpError {
   return new HttpError(404, "not_found", "The page you are looking for does not exist on this site.", { title: "Page not found" });
 }
 
-/** Security headers of the self-contained auth pages (no framing, no scripts but ours). */
-function authPageHeaders(nonce: string): Headers {
+/**
+ * Security headers of the self-contained auth pages (no framing, no scripts
+ * but ours, no forms unless formAction names where one may go).
+ */
+function authPageHeaders(nonce: string, formAction = "'none'"): Headers {
   return new Headers({
     "Content-Type": "text/html; charset=utf-8",
-    "Cache-Control": "no-store",
+    "Cache-Control": "no-store, max-age=0",
+    Pragma: "no-cache",
+    Expires: "0",
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "DENY",
-    "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
+    "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action ${formAction}`,
   });
+}
+
+/** The confirmation form of a cross-site CLI login (/__backyard/auth/cli). */
+export interface CLIConfirmForm {
+  title: string;
+  message: string;
+  detail: string;
+  /** Where the form posts (the CLI login endpoint of this host). */
+  action: string;
+  /** Hidden fields: redirect_uri, state and mode ("" ones are left out) and the CSRF token. */
+  redirectURI: string;
+  state: string;
+  mode: string;
+  csrf: string;
+  cancelURL: string;
+  /**
+   * Extra CSP form-action source: the loopback origin the answer of the form
+   * redirects to (browsers apply form-action to those redirects too).
+   */
+  formAction: string;
+}
+
+/** Asks the user whether a CLI login that another site may have started may go ahead. */
+export function cliConfirmPage(f: CLIConfirmForm): Response {
+  const nonce = crypto.randomUUID().replace(/-/g, "");
+  const hidden = (name: string, value: string) => (value ? `<input type="hidden" name="${name}" value="${escapeHTML(value)}">\n` : "");
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="referrer" content="no-referrer">
+<title>${escapeHTML(f.title)} · Backyard</title>
+<style>${STYLE}</style>
+</head>
+<body>
+<main>
+<h1>${escapeHTML(f.title)}</h1>
+<p>${escapeHTML(f.message)}</p>
+<p>${escapeHTML(f.detail)}</p>
+<form method="post" action="${escapeHTML(f.action)}">
+${hidden("redirect_uri", f.redirectURI)}${hidden("state", f.state)}${hidden("mode", f.mode)}${hidden("csrf", f.csrf)}<div class="actions"><button class="btn primary" id="allow" type="submit">Allow</button><a class="btn" id="cancel" href="${escapeHTML(f.cancelURL)}">Cancel</a></div>
+</form>
+</main>
+</body>
+</html>
+`;
+  const formAction = ("'self' " + f.formAction).trim();
+  return new Response(html, { status: 200, headers: authPageHeaders(nonce, formAction) });
 }
 
 /** Auth-flow error page (/__backyard/auth/*). */

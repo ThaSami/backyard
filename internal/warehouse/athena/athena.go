@@ -170,11 +170,10 @@ func (s *Source) Placeholder(int) string { return "?" }
 // Close is a no-op: the SDK client holds no resources that need releasing.
 func (s *Source) Close() error { return nil }
 
-// Query runs sql and returns at most maxRows rows.
-func (s *Source) Query(ctx context.Context, sql string, args []any, maxRows int) (*warehouse.Result, error) {
-	if maxRows <= 0 {
-		maxRows = 1
-	}
+// Query runs sql and returns the rows that fit within lim. No further pages
+// are fetched once the size cap is reached.
+func (s *Source) Query(ctx context.Context, sql string, args []any, lim warehouse.Limits) (*warehouse.Result, error) {
+	lim = lim.WithDefaults()
 	in, err := s.startInput(sql, args)
 	if err != nil {
 		return nil, err
@@ -191,7 +190,7 @@ func (s *Source) Query(ctx context.Context, sql string, args []any, maxRows int)
 	if err != nil {
 		return nil, err
 	}
-	return s.results(ctx, id, exec.StatementType, maxRows)
+	return s.results(ctx, id, exec.StatementType, lim)
 }
 
 // startInput builds the StartQueryExecution request.
@@ -325,7 +324,8 @@ func (s *Source) stop(ctx context.Context, id string) {
 }
 
 // results pages through GetQueryResults.
-func (s *Source) results(ctx context.Context, id string, stmt types.StatementType, maxRows int) (*warehouse.Result, error) {
+func (s *Source) results(ctx context.Context, id string, stmt types.StatementType, lim warehouse.Limits) (*warehouse.Result, error) {
+	maxRows := lim.MaxRows
 	var (
 		cols      []warehouse.Column
 		colTypes  []string
@@ -333,6 +333,7 @@ func (s *Source) results(ctx context.Context, id string, stmt types.StatementTyp
 		truncated bool
 		token     *string
 		first     = true
+		budget    = conv.NewBudget(lim.MaxBytes)
 	)
 	for {
 		want := maxRows - len(rows) + 1 // one extra row detects truncation
@@ -368,7 +369,12 @@ func (s *Source) results(ctx context.Context, id string, stmt types.StatementTyp
 				truncated = true
 				break
 			}
-			rows = append(rows, convertRow(r, cols, colTypes))
+			row := convertRow(r, cols, colTypes)
+			if !budget.Add(row) {
+				truncated = true
+				break
+			}
+			rows = append(rows, row)
 		}
 		if truncated || out.NextToken == nil || *out.NextToken == "" {
 			break

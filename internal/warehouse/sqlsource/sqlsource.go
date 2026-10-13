@@ -13,8 +13,15 @@
 // Parameters are sent in text format, so PostgreSQL parses them for the
 // inferred parameter type exactly as it would parse a quoted literal.
 //
-// When a result exceeds the row cap, up to 10 000 surplus rows are discarded
-// and larger results are canceled server-side rather than streamed.
+// When a result exceeds the row cap, up to 10 000 surplus rows (and at most
+// the size cap's worth of data) are discarded and larger results are
+// canceled server-side rather than streamed. A result that reaches the size
+// cap (warehouse.Limits.MaxBytes) is canceled at once. pgx reads every
+// protocol message whole, so the connection refuses messages larger than
+// what is left of the size cap (at least 64 KiB): such a row ends the result
+// (Truncated) and the connection is closed instead of the row being
+// buffered. When that happens to the first row, the result has no columns
+// either (pgx learns them with the first row).
 //
 // Result values are converted to JSON-friendly Go values:
 //
@@ -53,6 +60,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -66,6 +74,10 @@ const (
 	// the row cap before the server is asked to cancel the statement. Small
 	// overshoots finish cleanly; huge results are canceled.
 	drainLimit = 10000
+	// minBodyLen is the smallest protocol message size limit set on a
+	// connection, so ordinary rows, errors and notices are always read
+	// even when little of the size cap is left.
+	minBodyLen = 64 << 10
 	// rollbackTimeout bounds the ROLLBACK issued after every query.
 	rollbackTimeout = 5 * time.Second
 	// cancelDeadlineDelay is how long a canceled query may take to stop
@@ -153,21 +165,25 @@ func (s *Source) Close() error {
 	return nil
 }
 
-// Query runs sql in a READ ONLY transaction and returns at most maxRows rows.
-func (s *Source) Query(ctx context.Context, sql string, args []any, maxRows int) (*warehouse.Result, error) {
-	if maxRows <= 0 {
-		maxRows = 1
-	}
+// Query runs sql in a READ ONLY transaction and returns the rows that fit
+// within lim.
+func (s *Source) Query(ctx context.Context, sql string, args []any, lim warehouse.Limits) (*warehouse.Result, error) {
+	lim = lim.WithDefaults()
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return nil, classify(ctx, fmt.Errorf("acquire connection: %w", err))
 	}
 	defer conn.Release()
 
-	res, fds, err := s.run(ctx, conn, sql, args, maxRows)
+	// pgx buffers each protocol message whole (by default up to 1 GiB);
+	// no message may be larger than the result is allowed to be.
+	fe := conn.Conn().PgConn().Frontend()
+	fe.SetMaxBodyLen(bodyLimit(lim.MaxBytes))
+	res, fds, err := s.run(ctx, conn, sql, args, lim)
 	if err != nil {
 		return nil, err
 	}
+	fe.SetMaxBodyLen(bodyLimit(lim.MaxBytes))
 	// Types unknown to pgtype (enums, extension types) are named from
 	// pg_type on the same connection, after the read-only transaction.
 	var unknown []int
@@ -182,8 +198,12 @@ func (s *Source) Query(ctx context.Context, sql string, args []any, maxRows int)
 	return res, nil
 }
 
+// bodyLimit is the protocol message size limit while budget bytes of the
+// size cap are left.
+func bodyLimit(budget int) int { return max(budget, minBodyLen) }
+
 // run executes sql inside a READ ONLY transaction that is always rolled back.
-func (s *Source) run(ctx context.Context, conn *pgxpool.Conn, sql string, args []any, maxRows int) (*warehouse.Result, []pgconn.FieldDescription, error) {
+func (s *Source) run(ctx context.Context, conn *pgxpool.Conn, sql string, args []any, lim warehouse.Limits) (*warehouse.Result, []pgconn.FieldDescription, error) {
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, nil, classify(ctx, fmt.Errorf("begin read-only transaction: %w", err))
@@ -227,6 +247,10 @@ func (s *Source) run(ctx context.Context, conn *pgxpool.Conn, sql string, args [
 	}
 	rows, err := tx.Query(qctx, sql, qargs...)
 	if err != nil {
+		if tooLarge(err) {
+			// Refused before the first row could be read (see bodyLimit).
+			return &warehouse.Result{Columns: []warehouse.Column{}, Rows: []map[string]any{}, Truncated: true}, nil, nil
+		}
 		return nil, nil, classify(ctx, err)
 	}
 	defer rows.Close()
@@ -243,10 +267,18 @@ func (s *Source) run(ctx context.Context, conn *pgxpool.Conn, sql string, args [
 		cols[i].Name = keys[i]
 	}
 
-	out := make([]map[string]any, 0, min(maxRows, 1024))
-	truncated := false
-	for rows.Next() {
-		if len(out) == maxRows {
+	fe := conn.Conn().PgConn().Frontend()
+	budget := conv.NewBudget(lim.MaxBytes)
+	out := make([]map[string]any, 0, min(lim.MaxRows, 1024))
+	truncated, full := false, false
+	for {
+		// A row larger than what is left of the budget is refused by pgx
+		// (which closes the connection) instead of being read.
+		fe.SetMaxBodyLen(bodyLimit(budget.Remaining()))
+		if !rows.Next() {
+			break
+		}
+		if len(out) == lim.MaxRows {
 			truncated = true
 			break
 		}
@@ -258,26 +290,59 @@ func (s *Source) run(ctx context.Context, conn *pgxpool.Conn, sql string, args [
 			rows.Close()
 			return nil, nil, fmt.Errorf("%w: %s: %w", warehouse.ErrUpstream, s.name, err)
 		}
+		if !budget.Add(row) {
+			truncated, full = true, true
+			break
+		}
 		out = append(out, row)
 	}
-	if truncated {
+	switch {
+	case full:
+		// The rows are large: stop the statement rather than read on.
+		cancelQuery()
+		rows.Close()
+	case truncated:
 		// Discard a bounded number of surplus rows; if the result is
 		// larger, cancel the statement rather than stream it all.
-		drained := 0
-		for drained < drainLimit && rows.Next() {
-			drained++
-		}
-		if drained == drainLimit {
+		if !drain(rows, drainLimit, lim.MaxBytes) {
 			cancelQuery()
 		}
 		rows.Close()
-	} else {
+	default:
 		rows.Close()
 		if err := rows.Err(); err != nil {
-			return nil, nil, classify(ctx, err)
+			if !tooLarge(err) {
+				return nil, nil, classify(ctx, err)
+			}
+			// The next row did not fit in the budget; pgx refused it
+			// and closed the connection.
+			truncated = true
 		}
 	}
 	return &warehouse.Result{Columns: cols, Rows: out, RowCount: len(out), Truncated: truncated}, fds, nil
+}
+
+// drain reads and discards up to maxRows rows holding at most about maxBytes
+// of data, reporting whether the result ended within those bounds.
+func drain(rows pgx.Rows, maxRows, maxBytes int) bool {
+	n, size := 0, 0
+	for n < maxRows && size < maxBytes {
+		if !rows.Next() {
+			return true
+		}
+		n++
+		for _, v := range rows.RawValues() {
+			size += len(v)
+		}
+	}
+	return false
+}
+
+// tooLarge reports whether err is pgx refusing a protocol message larger
+// than the connection's limit (see bodyLimit).
+func tooLarge(err error) bool {
+	var e *pgproto3.ExceededMaxBodyLenErr
+	return errors.As(err, &e)
 }
 
 // convertRow converts the current row into a map keyed by column name.

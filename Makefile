@@ -171,24 +171,43 @@ scripts-test: ## Test the release/CI tooling in scripts/ (Go and node --test)
 	$(GO) test -count=1 ./scripts/...
 	$(NODE) --test 'scripts/*.test.mjs'
 
-CONFORMANCE_TARGET ?= go
+# CONFORMANCE_TARGET: go (conformance/run-go.sh: backyard serve --dev, host and
+# path mode), worker (conformance/run-worker.sh: wrangler dev --env local, path
+# and host mode) or all (both editions, Go first; a failure in one still runs
+# the other). CONFORMANCE_ARGS is passed to the runners, e.g.
+# CONFORMANCE_ARGS="path -- --test-name-pattern=files".
+CONFORMANCE_TARGET ?= all
+CONFORMANCE_ARGS   ?=
+CONFORMANCE_RUNNERS = $(strip \
+	$(if $(filter go all,$(CONFORMANCE_TARGET)),conformance/run-go.sh) \
+	$(if $(filter worker all,$(CONFORMANCE_TARGET)),conformance/run-worker.sh))
 
 .PHONY: conformance
-conformance: ## Run the API conformance suite (CONFORMANCE_TARGET=go: serve --dev, worker: wrangler dev --env local)
-	@if [ ! -d conformance ]; then echo "conformance/ does not exist: nothing to run"; exit 0; fi; \
-	./scripts/conformance.sh $(CONFORMANCE_TARGET)
+conformance: ## Run the cross-edition API conformance suite (CONFORMANCE_TARGET=go|worker|all, default all)
+	$(if $(filter-out go worker all,$(CONFORMANCE_TARGET))$(filter-out 1,$(words $(CONFORMANCE_TARGET))),$(error CONFORMANCE_TARGET must be go, worker or all (got "$(CONFORMANCE_TARGET)")))
+	$(if $(filter worker all,$(CONFORMANCE_TARGET)),@[ -d $(CF_DIR)/node_modules/wrangler ] || { echo ">> npm ci in $(CF_DIR)"; cd $(CF_DIR) && $(NPM) ci --no-audit --no-fund; })
+	@status=0; for runner in $(CONFORMANCE_RUNNERS); do \
+		echo ">> $$runner $(CONFORMANCE_ARGS)"; \
+		./$$runner $(CONFORMANCE_ARGS) || status=1; \
+	done; exit $$status
 
-# E2E_TARGET: go (backyard serve --dev) or worker (wrangler dev --env local).
+# E2E_TARGET: go (default: the Playwright suite in e2e/, which builds and starts
+# its own `backyard serve` instances) or worker (web/test/e2e.test.mjs against
+# the Cloudflare edition under wrangler dev --env local, through
+# scripts/with-server.sh; PLAYWRIGHT_CORE defaults to e2e/'s playwright-core).
 E2E_TARGET ?= go
+E2E_PLAYWRIGHT_CORE := $(CURDIR)/e2e/node_modules/playwright-core/index.mjs
 
 .PHONY: e2e
-e2e: ## Browser end-to-end test against a local server (E2E_TARGET=go|worker; needs playwright-core)
-	@if [ -f e2e/package.json ]; then \
-		cd e2e && $(NPM) ci && $(NPM) test; \
-	else \
-		if [ -z "$${PLAYWRIGHT_CORE:-}" ]; then echo "note: set PLAYWRIGHT_CORE=/path/to/playwright-core/index.mjs or the test skips (see web/test/browser.test.mjs)"; fi; \
-		./scripts/with-server.sh $(E2E_TARGET) -- $(NODE) --test web/test/e2e.test.mjs; \
-	fi
+e2e: ## Browser end-to-end tests (E2E_TARGET=go: Playwright suite in e2e/; worker: web/test/e2e.test.mjs on wrangler dev)
+	$(if $(filter-out go worker,$(E2E_TARGET))$(filter-out 1,$(words $(E2E_TARGET))),$(error E2E_TARGET must be go or worker (got "$(E2E_TARGET)")))
+ifeq ($(strip $(E2E_TARGET)),worker)
+	@[ -d $(CF_DIR)/node_modules/wrangler ] || { echo ">> npm ci in $(CF_DIR)"; cd $(CF_DIR) && $(NPM) ci --no-audit --no-fund; }
+	@[ -n "$${PLAYWRIGHT_CORE:-}" ] || [ -f "$(E2E_PLAYWRIGHT_CORE)" ] || { echo ">> npm ci in e2e (playwright-core)"; cd e2e && $(NPM) ci --no-audit --no-fund; }
+	PLAYWRIGHT_CORE="$${PLAYWRIGHT_CORE:-$(E2E_PLAYWRIGHT_CORE)}" ./scripts/with-server.sh worker -- $(NODE) --test web/test/e2e.test.mjs
+else
+	cd e2e && $(NPM) ci --no-audit --no-fund && $(NPM) test
+endif
 
 .PHONY: validate-configs
 validate-configs: ## Validate the sample backyard.yaml files under deploy/ against the config schema
@@ -237,12 +256,22 @@ tf-validate: ## terraform fmt -check, init -backend=false and validate for deplo
 		$(TERRAFORM) -chdir=$$dir validate -no-color; \
 	done
 
+# Terraform modules with a configcheck test (deploy/terraform/<cloud>/configcheck).
+TF_CONFIGCHECK_PKGS = $(strip $(foreach d,$(TF_DIRS),$(if $(wildcard $(d)/configcheck/*_test.go),./$(d)/configcheck/)))
+
+# -p 1: the modules share providers, and Terraform's plugin cache
+# (TF_PLUGIN_CACHE_DIR) is not safe for concurrent inits.
+.PHONY: tf-configcheck
+tf-configcheck: ## Render the Terraform modules' test scenarios and load every backyard.yaml with the server's config loader
+	BACKYARD_TEST_TERRAFORM=1 $(GO) test -p 1 -count=1 $(TF_CONFIGCHECK_PKGS)
+
 .PHONY: helm-lint
-helm-lint: ## helm lint + template the chart (default and production values)
+helm-lint: ## helm lint + template the chart (default and production values) and run its guard tests
 	$(HELM) lint --strict $(HELM_CHART)
 	$(HELM) lint --strict $(HELM_CHART) -f $(HELM_CHART)/values-production.yaml
 	$(HELM) template backyard $(HELM_CHART) >/dev/null
 	$(HELM) template backyard $(HELM_CHART) -f $(HELM_CHART)/values-production.yaml >/dev/null
+	BACKYARD_TEST_HELM=1 $(GO) test -count=1 ./deploy/helm/...
 
 .PHONY: compose-config
 compose-config: ## Validate the docker-compose files (docker compose config)

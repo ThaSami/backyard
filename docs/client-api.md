@@ -93,10 +93,16 @@ login screen unless `backyard.configure({ autoLogin: false })`.
 | `not_found` | 404 | Unknown document, file, alias or named query (`get` returns `null`) |
 | `conflict` | 409 | `create` with an existing id |
 | `too_large` | 413 | Document, upload or quota over the limit |
-| `rate_limited` | 429 | Per-user limits |
+| `rate_limited` | 429 | Per-user limits, or the AI provider throttling the server (with `Retry-After`) |
 | `unsupported` | 501 | Feature not configured (AI, warehouse, realtime) |
-| `upstream_error` | 502 / 504 | AI provider or warehouse failed |
+| `upstream_error` | 502 / 503 / 504 | AI provider or warehouse failed, throttled without a retry time (503) or timed out (504) |
 | `internal` | 500 | Server bug |
+
+AI provider answers map onto these codes the same way on both editions (a rejected request is
+`bad_request`, an oversized one `too_large`; see
+[SPEC §5.4](spec/SPEC.md#54-ai)). Warehouse failures on the server's side carry a generic
+message naming the request id (`X-Request-Id`, present on every response) under which the
+server logged the details — quote it when you ask the platform team.
 
 ## The HTTP API underneath
 

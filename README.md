@@ -253,6 +253,8 @@ commands/, .claude-plugin/  the Claude Code plugin
 deploy/                  Terraform (aws, gcp, azure, cloudflare), Helm, Docker Compose, systemd,
                          and the Cloudflare Workers edition (deploy/cloudflare)
 examples/                complete example sites
+conformance/             the black-box API suite both editions must pass (SPEC §17)
+e2e/                     real-browser end-to-end tests (Playwright, Chromium)
 docs/                    documentation and the design specification (docs/spec/SPEC.md)
 scripts/                 install script and CI tooling
 ```
@@ -260,8 +262,8 @@ scripts/                 install script and CI tooling
 ## Contributing
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup,
-tests (including the integration services and the cross-edition conformance suite) and
-guidelines. Please follow the [code of conduct](CODE_OF_CONDUCT.md).
+tests (including the integration services, the cross-edition conformance suite and the
+Playwright end-to-end tests) and guidelines. Please follow the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## License
 

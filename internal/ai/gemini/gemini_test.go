@@ -718,3 +718,44 @@ func TestResponseBodiesClosed(t *testing.T) {
 		t.Fatalf("response bodies: %d opened, %d closed", o, c)
 	}
 }
+
+// TestThrottledRetryInfo: Gemini reports when to retry a quota error in a
+// google.rpc.RetryInfo detail, not a header; it reaches the
+// *ai.UpstreamError (Retry-After, when sent, takes precedence).
+func TestThrottledRetryInfo(t *testing.T) {
+	ctx := context.Background()
+	msgs := []ai.Message{{Role: "user", Content: []ai.Part{{Type: "text", Text: "x"}}}}
+	f := newFake(t, func(w http.ResponseWriter, r *http.Request, _ map[string]any) {
+		if strings.Contains(r.URL.Path, "with-header") {
+			w.Header().Set("Retry-After", "3")
+		}
+		writeJSON(w, 429, map[string]any{"error": map[string]any{
+			"code": 429, "message": "You exceeded your current quota. Please retry in 21.5s.", "status": "RESOURCE_EXHAUSTED",
+			"details": []any{
+				map[string]any{"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": []any{}},
+				map[string]any{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "21.5s"},
+			},
+		}})
+	})
+	p := studio(t, f)
+	for _, tc := range []struct {
+		model  string
+		stream bool
+		want   time.Duration
+	}{
+		{"m", false, 21500 * time.Millisecond},
+		{"m", true, 21500 * time.Millisecond},
+		{"with-header", false, 3 * time.Second},
+	} {
+		var err error
+		if tc.stream {
+			_, err = p.ChatStream(ctx, ai.ChatRequest{Model: tc.model, Messages: msgs}, nil)
+		} else {
+			_, err = p.Chat(ctx, ai.ChatRequest{Model: tc.model, Messages: msgs})
+		}
+		var ue *ai.UpstreamError
+		if !errors.As(err, &ue) || ue.Status != 429 || ue.RetryAfter() != tc.want {
+			t.Errorf("%s stream=%v: got %#v, want RetryAfter %v", tc.model, tc.stream, err, tc.want)
+		}
+	}
+}

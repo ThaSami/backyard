@@ -24,8 +24,12 @@
 //     are not subject to the statement guard. Their "@name" placeholders are
 //     bound from the params object; every declared parameter is required and
 //     unknown parameters are rejected.
-//   - Results are capped at warehouse.max_rows (Truncated reports the cap)
-//     and queries are bounded by warehouse.timeout.
+//   - Results are capped at warehouse.max_rows and, by default, at 32 MiB
+//     of row data (their JSON encoding plus a small per-value overhead;
+//     Truncated reports either cap), and queries are bounded by
+//     warehouse.timeout.
+//     Sources enforce the size cap while they read, so a few very wide rows
+//     cannot make the server hold an arbitrarily large result.
 //
 // Trailing semicolons and comments are removed before a statement is sent.
 // Parameter values and SQL text are never logged.
@@ -48,6 +52,7 @@ import (
 	"github.com/thasami/backyard/internal/warehouse"
 	"github.com/thasami/backyard/internal/warehouse/athena"
 	"github.com/thasami/backyard/internal/warehouse/bigquery"
+	"github.com/thasami/backyard/internal/warehouse/internal/conv"
 	"github.com/thasami/backyard/internal/warehouse/sqlsource"
 )
 
@@ -78,6 +83,9 @@ type Options struct {
 	// "upstream"; elapsed is the time spent in the source (0 for requests
 	// rejected before reaching it).
 	Observe func(source, result string, elapsed time.Duration)
+	// MaxResultBytes overrides the result-size cap (default
+	// warehouse.DefaultMaxResultBytes; see warehouse.Limits.MaxBytes).
+	MaxResultBytes int
 }
 
 // Service is the policy-enforcing warehouse.Service. It is safe for
@@ -91,6 +99,7 @@ type Service struct {
 	allowRaw bool
 	allowAny bool
 	maxRows  int
+	maxBytes int
 	timeout  time.Duration
 
 	defaultSource string
@@ -148,6 +157,7 @@ func NewWithOptions(ctx context.Context, cfg config.WarehouseConfig, opts Option
 		allowRaw:      cfg.AllowRawSQL,
 		allowAny:      cfg.AllowAnyStatement,
 		maxRows:       cfg.MaxRows,
+		maxBytes:      opts.MaxResultBytes,
 		timeout:       cfg.Timeout.D(),
 		defaultSource: cfg.DefaultSource,
 		sources:       make(map[string]*sourceEntry, len(cfg.Sources)),
@@ -161,6 +171,9 @@ func NewWithOptions(ctx context.Context, cfg config.WarehouseConfig, opts Option
 	}
 	if s.maxRows <= 0 {
 		s.maxRows = defaultMaxRows
+	}
+	if s.maxBytes <= 0 {
+		s.maxBytes = warehouse.DefaultMaxResultBytes
 	}
 	if s.timeout <= 0 {
 		s.timeout = defaultTimeout
@@ -299,7 +312,7 @@ type plan struct {
 }
 
 // Query validates req against the policy, runs it on the selected source and
-// returns at most warehouse.max_rows rows.
+// returns at most warehouse.max_rows rows of at most MaxResultBytes.
 func (s *Service) Query(ctx context.Context, req warehouse.QueryRequest) (*warehouse.Result, error) {
 	if !s.Enabled() {
 		return nil, warehouse.ErrDisabled
@@ -327,16 +340,16 @@ func (s *Service) Query(ctx context.Context, req warehouse.QueryRequest) (*wareh
 	qctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 	start := time.Now()
-	res, err := src.Query(qctx, sql, p.args, s.maxRows)
+	res, err := src.Query(qctx, sql, p.args, warehouse.Limits{MaxRows: s.maxRows, MaxBytes: s.maxBytes})
 	elapsed := time.Since(start)
 	if err != nil {
 		err = s.classify(ctx, qctx, p.entry.name, err)
-		s.logQuery(ctx, p, len(sql), elapsed, nil, err)
+		s.logQuery(ctx, p, len(sql), elapsed, nil, 0, err)
 		s.observeResult(p.entry.name, err, elapsed)
 		return nil, err
 	}
-	res = s.finish(res)
-	s.logQuery(ctx, p, len(sql), elapsed, res, nil)
+	res, size := s.finish(res)
+	s.logQuery(ctx, p, len(sql), elapsed, res, size, nil)
 	s.observeResult(p.entry.name, nil, elapsed)
 	return res, nil
 }
@@ -538,8 +551,9 @@ func (s *Service) classify(ctx, qctx context.Context, source string, err error) 
 }
 
 // finish enforces the result invariants: non-nil slices, at most maxRows
-// rows, RowCount == len(Rows).
-func (s *Service) finish(res *warehouse.Result) *warehouse.Result {
+// rows of at most maxBytes (estimated as the sources do), RowCount ==
+// len(Rows). It also returns the estimated size of the rows.
+func (s *Service) finish(res *warehouse.Result) (*warehouse.Result, int) {
 	if res == nil {
 		res = &warehouse.Result{}
 	}
@@ -553,11 +567,19 @@ func (s *Service) finish(res *warehouse.Result) *warehouse.Result {
 		res.Rows = res.Rows[:s.maxRows]
 		res.Truncated = true
 	}
+	budget := conv.NewBudget(s.maxBytes)
+	for i, row := range res.Rows {
+		if !budget.Add(row) {
+			res.Rows = res.Rows[:i]
+			res.Truncated = true
+			break
+		}
+	}
 	res.RowCount = len(res.Rows)
-	return res
+	return res, budget.Used()
 }
 
-func (s *Service) logQuery(ctx context.Context, p *plan, sqlBytes int, elapsed time.Duration, res *warehouse.Result, err error) {
+func (s *Service) logQuery(ctx context.Context, p *plan, sqlBytes int, elapsed time.Duration, res *warehouse.Result, resultBytes int, err error) {
 	attrs := []slog.Attr{
 		slog.String("source", p.entry.name),
 		slog.String("kind", p.kind),
@@ -580,7 +602,7 @@ func (s *Service) logQuery(ctx context.Context, p *plan, sqlBytes int, elapsed t
 		}
 	} else {
 		attrs = append(attrs, slog.String("result", "ok"))
-		attrs = append(attrs, slog.Int("rows", res.RowCount), slog.Bool("truncated", res.Truncated))
+		attrs = append(attrs, slog.Int("rows", res.RowCount), slog.Int("result_bytes", resultBytes), slog.Bool("truncated", res.Truncated))
 	}
 	s.log.LogAttrs(ctx, level, "warehouse query", attrs...)
 }

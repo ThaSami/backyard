@@ -54,6 +54,20 @@ between all sites and the hub** — see [security](security.md#host-mode-vs-path
 With the default `AUTH_MODE=none`, anyone with a link can open sites and use their APIs as an
 anonymous guest; put Cloudflare Access in front (free for up to 50 users) for a company login.
 
+Within the shared contract, a few edition differences are visible to pages and CLIs (all
+listed in the [specification](spec/SPEC.md#16-cloudflare-edition-free-tier)):
+
+- **Deploys are atomic:** site files are content-addressed in the site's Durable Object, every
+  upload is verified (size and SHA-256) before it is stored, and the commit switches the whole
+  site in one transaction. Uploads of deploys that never commit are garbage-collected later.
+- **Smaller AI requests:** at most 4 images per `backyard.ai.image` call (Go server: 10) and
+  100 strings per `backyard.ai.embed` call (Go server: 2048). Provider failures map to the same
+  status codes as on the Go server.
+- **Dot segments:** the Workers runtime resolves `/./` and `/../` in a URL before the Worker
+  sees it, so such a URL is served as its cleaned path instead of being redirected.
+- **Sign-in:** Cloudflare Access (or nobody, in `none`) signs people in, so
+  `/__backyard/auth/login?rd=…` simply redirects to `rd`.
+
 Everything else — free-plan quotas and Backyard's guardrails, configuration variables, AI
 model aliases, local development, CI, differences from the Go edition, upgrades and
 troubleshooting — is in the edition's [README](../deploy/cloudflare/README.md).

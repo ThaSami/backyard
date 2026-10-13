@@ -110,6 +110,13 @@ realtime hub gossips presence through pub/sub, so session affinity is optional. 
   module uses 60 minutes).
 - **Postgres pub/sub** needs a direct (session-mode) connection; a transaction-pooling
   PgBouncer breaks LISTEN.
+- **Postgres connections**: each instance opens up to `database.postgres.max_conns` (20) for
+  documents, plus — with Postgres pub/sub — one LISTEN connection and a publishing pool of 2–4
+  (`pool_max_conns` in the pub/sub DSN overrides it). Keep replicas × that total below the
+  database's `max_connections`.
+- **Cloud Run** rejects HTTP/1 responses that declare more than 32 MiB; Backyard detects Cloud
+  Run (`K_SERVICE`) and streams larger site files and uploads chunked, and shortens range
+  responses to 32 MiB (clients fetch the rest).
 - The `database.max_docs_per_site` quota is soft across instances (it can be overshot slightly).
 - Autoscale on CPU or request concurrency; `server.shutdown_timeout` (20 s) lets in-flight
   requests finish, and websockets are closed so clients reconnect to another instance.

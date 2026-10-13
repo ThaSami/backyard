@@ -10,7 +10,7 @@ presence) and `backyard.id` (the signed-in user).
 {{- if .Server}}
 
 - Backyard server (hub): {{.Server}}
-- This site once deployed: {{if .HostURL}}{{.HostURL}} (host mode) or {{end}}{{.PathURL}} (path mode); `backyard deploy` prints the exact URL.
+- This site once deployed: {{if .SiteURL}}{{.SiteURL}}{{else}}{{if .HostURL}}{{.HostURL}} (host mode) or {{end}}{{.PathURL}} (path mode){{end}}; `backyard deploy` prints the exact URL.
 {{- end}}
 {{- end}}
 
@@ -48,6 +48,9 @@ backyard deploy --dry-run     # show what would be uploaded and deleted
 backyard sites list [filter]  # existing sites; `backyard pull <site>` downloads one to study or reuse
 ```
 
+- Check the running preview with curl: `curl -s -H 'Host: {{.Site}}.localhost:4321' http://127.0.0.1:4321/`.
+  Outside browsers `*.localhost` often does not resolve (Node `fetch`, wget and Python fail in
+  containers and CI), and `http://localhost:4321/` is the dev hub, not this site.
 - The site name is in `.backyard.json`. Never deployed: `CLAUDE.md`, `AGENTS.md`, `.claude/`,
   `.cursor/`, `.github/`, `node_modules/`, dotfiles (including `.backyard-data/`, the local
   data of `backyard dev`) and the patterns in `.backyardignore`.

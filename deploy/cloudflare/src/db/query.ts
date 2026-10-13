@@ -28,7 +28,12 @@ export const SYSTEM_COLLECTION_RE = /^_[A-Za-z0-9][A-Za-z0-9_-]{0,62}$/;
 export const DOC_ID_RE = /^[A-Za-z0-9_\-:.]{1,128}$/;
 const SEGMENT_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
 
-/** Addressable non-data fields and their SQL columns. */
+/**
+ * Addressable non-data fields and their SQL columns. Field names are client
+ * input: look them up with systemColumn (own entries only), so that data
+ * fields such as "constructor" or "toString" are never mistaken for
+ * members of Object.prototype.
+ */
 export const SYSTEM_COLUMNS: Record<string, string> = {
   id: "id",
   "_meta.created_at": "created_at",
@@ -48,6 +53,11 @@ const SYSTEM_KINDS: Record<string, Kind> = {
   "_meta.updated_at": "time",
   "_meta.version": "number",
 };
+
+/** The SQL column of a system field, or "" for a data field. */
+export function systemColumn(field: string): string {
+  return Object.hasOwn(SYSTEM_COLUMNS, field) ? SYSTEM_COLUMNS[field]! : "";
+}
 
 export type Op = "==" | "!=" | "<" | "<=" | ">" | ">=" | "in" | "not-in" | "contains";
 const OPS = new Set<string>(["==", "!=", "<", "<=", ">", ">=", "in", "not-in", "contains"]);
@@ -93,7 +103,7 @@ export function docIDError(id: string): string {
 /** Validates a dot-path field reference (user data path or system field). */
 export function fieldError(field: unknown): string {
   if (typeof field !== "string") return "field must be a string";
-  if (field in SYSTEM_COLUMNS) return "";
+  if (systemColumn(field)) return "";
   const segs = field.split(".");
   if (segs.length > 8) return `field path ${JSON.stringify(field)} too deep`;
   for (const s of segs) if (!SEGMENT_RE.test(s)) return `field path ${JSON.stringify(field)}`;
@@ -404,7 +414,7 @@ function systemFilter(b: Builder, col: string, f: Filter): void {
 }
 
 function filterSQL(b: Builder, f: Filter): void {
-  const col = SYSTEM_COLUMNS[f.field];
+  const col = systemColumn(f.field);
   if (col) {
     systemFilter(b, col, f);
     return;
@@ -427,7 +437,7 @@ function filterSQL(b: Builder, f: Filter): void {
 
 function orderSQL(o: Order): string {
   const dir = o.desc ? " DESC" : " ASC";
-  const col = SYSTEM_COLUMNS[o.field];
+  const col = systemColumn(o.field);
   if (col) return col + dir;
   const path = jsonPath(o.field);
   const jt = `json_type(data, ${path})`;

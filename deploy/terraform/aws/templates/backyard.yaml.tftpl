@@ -5,7 +5,8 @@
 # expands at startup, and server.secret is read from BACKYARD_SECRET.
 %{ else ~}
 # Deploy gateway (AWS Lambda) configuration rendered by Terraform.
-# server.secret is read from BACKYARD_SECRET.
+# server.secret is read at cold start from the Secrets Manager secret named by
+# BACKYARD_SECRET_ARN.
 %{ endif ~}
 server:
   name: ${jsonencode(display_name)}

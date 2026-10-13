@@ -68,25 +68,33 @@ export function docMarkdown(rel: string, publicURL = ""): string {
   return md ? localize(md, publicURL) : "";
 }
 
+/** scheme, authority and path of an absolute URL ("scheme://authority/path?query#fragment"). */
+const ABS_URL_RE = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/([^/?#]*)([^?#]*)/;
+
+/**
+ * Splits an absolute URL like Go's url.Parse does for the parts the
+ * documents need: the scheme (lowercased), the host[:port] as written (user
+ * info dropped; unlike WHATWG URL, neither lowercased nor stripped of a
+ * default port) and the path. null when s is not "scheme://host…".
+ */
+function splitURL(s: string): { scheme: string; host: string; path: string } | null {
+  const m = ABS_URL_RE.exec(s);
+  if (!m) return null;
+  const authority = m[2]!;
+  const host = authority.slice(authority.lastIndexOf("@") + 1);
+  if (!host) return null;
+  return { scheme: m[1]!.toLowerCase(), host, path: m[3]! };
+}
+
 /**
  * Normalizes a public URL like skills.baseURL: surrounding space, user info,
  * a query, a fragment and trailing slashes are dropped ("" stays "", so links
- * become server-relative).
+ * become server-relative). The host keeps its spelling, as in Go.
  */
 export function baseURL(publicURL: string): string {
   let s = publicURL.trim();
-  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/?#]/.test(s)) {
-    try {
-      const u = new URL(s);
-      u.username = "";
-      u.password = "";
-      u.search = "";
-      u.hash = "";
-      s = u.toString();
-    } catch {
-      /* not a URL: used as given */
-    }
-  }
+  const u = splitURL(s);
+  if (u) s = `${u.scheme}://${u.host}${u.path}`;
   return s.replace(/\/+$/, "");
 }
 
@@ -120,9 +128,18 @@ function docTitle(name: string): string {
     .join(" ");
 }
 
-/** Reports whether a URL hostname is an IP address (IPv6 hostnames keep their brackets). */
-function isIPHost(hostname: string): boolean {
-  return hostname.startsWith("[") || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname);
+/**
+ * Reports whether the host of host[:port] is an IP address (like Go's
+ * net.ParseIP(u.Hostname()): a bracketed or bare IPv6 address, or a dotted
+ * IPv4 address without leading zeros).
+ */
+function isIPHost(hostport: string): boolean {
+  if (hostport.startsWith("[")) return true;
+  const colon = hostport.lastIndexOf(":");
+  const host = colon >= 0 && /^:\d*$/.test(hostport.slice(colon)) ? hostport.slice(0, colon) : hostport;
+  if (host.includes(":")) return true;
+  const parts = host.split(".");
+  return parts.length === 4 && parts.every((p) => /^(?:0|[1-9]\d{0,2})$/.test(p) && Number(p) <= 255);
 }
 
 /**
@@ -130,14 +147,9 @@ function isIPHost(hostname: string): boolean {
  * when site subdomains cannot be derived from it (a path, or an IP address).
  */
 function hubHost(base: string): { scheme: string; host: string } | null {
-  try {
-    const u = new URL(base);
-    if ((u.protocol !== "http:" && u.protocol !== "https:") || (u.pathname !== "" && u.pathname !== "/")) return null;
-    if (!u.hostname || isIPHost(u.hostname)) return null;
-    return { scheme: u.protocol.slice(0, -1), host: u.host };
-  } catch {
-    return null;
-  }
+  const u = splitURL(base);
+  if (!u || (u.scheme !== "http" && u.scheme !== "https") || (u.path !== "" && u.path !== "/") || isIPHost(u.host)) return null;
+  return { scheme: u.scheme, host: u.host };
 }
 
 function link(title: string, href: string, desc: string): string {

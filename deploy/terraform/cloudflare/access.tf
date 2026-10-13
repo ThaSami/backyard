@@ -102,8 +102,9 @@ resource "cloudflare_zero_trust_access_application" "backyard" {
   }]
 }
 
-# More specific paths win in Access: the deploy gateway and health checks are
-# authenticated by the Worker (bearer tokens, signed upload URLs).
+# More specific paths win in Access: the deploy gateway, token minting and the
+# health checks are authenticated by the Worker (bearer tokens, signed upload
+# URLs, or the CF_Authorization cookie, which it verifies itself).
 resource "cloudflare_zero_trust_access_application" "bypass" {
   count = var.enable_access && length(var.bypass_paths) > 0 ? 1 : 0
 

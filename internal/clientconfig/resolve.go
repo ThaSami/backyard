@@ -124,6 +124,29 @@ func sameURL(a, b string) bool {
 	return strings.EqualFold(strings.TrimSuffix(a, "/"), strings.TrimSuffix(b, "/"))
 }
 
+// UsesProfileServer reports whether the effective server and gateway are the
+// stored profile's own, i.e. no flag or environment variable pointed this
+// invocation at another server or gateway.
+func (r *Resolved) UsesProfileServer() bool {
+	if r == nil || !r.Exists || r.Profile == nil {
+		return false
+	}
+	p := r.Profile
+	return sameURL(r.Server, p.Server) && sameURL(r.Gateway, GatewayURL(p.Server, p.Gateway))
+}
+
+// CachedInfo returns the server info cached in the profile, or nil when this
+// invocation targets another server or gateway than the profile's: the cache
+// describes the profile's server only (its storage, URLs and methods), and
+// applying it to another one would, for example, point a direct-sync deploy
+// at the wrong bucket.
+func (r *Resolved) CachedInfo() *deploy.Info {
+	if !r.UsesProfileServer() {
+		return nil
+	}
+	return r.Profile.Info
+}
+
 // GatewayURL returns gateway if set, else server + "/__backyard/api/deploy"
 // ("" when both are empty).
 func GatewayURL(server, gateway string) string {
@@ -195,11 +218,13 @@ func IsLocalHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// SiteURL returns the public URL of site for a server described by info
-// (host mode: https://<site>.<host>/, path mode: <public_url>/s/<site>/).
-// server is used when info lacks a public URL.
+// SiteURL returns the public URL of site for a server described by info. In
+// host mode that is <scheme>://<site>.<base_domain>[:<port>]/ with the scheme
+// and port of the public URL (base_domain may differ from the public URL's
+// host; without one the public URL's host is used), in path mode
+// <public_url>/s/<site>/. server is used when info lacks a public URL.
 func SiteURL(info *deploy.Info, server, site string) string {
-	public, mode := server, "host"
+	public, mode, base := server, "host", ""
 	if info != nil {
 		if info.PublicURL != "" {
 			public = info.PublicURL
@@ -207,6 +232,7 @@ func SiteURL(info *deploy.Info, server, site string) string {
 		if info.URLMode != "" {
 			mode = info.URLMode
 		}
+		base = info.BaseDomain
 	}
 	public = strings.TrimSuffix(public, "/")
 	if public == "" {
@@ -219,9 +245,28 @@ func SiteURL(info *deploy.Info, server, site string) string {
 	if err != nil || u.Host == "" {
 		return ""
 	}
-	u.Host = site + "." + u.Host
-	u.Path, u.RawPath, u.RawQuery, u.Fragment = "/", "", "", ""
-	return u.String()
+	host := bareHost(base)
+	if host == "" {
+		host = bareHost(u.Host)
+	}
+	if host == "" {
+		return ""
+	}
+	host = site + "." + host
+	if p := u.Port(); p != "" {
+		host = net.JoinHostPort(host, p)
+	}
+	return (&url.URL{Scheme: strings.ToLower(u.Scheme), Host: host, Path: "/"}).String()
+}
+
+// bareHost lowercases a host name and drops a port, IPv6 brackets and a
+// trailing dot.
+func bareHost(h string) string {
+	h = strings.ToLower(strings.TrimSpace(h))
+	if hh, _, err := net.SplitHostPort(h); err == nil {
+		h = hh
+	}
+	return strings.TrimSuffix(strings.Trim(h, "[]"), ".")
 }
 
 // HubURL returns the hub URL for a server described by info.

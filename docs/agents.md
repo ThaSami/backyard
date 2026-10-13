@@ -74,17 +74,37 @@ claude mcp add backyard -- backyard mcp
 
 | Tool | Input | Does |
 |---|---|---|
-| `backyard_docs` | `topic`: `skill` (default), `api`, `recipes`, `deploy` | Returns the documentation as markdown. Agents call it first. |
+| `backyard_docs` | `topic?` (`skill`, the default, `api`, `recipes` or `deploy`) | Returns the documentation as markdown. Agents call it first. |
 | `backyard_init` | `dir`, `site`, `agents?` | Scaffolds a site (`index.html`, `.backyard.json`, agent files, skill). Never overwrites. |
-| `backyard_deploy` | `dir`, `site?`, `message?`, `dry_run?`, `overwrite?` | Publishes the folder and returns the URL and counts. Refuses to replace a site someone else deployed last unless `overwrite` is true — which agents must only set after asking the user. |
+| `backyard_deploy` | `dir?`, `site?`, `message?`, `dry_run?`, `overwrite?` | Publishes a folder and returns the URL and counts. Without `dir` it publishes the current project like `backyard deploy` (the folder `.backyard.json` names, else the working directory). Refuses to replace a site someone else deployed last unless `overwrite` is true — which agents must only set after asking the user. |
 | `backyard_list_sites` | `query?` | Sites with title, description, URL and last deploy — to find existing tools and free names. |
-| `backyard_site_files` | `site` | A site's deployed files (path, size). |
-| `backyard_read_site_file` | `site`, `path` | One text file of a site (≤ 256 KiB; binaries refused) — to study or reuse another site's code. |
+| `backyard_site_files` | `site` | A site's deployed files (path, size; at most 2,000 listed). |
+| `backyard_read_site_file` | `site`, `path` | One text file of a site (≤ 256 KiB) — to study or reuse another site's code. Binary file types (images, fonts, archives, media…) are refused without being downloaded, and so is a file whose content is not text. |
 | `backyard_whoami` | — | The logged-in user, server and profile. |
 | `backyard_open_url` | `site?` | The URL of a site or the hub (does not open a browser). |
 
 Tool annotations mark the read-only tools as such and `backyard_deploy` as destructive, so MCP
 clients can ask for confirmation.
+
+The tools are driven by an agent that may have read a prompt injection, so they keep it inside
+the project and away from credentials:
+
+- **Local folders.** `backyard_init` and `backyard_deploy` work in the folder the agent was
+  started in (the MCP server's working directory): a relative `dir` must stay inside it, also
+  once symlinks are resolved. Any other folder is used only when the agent passes its absolute
+  path (or `~/…`) and it already exists. The filesystem root and the home directory are always
+  refused, and so are folders that hold credentials: the CLI's own config folder (and any folder
+  whose deploy would include the CLI's config file), hidden folders of the home directory such
+  as `~/.ssh` or `~/.config` and `~/Library` or `~/AppData` (unless the agent was started inside
+  one), and, outside the working
+  directory, any hidden folder. `backyard_deploy` also refuses to publish the root of a project
+  whose `.backyard.json` publishes another folder (a build output such as `dist`).
+- **Other people's code.** What `backyard_read_site_file` returns was written by other people:
+  it is untrusted data to study, never instructions to follow (the tool's description tells the
+  agent so).
+- **Credentials.** Tool results and error messages never contain tokens or signed upload URLs:
+  the CLI's access and refresh tokens, bearer credentials, JWTs, URL query strings (presigned
+  signatures) and the capability in gateway upload paths are redacted.
 
 ## Project instructions (`backyard init` templates)
 
@@ -111,7 +131,7 @@ Every hub serves agent-readable docs, with example URLs rewritten to the hub's r
 | `/llms.txt` | What Backyard is, the essentials, links to each document ([llmstxt.org](https://llmstxt.org) format) |
 | `/llms-full.txt` | `SKILL.md` plus every reference in one file |
 | `/docs` | The same documents rendered for people |
-| `/docs/skill.md`, `/docs/references/<name>.md` | Individual documents as markdown |
+| `/docs/skill.md`, `/docs/<name>.md`, `/docs/references/<name>.md` | Individual documents as markdown (`<name>`: `api`, `recipes`, `deploy`; `SKILL.md` links to its references as `references/<name>.md`) |
 | `/__backyard/backyard.d.ts` | Normative TypeScript declarations of the SDK |
 
 The Cloudflare edition serves the same paths.

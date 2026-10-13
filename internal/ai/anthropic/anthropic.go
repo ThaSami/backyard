@@ -564,7 +564,14 @@ func (p *Provider) convertErr(ctx context.Context, err error) error {
 		if msg == "" {
 			msg = "request failed"
 		}
-		return &ai.UpstreamError{Provider: p.name, Status: status, Message: msg}
+		ue := &ai.UpstreamError{Provider: p.name, Status: status, Message: msg}
+		// The SDK keeps the final attempt's response (for an error event
+		// inside a stream: the 200 stream response, whose headers carry no
+		// retry time and whose status keeps reset headers out of it).
+		if apiErr.Response != nil {
+			ue.RetryDelay = httpx.RetryAfter(apiErr.Response.StatusCode, apiErr.Response.Header, time.Now())
+		}
+		return ue
 	}
 	return &ai.UpstreamError{Provider: p.name, Message: httpx.ErrorText(err)}
 }

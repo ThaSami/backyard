@@ -264,7 +264,7 @@ func (h *hub) PublishDB(ctx context.Context, siteName string, ev DBEvent) error 
 	}
 	w := dbWire{Collection: ev.Collection, Op: ev.Op, DocID: ev.DocID, Doc: json.RawMessage("null")}
 	if ev.Doc != nil {
-		doc, err := ev.Doc.MarshalJSON()
+		doc, err := marshalUnescaped(ev.Doc.Wire())
 		if err != nil {
 			return fmt.Errorf("realtime: encode document: %w", err)
 		}
@@ -276,9 +276,22 @@ func (h *hub) PublishDB(ctx context.Context, siteName string, ev DBEvent) error 
 	if w.DocID == "" {
 		return errors.New("realtime: publish db event: missing document id")
 	}
-	payload, err := json.Marshal(w)
+	payload, err := marshalUnescaped(w)
 	if err != nil {
 		return fmt.Errorf("realtime: encode db event: %w", err)
+	}
+	if len(payload) > pubsub.MaxPayloadBytes && ev.Doc != nil {
+		// The document does not fit in one broker message (database.max_doc_bytes
+		// is not bounded by it): publish the change without the document
+		// (doc: null) rather than not at all, so that subscribers still learn
+		// about it and can read the document.
+		h.log.Info("db event published without its document: too large for one broker message",
+			"site", siteName, "collection", ev.Collection, "doc_id", w.DocID,
+			"bytes", len(payload), "max_bytes", pubsub.MaxPayloadBytes)
+		w.Doc = json.RawMessage("null")
+		if payload, err = marshalUnescaped(w); err != nil {
+			return fmt.Errorf("realtime: encode db event: %w", err)
+		}
 	}
 	if err := h.broker.Publish(ctx, dbTopic(siteName), payload); err != nil {
 		return fmt.Errorf("realtime: publish db event: %w", err)
@@ -302,7 +315,7 @@ func (h *hub) onDBMessage(siteName string, payload []byte) {
 		w.Doc = json.RawMessage("null")
 	}
 	// Everything after "sub" is identical for all subscribers: encode once.
-	tail, err := json.Marshal(struct {
+	tail, err := marshalUnescaped(struct {
 		Collection string          `json:"collection"`
 		Op         Op              `json:"op"`
 		Doc        json.RawMessage `json:"doc"`

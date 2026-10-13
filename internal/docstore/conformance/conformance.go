@@ -60,6 +60,7 @@ func Run(t *testing.T, newStore func(t *testing.T) docstore.Store) {
 		{"SystemFieldFilters", testSystemFieldFilters},
 		{"OrderNumbers", testOrderNumbers},
 		{"NumberEdgeCases", testNumberEdgeCases},
+		{"LargeIntegers", testLargeIntegers},
 		{"OrderStrings", testOrderStrings},
 		{"OrderBooleans", testOrderBooleans},
 		{"OrderCrossType", testOrderCrossType},
@@ -844,6 +845,59 @@ func testNumberEdgeCases(t *testing.T, s docstore.Store) {
 	})
 	assertData(t, "0.1+0.2 round trip", mustGet(t, s, site, "nums", "e8").Data, doc{"v": sumPointOneTwo})
 	assertData(t, "2^63 round trip", mustGet(t, s, site, "nums", "e2").Data, doc{"v": float64(1 << 63)})
+}
+
+// Integers between 2^53 and 2^63 (nanosecond timestamps, 64-bit ids sent as
+// JSON numbers) are stored as the nearest float64, whose shortest JSON form
+// has integer digits that differ from the double's exact value
+// (1760000000123456789 → 1760000000123456768 → "1760000000123456800").
+// Every comparison must still treat the stored value and the operand as the
+// same double.
+const (
+	bigInt      = 1760000000123456789 // as float64: 1760000000123456768
+	bigIntUp    = 1760000000123457024 // the next float64 above it
+	bigIntDown  = 1760000000123456512 // the next float64 below it
+	belowTwo63  = 9223372036854774784 // the largest float64 below 2^63
+	twoPow53One = 9007199254740994    // 2^53 + 2
+)
+
+func testLargeIntegers(t *testing.T, s docstore.Store) {
+	site := newSite(t)
+	all := createAll(t, s, site, "big", []idDoc{
+		{"i1", doc{"v": int64(bigInt)}},
+		{"i2", doc{"v": float64(bigIntUp)}},
+		{"i3", doc{"v": float64(bigIntDown)}},
+		{"i4", doc{"v": float64(belowTwo63)}},
+		{"i5", doc{"v": -float64(bigInt)}},
+		{"i6", doc{"v": float64(twoPow53One)}},
+		{"i7", doc{"v": "1760000000123456789"}},
+		{"i8", doc{"arr": []any{int64(bigInt), 1}}},
+		{"i9", doc{"arr": []any{float64(bigIntUp)}}},
+	})
+	x := float64(bigInt)
+	runFilterCases(t, s, site, "big", all, []filterCase{
+		{"==", []docstore.Filter{w("v", "==", x)}, []string{"i1"}},
+		{"== exact double", []docstore.Filter{w("v", "==", 1760000000123456768.0)}, []string{"i1"}},
+		{"== int64 operand", []docstore.Filter{w("v", "==", int64(bigInt))}, []string{"i1"}},
+		{"!=", []docstore.Filter{w("v", "!=", x)}, []string{"i2", "i3", "i4", "i5", "i6"}},
+		{"<", []docstore.Filter{w("v", "<", x)}, []string{"i3", "i5", "i6"}},
+		{"<=", []docstore.Filter{w("v", "<=", x)}, []string{"i1", "i3", "i5", "i6"}},
+		{">", []docstore.Filter{w("v", ">", x)}, []string{"i2", "i4"}},
+		{">=", []docstore.Filter{w("v", ">=", x)}, []string{"i1", "i2", "i4"}},
+		{"in", []docstore.Filter{w("v", "in", []any{x, float64(belowTwo63)})}, []string{"i1", "i4"}},
+		{"not-in", []docstore.Filter{w("v", "not-in", []any{x})}, []string{"i2", "i3", "i4", "i5", "i6"}},
+		{"== negative", []docstore.Filter{w("v", "==", -x)}, []string{"i5"}},
+		{"== below 2^63", []docstore.Filter{w("v", "==", float64(belowTwo63))}, []string{"i4"}},
+		{"< below 2^63", []docstore.Filter{w("v", "<", float64(belowTwo63))}, []string{"i1", "i2", "i3", "i5", "i6"}},
+		{"== 2^53+2", []docstore.Filter{w("v", "==", float64(twoPow53One))}, []string{"i6"}},
+		{"contains", []docstore.Filter{w("arr", "contains", x)}, []string{"i8"}},
+		{"contains next", []docstore.Filter{w("arr", "contains", float64(bigIntUp))}, []string{"i9"}},
+	})
+	runOrderCases(t, s, site, "big", all, []orderCase{
+		{"asc", []docstore.Order{asc("v")}, nil, []string{"i8", "i9", "i5", "i6", "i3", "i1", "i2", "i4", "i7"}},
+		{"desc", []docstore.Order{desc("v")}, nil, []string{"i7", "i4", "i2", "i1", "i3", "i6", "i5", "i8", "i9"}},
+	})
+	assertData(t, "large integer round trip", mustGet(t, s, site, "big", "i1").Data, doc{"v": x})
 }
 
 func testOrderStrings(t *testing.T, s docstore.Store) {

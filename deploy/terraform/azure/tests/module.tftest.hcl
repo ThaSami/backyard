@@ -2,8 +2,10 @@
 # terraform test` (Terraform >= 1.7). azurerm, azuread, azapi and time are
 # mocked, so no Azure credentials are needed and nothing is created. The runs
 # check resource selection (edge, DNS, auth, database, networking, AI) and the
-# rendered backyard.yaml against Backyard's config schema
-# (internal/config/config.go decodes strictly: unknown keys are fatal).
+# rendered backyard.yaml. configcheck/ loads every configuration these runs
+# give the Container App with Backyard's own config loader, which decodes
+# strictly (BACKYARD_TEST_TERRAFORM=1 go test
+# ./deploy/terraform/azure/configcheck/).
 
 mock_provider "azurerm" {
   mock_data "azurerm_network_service_tags" {
@@ -207,6 +209,10 @@ mock_provider "time" {}
 
 variables {
   location = "westeurope"
+  # The module's default (true) makes every plan with a module-created public
+  # Postgres warn (check postgres_open_to_all_of_azure); frontdoor_host_mode_entra
+  # covers that default, the other runs stay quiet.
+  postgres_allow_azure_services = false
 }
 
 # -----------------------------------------------------------------------------
@@ -223,69 +229,13 @@ run "frontdoor_host_mode_entra" {
     admins        = ["alice@acme.com"]
     admin_groups  = ["7c9e6679-7425-40de-944b-e07fc1f90ae7", "team-$${HOME}"]
     static_tokens = [{ name = "ci", sha256 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", admin = true }]
+    # The module's default (the file-level variables turn it off).
+    postgres_allow_azure_services = true
   }
 
-  # Managed wildcard certificate: the plan warns (check block).
-  expect_failures = [check.frontdoor_wildcard_certificate]
-
-  # --- rendered backyard.yaml: only keys that internal/config knows --------
-  assert {
-    condition = length(setsubtract(keys(yamldecode(output.backyard_config_yaml)), [
-      "server", "auth", "identity", "storage", "database", "pubsub", "ai", "warehouse",
-      "sites", "files", "deploy", "ratelimit", "realtime", "telemetry",
-    ])) == 0
-    error_message = "Unknown top-level key in backyard.yaml."
-  }
-
-  assert {
-    condition = length(setsubtract(keys(yamldecode(output.backyard_config_yaml).server), [
-      "listen", "base_domain", "public_url", "url_mode", "secret", "trusted_proxies", "dev", "name",
-      "read_timeout", "write_timeout", "idle_timeout", "shutdown_timeout",
-    ])) == 0
-    error_message = "Unknown key under server."
-  }
-
-  assert {
-    condition = length(setsubtract(keys(yamldecode(output.backyard_config_yaml).auth), [
-      "mode", "admins", "admin_groups", "allowed_domains", "allowed_groups", "token_ttl", "tokens",
-      "oidc", "iap", "alb", "header",
-    ])) == 0
-    error_message = "Unknown key under auth."
-  }
-
-  assert {
-    condition = length(setsubtract(keys(yamldecode(output.backyard_config_yaml).auth.oidc), [
-      "issuer", "client_id", "client_secret", "scopes", "redirect_url", "session_ttl", "use_userinfo",
-      "device_client_id", "device_scopes", "api_audiences", "insecure_skip_issuer_check",
-    ])) == 0
-    error_message = "Unknown key under auth.oidc."
-  }
-
-  assert {
-    condition = length(setsubtract(keys(yamldecode(output.backyard_config_yaml).auth.tokens[0]), [
-      "name", "sha256", "admin",
-    ])) == 0
-    error_message = "Unknown key under auth.tokens."
-  }
-
-  assert {
-    condition = (
-      length(setsubtract(keys(yamldecode(output.backyard_config_yaml).storage), ["type", "fs", "s3", "gcs", "azure", "cache_bytes", "cache_ttl"])) == 0 &&
-      length(setsubtract(keys(yamldecode(output.backyard_config_yaml).storage.azure), ["account", "container", "prefix", "connection_string", "account_key", "endpoint"])) == 0
-    )
-    error_message = "Unknown key under storage."
-  }
-
-  assert {
-    condition = (
-      length(setsubtract(keys(yamldecode(output.backyard_config_yaml).database), ["type", "sqlite", "postgres", "dynamodb", "max_doc_bytes", "max_list", "max_docs_per_site"])) == 0 &&
-      length(setsubtract(keys(yamldecode(output.backyard_config_yaml).database.postgres), ["dsn", "max_conns", "schema", "auto_migrate"])) == 0 &&
-      length(setsubtract(keys(yamldecode(output.backyard_config_yaml).pubsub), ["type", "redis", "postgres"])) == 0 &&
-      length(setsubtract(keys(try(yamldecode(output.backyard_config_yaml).pubsub.postgres, {})), ["dsn", "channel"])) == 0 &&
-      length(setsubtract(keys(yamldecode(output.backyard_config_yaml).telemetry), ["log_level", "log_format", "metrics", "metrics_listen", "access_log"])) == 0
-    )
-    error_message = "Unknown key under database, pubsub or telemetry."
-  }
+  # Managed wildcard certificate: the plan warns (check block). So does the
+  # default public Postgres endpoint, open to every Azure IP.
+  expect_failures = [check.frontdoor_wildcard_certificate, check.postgres_open_to_all_of_azure]
 
   # --- rendered values ------------------------------------------------------
   assert {
@@ -411,6 +361,16 @@ run "frontdoor_host_mode_entra" {
   assert {
     condition     = azurerm_storage_account.this.shared_access_key_enabled == false && contains(azurerm_storage_account.this.blob_properties[0].cors_rule[0].allowed_origins, "https://backyard.acme.com") && contains(azurerm_storage_account.this.blob_properties[0].cors_rule[0].allowed_methods, "PUT")
     error_message = "Storage must be Entra-only and allow presigned PUTs from the hub."
+  }
+
+  assert {
+    # The headers a SAS upload must carry (internal/blob/azure PresignPut).
+    condition = alltrue([
+      for h in ["x-ms-blob-type", "content-type"] :
+      contains(azurerm_storage_account.this.blob_properties[0].cors_rule[0].allowed_headers, "*") ||
+      contains([for a in azurerm_storage_account.this.blob_properties[0].cors_rule[0].allowed_headers : lower(a)], h)
+    ])
+    error_message = "The storage CORS rule must allow the headers of a presigned upload (x-ms-blob-type, Content-Type)."
   }
 
   assert {
@@ -766,23 +726,6 @@ run "default_hostname_lab_with_ai" {
 
   assert {
     condition = (
-      length(setsubtract(keys(yamldecode(output.backyard_config_yaml).ai), [
-        "enabled", "default_model", "default_image_model", "default_embedding_model", "providers", "models",
-        "allow_raw_models", "expose_model_ids", "max_tokens", "request_timeout", "system_prompt",
-      ])) == 0 &&
-      alltrue([for p in values(yamldecode(output.backyard_config_yaml).ai.providers) : length(setsubtract(keys(p), [
-        "type", "api_key", "base_url", "headers", "platform", "refusal_fallback", "effort", "organization",
-        "openai_project", "endpoint", "api_version", "use_azure_ad", "region", "project_id", "location",
-      ])) == 0]) &&
-      alltrue([for m in values(yamldecode(output.backyard_config_yaml).ai.models) : length(setsubtract(keys(m), [
-        "provider", "model", "kind", "description", "max_tokens", "effort",
-      ])) == 0])
-    )
-    error_message = "Unknown key under ai."
-  }
-
-  assert {
-    condition = (
       yamldecode(output.backyard_config_yaml).ai.providers.azure.type == "azure-openai" &&
       yamldecode(output.backyard_config_yaml).ai.providers.azure.endpoint == "https://backyard-aoai-abc123.openai.azure.com" &&
       yamldecode(output.backyard_config_yaml).ai.providers.azure.use_azure_ad == true &&
@@ -887,6 +830,68 @@ run "existing_rg_acr_public_address_space_vnet" {
 # -----------------------------------------------------------------------------
 # Invalid combinations fail at plan time.
 # -----------------------------------------------------------------------------
+
+# Direct-sync deployers (az storage blob sync) may touch <prefix>sites/ only:
+# _meta/ (site owners, manifests) and uploads/ stay with the server.
+run "direct_deployers_limited_to_sites" {
+  command = plan
+
+  variables {
+    url_mode                       = "path"
+    database_url                   = "postgres://u:p@db.internal:5432/backyard?sslmode=require"
+    storage_deployer_principal_ids = ["00000000-0000-0000-0000-0000000000aa", "00000000-0000-0000-0000-0000000000bb"]
+  }
+
+  assert {
+    condition = alltrue([
+      for a in azurerm_role_assignment.deployers_blob_data :
+      a.role_definition_name == "Storage Blob Data Contributor" &&
+      a.condition_version == "2.0" &&
+      strcontains(a.condition, "@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'sites/'") &&
+      strcontains(a.condition, "@Request[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:prefix] StringStartsWith 'sites/'") &&
+      alltrue([for action in ["blobs/read'} AND NOT SubOperationMatches{'Blob.List'}", "blobs/write'}", "blobs/add/action'}", "blobs/delete'}", "blobs/read'} AND SubOperationMatches{'Blob.List'}"] :
+      strcontains(a.condition, "ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/${action}")])
+    ]) && length(azurerm_role_assignment.deployers_blob_data) == 2
+    error_message = "Deployers' blob reads, writes, deletes and listings must be limited to sites/ by an ABAC condition."
+  }
+
+  assert {
+    condition     = azurerm_role_assignment.app_blob_data.condition == null
+    error_message = "The server's own identity keeps access to the whole container (_meta, uploads)."
+  }
+}
+
+run "direct_deployers_with_storage_prefix" {
+  command = plan
+
+  variables {
+    url_mode                       = "path"
+    database_url                   = "postgres://u:p@db.internal:5432/backyard?sslmode=require"
+    storage_prefix                 = " /team-a/ "
+    storage_deployer_principal_ids = ["00000000-0000-0000-0000-0000000000aa"]
+  }
+
+  assert {
+    condition = (
+      strcontains(azurerm_role_assignment.deployers_blob_data["00000000-0000-0000-0000-0000000000aa"].condition, "blobs:path] StringStartsWith 'team-a/sites/'") &&
+      strcontains(azurerm_role_assignment.deployers_blob_data["00000000-0000-0000-0000-0000000000aa"].condition, "blobs:prefix] StringStartsWith 'team-a/sites/'")
+    )
+    error_message = "The condition must use the storage prefix as Backyard normalises it (team-a/sites/)."
+  }
+}
+
+run "direct_deployers_reject_quote_in_prefix" {
+  command = plan
+
+  variables {
+    url_mode                       = "path"
+    database_url                   = "postgres://u:p@db.internal:5432/backyard?sslmode=require"
+    storage_prefix                 = "it's"
+    storage_deployer_principal_ids = ["00000000-0000-0000-0000-0000000000aa"]
+  }
+
+  expect_failures = [azurerm_role_assignment.deployers_blob_data]
+}
 
 run "host_mode_requires_domain" {
   command = plan

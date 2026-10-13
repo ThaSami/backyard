@@ -5,16 +5,20 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	"github.com/thasami/backyard/internal/ai"
+	"github.com/thasami/backyard/internal/ai/router"
 	"github.com/thasami/backyard/internal/config"
 )
 
@@ -364,6 +368,10 @@ func TestAIUpstreamStatusMapping(t *testing.T) {
 		{"provider request timeout", up(408, "timeout"), 504, "upstream_error", "", nil, nil},
 		{"throttled with retry-after", retryAfterErr{up(429, "slow down"), 20 * time.Second}, 429, "rate_limited", "20", nil, nil},
 		{"throttled wrapped", fmt.Errorf("router: %w", retryAfterErr{up(429, "slow down"), 1500 * time.Millisecond}), 429, "rate_limited", "2", nil, nil},
+		// The provider's retry headers, carried by the UpstreamError itself
+		// (no hint in the message).
+		{"throttled retry delay", fmt.Errorf("router: %w", &ai.UpstreamError{Provider: "anthropic", Status: 429, Message: "rate_limit_error",
+			RetryDelay: 9 * time.Second}), 429, "rate_limited", "9", nil, nil},
 		{"throttled zero retry-after with hint", retryAfterErr{up(429, "try again in 7s"), 0}, 429, "rate_limited", "7", nil, nil},
 		{"throttled hint milliseconds", up(429, "Please try again in 350ms."), 429, "rate_limited", "1", nil, nil},
 		{"throttled hint seconds", up(429, "Rate limit reached for gpt-4o in organization org-AbCdEf123456 on tokens per min. Please try again in 1.5s."),
@@ -455,4 +463,182 @@ func TestAIUpstreamStatusInStream(t *testing.T) {
 			t.Fatalf("last event = %v, want code %s with %q", last, tc.code, tc.msg)
 		}
 	}
+}
+
+// TestAIChatResolvesSiteUploads: chat requests carry a resolver that reads
+// the site's own uploads (the URL files.upload returns) from storage, and
+// nothing else.
+func TestAIChatResolvesSiteUploads(t *testing.T) {
+	png := "\x89PNG\r\n\x1a\n" + strings.Repeat("p", 100)
+	for _, mode := range []string{"host", "path"} {
+		t.Run(mode, func(t *testing.T) {
+			var opts []option
+			origin, prefix, other := "https://foo.backyard.test", "", "https://bar.backyard.test"
+			if mode == "path" {
+				opts = append(opts, pathMode())
+				origin, prefix, other = "https://backyard.test", "/s/foo", "https://evil.example"
+			}
+			h := newHarness(t, opts...)
+			upload := func(site string) fileJSON {
+				t.Helper()
+				u := "https://" + site + ".backyard.test/__backyard/api/files"
+				hdr := map[string]string{"X-Backyard": "1"}
+				if mode == "path" {
+					u = "https://backyard.test/s/" + site + "/__backyard/api/files"
+					hdr["Origin"] = "https://backyard.test"
+				}
+				body, ct := multipartBody(t, part{field: "file", filename: "pic.png", ctype: "image/png", content: png})
+				hdr["Content-Type"] = ct
+				w := h.serve(req{method: "POST", url: u, body: body, hdr: hdr})
+				expectStatus(t, w, 201)
+				var fi fileJSON
+				mustJSON(t, w.Body.Bytes(), &fi)
+				return fi
+			}
+			fi := upload("foo")
+			barFile := upload("bar")
+			if !strings.HasPrefix(fi.URL, prefix+"/__backyard/files/") {
+				t.Fatalf("file url = %q", fi.URL)
+			}
+			bare := strings.TrimPrefix(fi.URL, prefix)
+
+			chatURL := origin + prefix + "/__backyard/api/ai/chat"
+			for _, stream := range []bool{false, true} {
+				w := h.api("POST", chatURL, map[string]any{"stream": stream, "messages": []any{
+					map[string]any{"role": "user", "content": []any{map[string]any{"type": "image", "url": fi.URL}}}}},
+					"Origin", origin)
+				expectStatus(t, w, 200)
+				_, rq := h.ai.lastChat()
+				if rq.ResolveImage == nil || rq.Messages[0].Content[0].URL != fi.URL {
+					t.Fatalf("stream=%v: request = %+v", stream, rq)
+				}
+			}
+			_, rq := h.ai.lastChat()
+			resolve := rq.ResolveImage
+			ctx := t.Context()
+
+			for _, ref := range []string{fi.URL, bare, origin + fi.URL, origin + bare,
+				origin + ":443" + fi.URL} {
+				data, err := resolve(ctx, ref, 1<<20)
+				if err != nil || string(data) != png {
+					t.Fatalf("resolve(%q) = %q, %v", ref, data, err)
+				}
+			}
+
+			badRequest := []string{
+				"/__backyard/files/01JAAAAAAAAAAAAAAAAAAAAAAA/x.png", // unknown file
+				"/__backyard/files/" + barFile.ID + "/pic.png",       // another site's upload
+				"/assets/logo.png", // not an upload
+				"/__backyard/files/",
+			}
+			if mode == "path" {
+				badRequest = append(badRequest,
+					"/s/bar/__backyard/files/"+barFile.ID+"/pic.png", // another site, by its URL
+					"/s/bar"+bare,
+					origin+"/s/bar/__backyard/files/"+barFile.ID+"/pic.png")
+			}
+			for _, ref := range badRequest {
+				if _, err := resolve(ctx, ref, 1<<20); !errors.Is(err, ai.ErrBadRequest) {
+					t.Errorf("resolve(%q) err = %v, want ErrBadRequest", ref, err)
+				}
+			}
+			for _, ref := range []string{
+				"https://evil.example" + fi.URL, // another host
+				other + bare,                    // host mode: another site's host
+				origin + ":8443" + fi.URL,       // another port
+				origin + prefix + "/logo.png",   // same host, not an upload
+				"ftp://foo.backyard.test" + bare,
+			} {
+				if _, err := resolve(ctx, ref, 1<<20); !errors.Is(err, ai.ErrNotLocal) {
+					t.Errorf("resolve(%q) err = %v, want ErrNotLocal", ref, err)
+				}
+			}
+
+			// Oversize by the stored size: rejected before reading.
+			_, gets, _ := h.blob.counts()
+			if _, err := resolve(ctx, fi.URL, 10); !errors.Is(err, ai.ErrBadRequest) || !strings.Contains(err.Error(), "size limit") {
+				t.Fatalf("oversize err = %v", err)
+			}
+			if _, after, _ := h.blob.counts(); after != gets {
+				t.Fatalf("oversize image was read (%d gets)", after-gets)
+			}
+			// Bytes larger than the stored size are cut off too.
+			key := "uploads/foo/" + fi.ID + "/pic.png"
+			h.blob.set(key, []byte(png+strings.Repeat("x", 1000)), time.Now())
+			if _, err := resolve(ctx, fi.URL, 200); !errors.Is(err, ai.ErrBadRequest) || !strings.Contains(err.Error(), "size limit") {
+				t.Fatalf("grown object err = %v", err)
+			}
+			// Metadata without bytes.
+			if err := h.blob.Delete(ctx, key); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := resolve(ctx, fi.URL, 1<<20); !errors.Is(err, ai.ErrBadRequest) || !strings.Contains(err.Error(), "not found") {
+				t.Fatalf("missing bytes err = %v", err)
+			}
+		})
+	}
+}
+
+// captureProvider is an ai.Provider that records chat requests.
+type captureProvider struct {
+	mu   sync.Mutex
+	reqs []ai.ChatRequest
+}
+
+func (p *captureProvider) Name() string { return "capture" }
+func (p *captureProvider) Chat(_ context.Context, req ai.ChatRequest) (*ai.ChatResponse, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reqs = append(p.reqs, req)
+	return &ai.ChatResponse{Content: "ok", Model: req.Model, StopReason: ai.StopEndTurn, Usage: ai.Usage{InputTokens: 1, OutputTokens: 1}}, nil
+}
+func (p *captureProvider) ChatStream(ctx context.Context, req ai.ChatRequest, _ func(string) error) (*ai.ChatResponse, error) {
+	return p.Chat(ctx, req)
+}
+func (p *captureProvider) Image(context.Context, ai.ImageRequest) (*ai.ImageResponse, error) {
+	return nil, ai.ErrUnsupported
+}
+func (p *captureProvider) Embed(context.Context, ai.EmbedRequest) (*ai.EmbedResponse, error) {
+	return nil, ai.ErrUnsupported
+}
+
+// TestAIChatUploadEndToEnd: with the real router, an image part naming one
+// of the site's uploads reaches the provider as inline bytes.
+func TestAIChatUploadEndToEnd(t *testing.T) {
+	prov := &captureProvider{}
+	h := newHarness(t, func(h *harness, d *Deps) {
+		svc, err := router.New(t.Context(), config.AIConfig{
+			Models: map[string]config.ModelConfig{"smart": {Provider: "capture", Model: "m1"}},
+		}, router.Options{Providers: map[string]ai.Provider{"capture": prov}, Logger: slog.New(slog.DiscardHandler)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		d.AI = svc
+	})
+	png := "\x89PNG\r\n\x1a\n" + strings.Repeat("\x00", 64)
+	up := h.upload(filesURL, part{field: "file", filename: "shot.png", ctype: "image/png", content: png})
+	var fi fileJSON
+	mustJSON(t, up.body, &fi)
+	bar := h.upload("https://bar.backyard.test/__backyard/api/files", part{field: "file", filename: "b.png", ctype: "image/png", content: png})
+	var bfi fileJSON
+	mustJSON(t, bar.body, &bfi)
+
+	chat := func(url string) *httptest.ResponseRecorder {
+		return h.api("POST", aiURL+"/chat", map[string]any{"model": "smart", "messages": []any{
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "text", "text": "describe"},
+				map[string]any{"type": "image", "url": url}}}}})
+	}
+	expectStatus(t, chat(fi.URL), 200)
+	prov.mu.Lock()
+	got := prov.reqs[len(prov.reqs)-1].Messages[0].Content[1]
+	prov.mu.Unlock()
+	if string(got.Data) != png || got.MediaType != "image/png" || got.URL != "" {
+		t.Fatalf("provider image part = %+v", got)
+	}
+	expectStatus(t, chat("https://foo.backyard.test"+fi.URL), 200)
+
+	expectError(t, chat(bfi.URL), 400, "bad_request") // bar's upload, from foo
+	expectError(t, chat("/assets/x.png"), 400, "bad_request")
+	expectError(t, chat("/__backyard/files/01JAAAAAAAAAAAAAAAAAAAAAAA/x.png"), 400, "bad_request")
 }

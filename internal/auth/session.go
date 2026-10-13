@@ -188,11 +188,34 @@ func (a *authenticator) isImportantGroup(g string) bool {
 	return a.important[strings.ToLower(strings.TrimSpace(g))]
 }
 
-// authenticateSession reads the backyard_session cookie (oidc mode). Every
-// cookie with that name is tried, so a stale host-only cookie does not shadow
-// a valid domain cookie.
-func (a *authenticator) authenticateSession(r *http.Request) (*identity.User, error) {
+// authenticateSession reads the backyard_session cookie (oidc mode). On a
+// cookie conflict it also expires the cookies Backyard did not set (when w is
+// non-nil).
+func (a *authenticator) authenticateSession(w http.ResponseWriter, r *http.Request) (*identity.User, error) {
+	u, _, err := a.sessionFromCookies(r)
+	if errors.Is(err, ErrCookieConflict) {
+		a.log.Warn("auth: request carries session cookies of different users; possibly planted by a site's page",
+			"host", r.Host, "path", truncate(r.URL.Path, 128), "audit", true)
+		a.expireForeignCookies(w, r, SessionCookie)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return a.finalize(r.Context(), u, srcIDP)
+}
+
+// sessionFromCookies opens the backyard_session cookies of r and returns the
+// session's user and the cookie value that holds it. Every cookie with that
+// name is tried, so a stale host-only cookie does not shadow a valid domain
+// cookie. Valid cookies of different users fail closed (ErrCookieConflict):
+// a site's page can plant its author's own session next to the visitor's
+// (see expireForeignCookies), and taking the first one — which browsers send
+// first when its path is longer — would run the visitor's requests as the
+// site's author.
+func (a *authenticator) sessionFromCookies(r *http.Request) (*identity.User, string, error) {
 	found := false
+	var user *identity.User
+	value := ""
 	for _, c := range r.Cookies() {
 		if c.Name != SessionCookie {
 			continue
@@ -203,12 +226,20 @@ func (a *authenticator) authenticateSession(r *http.Request) (*identity.User, er
 			a.log.Debug("auth: session cookie rejected", "error", err)
 			continue
 		}
-		return a.finalize(r.Context(), u, srcIDP)
+		switch {
+		case user == nil:
+			user, value = u, c.Value
+		case u.ID != user.ID:
+			return nil, "", fmt.Errorf("%w: %w", ErrUnauthenticated, ErrCookieConflict)
+		}
 	}
-	if found {
-		return nil, fmt.Errorf("%w: invalid or expired session", ErrUnauthenticated)
+	switch {
+	case user != nil:
+		return user, value, nil
+	case found:
+		return nil, "", fmt.Errorf("%w: invalid or expired session", ErrUnauthenticated)
 	}
-	return nil, fmt.Errorf("%w: no session", ErrUnauthenticated)
+	return nil, "", fmt.Errorf("%w: no session", ErrUnauthenticated)
 }
 
 // sessionCookie builds the session cookie for value.
@@ -225,7 +256,7 @@ func (a *authenticator) clearSessionCookies(w http.ResponseWriter) {
 	}
 }
 
-// oauthState is the content of the signed backyard_oauth cookie.
+// oauthState is the content of the signed login state cookie.
 type oauthState struct {
 	State    string `json:"s"`
 	Verifier string `json:"v"`

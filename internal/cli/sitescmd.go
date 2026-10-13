@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -201,8 +203,8 @@ func (a *cliApp) newOpenCommand() *cobra.Command {
 			if err := s.RequireGateway(); err != nil {
 				return err
 			}
-			info := s.Profile.Info
-			if info == nil || s.ServerSource != clientconfig.SourceProfile {
+			info := s.CachedInfo()
+			if info == nil {
 				if fresh, err := a.fetchInfo(ctx, a.client(s.Gateway, s.Token)); err == nil {
 					info = fresh
 				}
@@ -235,7 +237,12 @@ func (a *cliApp) newPullCommand() *cobra.Command {
 		Use:   "pull <site> [dir]",
 		Short: "Download a site's files",
 		Long: `Download the deployed files of a site into dir (default ./<site>) — handy to fork or
-remix another site. Local files that differ from the site are not overwritten unless --force.`,
+remix another site. Local files that differ from the site are not overwritten unless --force.
+
+Files a deploy never publishes are skipped (and listed), even if the site holds them: dotfiles
+and dot-directories (.git/, .claude/, .env…; .well-known/ is kept), node_modules/,
+.backyard.json, .backyardignore, CLAUDE.md and AGENTS.md. A site cannot plant repository
+metadata, project settings or agent instructions in your folder.`,
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			site := args[0]
@@ -263,6 +270,47 @@ type pullResult struct {
 	Dir        string   `json:"dir"`
 	Downloaded []string `json:"downloaded"`
 	Unchanged  []string `json:"unchanged"`
+	// Skipped lists site files pull never writes (see pullSkips).
+	Skipped []string `json:"skipped"`
+}
+
+// pullIgnore matches, case-insensitively, what deploys never publish
+// (deploy.DefaultIgnore): VCS metadata, the project and ignore files, agent
+// instructions and settings, node_modules and every other dotfile except
+// .well-known/.
+var pullIgnore = sync.OnceValue(func() *deploy.Matcher {
+	patterns := deploy.DefaultIgnore()
+	for i, p := range patterns {
+		patterns[i] = strings.ToLower(p)
+	}
+	return deploy.NewMatcher(patterns)
+})
+
+// windowsShortName matches an 8.3 short-name alias ("GIT~1", "CLAUDE~1.MD"),
+// which Windows resolves to an existing long name.
+var windowsShortName = regexp.MustCompile(`~[0-9]`)
+
+// pullSkips reports whether pull must not write the site file p: anything a
+// deploy never publishes. A site is written by whoever deployed it, possibly
+// through the raw gateway API, so without this a pulled folder could carry a
+// crafted .git/config (git runs commands named there, e.g. core.fsmonitor,
+// on the next git command or git-aware shell prompt), a .backyard.json
+// redirecting later deploys, or instructions and settings for coding
+// agents. Segments are compared the way case-insensitive and Windows file
+// systems resolve them ("CLAUDE.md." and "claude.md" are CLAUDE.md there).
+func pullSkips(p string) bool {
+	segs := strings.Split(p, "/")
+	for i, seg := range segs {
+		if j := strings.IndexByte(seg, ':'); j >= 0 {
+			seg = seg[:j] // NTFS alternate data streams ("AGENTS.md::$DATA")
+		}
+		seg = strings.TrimRight(seg, ". ") // Windows drops trailing dots and spaces
+		if seg == "" || (runtime.GOOS == "windows" && windowsShortName.MatchString(seg)) {
+			return true
+		}
+		segs[i] = strings.ToLower(seg)
+	}
+	return pullIgnore().Ignored(strings.Join(segs, "/"), false)
 }
 
 // pullMaxFile caps a single pulled file.
@@ -291,10 +339,15 @@ func (a *cliApp) runPull(ctx context.Context, site, dir string, force bool) erro
 		jobs      []job
 		unchanged []string
 		conflicts []string
+		skipped   []string
 	)
 	for _, f := range files {
 		if why := deploy.ValidatePath(f.Path); why != "" {
 			return fmt.Errorf("refusing to pull %q: %s", f.Path, why)
+		}
+		if pullSkips(f.Path) {
+			skipped = append(skipped, f.Path)
+			continue
 		}
 		target, err := scaffold.SafeJoin(dir, f.Path)
 		if err != nil {
@@ -362,6 +415,7 @@ feed:
 		return explain(firstErr, s)
 	}
 	slices.Sort(downloaded)
+	slices.Sort(skipped)
 	if a.g.json {
 		if downloaded == nil {
 			downloaded = []string{}
@@ -369,9 +423,22 @@ feed:
 		if unchanged == nil {
 			unchanged = []string{}
 		}
-		return a.printJSON(pullResult{Site: site, Dir: dir, Downloaded: downloaded, Unchanged: unchanged})
+		if skipped == nil {
+			skipped = []string{}
+		}
+		return a.printJSON(pullResult{Site: site, Dir: dir, Downloaded: downloaded, Unchanged: unchanged, Skipped: skipped})
 	}
 	a.outf("Pulled %s into %s: %d files downloaded, %d unchanged.\n", site, dir, len(downloaded), len(unchanged))
+	if len(skipped) > 0 {
+		const maxListed = 20
+		list := skipped[:min(len(skipped), maxListed)]
+		more := ""
+		if len(skipped) > maxListed {
+			more = fmt.Sprintf("\n  … and %d more", len(skipped)-maxListed)
+		}
+		a.errf("Skipped %d files that deploys never publish (dotfiles, .git/, node_modules/, .backyard.json, CLAUDE.md, AGENTS.md…):\n  %s%s\n",
+			len(skipped), strings.Join(list, "\n  "), more)
+	}
 	return nil
 }
 

@@ -165,9 +165,9 @@ func (s *Session) UpdateProfile(mutate func(p *Profile)) error {
 }
 
 // CacheInfo stores info in the profile (best effort) when the session uses
-// a stored profile for the same server.
+// the stored profile's own server and gateway (see CachedInfo).
 func (s *Session) CacheInfo(info *deploy.Info) {
-	if info == nil || !s.Exists || s.ServerSource != SourceProfile || reflect.DeepEqual(info, s.Profile.Info) {
+	if info == nil || !s.UsesProfileServer() || reflect.DeepEqual(info, s.Profile.Info) {
 		return
 	}
 	if err := s.UpdateProfile(func(p *Profile) { p.Info = info }); err != nil {

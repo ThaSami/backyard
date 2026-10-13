@@ -18,6 +18,12 @@ type InitOptions struct {
 	Agents    []string // any of: claude, codex, cursor, copilot (default: claude, codex)
 	Template  string   // blank (default) | app
 	SkipIndex bool     // do not write index.html (existing project)
+	// BaseDomain and URLMode describe the server (its /info base_domain
+	// and url_mode) when known: host-mode sites live at
+	// <scheme>://<site>.<base_domain>[:port]/, and base_domain may differ
+	// from the hub's host. Empty: guessed from Server.
+	BaseDomain string
+	URLMode    string // host | path | ""
 }
 
 // Render returns the files to create, keyed by "/"-separated relative path.

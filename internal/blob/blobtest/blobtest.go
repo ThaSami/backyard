@@ -47,8 +47,9 @@ import (
 type Option func(*suite)
 
 type suite struct {
-	presignSize   bool
-	presignSHA256 bool
+	presignSize    bool
+	presignSHA256  bool
+	presignDigests bool
 }
 
 // PresignEnforcesSize declares that the storage endpoint rejects a PUT to a
@@ -60,6 +61,11 @@ func PresignEnforcesSize() Option { return func(s *suite) { s.presignSize = true
 // body of the right size whose SHA-256 differs from PresignPutOptions.SHA256
 // (S3 with flexible checksums).
 func PresignEnforcesSHA256() Option { return func(s *suite) { s.presignSHA256 = true } }
+
+// ReportsPresignedDigests declares that the store implements
+// blob.DigestReporter and reports the SHA-256 of an object uploaded through
+// a presigned URL that declared one (S3 with flexible checksums).
+func ReportsPresignedDigests() Option { return func(s *suite) { s.presignDigests = true } }
 
 // Run executes the conformance suite against stores built by newStore.
 func Run(t *testing.T, newStore func(t *testing.T) blob.Store, opts ...Option) {
@@ -93,6 +99,7 @@ func Run(t *testing.T, newStore func(t *testing.T) blob.Store, opts ...Option) {
 		{"PingDescribe", testPingDescribe},
 		{"Presign", testPresign},
 		{"PresignEnforcement", func(t *testing.T, s blob.Store) { testPresignEnforcement(t, s, cfg) }},
+		{"DigestReporter", func(t *testing.T, s blob.Store) { testDigestReporter(t, s, cfg) }},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1065,6 +1072,70 @@ func testPresignEnforcement(t *testing.T, s blob.Store, cfg suite) {
 			t.Errorf("Get after presigned PUT = %q", got)
 		}
 	}
+}
+
+// testDigestReporter checks blob.DigestReporter where a store implements
+// it: a reported digest is always that of the object's current content
+// (never a stale one after an overwrite), with the object's current info.
+func testDigestReporter(t *testing.T, s blob.Store, cfg suite) {
+	dr, ok := s.(blob.DigestReporter)
+	if !ok {
+		if cfg.presignDigests {
+			t.Fatal("store declares ReportsPresignedDigests but does not implement blob.DigestReporter")
+		}
+		t.Skip("store does not implement blob.DigestReporter")
+	}
+	ctx := testCtx(t)
+	_, _, err := dr.StatSHA256(ctx, "digest/missing.txt")
+	if errors.Is(err, blob.ErrNotSupported) {
+		if cfg.presignDigests {
+			t.Fatal("StatSHA256: ErrNotSupported, but the store declares ReportsPresignedDigests")
+		}
+		t.Skip("store cannot report digests in this configuration")
+	}
+	if !errors.Is(err, blob.ErrNotFound) {
+		t.Errorf("StatSHA256(missing) err = %v, want ErrNotFound", err)
+	}
+	if _, _, err := dr.StatSHA256(ctx, "../escape"); !errors.Is(err, blob.ErrInvalidKey) {
+		t.Errorf("StatSHA256(invalid key) err = %v, want ErrInvalidKey", err)
+	}
+	check := func(key string, data []byte, required bool) {
+		t.Helper()
+		info, sum, err := dr.StatSHA256(ctx, key)
+		if err != nil {
+			t.Fatalf("StatSHA256(%q): %v", key, err)
+		}
+		sameInfo(t, "StatSHA256("+key+")", info, mustStat(t, s, key))
+		switch {
+		case sum == "" && required:
+			t.Errorf("StatSHA256(%q) reported no digest for a presigned upload with a declared sha256", key)
+		case sum != "" && sum != sha256Hex(data):
+			t.Errorf("StatSHA256(%q) = %s, want %s (the current content's) or none", key, sum, sha256Hex(data))
+		}
+	}
+
+	data := []byte("digest me")
+	mustPut(t, s, "digest/plain.txt", data, "text/plain")
+	check("digest/plain.txt", data, false)
+
+	const key = "digest/presigned.txt"
+	req, err := s.PresignPut(ctx, key, exact("text/plain", data), 10*time.Minute)
+	if errors.Is(err, blob.ErrNotSupported) {
+		if cfg.presignDigests {
+			t.Fatal("PresignPut: ErrNotSupported, but the store declares ReportsPresignedDigests")
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("PresignPut(%q): %v", key, err)
+	}
+	doHTTP(t, req, data, http.StatusOK, http.StatusCreated, http.StatusNoContent)
+	check(key, data, cfg.presignDigests)
+	// Overwritten (same size) without a declared digest: the old digest
+	// must not linger.
+	other := bytes.ToUpper(data)
+	mustPut(t, s, key, other, "text/plain")
+	check(key, other, false)
 }
 
 // sendPresigned performs a presigned request with exactly its headers and

@@ -135,6 +135,16 @@ INSERT INTO `+schema+`.events VALUES
 		t.Fatalf("table modified: %d rows", n)
 	}
 
+	// Results are capped by size (32 MiB by default) as well as by row
+	// count: of four 20 MiB rows only the first fits.
+	res, err = svc.Query(ctx, warehouse.QueryRequest{SQL: "SELECT g, repeat('x', 20 * 1024 * 1024) AS pad FROM generate_series(1, 4) g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 1 || res.RowCount != 1 || !res.Truncated || res.Rows[0]["g"] != int64(1) {
+		t.Fatalf("wide rows: %d rows, truncated %v", len(res.Rows), res.Truncated)
+	}
+
 	// Engine errors are classified.
 	if _, err := svc.Query(ctx, warehouse.QueryRequest{SQL: "SELECT * FROM " + schema + ".nope"}); !errors.Is(err, warehouse.ErrBadRequest) {
 		t.Errorf("missing table: %v", err)

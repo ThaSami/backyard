@@ -77,7 +77,9 @@ CLI variables (`BACKYARD_SERVER`, `BACKYARD_TOKEN`, …) are listed in the [CLI 
 - **Durations** accept Go syntax (`90s`, `15m`, `12h`), a plain integer number of seconds
   (`3600`), or days with a `d` suffix (`30d`).
 - **Sizes** are integers in bytes (`104857600` = 100 MiB).
-- For numeric limits, `0` (or leaving the key out) selects the default.
+- For numeric limits, `0` (or leaving the key out) selects the default. For the `ratelimit.*`
+  limits and `database.max_docs_per_site` a negative value means unlimited (that limit is
+  off); `storage.cache_bytes: -1` disables the cache.
 
 ### Dev mode
 
@@ -96,8 +98,8 @@ wins. Never use dev mode on a shared network.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `server.listen` | string | `:$PORT`, else `:8080` | Listen address. |
-| `server.base_domain` | string | **required** (dev: `localhost`) | The hub's host name. Sites live at `<site>.<base_domain>` in host mode. Point the apex and a wildcard DNS record at the server. |
-| `server.public_url` | string | `https://<base_domain>` (`http://` plus the listen port for `localhost`/`127.*`/`lvh.me`) | The externally visible hub URL. Used for redirects, cookies, CLI login and site URLs. |
+| `server.base_domain` | string | **required** (dev: `localhost`) | The hub's host name. Sites live at `<site>.<base_domain>` in host mode. Point the apex and a wildcard DNS record at the server. With `auth.mode: oidc` in host mode it must be able to carry a cookie (see [`auth.oidc`](#authoidc)). |
+| `server.public_url` | string | `https://<base_domain>` (`http://` plus the listen port for `localhost`/`127.*`/`lvh.me`) | The externally visible hub URL. Used for redirects, cookies, CLI login and site URLs (in host mode `<site>.<base_domain>` with this URL's scheme and port). |
 | `server.url_mode` | `host` \| `path` | `host` | `host`: one subdomain per site (needs wildcard DNS + TLS). `path`: sites at `<public_url>/s/<site>/` on one host (sites then share an origin — see [security](security.md#host-mode-vs-path-mode)). |
 | `server.secret` | string | **required**, ≥ 32 characters (dev: random) | Root secret. Every signing/encryption key (sessions, API tokens, deploy ids, upload URLs, anonymous ids) is derived from it. Generate with `openssl rand -hex 32`. Rotating it signs everybody out and revokes all API tokens. |
 | `server.trusted_proxies` | list of CIDRs/IPs | `[]` | Peers whose `X-Forwarded-For/-Host/-Proto` are honoured, and who may send identity headers in `auth.mode: header`. Set it to your load balancer ranges. |
@@ -129,6 +131,22 @@ See [authentication](authentication.md) for step-by-step setups.
 
 Built-in OpenID Connect login (authorization code + PKCE) for `auth.mode: oidc`. When `issuer`
 is set in another mode, IdP-issued bearer tokens (CLI device flow) are accepted there too.
+
+In host mode the session cookie is set for `.<base_domain>` so that every site sees it.
+Validation (`backyard config validate`, and `backyard serve` at startup) therefore rejects
+`auth.mode: oidc` with `server.url_mode: host` in two cases — otherwise every site visit would
+bounce through the IdP forever:
+
+- `server.base_domain` cannot carry a cookie `Domain`: `localhost`, `*.localhost`, an IP
+  address or a single-label name. The error reads
+  `server.base_domain "localhost" cannot carry a cookie Domain …`.
+- The host of `server.public_url` is neither `base_domain` nor one of its subdomains
+  (`public_url: https://hub.acme.com` with `base_domain: apps.acme.com`). The error reads
+  `server.public_url host "hub.acme.com" must be server.base_domain "apps.acme.com" or one of its subdomains …`.
+
+Use `url_mode: path` then, or — for local tests — a real domain whose subdomains resolve to
+loopback, such as `lvh.me`; a hub on a subdomain of `base_domain`
+(`public_url: https://hub.apps.acme.com`) is fine.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -236,10 +254,10 @@ The document store behind `backyard.db`, plus the user cache, upload metadata an
 | `database.type` | `sqlite` \| `postgres` \| `dynamodb` \| `memory` | `sqlite` | Backend. `memory` loses everything on restart (tests, demos). |
 | `database.max_doc_bytes` | int | `262144` (256 KiB) | Largest document (JSON). Keep it below ~390000 on DynamoDB (400 KB item limit). |
 | `database.max_list` | int | `1000` | Largest `limit` of a list or query (default page size is 100). |
-| `database.max_docs_per_site` | int | `100000` | Soft per-site document quota (`413 too_large` beyond it); a negative value disables it. |
+| `database.max_docs_per_site` | int | `100000` | Soft per-site document quota (`413 too_large` beyond it); negative = unlimited. |
 | `database.sqlite.path` | path | `<storage.fs.root>/backyard.db` | Database file (WAL mode; single node). |
 | `database.postgres.dsn` | string | `$DATABASE_URL` | `postgres://user:pass@host:5432/db?sslmode=require`. |
-| `database.postgres.max_conns` | int | `20` | Connection pool size per instance. |
+| `database.postgres.max_conns` | int | `20` | Document store connection pool size per instance. It takes precedence over a `pool_max_conns` parameter in the DSN. |
 | `database.postgres.schema` | string | `public` | Schema for Backyard's tables. |
 | `database.postgres.auto_migrate` | bool | `true` | Create and migrate tables on start (serialized with an advisory lock). |
 | `database.dynamodb.table` | string | `backyard` | Table name (partition key `pk`, sort key `sk`, both strings). |
@@ -256,7 +274,7 @@ Cross-instance fan-out for realtime events. One instance needs nothing.
 |---|---|---|---|
 | `pubsub.type` | `memory` \| `postgres` \| `redis` | `memory` | `memory` is single-instance only. |
 | `pubsub.redis.url` | URL | **required** for `redis` | `redis://[:password@]host:6379/0` or `rediss://…` (Redis, Valkey, ElastiCache, Memorystore). |
-| `pubsub.postgres.dsn` | string | `database.postgres.dsn` | LISTEN/NOTIFY connection. |
+| `pubsub.postgres.dsn` | string | `database.postgres.dsn` | LISTEN/NOTIFY database. Pub/sub opens one LISTEN connection plus a publishing pool of 2–4 connections (half the CPU count, clamped); a `pool_max_conns` parameter in the DSN sets the pool size instead — also when the DSN is inherited from `database.postgres.dsn`. |
 | `pubsub.postgres.channel` | string | `backyard_events` | Notification channel. |
 
 ## `ai`
@@ -372,18 +390,19 @@ See [warehouse](warehouse.md).
 ## `ratelimit`
 
 Per-user token buckets, **per instance** (anonymous users are keyed by client IP). Limited
-requests get `429 rate_limited` with `Retry-After`. A negative value disables one limit.
+requests get `429 rate_limited` with `Retry-After`. `0` (or leaving a key out) selects the
+default; a negative value means unlimited (that one limit is off).
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `ratelimit.disabled` | bool | `false` | Turn every limit off. |
-| `ratelimit.api_per_minute` | int | `600` | All site and hub API calls. |
-| `ratelimit.db_writes_per_minute` | int | `300` | Document writes and file deletes. |
-| `ratelimit.ai_per_minute` | int | `20` | AI calls. |
-| `ratelimit.ai_tokens_per_day` | int | `2000000` | Input + output AI tokens per user per day (resets 00:00 UTC). |
-| `ratelimit.deploys_per_hour` | int | `60` | Deploy creates and refreshes (enforced by the gateway). |
-| `ratelimit.uploads_per_minute` | int | `60` | `backyard.files.upload` calls. |
-| `ratelimit.warehouse_per_minute` | int | `30` | Warehouse queries. |
+| `ratelimit.api_per_minute` | int | `600` | All site and hub API calls; negative = unlimited. |
+| `ratelimit.db_writes_per_minute` | int | `300` | Document writes and file deletes; negative = unlimited. |
+| `ratelimit.ai_per_minute` | int | `20` | AI calls; negative = unlimited. |
+| `ratelimit.ai_tokens_per_day` | int | `2000000` | Input + output AI tokens per user per day (resets 00:00 UTC); negative = unlimited. |
+| `ratelimit.deploys_per_hour` | int | `60` | Deploy creates and refreshes (enforced by the gateway); negative = unlimited. |
+| `ratelimit.uploads_per_minute` | int | `60` | `backyard.files.upload` calls; negative = unlimited. |
+| `ratelimit.warehouse_per_minute` | int | `30` | Warehouse queries; negative = unlimited. |
 
 ## `realtime`
 

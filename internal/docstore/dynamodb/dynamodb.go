@@ -24,8 +24,10 @@
 // Create is a conditional PutItem (attribute_not_exists(pk)). Put is a single
 // UpdateItem that preserves created_* with if_not_exists and increments the
 // version atomically. Update reads the document, merges the patch and writes
-// it back conditioned on the version it read, retrying on conflicts
-// (optimistic concurrency), so concurrent updates never lose keys.
+// it back conditioned on the item being unchanged since the read (version,
+// created_at and updated_at, so a delete and re-create in between is noticed
+// too), retrying on conflicts (optimistic concurrency), so concurrent updates
+// never lose keys.
 //
 // # Queries (limitation)
 //
@@ -357,18 +359,52 @@ func (s *Store) bumpCounter(ctx context.Context, site, collection string, delta 
 }
 
 func (s *Store) getItem(ctx context.Context, site, collection, id string) (*docstore.Doc, error) {
+	d, _, err := s.getRawItem(ctx, site, collection, id)
+	return d, err
+}
+
+// getRawItem reads a document and also returns its item as stored.
+func (s *Store) getRawItem(ctx context.Context, site, collection, id string) (*docstore.Doc, map[string]types.AttributeValue, error) {
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName:      aws.String(s.table),
 		Key:            key(site, collection, id),
 		ConsistentRead: aws.Bool(true),
 	})
 	if err != nil {
-		return nil, mapErr("get", err)
+		return nil, nil, mapErr("get", err)
 	}
 	if len(out.Item) == 0 {
-		return nil, docstore.ErrNotFound
+		return nil, nil, docstore.ErrNotFound
 	}
-	return decodeItem(out.Item, site, collection)
+	d, err := decodeItem(out.Item, site, collection)
+	return d, out.Item, err
+}
+
+// unchangedCondition returns a condition expression that holds only while the
+// document is exactly the item that was read. The version alone is not
+// enough: Create, and Put on a missing item, start over at version 1, so a
+// delete and re-create between the read and the write would pass a version
+// check and the write would bring back the deleted document. created_at
+// identifies the incarnation and updated_at its last write; both are compared
+// as stored.
+func unchangedCondition(item map[string]types.AttributeValue) (string, map[string]string, map[string]types.AttributeValue) {
+	names := make(map[string]string, 3)
+	values := make(map[string]types.AttributeValue, 3)
+	conds := make([]string, 0, 3)
+	for i, attr := range []string{attrVersion, attrCreatedAt, attrUpdatedAt} {
+		name, value := "#c"+strconv.Itoa(i), ":c"+strconv.Itoa(i)
+		names[name] = attr
+		if v, ok := item[attr]; ok {
+			values[value] = v
+			conds = append(conds, name+" = "+value)
+		} else {
+			conds = append(conds, "attribute_not_exists("+name+")")
+		}
+	}
+	if len(values) == 0 {
+		values = nil // DynamoDB rejects an empty map
+	}
+	return strings.Join(conds, " AND "), names, values
 }
 
 // Get returns a document (strongly consistent read); see docstore.Store.
@@ -420,7 +456,8 @@ func (s *Store) Put(ctx context.Context, site, collection, id string, data map[s
 }
 
 // Update shallow-merges patch into an existing document using optimistic
-// concurrency (conditional write on the version read); see docstore.Store.
+// concurrency (a write conditioned on the item read being unchanged); see
+// docstore.Store.
 func (s *Store) Update(ctx context.Context, site, collection, id string, patch map[string]any, actor string) (*docstore.Doc, error) {
 	actor, err := dsutil.CheckWrite(site, collection, id, actor)
 	if err != nil {
@@ -431,7 +468,7 @@ func (s *Store) Update(ctx context.Context, site, collection, id string, patch m
 		return nil, err
 	}
 	for attempt := 0; ; attempt++ {
-		cur, err := s.getItem(ctx, site, collection, id)
+		cur, item, err := s.getRawItem(ctx, site, collection, id)
 		if err != nil {
 			return nil, err
 		}
@@ -444,12 +481,13 @@ func (s *Store) Update(ctx context.Context, site, collection, id string, patch m
 		next.UpdatedAt = docstore.Now()
 		next.UpdatedBy = actor
 		next.Version = cur.Version + 1
+		cond, names, values := unchangedCondition(item)
 		_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{
 			TableName:                 aws.String(s.table),
 			Item:                      docItem(&next, raw),
-			ConditionExpression:       aws.String("#v = :v"),
-			ExpressionAttributeNames:  map[string]string{"#v": attrVersion},
-			ExpressionAttributeValues: map[string]types.AttributeValue{":v": attrN(cur.Version)},
+			ConditionExpression:       aws.String(cond),
+			ExpressionAttributeNames:  names,
+			ExpressionAttributeValues: values,
 		})
 		if err == nil {
 			return &next, nil
@@ -457,8 +495,8 @@ func (s *Store) Update(ctx context.Context, site, collection, id string, patch m
 		if !isConditionFailed(err) {
 			return nil, mapErr("update", err)
 		}
-		// Lost a race with another writer (or the document was deleted):
-		// back off with jitter and re-read.
+		// Lost a race with another writer (or the document was deleted, and
+		// maybe created again): back off with jitter and re-read.
 		if attempt+1 >= maxUpdateAttempts {
 			return nil, fmt.Errorf("%w: document %q is updated too frequently", docstore.ErrConflict, id)
 		}

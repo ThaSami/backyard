@@ -19,6 +19,10 @@ const (
 	Deploy     = "backyard/deploy/v1"
 	Upload     = "backyard/upload/v1"
 	Anon       = "backyard/anon/v1"
+	// CLIConfirm signs the confirmation form of a cross-site CLI login
+	// (/__backyard/auth/cli). The value never leaves one deployment, so the
+	// Cloudflare edition need not derive it identically.
+	CLIConfirm = "backyard/cli-confirm/v1"
 )
 
 // Derive returns a 32-byte key for label derived from secret with HKDF-SHA256.

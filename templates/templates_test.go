@@ -218,6 +218,31 @@ func TestRenderServer(t *testing.T) {
 			t.Errorf("unexpected site URLs for the hub %s:\n%s", srv, ip)
 		}
 	}
+	// With the server's /info, the exact URL: sites live under base_domain
+	// (which may differ from the hub's host), with the hub's scheme and port.
+	for _, tc := range []struct {
+		opts      InitOptions
+		want, not string
+	}{
+		{InitOptions{Server: "https://hub.acme.com", BaseDomain: "apps.acme.com", URLMode: "host"},
+			"This site once deployed: https://x.apps.acme.com/;", "x.hub.acme.com"},
+		{InitOptions{Server: "http://hub.acme.test:8080", BaseDomain: "Apps.Acme.Test.", URLMode: "host"},
+			"This site once deployed: http://x.apps.acme.test:8080/;", "(path mode)"},
+		{InitOptions{Server: "https://hub.acme.com", BaseDomain: "apps.acme.com", URLMode: "path"},
+			"This site once deployed: https://hub.acme.com/s/x/;", "x.apps.acme.com"},
+		{InitOptions{Server: "https://hub.acme.com", BaseDomain: "apps.acme.com"},
+			"https://x.apps.acme.com/ (host mode) or https://hub.acme.com/s/x/ (path mode)", "x.hub.acme.com"},
+		{InitOptions{Server: "http://127.0.0.1:8080", BaseDomain: "127.0.0.1", URLMode: "path"},
+			"This site once deployed: http://127.0.0.1:8080/s/x/;", "x.127"},
+		{InitOptions{Server: "https://hub.acme.com", BaseDomain: "evil.com\"><script>", URLMode: "host"},
+			"https://x.hub.acme.com/", "evil.com"},
+	} {
+		tc.opts.Site, tc.opts.Agents = "x", []string{"codex"}
+		doc := string(mustRender(t, tc.opts)["AGENTS.md"])
+		if !strings.Contains(doc, tc.want) || strings.Contains(doc, tc.not) {
+			t.Errorf("%+v: AGENTS.md lacks %q or has %q:\n%s", tc.opts, tc.want, tc.not, doc)
+		}
+	}
 	// Without a server nothing hub-specific is invented.
 	none := mustRender(t, InitOptions{Site: "x", Agents: KnownAgents()})
 	for p, b := range none {

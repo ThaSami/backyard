@@ -389,6 +389,38 @@ func (r *Registry) Refresh(ctx context.Context, name, actor string) (*Meta, erro
 	return m, nil
 }
 
+// FileDigest returns the manifest entry of the object currently stored for
+// path in site: its size, SHA-256 and etag, where the digest is always that
+// of the bytes the etag identifies. It uses a digest the storage service
+// verified itself when the store reports one (blob.DigestReporter, e.g. S3
+// objects uploaded with x-amz-checksum-sha256) and otherwise reads and
+// hashes the object. A missing object yields an error wrapping
+// blob.ErrNotFound.
+func (r *Registry) FileDigest(ctx context.Context, site, path string) (*ManifestFile, error) {
+	if err := checkName(site); err != nil {
+		return nil, err
+	}
+	key := SiteKey(site, path)
+	if dr, ok := r.store.(blob.DigestReporter); ok {
+		info, sum, err := dr.StatSHA256(ctx, key)
+		switch {
+		case err == nil && sum != "":
+			return &ManifestFile{Path: path, Size: info.Size, SHA256: sum, ETag: info.ETag}, nil
+		case errors.Is(err, blob.ErrNotFound):
+			return nil, err
+		case err != nil && ctx.Err() != nil:
+			return nil, ctx.Err()
+		}
+		// No verified digest for this object (or none available): read it.
+	}
+	mf, _, err := r.hashObject(ctx, key, false)
+	if err != nil {
+		return nil, err
+	}
+	mf.Path = path
+	return mf, nil
+}
+
 // hashObject reads an object fully, returning its manifest entry (without
 // Path) and, when keepHead is set, its first TitleScanBytes bytes.
 func (r *Registry) hashObject(ctx context.Context, key string, keepHead bool) (*ManifestFile, []byte, error) {

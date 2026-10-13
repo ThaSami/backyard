@@ -58,6 +58,31 @@ describe("files API", () => {
     expect((await call(`/s/${site}/__backyard/api/files/${info.id}`, { method: "DELETE", headers: { "X-Backyard": "1" } })).status).toBe(204);
   });
 
+  it("sandboxes every upload whose type is not known to be passive (text/xsl included)", async () => {
+    const site = uniqueSite("xsl");
+    const xsl = '<?xml version="1.0"?><xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><html><script>alert(document.domain)</script></html></xsl:template></xsl:stylesheet>';
+    const cases: [string, string, boolean][] = [
+      ["text/xsl", "x.xsl", true],
+      ["application/xslt+xml", "x.xslt", true],
+      ["text/markdown", "x.md", true],
+      ["application/x-anything", "x.bin", true],
+      ["image/png", "x.png", false],
+      ["text/plain", "x.txt", false],
+      ["application/json", "x.json", false],
+      ["audio/mpeg", "x.mp3", false],
+    ];
+    for (const [type, name, sandboxed] of cases) {
+      const res = await upload(site, form(new Blob([xsl], { type }), name));
+      expect(res.status, type).toBe(201);
+      const info = (await res.json()) as { url: string; content_type: string };
+      expect(info.content_type, type).toBe(type);
+      const got = await call(info.url);
+      expect(got.status, type).toBe(200);
+      expect(got.headers.get("Content-Type"), type).toContain(type);
+      expect(got.headers.get("Content-Security-Policy"), type).toBe(sandboxed ? "sandbox" : null);
+    }
+  });
+
   it("rejects malformed uploads", async () => {
     const site = uniqueSite("badup");
     let res = await call(`/s/${site}/__backyard/api/files`, { method: "POST", headers: apiHeaders(), body: "{}" });

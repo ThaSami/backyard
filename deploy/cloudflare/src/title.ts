@@ -68,7 +68,7 @@ function parseAttrs(s: string): Record<string, string> {
       if (i === start) i++;
       continue;
     }
-    if (!(name in attrs)) attrs[name] = val;
+    if (!Object.hasOwn(attrs, name)) attrs[name] = val;
   }
   return attrs;
 }
@@ -81,7 +81,7 @@ function unescapeHTML(s: string): string {
       const cp = e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
       return Number.isFinite(cp) && cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : m;
     }
-    return ENTITIES[e] ?? m;
+    return Object.hasOwn(ENTITIES, e) ? ENTITIES[e]! : m;
   });
 }
 

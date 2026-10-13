@@ -23,6 +23,7 @@ import (
 
 	"github.com/thasami/backyard/internal/config"
 	"github.com/thasami/backyard/internal/warehouse"
+	"github.com/thasami/backyard/internal/warehouse/internal/conv"
 )
 
 func TestConvertValue(t *testing.T) {
@@ -339,7 +340,7 @@ func TestQueryAgainstFakeAPI(t *testing.T) {
 	defer cancel()
 
 	sql := "SELECT day, n FROM t WHERE team = ? AND n > ? AND ok = ? AND x = ?"
-	res, err := s.Query(ctx, sql, []any{"o'brien", int64(5), true, nil}, 1500)
+	res, err := s.Query(ctx, sql, []any{"o'brien", int64(5), true, nil}, warehouse.Limits{MaxRows: 1500})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +400,7 @@ func TestQuerySmallResult(t *testing.T) {
 		rows:    [][]any{{"a"}, {"b"}},
 	}
 	s := newFake(t, f)
-	res, err := s.Query(context.Background(), "SHOW TABLES", nil, 10)
+	res, err := s.Query(context.Background(), "SHOW TABLES", nil, warehouse.Limits{MaxRows: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +412,7 @@ func TestQuerySmallResult(t *testing.T) {
 	}
 
 	// Exactly maxRows rows is not truncated.
-	res, err = s.Query(context.Background(), "SHOW TABLES", nil, 2)
+	res, err = s.Query(context.Background(), "SHOW TABLES", nil, warehouse.Limits{MaxRows: 2})
 	if err != nil || res.Truncated || len(res.Rows) != 2 {
 		t.Fatalf("exact: %+v %v", res, err)
 	}
@@ -422,7 +423,7 @@ func TestQueryStopsOnTimeout(t *testing.T) {
 	s := newFake(t, f)
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	_, err := s.Query(ctx, "SELECT 1", nil, 10)
+	_, err := s.Query(ctx, "SELECT 1", nil, warehouse.Limits{MaxRows: 10})
 	if !errors.Is(err, warehouse.ErrTimeout) {
 		t.Fatalf("err = %v, want ErrTimeout", err)
 	}
@@ -436,7 +437,7 @@ func TestQueryStopsOnTimeout(t *testing.T) {
 func TestQueryStopsWhenPollingFails(t *testing.T) {
 	f := &fakeAthena{pollErr: "AccessDeniedException"}
 	s := newFake(t, f)
-	_, err := s.Query(context.Background(), "SELECT 1", nil, 10)
+	_, err := s.Query(context.Background(), "SELECT 1", nil, warehouse.Limits{MaxRows: 10})
 	if !errors.Is(err, warehouse.ErrForbidden) {
 		t.Fatalf("err = %v, want ErrForbidden", err)
 	}
@@ -453,24 +454,24 @@ func TestQueryFailures(t *testing.T) {
 		"AthenaError":       map[string]any{"ErrorCategory": 2, "ErrorType": 1006},
 	}}
 	s := newFake(t, f)
-	_, err := s.Query(context.Background(), "SELECT x", nil, 10)
+	_, err := s.Query(context.Background(), "SELECT x", nil, warehouse.Limits{MaxRows: 10})
 	if !errors.Is(err, warehouse.ErrBadRequest) || !strings.Contains(err.Error(), "cannot be resolved") {
 		t.Fatalf("failed query: %v", err)
 	}
 
 	f = &fakeAthena{final: "CANCELLED"}
 	s = newFake(t, f)
-	if _, err := s.Query(context.Background(), "SELECT 1", nil, 10); !errors.Is(err, warehouse.ErrUpstream) {
+	if _, err := s.Query(context.Background(), "SELECT 1", nil, warehouse.Limits{MaxRows: 10}); !errors.Is(err, warehouse.ErrUpstream) {
 		t.Fatalf("cancelled query: %v", err)
 	}
 
 	f = &fakeAthena{startErr: "InvalidRequestException"}
 	s = newFake(t, f)
-	if _, err := s.Query(context.Background(), "SELECT 1; SELECT 2", nil, 10); !errors.Is(err, warehouse.ErrBadRequest) {
+	if _, err := s.Query(context.Background(), "SELECT 1; SELECT 2", nil, warehouse.Limits{MaxRows: 10}); !errors.Is(err, warehouse.ErrBadRequest) {
 		t.Fatalf("invalid request: %v", err)
 	}
 
-	if _, err := s.Query(context.Background(), "SELECT ?", []any{[]any{1}}, 10); !errors.Is(err, warehouse.ErrBadRequest) {
+	if _, err := s.Query(context.Background(), "SELECT ?", []any{[]any{1}}, warehouse.Limits{MaxRows: 10}); !errors.Is(err, warehouse.ErrBadRequest) {
 		t.Fatalf("bad param: %v", err)
 	}
 	if s.Placeholder(0) != "?" || s.Close() != nil {
@@ -485,5 +486,42 @@ func TestNewRequiresRegion(t *testing.T) {
 	cfg := aws.Config{}
 	if _, err := New(context.Background(), "x", config.WarehouseSource{}, Options{AWSConfig: &cfg}); err == nil {
 		t.Error("missing region accepted")
+	}
+}
+
+// TestQueryResultSizeCap: a result stops at the last row that fits in
+// Limits.MaxBytes, and no further pages are fetched.
+func TestQueryResultSizeCap(t *testing.T) {
+	f := &fakeAthena{
+		final: "SUCCEEDED", stmtType: "DML", addHeader: true,
+		columns: []map[string]any{{"Name": "i", "Type": "bigint"}, {"Name": "pad", "Type": "varchar"}},
+	}
+	pad := strings.Repeat("x", 1000)
+	for i := range 2500 {
+		f.rows = append(f.rows, []any{strconv.Itoa(i), pad})
+	}
+	s := newFake(t, f)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const limit = 3 << 19 // 1.5 MiB: about 1450 rows
+	want, budget := 0, conv.NewBudget(limit)
+	for budget.Add(map[string]any{"i": int64(want), "pad": pad}) {
+		want++
+	}
+	res, err := s.Query(ctx, "SELECT i, pad FROM t", nil, warehouse.Limits{MaxRows: 2000, MaxBytes: limit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want < 1000 || want >= 2000 || len(res.Rows) != want || res.RowCount != want || !res.Truncated || res.Rows[want-1]["i"] != int64(want-1) {
+		t.Fatalf("rows = %d (want %d) truncated = %v", len(res.Rows), want, res.Truncated)
+	}
+	if b, _ := json.Marshal(res.Rows); len(b) > limit {
+		t.Errorf("rows encode to %d bytes, cap %d", len(b), limit)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.pageReqs) != 2 {
+		t.Errorf("read %d pages, want 2", len(f.pageReqs))
 	}
 }

@@ -34,6 +34,10 @@ type Options struct {
 	Site string
 	// Server is the hub URL recorded in generated docs ("" when unknown).
 	Server string
+	// BaseDomain and URLMode describe Server when known (its /info), so
+	// the docs name the exact site URL (templates.InitOptions).
+	BaseDomain string
+	URLMode    string
 	// Agents selects agent files (default: the templates' default).
 	Agents []string
 	// Template is the template name (default: the templates' default).
@@ -103,6 +107,7 @@ func Init(o Options) (*Result, error) {
 	}
 	files, err := render(templates.InitOptions{
 		Site: o.Site, Server: o.Server, Agents: agents, Template: o.Template, SkipIndex: skipIndex,
+		BaseDomain: o.BaseDomain, URLMode: o.URLMode,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("scaffold: render templates: %w", err)

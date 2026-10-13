@@ -101,6 +101,13 @@ func (a *cliApp) runLogin(ctx context.Context, fl loginFlags) error {
 		}
 	}
 	gateway := clientconfig.GatewayURL(server, gatewayFlag)
+	// The URLs the user chose (flag, environment, profile or prompt). Saved
+	// credentials are only ever matched against these, never against what
+	// the contacted server claims about itself in /info.
+	chosen := []string{server}
+	if g, ok := strings.CutSuffix(gatewayFlag, clientconfig.GatewayPath); ok {
+		chosen = append(chosen, g)
+	}
 
 	info, err := a.fetchInfo(ctx, a.client(gateway, ""))
 	if err != nil {
@@ -146,7 +153,7 @@ func (a *cliApp) runLogin(ctx context.Context, fl loginFlags) error {
 		// pre-shared token (auth.tokens, or DEPLOY_TOKEN on Cloudflare,
 		// which `backyard cloudflare setup` saved on this machine).
 		method = clientconfig.LoginToken
-		if tok, path := a.savedCloudflareToken(server, info.PublicURL); tok != "" {
+		if tok, path := a.savedCloudflareToken(chosen...); tok != "" {
 			a.errf("Using the deploy token saved by the Cloudflare setup (%s).\n", path)
 			cred = credentials{token: tok}
 		} else {

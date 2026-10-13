@@ -5,6 +5,7 @@ import (
 	"html/template"
 	"net/http"
 	"strconv"
+	"strings"
 )
 
 // pageData feeds pageTemplate.
@@ -19,6 +20,11 @@ type pageData struct {
 	ExpiresAt string
 	Command   string
 	Nonce     string
+	// Confirm renders the CLI login confirmation form.
+	Confirm *cliConfirmForm
+	// formAction is an extra CSP form-action source for Confirm (the
+	// target of the redirect that answers the form).
+	formAction string
 }
 
 var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
@@ -46,6 +52,8 @@ textarea, pre { width:100%; font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,mon
 textarea { height:120px; resize:vertical; }
 button { margin-top:8px; font:inherit; padding:6px 14px; border-radius:8px; border:1px solid var(--border);
   background:var(--accent); color:var(--card); cursor:pointer; }
+form { margin-top:16px; display:flex; flex-wrap:wrap; align-items:center; gap:16px; }
+form button { margin-top:0; }
 </style>
 </head>
 <body>
@@ -67,6 +75,16 @@ document.getElementById("copy").addEventListener("click", function () {
   this.textContent = "Copied";
 });
 </script>
+{{end}}
+{{with .Confirm}}
+<form method="post" action="{{.Action}}">
+{{if .RedirectURI}}<input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">{{end}}
+{{if .State}}<input type="hidden" name="state" value="{{.State}}">{{end}}
+{{if .Mode}}<input type="hidden" name="mode" value="{{.Mode}}">{{end}}
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<button id="allow" type="submit">Allow</button>
+<a id="cancel" href="{{.CancelURL}}">Cancel</a>
+</form>
 {{end}}
 {{if .LinkURL}}<p><a href="{{.LinkURL}}">{{.LinkText}}</a></p>{{end}}
 </main>
@@ -99,8 +117,12 @@ func renderPage(w http.ResponseWriter, status int, d pageData) {
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("X-Frame-Options", "DENY")
+	formAction := "'none'"
+	if d.Confirm != nil {
+		formAction = strings.TrimSpace("'self' " + d.formAction)
+	}
 	h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-"+d.Nonce+
-		"'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+		"'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action "+formAction)
 	w.WriteHeader(status)
 	_, _ = w.Write(buf.Bytes())
 }

@@ -9,7 +9,9 @@ import { HttpError } from "../http";
 import { sniff } from "../mime";
 import { readSSE } from "./sse";
 import {
-  dataURL,
+  errorBodyMessage,
+  imageURL,
+  isTimeout,
   stripCodeFences,
   systemWithJSON,
   upstreamError,
@@ -38,7 +40,7 @@ function contentOf(m: Message): string | AnyRecord[] {
   return m.content.map((p) =>
     p.type === "text"
       ? { type: "text", text: p.text ?? "" }
-      : { type: "image_url", image_url: { url: p.data ? dataURL(p.data, p.media_type || "image/png") : (p.url ?? "") } },
+      : { type: "image_url", image_url: { url: imageURL(p) } },
   );
 }
 
@@ -130,7 +132,9 @@ export class WorkersAIProvider implements Provider {
     } catch (e) {
       if (e instanceof HttpError) throw e;
       const msg = e instanceof Error ? e.message : String(e);
-      throw upstreamError(this.name, msg, /rate|limit|capacity|429/i.test(msg) ? 429 : 502);
+      // The binding throws plain errors ("3040: Capacity temporarily exceeded…"):
+      // throttling becomes 429 (→ 429 with a retry hint, else 503), the rest 502.
+      throw upstreamError(this.name, msg, /rate|limit|capacity|429/i.test(msg) ? 429 : isTimeout(e) ? 504 : 0);
     }
   }
 
@@ -163,7 +167,7 @@ export class WorkersAIProvider implements Provider {
       } catch {
         return;
       }
-      if (j.error) throw upstreamError(this.name, typeof j.error === "string" ? j.error : JSON.stringify(j.error));
+      if (j.error) throw upstreamError(this.name, errorBodyMessage(JSON.stringify({ error: j.error })));
       let text = "";
       if (typeof j.response === "string") text = j.response;
       const choice = (j.choices as AnyRecord[] | undefined)?.[0];

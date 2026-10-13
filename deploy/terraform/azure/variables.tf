@@ -613,7 +613,7 @@ variable "rbac_propagation_wait" {
 # -----------------------------------------------------------------------------
 
 variable "vnet_integration" {
-  description = "Run the Container Apps environment in a virtual network and give the Postgres server private access only (delegated subnet + private DNS zone). false (default) uses public endpoints with the Postgres firewall."
+  description = "Run the Container Apps environment in a virtual network and give the Postgres server private access only (delegated subnet + private DNS zone); recommended for production. false (default) gives Postgres a public endpoint whose firewall (postgres_allow_azure_services) admits all of Azure, other tenants included."
   type        = bool
   default     = false
 }
@@ -753,7 +753,7 @@ variable "storage_cors_extra_origins" {
 }
 
 variable "storage_deployer_principal_ids" {
-  description = "Entra object IDs (users, groups or service principals) granted Storage Blob Data Contributor on the container, for direct `backyard deploy --method azure` (az storage blob sync with AZURE_STORAGE_AUTH_MODE=login)."
+  description = "Entra object IDs (users, groups or service principals) granted Storage Blob Data Contributor on the container, for direct `backyard deploy --method azure` (az storage blob sync with AZURE_STORAGE_AUTH_MODE=login). An ABAC condition limits their blob reads, writes, deletes and listings to <storage_prefix>sites/."
   type        = list(string)
   default     = []
 }
@@ -859,7 +859,7 @@ variable "postgres_database_name" {
 }
 
 variable "postgres_allow_azure_services" {
-  description = "Public mode only: add the 0.0.0.0 firewall rule that lets Azure services (including Container Apps) connect. Connections still need the generated password and TLS. Prefer vnet_integration for production."
+  description = "Public mode only: add Azure's 0.0.0.0 \"allow Azure services\" firewall rule, which is how Container Apps (no stable outbound IP without a VNet) reach the server. It admits every Azure IP, including other customers' subscriptions; connections still need TLS and the generated password, and the module warns (check postgres_open_to_all_of_azure). Use vnet_integration for production."
   type        = bool
   default     = true
 }

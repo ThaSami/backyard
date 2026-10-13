@@ -137,11 +137,11 @@ func (s *Source) Placeholder(int) string { return "?" }
 // Close closes the client.
 func (s *Source) Close() error { return s.client.Close() }
 
-// Query runs sql as a query job and returns at most maxRows rows.
-func (s *Source) Query(ctx context.Context, sql string, args []any, maxRows int) (*warehouse.Result, error) {
-	if maxRows <= 0 {
-		maxRows = 1
-	}
+// Query runs sql as a query job and returns the rows that fit within lim.
+// No further pages are fetched once the size cap is reached.
+func (s *Source) Query(ctx context.Context, sql string, args []any, lim warehouse.Limits) (*warehouse.Result, error) {
+	lim = lim.WithDefaults()
+	maxRows := lim.MaxRows
 	q, err := s.newQuery(ctx, sql, args)
 	if err != nil {
 		return nil, err
@@ -163,6 +163,7 @@ func (s *Source) Query(ctx context.Context, sql string, args []any, maxRows int)
 		rows      = make([]map[string]any, 0, min(maxRows, 1024))
 		keys      []string
 		truncated bool
+		budget    = conv.NewBudget(lim.MaxBytes)
 	)
 	for {
 		var vals []bq.Value
@@ -183,6 +184,10 @@ func (s *Source) Query(ctx context.Context, sql string, args []any, maxRows int)
 		row, err := convertRow(vals, it.Schema, keys)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %s: %w", warehouse.ErrUpstream, s.name, err)
+		}
+		if !budget.Add(row) {
+			truncated = true
+			break
 		}
 		rows = append(rows, row)
 	}

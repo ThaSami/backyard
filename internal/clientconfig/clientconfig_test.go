@@ -301,6 +301,10 @@ func TestGatewayAndSiteURLs(t *testing.T) {
 	host := &deploy.Info{PublicURL: "https://backyard.acme.com", URLMode: "host"}
 	path := &deploy.Info{PublicURL: "https://x.workers.dev/", URLMode: "path"}
 	local := &deploy.Info{PublicURL: "http://localhost:8080", URLMode: "host"}
+	// Sites are routed by base_domain, which may differ from the hub's host;
+	// the scheme and port come from the public URL.
+	apps := &deploy.Info{PublicURL: "https://hub.acme.com", BaseDomain: "apps.acme.com", URLMode: "host"}
+	appsPort := &deploy.Info{PublicURL: "http://hub.acme.test:8080/", BaseDomain: "Apps.Acme.Test.", URLMode: "host"}
 	tests := []struct {
 		info         *deploy.Info
 		server, site string
@@ -309,6 +313,9 @@ func TestGatewayAndSiteURLs(t *testing.T) {
 		{host, "", "lunch", "https://lunch.backyard.acme.com/"},
 		{path, "", "lunch", "https://x.workers.dev/s/lunch/"},
 		{local, "", "demo", "http://demo.localhost:8080/"},
+		{apps, "", "lunch", "https://lunch.apps.acme.com/"},
+		{appsPort, "", "lunch", "http://lunch.apps.acme.test:8080/"},
+		{&deploy.Info{PublicURL: "https://hub.acme.com", BaseDomain: "apps.acme.com", URLMode: "path"}, "", "x", "https://hub.acme.com/s/x/"},
 		{nil, "https://b.example.com", "demo", "https://demo.b.example.com/"},
 		{nil, "", "demo", ""},
 	}
@@ -372,8 +379,8 @@ func TestFindProject(t *testing.T) {
 	if err != nil || pf == nil {
 		t.Fatalf("FindProject: %v %v", pf, err)
 	}
-	if pf.Site != "lunch" || pf.Root() != filepath.Join(root, "a") || pf.DeployDir() != filepath.Join(root, "a", "dist") || pf.Ignore[0] != "*.map" {
-		t.Fatalf("unexpected project %+v root=%s dir=%s", pf, pf.Root(), pf.DeployDir())
+	if dd, err := pf.DeployDir(); err != nil || pf.Site != "lunch" || pf.Root() != filepath.Join(root, "a") || dd != filepath.Join(root, "a", "dist") || pf.Ignore[0] != "*.map" {
+		t.Fatalf("unexpected project %+v root=%s dir=%s (%v)", pf, pf.Root(), dd, err)
 	}
 	// A file path starts the search in its directory.
 	f := filepath.Join(deep, "x.txt")
@@ -385,8 +392,10 @@ func TestFindProject(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(deep, ProjectFileName), []byte(`{"site":"inner"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if pf, _ := FindProject(deep); pf == nil || pf.Site != "inner" || pf.DeployDir() != deep {
+	if pf, _ := FindProject(deep); pf == nil || pf.Site != "inner" {
 		t.Fatalf("closest project: %+v", pf)
+	} else if dd, err := pf.DeployDir(); err != nil || dd != deep {
+		t.Fatalf("closest project dir = %q, %v", dd, err)
 	}
 	if err := os.WriteFile(filepath.Join(deep, ProjectFileName), []byte(`{"method":"ftp"}`), 0o644); err != nil {
 		t.Fatal(err)
@@ -399,6 +408,81 @@ func TestFindProject(t *testing.T) {
 	}
 	if _, err := FindProject(deep); err == nil {
 		t.Fatal("expected parse error")
+	}
+}
+
+// TestDeployDirStaysInsideTheProject: a .backyard.json "dir" can only name a
+// folder inside the project, so a project file that came with a cloned
+// repository or a pulled site cannot redirect a plain `backyard deploy` to
+// an unrelated local folder.
+func TestDeployDirStaysInsideTheProject(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "proj")
+	secrets := filepath.Join(base, "secrets")
+	for _, d := range []string{filepath.Join(root, "dist", "inner"), secrets} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pf := func(dir string) *ProjectFile {
+		return &ProjectFile{Path: filepath.Join(root, ProjectFileName), Project: Project{Dir: dir}}
+	}
+	for dir, want := range map[string]string{
+		"":             root,
+		".":            root,
+		"dist":         filepath.Join(root, "dist"),
+		"./dist/":      filepath.Join(root, "dist"),
+		"dist/inner":   filepath.Join(root, "dist", "inner"),
+		"dist/../dist": filepath.Join(root, "dist"),
+		"not-yet":      filepath.Join(root, "not-yet"), // missing: reported by the caller
+	} {
+		if got, err := pf(dir).DeployDir(); err != nil || got != want {
+			t.Errorf("DeployDir(%q) = %q, %v; want %q", dir, got, err, want)
+		}
+	}
+	for _, dir := range []string{secrets, "/", "..", "../secrets", "dist/../../secrets", "../../..", "~/../.."} {
+		got, err := pf(dir).DeployDir()
+		if dir == "~/../.." {
+			// "~" is an ordinary folder name here; "~/../.." leaves the project.
+			if err == nil {
+				t.Errorf("DeployDir(%q) = %q, want an error", dir, got)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), ProjectFileName) || !strings.Contains(err.Error(), "inside") {
+			t.Errorf("DeployDir(%q) = %q, %v; want an error naming the project file", dir, got, err)
+		}
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	// A symlink inside the project that leads out of it is refused too.
+	if err := os.Symlink(secrets, filepath.Join(root, "dist", "out")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../secrets", filepath.Join(root, "build")); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{"dist/out", "build"} {
+		if got, err := pf(dir).DeployDir(); err == nil || !strings.Contains(err.Error(), "symlink") {
+			t.Errorf("DeployDir(%q) = %q, %v; want a symlink error", dir, got, err)
+		}
+	}
+	// A symlink that stays inside is fine, and so is a project reached
+	// through a symlinked parent.
+	if err := os.Symlink("dist", filepath.Join(root, "current")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := pf("current").DeployDir(); err != nil || got != filepath.Join(root, "current") {
+		t.Errorf("DeployDir(current) = %q, %v", got, err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(root, link); err != nil {
+		t.Fatal(err)
+	}
+	viaLink := &ProjectFile{Path: filepath.Join(link, ProjectFileName), Project: Project{Dir: "dist"}}
+	if got, err := viaLink.DeployDir(); err != nil || got != filepath.Join(link, "dist") {
+		t.Errorf("DeployDir via a symlinked project = %q, %v", got, err)
 	}
 }
 

@@ -22,9 +22,16 @@
 // the router fills in an estimate (about four bytes per token, a flat cost
 // per image) so per-user token limits cannot be bypassed.
 //
+// Image URLs of the calling site's own content (site-relative upload URLs
+// such as /__backyard/files/{id}/{name}, and absolute URLs of the site's
+// origin) are loaded through the request's ai.ImageResolver, when the HTTP
+// layer supplies one, and sent as inline bytes; without a resolver
+// site-relative URLs are rejected.
+//
 // Untrusted input is contained: image URLs that a provider needs as inline
 // bytes are downloaded by an SSRF-guarded fetcher within a per-request byte
-// budget (MaxRemoteImageBytes); end-user ids are replaced by keyed opaque ids
+// budget (MaxRemoteImageBytes, shared with images loaded through the
+// resolver); end-user ids are replaced by keyed opaque ids
 // (Options.UserIDKey) before they reach a provider; generated images get
 // their media type from their content, and non-raster formats are refused.
 package router
@@ -74,9 +81,10 @@ const (
 	// MaxEmbedBytes bounds the total size of an embedding request's input.
 	MaxEmbedBytes = 8 << 20
 	// MaxRemoteImageBytes bounds the total size of the image URLs one chat
-	// request makes Backyard download (for providers that need inline
-	// bytes: Bedrock, Gemini, Claude on Vertex AI/Bedrock, Ollama and other
-	// self-hosted OpenAI-compatible servers).
+	// request makes Backyard load: the site's own uploads (through the
+	// request's ai.ImageResolver) and downloads for providers that need
+	// inline bytes (Bedrock, Gemini, Claude on Vertex AI/Bedrock, Ollama and
+	// other self-hosted OpenAI-compatible servers).
 	MaxRemoteImageBytes = 64 << 20
 
 	defaultMaxTokens      = 8192
@@ -386,14 +394,18 @@ func (r *Router) Chat(ctx context.Context, alias string, req ai.ChatRequest) (*a
 	if err != nil {
 		return nil, err
 	}
-	preq, err := r.prepareChat(rt, req)
+	preq, local, err := r.prepareChat(rt, req)
 	if err != nil {
 		return nil, err
 	}
 	cctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
-	cctx = imagefetch.WithBudget(cctx, MaxRemoteImageBytes)
 	start := time.Now()
+	used, err := resolveLocalImages(cctx, req.ResolveImage, local, preq.Messages)
+	if err != nil {
+		return nil, r.upstreamErr(ctx, rt, "chat", start, r.timeout, err)
+	}
+	cctx = imagefetch.WithBudget(cctx, MaxRemoteImageBytes-used)
 	resp, err := rt.provider.Chat(cctx, preq)
 	return r.finishChat(ctx, rt, "chat", start, r.timeout, preq, resp, err)
 }
@@ -404,7 +416,7 @@ func (r *Router) ChatStream(ctx context.Context, alias string, req ai.ChatReques
 	if err != nil {
 		return nil, err
 	}
-	preq, err := r.prepareChat(rt, req)
+	preq, local, err := r.prepareChat(rt, req)
 	if err != nil {
 		return nil, err
 	}
@@ -413,8 +425,12 @@ func (r *Router) ChatStream(ctx context.Context, alias string, req ai.ChatReques
 	}
 	cctx, cancel := context.WithTimeout(ctx, r.longTimeout)
 	defer cancel()
-	cctx = imagefetch.WithBudget(cctx, MaxRemoteImageBytes)
 	start := time.Now()
+	used, err := resolveLocalImages(cctx, req.ResolveImage, local, preq.Messages)
+	if err != nil {
+		return nil, r.upstreamErr(ctx, rt, "chat_stream", start, r.longTimeout, err)
+	}
+	cctx = imagefetch.WithBudget(cctx, MaxRemoteImageBytes-used)
 	resp, err := rt.provider.ChatStream(cctx, preq, onDelta)
 	return r.finishChat(ctx, rt, "chat_stream", start, r.longTimeout, preq, resp, err)
 }
@@ -634,10 +650,14 @@ func (r *Router) Embed(ctx context.Context, alias string, req ai.EmbedRequest) (
 // ---------------------------------------------------------------------------
 // Request preparation
 
-// prepareChat validates req and returns the provider-level request for rt.
-// The caller's slices are never modified.
-func (r *Router) prepareChat(rt route, req ai.ChatRequest) (ai.ChatRequest, error) {
+// prepareChat validates req and returns the provider-level request for rt,
+// plus the image URLs that req.ResolveImage is offered (none without a
+// resolver; see resolveLocalImages). The caller's slices are never modified.
+func (r *Router) prepareChat(rt route, req ai.ChatRequest) (ai.ChatRequest, []localImage, error) {
 	out := ai.ChatRequest{Model: rt.model, JSON: req.JSON, User: ai.KeyedUserID(r.userKey, req.User)}
+	resolvable := req.ResolveImage != nil
+	var local []localImage
+	offered := map[string]bool{}
 
 	var system []string
 	if r.systemPrompt != "" {
@@ -654,7 +674,7 @@ func (r *Router) prepareChat(rt route, req ai.ChatRequest) (ai.ChatRequest, erro
 		case "system", "developer":
 			for _, p := range m.Content {
 				if t := strings.ToLower(p.Type); t != "" && t != "text" {
-					return out, fmt.Errorf("%w: message %d: system messages may only contain text", ai.ErrBadRequest, i)
+					return out, nil, fmt.Errorf("%w: message %d: system messages may only contain text", ai.ErrBadRequest, i)
 				}
 			}
 			if t := strings.TrimSpace(ai.TextOf(textTyped(m.Content))); t != "" {
@@ -663,24 +683,28 @@ func (r *Router) prepareChat(rt route, req ai.ChatRequest) (ai.ChatRequest, erro
 			continue
 		case "user", "assistant":
 		case "":
-			return out, fmt.Errorf("%w: message %d: role is required", ai.ErrBadRequest, i)
+			return out, nil, fmt.Errorf("%w: message %d: role is required", ai.ErrBadRequest, i)
 		default:
-			return out, fmt.Errorf("%w: message %d: role must be user, assistant or system; got %q", ai.ErrBadRequest, i, m.Role)
+			return out, nil, fmt.Errorf("%w: message %d: role must be user, assistant or system; got %q", ai.ErrBadRequest, i, m.Role)
 		}
 		parts := make([]ai.Part, 0, len(m.Content))
 		for j, p := range m.Content {
-			np, keep, err := normalizePart(p)
+			np, keep, err := normalizePart(p, resolvable)
 			if err != nil {
-				return out, fmt.Errorf("%w: message %d part %d: %v", ai.ErrBadRequest, i, j, err)
+				return out, nil, fmt.Errorf("%w: message %d part %d: %v", ai.ErrBadRequest, i, j, err)
 			}
 			if !keep {
 				continue
 			}
 			if np.Type == "image" {
 				if role != "user" {
-					return out, fmt.Errorf("%w: message %d: images are only allowed in user messages", ai.ErrBadRequest, i)
+					return out, nil, fmt.Errorf("%w: message %d: images are only allowed in user messages", ai.ErrBadRequest, i)
 				}
 				images++
+				if resolvable && np.URL != "" && !offered[np.URL] {
+					offered[np.URL] = true
+					local = append(local, localImage{url: np.URL, msg: i, part: j, relative: siteRelative(np.URL)})
+				}
 			}
 			parts = append(parts, np)
 		}
@@ -694,10 +718,10 @@ func (r *Router) prepareChat(rt route, req ai.ChatRequest) (ai.ChatRequest, erro
 		msgs = append(msgs, ai.Message{Role: role, Content: parts})
 	}
 	if images > MaxImagesPerRequest {
-		return out, fmt.Errorf("%w: at most %d images per request", ai.ErrBadRequest, MaxImagesPerRequest)
+		return out, nil, fmt.Errorf("%w: at most %d images per request", ai.ErrBadRequest, MaxImagesPerRequest)
 	}
 	if len(msgs) == 0 {
-		return out, fmt.Errorf("%w: messages must contain at least one non-empty user or assistant message", ai.ErrBadRequest)
+		return out, nil, fmt.Errorf("%w: messages must contain at least one non-empty user or assistant message", ai.ErrBadRequest)
 	}
 	out.Messages = msgs
 	out.System = strings.Join(system, "\n\n")
@@ -710,7 +734,7 @@ func (r *Router) prepareChat(rt route, req ai.ChatRequest) (ai.ChatRequest, erro
 	}
 	switch {
 	case req.MaxTokens < 0:
-		return out, fmt.Errorf("%w: max_tokens must be positive", ai.ErrBadRequest)
+		return out, nil, fmt.Errorf("%w: max_tokens must be positive", ai.ErrBadRequest)
 	case req.MaxTokens == 0:
 		out.MaxTokens = min(defaultResponseTokens, limit)
 	default:
@@ -720,7 +744,7 @@ func (r *Router) prepareChat(rt route, req ai.ChatRequest) (ai.ChatRequest, erro
 	if req.Temperature != nil {
 		t := *req.Temperature
 		if math.IsNaN(t) || t < 0 || t > 2 {
-			return out, fmt.Errorf("%w: temperature must be between 0 and 2", ai.ErrBadRequest)
+			return out, nil, fmt.Errorf("%w: temperature must be between 0 and 2", ai.ErrBadRequest)
 		}
 		out.Temperature = &t
 	}
@@ -731,11 +755,11 @@ func (r *Router) prepareChat(rt route, req ai.ChatRequest) (ai.ChatRequest, erro
 	case req.Effort != "":
 		e := strings.ToLower(strings.TrimSpace(req.Effort))
 		if !ai.ValidEffort(e) {
-			return out, fmt.Errorf("%w: effort must be low, medium, high, xhigh or max", ai.ErrBadRequest)
+			return out, nil, fmt.Errorf("%w: effort must be low, medium, high, xhigh or max", ai.ErrBadRequest)
 		}
 		out.Effort = e
 	}
-	return out, nil
+	return out, local, nil
 }
 
 // blank reports whether parts carry no image and only whitespace text
@@ -780,8 +804,9 @@ var allowedImageTypes = map[string]string{
 }
 
 // normalizePart validates one content part. keep is false for parts that
-// carry nothing (empty text).
-func normalizePart(p ai.Part) (ai.Part, bool, error) {
+// carry nothing (empty text). Site-relative image URLs are accepted only
+// when the request has an image resolver (resolvable).
+func normalizePart(p ai.Part, resolvable bool) (ai.Part, bool, error) {
 	switch strings.ToLower(strings.TrimSpace(p.Type)) {
 	case "text", "":
 		if p.Type == "" && (len(p.Data) > 0 || p.URL != "") {
@@ -808,10 +833,7 @@ func normalizePart(p ai.Part) (ai.Part, bool, error) {
 			if len(data) > MaxImageBytes {
 				return ai.Part{}, false, fmt.Errorf("image exceeds %d MiB", MaxImageBytes>>20)
 			}
-			mt = strings.ToLower(strings.TrimSpace(mt))
-			if i := strings.IndexByte(mt, ';'); i >= 0 {
-				mt = strings.TrimSpace(mt[:i])
-			}
+			mt = normalizeMediaType(mt)
 			if mt == "" {
 				mt = sniff(data)
 			}
@@ -824,8 +846,17 @@ func normalizePart(p ai.Part) (ai.Part, bool, error) {
 		if u == "" {
 			return ai.Part{}, false, errors.New("image needs data or url")
 		}
-		parsed, err := url.Parse(u)
-		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || len(u) > maxURLLen {
+		if len(u) > maxURLLen {
+			return ai.Part{}, false, fmt.Errorf("image url exceeds %d bytes", maxURLLen)
+		}
+		if siteRelative(u) {
+			if !resolvable {
+				return ai.Part{}, false, errors.New("image url must be an absolute http(s) URL")
+			}
+		} else if parsed, err := url.Parse(u); err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			if resolvable {
+				return ai.Part{}, false, errors.New("image url must be an absolute http(s) URL or a site-relative URL of an uploaded file")
+			}
 			return ai.Part{}, false, errors.New("image url must be an absolute http(s) URL")
 		}
 		out := ai.Part{Type: "image", URL: u}
@@ -838,6 +869,124 @@ func normalizePart(p ai.Part) (ai.Part, bool, error) {
 	default:
 		return ai.Part{}, false, fmt.Errorf("unsupported content type %q", p.Type)
 	}
+}
+
+// siteRelative reports whether u is a site-relative URL reference ("/path",
+// not the network-path reference "//host/path", which names a host) that
+// parses as a URL.
+func siteRelative(u string) bool {
+	if !strings.HasPrefix(u, "/") || strings.HasPrefix(u, "//") || strings.HasPrefix(u, `/\`) {
+		return false
+	}
+	parsed, err := url.Parse(u)
+	return err == nil && parsed.Scheme == "" && parsed.Host == ""
+}
+
+// localImage is an image URL of a chat request that is offered to the
+// request's ImageResolver, with the client-side position of its first use
+// (for error messages).
+type localImage struct {
+	url       string
+	msg, part int
+	relative  bool // site-relative: must be served by the resolver
+}
+
+// resolvedImage is the outcome of offering one URL to a resolver.
+type resolvedImage struct {
+	data   []byte
+	mt     string
+	remote bool // ErrNotLocal: keep the URL
+}
+
+// resolveLocalImages loads the images that resolve serves (a site's own
+// uploads) and replaces their URL parts in msgs (the router's own copy)
+// with inline bytes. Each distinct URL is resolved once, in request order.
+// Site-relative URLs must resolve; absolute URLs the resolver does not
+// serve (ai.ErrNotLocal) are left for the provider or the SSRF-guarded
+// fetcher. Loaded bytes count against MaxRemoteImageBytes, like
+// downloads; the number of bytes loaded is returned so the caller can give
+// downloads what is left.
+func resolveLocalImages(ctx context.Context, resolve ai.ImageResolver, local []localImage, msgs []ai.Message) (int64, error) {
+	if resolve == nil || len(local) == 0 {
+		return 0, nil
+	}
+	var used int64
+	results := make(map[string]resolvedImage, len(local))
+	for _, li := range local {
+		limit := min(int64(MaxImageBytes), MaxRemoteImageBytes-used)
+		if limit <= 0 {
+			return used, fmt.Errorf("%w: message %d part %d: images loaded from URLs exceed %d MiB per request",
+				ai.ErrBadRequest, li.msg, li.part, MaxRemoteImageBytes>>20)
+		}
+		data, err := resolve(ctx, li.url, limit)
+		if err != nil {
+			if errors.Is(err, ai.ErrNotLocal) && !li.relative && ctx.Err() == nil {
+				results[li.url] = resolvedImage{remote: true}
+				continue
+			}
+			return used, resolveError(ctx, li, err)
+		}
+		switch n := int64(len(data)); {
+		case n == 0:
+			return used, fmt.Errorf("%w: message %d part %d: image is empty", ai.ErrBadRequest, li.msg, li.part)
+		case n > limit && limit < MaxImageBytes:
+			return used, fmt.Errorf("%w: message %d part %d: images loaded from URLs exceed %d MiB per request",
+				ai.ErrBadRequest, li.msg, li.part, MaxRemoteImageBytes>>20)
+		case n > limit:
+			return used, fmt.Errorf("%w: message %d part %d: image exceeds %d MiB", ai.ErrBadRequest, li.msg, li.part, MaxImageBytes>>20)
+		}
+		// Detection recognises every allowed format, so stored (client
+		// declared) content types are not consulted.
+		mt, ok := allowedImageTypes[sniff(data)]
+		if !ok {
+			return used, fmt.Errorf("%w: message %d part %d: file is not a png, jpeg, gif or webp image",
+				ai.ErrBadRequest, li.msg, li.part)
+		}
+		used += int64(len(data))
+		results[li.url] = resolvedImage{data: data, mt: mt}
+	}
+	for i := range msgs {
+		for j := range msgs[i].Content {
+			p := &msgs[i].Content[j]
+			if p.Type != "image" || p.URL == "" {
+				continue
+			}
+			if res, ok := results[p.URL]; ok && !res.remote {
+				*p = ai.Part{Type: "image", Data: res.data, MediaType: res.mt}
+			}
+		}
+	}
+	return used, nil
+}
+
+// resolveError converts a resolver failure: cancellation and deadlines pass
+// through (the caller maps our own deadline to 504), bad requests keep their
+// message with the part's position, and anything else (a storage failure)
+// is wrapped.
+func resolveError(ctx context.Context, li localImage, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("ai: load image: %w", ctxErr)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("ai: load image: %w", err)
+	}
+	if errors.Is(err, ai.ErrBadRequest) {
+		msg := strings.TrimPrefix(err.Error(), ai.ErrBadRequest.Error()+": ")
+		return fmt.Errorf("%w: message %d part %d: %s", ai.ErrBadRequest, li.msg, li.part, msg)
+	}
+	if errors.Is(err, ai.ErrNotLocal) {
+		return fmt.Errorf("%w: message %d part %d: image url does not refer to a file of this site", ai.ErrBadRequest, li.msg, li.part)
+	}
+	return fmt.Errorf("ai: message %d part %d: load image: %w", li.msg, li.part, err)
+}
+
+// normalizeMediaType lower-cases a media type and drops its parameters.
+func normalizeMediaType(mt string) string {
+	mt = strings.ToLower(strings.TrimSpace(mt))
+	if i := strings.IndexByte(mt, ';'); i >= 0 {
+		mt = strings.TrimSpace(mt[:i])
+	}
+	return mt
 }
 
 func sniff(data []byte) string {

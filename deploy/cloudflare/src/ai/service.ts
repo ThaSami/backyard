@@ -85,7 +85,7 @@ export class AIService {
   /** Whether alias names a configured model (or an allowed raw model). */
   known(alias: string): boolean {
     if (!alias) return true;
-    if (alias in this.cfg.ai.models) return true;
+    if (Object.hasOwn(this.cfg.ai.models, alias)) return true;
     return this.cfg.ai.allowRawModels && (alias.includes("/") || alias.startsWith("@"));
   }
 
@@ -111,7 +111,7 @@ export class AIService {
     const ai = this.cfg.ai;
     const name = alias || this.defaultAlias(kind);
     if (!name) throw new HttpError(501, "unsupported", `no ${kind} model is available on this server`);
-    const mc = ai.models[name];
+    const mc = Object.hasOwn(ai.models, name) ? ai.models[name] : undefined;
     if (mc) {
       if (mc.kind !== kind) throw new HttpError(400, "bad_request", `model ${JSON.stringify(name)} is a ${mc.kind} model, not a ${kind} model`);
       this.requireAvailable(name, mc.provider);

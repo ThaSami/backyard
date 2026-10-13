@@ -109,11 +109,13 @@ function wsAccept(req, socket, handlers) {
 // --- server -------------------------------------------------------------------
 
 /**
- * Starts the stub. opts: { info, requireToken, guest, sites, pages: {"/s/demo/": html},
+ * Starts the stub. opts: { info, requireToken, tokens, guest, sites, pages: {"/s/demo/": html},
  * presign: { cors } (deploy uploads go to a cross-origin "bucket"), expiredSession
  * (docs requests redirect to /__backyard/auth/login) }.
  * guest: visitors are anonymous guests (like AUTH_MODE=none on the Cloudflare
  * edition): deleting sites then needs the deploy token.
+ * tokens: {"<bearer token>": User} — the accounts of API tokens, as the deploy
+ * gateway's GET /me reports them (requireToken is "token:deploy", an admin).
  * Returns { url, state, close() }.
  */
 export async function startStub(opts = {}) {
@@ -140,6 +142,13 @@ export async function startStub(opts = {}) {
     const email = m ? decodeURIComponent(m[1]) : "alice@acme.com";
     const name = email.split("@")[0].replace(/^./, (c) => c.toUpperCase());
     return { id: email, email, name, groups: [], anonymous: false, admin: email.startsWith("admin") };
+  };
+  /** The account of a bearer token ("Bearer <token>" or the bare token), or null if unknown. */
+  const tokenUser = (auth) => {
+    const tok = String(auth || "").replace(/^Bearer\s+/i, "");
+    if (!tok) return null;
+    if (state.requireToken && tok === state.requireToken) return { id: "token:deploy", name: "deploy", groups: [], anonymous: false, admin: true };
+    return (opts.tokens && Object.hasOwn(opts.tokens, tok) && opts.tokens[tok]) || null;
   };
   const summary = (u) => ({ id: u.id, name: u.name, email: u.email });
   const now = () => new Date().toISOString();
@@ -275,6 +284,15 @@ export async function startStub(opts = {}) {
     }
     if (path === "/me") return json(res, 200, user);
     if (path === "/sites") return json(res, 200, { sites: state.sites });
+    // GET G/me (SPEC §7.2): a bearer token takes priority over the visitor's identity.
+    if (path === "/deploy/me" && method === "GET") {
+      if (!req.headers.authorization) {
+        if (user.anonymous && state.requireToken) return apiError(res, 401, "unauthenticated", "a token is required (run: backyard login)");
+        return json(res, 200, user);
+      }
+      const tu = tokenUser(req.headers.authorization);
+      return tu ? json(res, 200, tu) : apiError(res, 401, "unauthenticated", "invalid or expired token (run: backyard login)");
+    }
 
     // Deploy gateway (SPEC §7.3).
     if ((m = /^\/deploy\/sites\/([a-z0-9-]+)\/deploys$/.exec(path)) && method === "POST") {
@@ -320,7 +338,8 @@ export async function startStub(opts = {}) {
       if (!dep) return apiError(res, 404, "not_found", "unknown deploy");
       for (const f of jsonBody().files) if (!state.stored.has(m[1] + "/" + f.path)) return apiError(res, 400, "bad_request", "missing " + f.path);
       dep.committed = true;
-      const meta = { name: m[1], url: base + "/s/" + m[1] + "/", title: m[1], created_at: now(), updated_at: now(), updated_by: user.id, file_count: dep.files.length, bytes: 0, owners: [] };
+      const actor = tokenUser(req.headers.authorization) || user;
+      const meta = { name: m[1], url: base + "/s/" + m[1] + "/", title: m[1], created_at: now(), updated_at: now(), updated_by: actor.id, file_count: dep.files.length, bytes: 0, owners: [] };
       state.sites = state.sites.filter((s) => s.name !== m[1]).concat([meta]);
       return json(res, 200, { site: meta, url: meta.url, deleted: 0 });
     }

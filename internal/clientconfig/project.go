@@ -39,16 +39,47 @@ type ProjectFile struct {
 // Root returns the directory containing the project file.
 func (p *ProjectFile) Root() string { return filepath.Dir(p.Path) }
 
-// DeployDir returns the absolute folder to deploy (Root joined with Dir).
-func (p *ProjectFile) DeployDir() string {
+// DeployDir returns the absolute folder to deploy: Dir resolved against the
+// folder holding the project file (Root). Dir must name a folder inside Root:
+// an absolute path, a ".." that leaves Root or a symlink to a folder outside
+// it is an error naming the file. A .backyard.json that arrived with a cloned
+// repository or a pulled site therefore cannot point a plain `backyard
+// deploy` at an unrelated local folder.
+func (p *ProjectFile) DeployDir() (string, error) {
+	root := p.Root()
 	d := strings.TrimSpace(p.Dir)
 	if d == "" {
-		return p.Root()
+		return root, nil
 	}
-	if filepath.IsAbs(d) {
-		return filepath.Clean(d)
+	bad := func(why string) error {
+		return fmt.Errorf("clientconfig: %s: \"dir\" %q %s; it must name a folder inside %s (paths are relative to the file)",
+			p.Path, p.Dir, why, root)
 	}
-	return filepath.Join(p.Root(), filepath.FromSlash(d))
+	if filepath.IsAbs(d) || filepath.VolumeName(d) != "" || strings.HasPrefix(d, "/") || strings.HasPrefix(d, `\`) {
+		return "", bad("is an absolute path")
+	}
+	dir := filepath.Join(root, filepath.FromSlash(d))
+	if !within(root, dir) {
+		return "", bad("leaves the project folder")
+	}
+	// A symlink (dist -> /elsewhere) must not lead out either. A folder that
+	// does not exist yet is left to the caller, which reports it.
+	if realDir, err := filepath.EvalSymlinks(dir); err == nil {
+		realRoot, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			realRoot = root
+		}
+		if !within(realRoot, realDir) {
+			return "", bad("leads (through a symlink) to " + realDir + ", outside the project folder")
+		}
+	}
+	return dir, nil
+}
+
+// within reports whether p is root or inside it (both absolute and clean).
+func within(root, p string) bool {
+	rel, err := filepath.Rel(root, p)
+	return err == nil && !filepath.IsAbs(rel) && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // FindProject searches start and its parents for .backyard.json. It returns

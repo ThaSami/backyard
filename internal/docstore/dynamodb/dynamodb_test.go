@@ -6,7 +6,9 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -174,5 +176,116 @@ func TestDeleteSiteManyDocuments(t *testing.T) {
 		if len(p.Docs) != 0 {
 			t.Errorf("collection c%d still has %d docs", i, len(p.Docs))
 		}
+	}
+}
+
+// hookTransport runs a hook (once, when armed) before forwarding the first
+// request for the given DynamoDB operation.
+type hookTransport struct {
+	op string
+	mu sync.Mutex
+	fn func()
+}
+
+func (h *hookTransport) arm(fn func()) {
+	h.mu.Lock()
+	h.fn = fn
+	h.mu.Unlock()
+}
+
+func (h *hookTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(r.Header.Get("X-Amz-Target"), "."+h.op) {
+		h.mu.Lock()
+		fn := h.fn
+		h.fn = nil
+		h.mu.Unlock()
+		if fn != nil {
+			fn()
+		}
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// Update is optimistic: it reads the item, merges and writes it back on
+// condition. A delete and re-create of the document between the read and the
+// write starts the version over and must not let the write through: the
+// update applies to the new document, as on every other backend, instead of
+// bringing back the deleted one.
+func TestUpdateAfterDeleteAndRecreate(t *testing.T) {
+	ep := testEndpoint(t)
+	plain := testClient(ep)
+	table := testTable(t, plain)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	other, err := dynamodb.New(ctx, plain, config.DynamoDBConfig{Table: table, CreateTable: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook := &hookTransport{op: "PutItem"}
+	hooked := awsddb.New(awsddb.Options{
+		Region:       "us-east-1",
+		BaseEndpoint: aws.String(ep),
+		Credentials:  credentials.NewStaticCredentialsProvider("test", "test", ""),
+		HTTPClient:   &http.Client{Transport: hook},
+	})
+	s, err := dynamodb.New(ctx, hooked, config.DynamoDBConfig{Table: table})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type op func(id string) error
+	create := func(data map[string]any, actor string) op {
+		return func(id string) error { _, err := other.Create(ctx, "site", "c", id, data, actor); return err }
+	}
+	put := func(data map[string]any, actor string) op {
+		return func(id string) error { _, err := other.Put(ctx, "site", "c", id, data, actor); return err }
+	}
+	del := func(id string) error { _, err := other.Delete(ctx, "site", "c", id); return err }
+	run := func(id string, ops []op) error {
+		for _, o := range ops {
+			if err := o(id); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	old, fresh := map[string]any{"title": "old", "secret": 1}, map[string]any{"title": "fresh"}
+
+	for _, tc := range []struct {
+		name     string
+		setup    []op // by alice, before the update
+		recreate []op // by bob, between the update's read and its write
+		wantVer  int64
+	}{
+		{"create", []op{create(old, "alice")}, []op{del, create(fresh, "bob")}, 2},
+		// The re-created document is back at version 2, like the item read.
+		{"put twice", []op{put(old, "alice"), put(old, "alice")}, []op{del, put(fresh, "bob"), put(fresh, "bob")}, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "doc-" + strings.ReplaceAll(tc.name, " ", "-")
+			if err := run(id, tc.setup); err != nil {
+				t.Fatal(err)
+			}
+			fired, hookErr := false, error(nil)
+			hook.arm(func() { fired, hookErr = true, run(id, tc.recreate) })
+			got, err := s.Update(ctx, "site", "c", id, map[string]any{"votes": 1}, "carol")
+			if err != nil {
+				t.Fatalf("Update: %v", err)
+			}
+			if !fired || hookErr != nil {
+				t.Fatalf("re-creating the document during the update: ran=%v err=%v", fired, hookErr)
+			}
+			stored, err := other.Get(ctx, "site", "c", id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]any{"title": "fresh", "votes": 1.0}
+			for what, d := range map[string]*docstore.Doc{"returned": got, "stored": stored} {
+				if !reflect.DeepEqual(d.Data, want) || d.Version != tc.wantVer || d.CreatedBy != "bob" || d.UpdatedBy != "carol" {
+					t.Errorf("%s document = %v version %d created_by %q updated_by %q; want %v version %d created_by bob updated_by carol",
+						what, d.Data, d.Version, d.CreatedBy, d.UpdatedBy, want, tc.wantVer)
+				}
+			}
+		})
 	}
 }

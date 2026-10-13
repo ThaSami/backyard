@@ -155,6 +155,11 @@ function numericClaim(p: Record<string, unknown>, k: string): number | undefined
  * HKDF-derived key is accepted; iss must be "backyard" and scope "api".
  */
 export async function verifyAPIToken(secret: string, token: string, nowSeconds = Math.floor(Date.now() / 1000)): Promise<User> {
+  return (await verifyAPITokenClaims(secret, token, nowSeconds)).user;
+}
+
+/** Like verifyAPIToken, also returning the token's expiry ("exp", Unix seconds). */
+export async function verifyAPITokenClaims(secret: string, token: string, nowSeconds = Math.floor(Date.now() / 1000)): Promise<{ user: User; exp: number }> {
   const t = parseJWT(token);
   if (!t) throw new TokenError("malformed api token");
   if (t.header.alg !== "HS256") throw new TokenError("unexpected signing algorithm");
@@ -179,7 +184,7 @@ export async function verifyAPIToken(secret: string, token: string, nowSeconds =
   const u: User = { id: sub, name: name || sub, anonymous: sub.startsWith("anon:"), admin: p.admin === true };
   if (email) u.email = email;
   if (groups.length) u.groups = groups;
-  return u;
+  return { user: u, exp };
 }
 
 // --- RS256 (Cloudflare Access) ----------------------------------------------

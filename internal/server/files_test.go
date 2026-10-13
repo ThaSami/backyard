@@ -275,6 +275,75 @@ func TestFilesActiveContentSandboxed(t *testing.T) {
 	}
 }
 
+// TestFilesClientTypeSandboxed: the client declares an upload's type, and
+// browsers run script in more document types than HTML and *+xml (Chromium
+// renders text/xsl as an XML document). Only known passive types are served
+// without the sandbox, in both URL modes.
+func TestFilesClientTypeSandboxed(t *testing.T) {
+	const xsl = `<?xml version="1.0"?><x:script xmlns:x="http://www.w3.org/1999/xhtml">alert(document.domain)</x:script>`
+	for _, mode := range []string{"host", "path"} {
+		t.Run(mode, func(t *testing.T) {
+			opts := []option{}
+			upURL, base := filesURL, "https://foo.backyard.test"
+			if mode == "path" {
+				opts = append(opts, pathMode())
+				upURL, base = "https://backyard.test/s/foo/__backyard/api/files", "https://backyard.test"
+			}
+			h := newHarness(t, opts...)
+			tests := []struct {
+				ctype, name string
+				sandboxed   bool
+			}{
+				{"text/xsl", "up.txt", true},
+				{"TEXT/XSL; charset=utf-8", "up.xsl", true},
+				{"application/xslt+xml", "up.bin", true},
+				{"video/x+xml", "up.mp4", true},
+				{"audio/evil+xml", "up.mp3", true},
+				{"application/x-unknown-thing", "up.dat", true},
+				{"text/javascript", "up.js", true},
+				{"image/svg+xml", "up.png", true},
+				{"text/plain", "up.txt", false},
+				{"image/png", "up.png", false},
+				{"video/mp4", "up.mp4", false},
+				{"application/pdf", "up.pdf", false},
+			}
+			for _, tt := range tests {
+				body, ct := multipartBody(t, part{field: "file", filename: tt.name, ctype: tt.ctype, content: xsl})
+				w := h.serve(req{method: "POST", url: upURL, body: body,
+					hdr: map[string]string{"X-Backyard": "1", "Content-Type": ct, "Origin": base}})
+				expectStatus(t, w, 201)
+				var fi fileJSON
+				mustJSON(t, w.Body.Bytes(), &fi)
+				g := h.get(base + fi.URL)
+				expectStatus(t, g, 200)
+				if got := g.Header().Get("Content-Security-Policy") == "sandbox"; got != tt.sandboxed {
+					t.Errorf("%s (stored %q, served %q): sandboxed = %v, want %v",
+						tt.ctype, fi.ContentType, g.Header().Get("Content-Type"), got, tt.sandboxed)
+				}
+			}
+		})
+	}
+}
+
+func TestActiveContent(t *testing.T) {
+	active := []string{"text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml",
+		"text/xsl", "application/xslt+xml", "application/rss+xml", "video/foo+xml", "audio/x+xml", "text/javascript",
+		"text/markdown", "application/x-shockwave-flash", "multipart/x-mixed-replace", "video/", "garbage", ""}
+	for _, ct := range active {
+		if !activeContent(ct) {
+			t.Errorf("activeContent(%q) = false, want true", ct)
+		}
+	}
+	passive := []string{"image/png", "IMAGE/JPEG", "image/gif", "image/webp", "image/avif", "image/x-icon",
+		"text/plain; charset=utf-8", "text/csv", "application/pdf", "application/json", "application/octet-stream",
+		"video/mp4", "video/webm", "audio/mpeg", "audio/ogg; codecs=opus"}
+	for _, ct := range passive {
+		if activeContent(ct) {
+			t.Errorf("activeContent(%q) = true, want false", ct)
+		}
+	}
+}
+
 func TestFilesPathModeURL(t *testing.T) {
 	h := newHarness(t, pathMode())
 	body, ct := multipartBody(t, part{field: "file", filename: "a.txt", content: "abc"})

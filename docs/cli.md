@@ -147,6 +147,14 @@ using this CLI's login. Logs go to stderr. Tools: `backyard_docs`, `backyard_ini
 `backyard_deploy`, `backyard_list_sites`, `backyard_site_files`, `backyard_read_site_file`,
 `backyard_whoami`, `backyard_open_url` (see [agents](agents.md#mcp-server)).
 
+Start it in the project folder: `backyard_init` and `backyard_deploy` only use folders inside
+the working directory, and any other folder only when the agent names it by the absolute path of
+an existing directory; the filesystem root, the home directory and folders holding credentials
+(`~/.ssh`, `~/.config`, the CLI's own config folder…) are always refused.
+`backyard_read_site_file` refuses binary file types without downloading them, and its content
+is untrusted data written by other people. Tool results and errors never contain tokens or
+signed upload URLs.
+
 ```sh
 claude mcp add backyard -- backyard mcp
 ```

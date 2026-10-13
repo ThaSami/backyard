@@ -162,6 +162,14 @@ export interface Config {
   deployToken: string;
   warehouseURL: string;
   ai: AIConfig;
+  /**
+   * A misconfiguration that makes the Worker answer every request except the
+   * health checks with 503 (fail closed), "" when there is none: an
+   * AUTH_MODE other than "none" or "access". The Go server refuses to start
+   * then; serving without authentication instead would make public a Worker
+   * meant to sit behind Cloudflare Access (workers.dev is not behind Access).
+   */
+  fatal: string;
   /** Configuration problems (logged once per isolate: npx wrangler tail). */
   problems: string[];
 }
@@ -181,6 +189,66 @@ export function getConfig(env: Env): Config {
 
 function str(v: unknown): string {
   return typeof v === "string" ? v.trim() : "";
+}
+
+/** The variables of Env (bindings and secrets are not variables). */
+const VAR_KEYS = [
+  "BASE_DOMAIN",
+  "PUBLIC_URL",
+  "URL_MODE",
+  "AUTH_MODE",
+  "ACCESS_TEAM_DOMAIN",
+  "ACCESS_AUD",
+  "ACCESS_GET_IDENTITY",
+  "ALLOW_ANONYMOUS_DEPLOY",
+  "ADMINS",
+  "ADMIN_GROUPS",
+  "OWNERSHIP",
+  "SERVER_NAME",
+  "RESERVED_SITES",
+  "AI_MODELS",
+  "AI_DEFAULT_MODEL",
+  "AI_DEFAULT_IMAGE_MODEL",
+  "AI_DEFAULT_EMBEDDING_MODEL",
+  "AI_MAX_TOKENS",
+  "AI_ALLOW_RAW_MODELS",
+  "AI_EXPOSE_MODEL_IDS",
+  "AI_SYSTEM_PROMPT",
+  "AI_GATEWAY_ID",
+  "ANTHROPIC_BASE_URL",
+  "OPENAI_BASE_URL",
+  "LIMITS",
+  "FILE_INLINE_MAX",
+  "TOKEN_TTL_HOURS",
+  "WAREHOUSE_URL",
+] as const satisfies readonly (keyof Env)[];
+
+/** Variables that hold a JSON object: wrangler and the dashboard may deliver them parsed. */
+const JSON_VARS = new Set<string>(["LIMITS", "AI_MODELS"]);
+
+/**
+ * The variables of env as strings. Wrangler turns a variable written as a
+ * JSON value in wrangler.jsonc (or a dashboard variable of type JSON) into a
+ * parsed value: numbers and booleans are taken as their text, objects in
+ * LIMITS and AI_MODELS as their JSON. Any other value is reported and
+ * ignored (in AUTH_MODE it makes the configuration fatal).
+ */
+function stringVars(env: Env, problems: string[], invalid: Set<string>): Env {
+  const out: Record<string, unknown> = { ...env };
+  for (const k of VAR_KEYS) {
+    const v = (env as unknown as Record<string, unknown>)[k];
+    if (v === undefined || v === null || typeof v === "string") continue;
+    if (typeof v === "number" || typeof v === "boolean") {
+      out[k] = String(v);
+    } else if (JSON_VARS.has(k) && typeof v === "object" && !Array.isArray(v)) {
+      out[k] = JSON.stringify(v);
+    } else {
+      problems.push(`${k} must be a string${JSON_VARS.has(k) ? " or a JSON object" : ""} (got ${Array.isArray(v) ? "an array" : `a ${typeof v}`}); ignoring it`);
+      invalid.add(k);
+      delete out[k];
+    }
+  }
+  return out as unknown as Env;
 }
 
 function bool(v: unknown, def = false): boolean {
@@ -213,22 +281,34 @@ export function normalizeTeam(v: string): string {
 }
 
 /** Parses env into a Config (no caching). Exported for tests. */
-export function parseConfig(env: Env): Config {
+export function parseConfig(rawEnv: Env): Config {
   const problems: string[] = [];
+  const invalid = new Set<string>();
+  const env = stringVars(rawEnv, problems, invalid);
   const urlMode = str(env.URL_MODE).toLowerCase() === "host" ? "host" : "path";
   if (str(env.URL_MODE) && !["host", "path"].includes(str(env.URL_MODE).toLowerCase())) {
     problems.push(`URL_MODE must be "path" or "host" (got ${JSON.stringify(env.URL_MODE)}); using path`);
   }
   const baseDomain = str(env.BASE_DOMAIN).toLowerCase().replace(/^https?:\/\//, "").replace(/[:/].*$/, "").replace(/\.$/, "");
   if (urlMode === "host" && !baseDomain) problems.push("URL_MODE=host needs BASE_DOMAIN; sites are served in path mode until it is set");
-  let publicURL = str(env.PUBLIC_URL).replace(/\/+$/, "");
-  if (publicURL && !/^https?:\/\/[^/]+$/i.test(publicURL)) {
-    problems.push(`PUBLIC_URL must be an absolute origin like https://backyard.example.com (got ${JSON.stringify(publicURL)}); ignoring it`);
+  // Like the Go server's public URL: scheme://host[:port], lowercased (an
+  // explicit port is kept), so links, the SDK's hub and /docs read the same.
+  let publicURL = str(env.PUBLIC_URL).replace(/\/+$/, "").toLowerCase();
+  if (publicURL && !/^https?:\/\/[^/?#@\s]+$/.test(publicURL)) {
+    problems.push(`PUBLIC_URL must be an absolute origin like https://backyard.example.com (got ${JSON.stringify(str(env.PUBLIC_URL))}); ignoring it`);
     publicURL = "";
   }
   const am = str(env.AUTH_MODE).toLowerCase();
   const authMode = am === "access" ? "access" : "none";
-  if (am && am !== "access" && am !== "none") problems.push(`AUTH_MODE must be "none" or "access" (got ${JSON.stringify(am)}); using none`);
+  // Fail closed: a mistyped or Go-style mode ("oidc", "okta", "cloudflare-access")
+  // was meant to require sign-in, so it never silently means "none".
+  let fatal = "";
+  if (invalid.has("AUTH_MODE") || (am && am !== "access" && am !== "none")) {
+    fatal = 'AUTH_MODE must be "none" or "access"';
+    problems.push(
+      `${fatal} (got ${invalid.has("AUTH_MODE") ? "a value that is not a string" : JSON.stringify(am.slice(0, 64))}); every request but the health checks is refused with 503 until it is fixed`,
+    );
+  }
   const accessTeam = normalizeTeam(str(env.ACCESS_TEAM_DOMAIN));
   const accessAud = list(env.ACCESS_AUD);
   if (authMode === "access" && (!accessTeam || accessAud.length === 0)) {
@@ -242,7 +322,7 @@ export function parseConfig(env: Env): Config {
       const parsed = JSON.parse(rawLimits) as unknown;
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
       for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-        if (!(k in DEFAULT_LIMITS)) {
+        if (!Object.hasOwn(DEFAULT_LIMITS, k)) {
           problems.push(`LIMITS: unknown key ${JSON.stringify(k)}`);
           continue;
         }
@@ -285,6 +365,7 @@ export function parseConfig(env: Env): Config {
     deployToken: typeof env.DEPLOY_TOKEN === "string" ? env.DEPLOY_TOKEN.trim() : "",
     warehouseURL: str(env.WAREHOUSE_URL).replace(/\/+$/, ""),
     ai: parseAI(env, problems),
+    fatal,
     problems,
   };
 }
@@ -335,7 +416,7 @@ function parseAI(env: Env, problems: string[]): AIConfig {
   }
   const pick = (explicit: string, kind: ModelConfig["kind"], prefs: string[]): string => {
     if (explicit) {
-      if (models[explicit]?.kind === kind) return explicit;
+      if (Object.hasOwn(models, explicit) && models[explicit]!.kind === kind) return explicit;
       warnings.push(`default ${kind} model ${JSON.stringify(explicit)} is not a ${kind} alias in AI_MODELS`);
     }
     for (const p of prefs) if (models[p]?.kind === kind) return p;

@@ -43,7 +43,13 @@ config:
     # public_url: https://backyard.example.com
     # "host" (wildcard subdomains) or "path" (https://<base_domain>/s/<site>/).
     url_mode: host
-    # The ingress controller's pods; X-Forwarded-* is trusted from these.
+    # The ingress controller's pods: X-Forwarded-For/-Proto/-Host is trusted
+    # from these (client IPs for logs and per-IP rate limits). With
+    # auth.mode header and no auth.header.jwt_header, these peers may also
+    # assert any user's identity, admins included. The chart then refuses
+    # ranges wider than one proxy (IPv4 /24, IPv6 /120) unless
+    # networkPolicy.enabled admits only that proxy (README: "Identity-aware
+    # proxies").
     trusted_proxies:
       - 10.0.0.0/8
       - 172.16.0.0/12
@@ -155,6 +161,25 @@ ingress:
   #   - secretName: backyard-tls
   #     hosts: [backyard.example.com, "*.backyard.example.com"]
   tls: []
+
+# NetworkPolicy limiting which peers may connect to the Backyard pods (ingress
+# only; egress to databases, storage and AI APIs stays open). It needs a CNI
+# that enforces NetworkPolicy (Calico, Cilium, the EKS/GKE/AKS network policy
+# options); plain flannel ignores it. Required for auth.mode header without
+# auth.header.jwt_header when trusted_proxies spans the pod network: only the
+# peers below can then send identity headers.
+networkPolicy:
+  enabled: false
+  # NetworkPolicyPeer entries allowed to reach ports.http: the ingress
+  # controller and/or the authenticating proxy (oauth2-proxy, Pomerium). Must
+  # not be empty when enabled. Values pass through `tpl`.
+  from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+  # Peers allowed to reach ports.metrics (e.g. Prometheus' namespace). Empty:
+  # nobody, so serviceMonitor.enabled needs an entry here.
+  metricsFrom: []
 
 # -----------------------------------------------------------------------------
 # Pod settings

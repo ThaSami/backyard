@@ -386,7 +386,7 @@ func TestQueryAgainstFakeAPI(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	res, err := s.Query(ctx, "SELECT day, n FROM t WHERE team = ? AND n > ? AND x = ? AND y = ?", []any{"growth", int64(1), 2.5, nil}, 3)
+	res, err := s.Query(ctx, "SELECT day, n FROM t WHERE team = ? AND n > ? AND x = ? AND y = ?", []any{"growth", int64(1), 2.5, nil}, warehouse.Limits{MaxRows: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,7 +437,7 @@ func TestQueryCancelsJobOnTimeout(t *testing.T) {
 	s := newFake(t, f, config.WarehouseSource{})
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	_, err := s.Query(ctx, "SELECT 1", nil, 10)
+	_, err := s.Query(ctx, "SELECT 1", nil, warehouse.Limits{MaxRows: 10})
 	if !errors.Is(err, warehouse.ErrTimeout) {
 		t.Fatalf("err = %v, want ErrTimeout", err)
 	}
@@ -450,10 +450,44 @@ func TestQueryCancelsJobOnTimeout(t *testing.T) {
 
 func TestQueryBadParam(t *testing.T) {
 	s := newFake(t, &fakeBQ{}, config.WarehouseSource{})
-	if _, err := s.Query(context.Background(), "SELECT ?", []any{[]any{1}}, 10); !errors.Is(err, warehouse.ErrBadRequest) {
+	if _, err := s.Query(context.Background(), "SELECT ?", []any{[]any{1}}, warehouse.Limits{MaxRows: 10}); !errors.Is(err, warehouse.ErrBadRequest) {
 		t.Fatalf("err = %v", err)
 	}
 	if s.Placeholder(3) != "?" {
 		t.Error("placeholder")
+	}
+}
+
+// TestQueryResultSizeCap: a result stops at the last row that fits in
+// Limits.MaxBytes, well before the row cap.
+func TestQueryResultSizeCap(t *testing.T) {
+	f := &fakeBQ{schema: map[string]any{"fields": []any{
+		map[string]any{"name": "i", "type": "INTEGER"},
+		map[string]any{"name": "pad", "type": "STRING"},
+	}}}
+	pad := strings.Repeat("x", 300000)
+	for i := range 10 {
+		f.rows = append(f.rows, []any{strconv.Itoa(i), pad})
+	}
+	s := newFake(t, f, config.WarehouseSource{})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const limit = 1 << 20
+	res, err := s.Query(ctx, "SELECT i, pad FROM t", nil, warehouse.Limits{MaxRows: 100, MaxBytes: limit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 3 || res.RowCount != 3 || !res.Truncated || res.Rows[2]["i"] != int64(2) {
+		t.Fatalf("rows = %d truncated = %v", len(res.Rows), res.Truncated)
+	}
+	if b, _ := json.Marshal(res.Rows); len(b) > limit {
+		t.Errorf("rows encode to %d bytes, cap %d", len(b), limit)
+	}
+
+	// Without a cap the default (32 MiB) applies; all 3 MB fit.
+	res, err = s.Query(ctx, "SELECT i, pad FROM t", nil, warehouse.Limits{MaxRows: 100})
+	if err != nil || len(res.Rows) != 10 || res.Truncated {
+		t.Fatalf("default cap: %d rows, truncated %v, %v", len(res.Rows), res != nil && res.Truncated, err)
 	}
 }

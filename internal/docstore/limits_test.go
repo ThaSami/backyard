@@ -126,6 +126,63 @@ func TestWithLimitsSizeOnly(t *testing.T) {
 	}
 }
 
+// The size limit counts the stored (unescaped) JSON: '<', '>' and '&' are one
+// byte each, not the six of json.Marshal's HTML escapes, so HTML and rich
+// text documents get the full max_doc_bytes like on the Cloudflare edition.
+func TestWithLimitsCountsHTMLCharactersOnce(t *testing.T) {
+	const limit = 1000
+	// {"x":"…"} is 8 bytes plus the string.
+	html := func(n int) map[string]any {
+		return map[string]any{"x": strings.Repeat("<&>", n/3) + strings.Repeat("<", n%3)}
+	}
+	atLimit, overLimit := html(limit-8), html(limit-7)
+
+	if _, err := docstore.PrepareData(atLimit, limit); err != nil {
+		t.Errorf("PrepareData at the limit: %v", err)
+	}
+	if _, err := docstore.PrepareData(overLimit, limit); !errors.Is(err, docstore.ErrTooLarge) {
+		t.Errorf("PrepareData one byte over the limit = %v, want ErrTooLarge", err)
+	}
+	// U+2028/U+2029 are always escaped in the stored form, so they count as
+	// such (6 bytes).
+	if _, err := docstore.PrepareData(map[string]any{"x": strings.Repeat("\u2028", 165)}, limit); err != nil {
+		t.Errorf("PrepareData with 165 U+2028 (998 bytes): %v", err)
+	}
+	if _, err := docstore.PrepareData(map[string]any{"x": strings.Repeat("\u2028", 166)}, limit); !errors.Is(err, docstore.ErrTooLarge) {
+		t.Errorf("PrepareData with 166 U+2028 (1004 bytes) = %v, want ErrTooLarge", err)
+	}
+
+	s := docstore.WithLimits(memory.New(), limit, 0)
+	ctx := context.Background()
+	if _, err := s.Create(ctx, "site", "c", "a", atLimit, ""); err != nil {
+		t.Errorf("Create at the limit: %v", err)
+	}
+	if _, err := s.Create(ctx, "site", "c", "b", overLimit, ""); !errors.Is(err, docstore.ErrTooLarge) {
+		t.Errorf("Create over the limit = %v, want ErrTooLarge", err)
+	}
+	if _, err := s.Put(ctx, "site", "c", "p", atLimit, ""); err != nil {
+		t.Errorf("Put at the limit: %v", err)
+	}
+	if _, err := s.Put(ctx, "site", "c", "p", overLimit, ""); !errors.Is(err, docstore.ErrTooLarge) {
+		t.Errorf("Put over the limit = %v, want ErrTooLarge", err)
+	}
+	// Update checks the merged document: {"x":"…","y":"…"} is 15 bytes plus
+	// both strings.
+	if _, err := s.Create(ctx, "site", "c", "u", map[string]any{"x": strings.Repeat("&", 485)}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Update(ctx, "site", "c", "u", map[string]any{"y": strings.Repeat("<", 501)}, ""); !errors.Is(err, docstore.ErrTooLarge) {
+		t.Errorf("Update over the limit = %v, want ErrTooLarge", err)
+	}
+	d, err := s.Update(ctx, "site", "c", "u", map[string]any{"y": strings.Repeat("<", 500)}, "")
+	if err != nil {
+		t.Fatalf("Update to the limit: %v", err)
+	}
+	if n := len(d.Data["x"].(string)) + len(d.Data["y"].(string)) + 15; n != limit {
+		t.Errorf("merged document is %d bytes, want %d", n, limit)
+	}
+}
+
 func TestWithLimitsPutCountsNewDocs(t *testing.T) {
 	s := docstore.WithLimits(memory.New(), 0, 2)
 	ctx := context.Background()

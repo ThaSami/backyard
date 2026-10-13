@@ -545,3 +545,66 @@ describe("ordering and pagination (conformance table)", () => {
     }
   });
 });
+
+describe("data fields named like members of Object.prototype", () => {
+  it("filters and orders constructor, toString, valueOf and __proto__ as data, like the Go edition", async () => {
+    const site = uniqueSite("protofields");
+    const q = async (query: Record<string, unknown>) => {
+      const res = await call(api(site, "/db/f1/query"), { method: "POST", headers: apiHeaders(), body: JSON.stringify(query) });
+      expect(res.status, JSON.stringify(query)).toBe(200);
+      return ((await res.json()) as { docs: Doc[] }).docs.map((d) => d.id);
+    };
+    expect((await call(api(site, "/db/f1"), { method: "POST", headers: apiHeaders(), body: '{"id":"a","constructor":"x","toString":2,"valueOf":true,"__proto__":3}' })).status).toBe(201);
+    expect((await create(site, "f1", { id: "b", constructor: "y", toString: 1, valueOf: false })).status).toBe(201);
+    expect((await create(site, "f1", { id: "c" })).status).toBe(201);
+    expect(await q({ where: [{ field: "constructor", op: "==", value: "x" }] })).toEqual(["a"]);
+    expect(await q({ where: [{ field: "constructor", op: "in", value: ["x", "y"] }], order_by: [{ field: "constructor", dir: "desc" }] })).toEqual(["b", "a"]);
+    expect(await q({ where: [{ field: "toString", op: ">", value: 0 }], order_by: [{ field: "toString" }] })).toEqual(["b", "a"]);
+    expect(await q({ where: [{ field: "valueOf", op: "==", value: true }] })).toEqual(["a"]);
+    expect(await q({ where: [{ field: "__proto__", op: "==", value: 3 }] })).toEqual(["a"]);
+    expect(await q({ where: [{ field: "hasOwnProperty", op: "!=", value: 1 }] })).toEqual([]);
+    expect(await q({ order_by: [{ field: "__proto__", dir: "desc" }] })).toEqual(["a", "b", "c"]);
+    for (const order of ["valueOf:asc", "toString:desc", "constructor:asc", "isPrototypeOf:asc"]) {
+      const res = await call(api(site, `/db/f1?order=${order}`));
+      expect(res.status, order).toBe(200);
+    }
+  });
+});
+
+describe("query pages and the Durable Object RPC limit", () => {
+  it("cuts a page at its byte budget with has_more instead of failing, and offsets reach every document", async () => {
+    const site = uniqueSite("bigpage");
+    // 64 documents of ~250 KB of numbers: ~16 MB of JSON, but over 32 MiB once
+    // parsed and serialized for RPC (9 bytes per number): a page of them all
+    // used to fail with 500 even at the default limit.
+    const body = JSON.stringify({ v: new Array(64000).fill(1.5) });
+    for (let i = 0; i < 64; i++) {
+      const res = await call(api(site, `/db/nums/d${String(i).padStart(2, "0")}`), { method: "PUT", headers: apiHeaders(), body });
+      expect(res.status, `put ${i}`).toBe(200);
+    }
+    for (const first of [() => call(api(site, "/db/nums")), () => call(api(site, "/db/nums/query"), { method: "POST", headers: apiHeaders(), body: '{"limit":1000}' })]) {
+      const res = await first();
+      expect(res.status).toBe(200);
+      const page = (await res.json()) as { docs: Doc[]; has_more: boolean };
+      expect(page.docs.length).toBeGreaterThan(0);
+      expect(page.docs.length).toBeLessThan(64);
+      expect(page.has_more).toBe(true);
+      expect((page.docs[0]!.v as number[]).length).toBe(64000);
+    }
+    const ids: string[] = [];
+    for (let offset = 0; ; ) {
+      const res = await call(api(site, `/db/nums?limit=1000&offset=${offset}`));
+      expect(res.status).toBe(200);
+      const page = (await res.json()) as { docs: Doc[]; has_more: boolean };
+      ids.push(...page.docs.map((d) => d.id));
+      offset += page.docs.length;
+      if (!page.has_more) break;
+    }
+    expect(ids).toEqual(Array.from({ length: 64 }, (_, i) => `d${String(i).padStart(2, "0")}`));
+    // Small documents still fill the page up to the limit.
+    for (let i = 0; i < 5; i++) await create(site, "small", { id: `s${i}`, n: i });
+    const small = (await (await call(api(site, "/db/small?limit=3"))).json()) as { docs: Doc[]; has_more: boolean };
+    expect(small.docs.map((d) => d.id)).toEqual(["s0", "s1", "s2"]);
+    expect(small.has_more).toBe(true);
+  });
+});

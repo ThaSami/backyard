@@ -78,10 +78,11 @@ run "path_mode_with_access" {
     condition = toset([for d in cloudflare_zero_trust_access_application.bypass[0].destinations : d.uri]) == toset([
       "backyard.example.com/__backyard/api/deploy",
       "backyard.example.com/__backyard/api/deploy/*",
+      "backyard.example.com/__backyard/api/tokens",
       "backyard.example.com/__backyard/healthz",
       "backyard.example.com/__backyard/readyz",
     ])
-    error_message = "the deploy gateway and health checks bypass Access"
+    error_message = "the deploy gateway, token minting (backyard token create) and health checks bypass Access"
   }
   assert {
     condition     = cloudflare_zero_trust_access_application.backyard[0].allowed_idps == null && cloudflare_zero_trust_access_application.backyard[0].auto_redirect_to_identity == false

@@ -234,6 +234,21 @@ async function open(context, url) {
   return { page, problems };
 }
 
+/**
+ * Hands the deploy token (if any) to the hub page in the URL fragment: the hub
+ * asks whose token it is before using it, so this confirms it (unless this
+ * browser already uses that token).
+ */
+async function useHandedToken(page) {
+  if (!TOKEN) return;
+  await page.waitForFunction((tok) => document.getElementById("handoff-dialog").open || document.getElementById("deploy-token").value === tok, TOKEN, { timeout: 15_000 });
+  if (await page.evaluate(() => document.getElementById("handoff-dialog").open)) {
+    assert.match(await page.textContent("#handoff-title"), /^Use the deploy token of /);
+    await page.click("#handoff-use");
+  }
+  await page.waitForFunction((tok) => document.getElementById("deploy-token").value === tok, TOKEN);
+}
+
 const SITE_FILES = {
   "index.html": `<!doctype html><html><head><meta charset="utf-8"><title>E2E site</title>
 <meta name="description" content="Backyard end-to-end test site">
@@ -262,6 +277,7 @@ test("hub deploy + SDK end to end against a real server", { timeout: 180_000 }, 
     // --- Hub: info, directory, drag-and-drop style folder deploy.
     hub = await open(context, BASE + "/" + (TOKEN ? "#token=" + encodeURIComponent(TOKEN) : ""));
     const { page } = hub;
+    await useHandedToken(page);
     await page.waitForSelector("#site-list:not([aria-busy])", { state: "attached" });
     assert.equal(await page.isHidden("#banner"), true, "server info and site list loaded: " + (await page.textContent("#banner")));
     const info = await page.evaluate(() => fetch("/__backyard/api/info").then((r) => r.json()));
@@ -540,6 +556,7 @@ test("hub deploy + SDK end to end against a real server", { timeout: 180_000 }, 
       const { page } = hub;
       try {
         await page.goto(BASE + "/" + (TOKEN ? "#token=" + encodeURIComponent(TOKEN) : ""));
+        await useHandedToken(page);
         await page.waitForSelector(`.site[data-site="${name}"]`, { timeout: 10_000 });
         const del = await page.$(`button[aria-label="Delete ${name}"]`);
         if (del) {

@@ -62,7 +62,7 @@ func (e *oidcEnv) startLogin(rd string) (string, *http.Cookie) {
 	if !strings.HasPrefix(loc, e.idp.issuer()+"/authorize?") {
 		e.t.Fatalf("login redirect = %q", loc)
 	}
-	sc := cookieNamed(res, OAuthCookie)
+	sc := cookieNamed(res, e.a.oidc.stateCookie)
 	if sc == nil || sc.Value == "" {
 		e.t.Fatal("no state cookie")
 	}
@@ -119,8 +119,10 @@ func TestOIDCLoginFlow(t *testing.T) {
 		q.Get("scope") != "openid profile email" {
 		t.Fatalf("authorize params = %v", q)
 	}
-	if sc.Path != PathPrefix || !sc.HttpOnly || !sc.Secure || sc.SameSite != http.SameSiteLaxMode ||
-		sc.MaxAge != 600 || sc.Domain != "" {
+	// An https hub uses a __Host- cookie (Secure, Path=/, no Domain): a
+	// site's page cannot plant it on the hub.
+	if sc.Name != "__Host-backyard_oauth" || sc.Path != "/" || !sc.HttpOnly || !sc.Secure ||
+		sc.SameSite != http.SameSiteLaxMode || sc.MaxAge != 600 || sc.Domain != "" {
 		t.Fatalf("state cookie attrs = %+v", sc)
 	}
 
@@ -146,7 +148,7 @@ func TestOIDCLoginFlow(t *testing.T) {
 	if len(sess.Value) > maxSessionCookieBytes {
 		t.Fatalf("session cookie too large: %d", len(sess.Value))
 	}
-	if c := cookieNamed(res, OAuthCookie); c == nil || c.MaxAge >= 0 {
+	if c := cookieNamed(res, OAuthHostCookie); c == nil || c.MaxAge >= 0 || c.Path != "/" {
 		t.Fatalf("state cookie not cleared: %+v", c)
 	}
 
@@ -245,7 +247,7 @@ func TestOIDCCallbackFailures(t *testing.T) {
 		e := newOIDCEnv(t, nil)
 		idpURL, sc := e.startLogin("")
 		cb := e.authorize(idpURL)
-		forged := &http.Cookie{Name: OAuthCookie, Value: sc.Value[:len(sc.Value)-3] + "xyz"}
+		forged := &http.Cookie{Name: OAuthHostCookie, Value: sc.Value[:len(sc.Value)-3] + "xyz"}
 		assertNoSession(t, serve(e.a.Handler(), req("GET", cb, forged)), http.StatusBadRequest)
 	})
 	t.Run("pkce mismatch", func(t *testing.T) {

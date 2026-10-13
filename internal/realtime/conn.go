@@ -458,11 +458,13 @@ func (c *conn) handleSub(f *inFrame, id json.RawMessage) {
 		s.subs[sub.collection] = set
 	}
 	set[sub] = struct{}{}
+	// Recorded before the ack is sent, so that Stats never lags behind what
+	// the client has seen.
+	c.subs[key] = sub
+	h.nsubs.Add(1)
 	// Enqueued under the lock: no event of this subscription precedes the ack.
 	c.enqueue(mustJSON(ackFrame{T: "ack", ID: id}))
 	s.mu.Unlock()
-	c.subs[key] = sub
-	h.nsubs.Add(1)
 }
 
 func (c *conn) handleUnsub(id json.RawMessage) {

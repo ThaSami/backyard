@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -330,6 +331,7 @@ func (c *Client) withRetry(ctx context.Context, policy retryPolicy, do func() (*
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			redactURLError(err)
 			lastErr, retryAfter = fmt.Errorf("deploy: %w", err), 0
 			if isRetryableNetErr(err) {
 				continue
@@ -361,7 +363,10 @@ func readAPIError(resp *http.Response) (*APIError, time.Duration) {
 		e.Code, e.Message, e.LoginURL = eb.Error.Code, eb.Error.Message, eb.Error.LoginURL
 	} else {
 		e.Code = codeForStatus(resp.StatusCode)
-		msg := strings.Join(strings.Fields(string(b)), " ")
+		msg, ok := storageError(b)
+		if !ok {
+			msg = strings.Join(strings.Fields(string(b)), " ")
+		}
 		if msg == "" {
 			msg = http.StatusText(resp.StatusCode)
 		}
@@ -376,6 +381,58 @@ func readAPIError(resp *http.Response) (*APIError, time.Duration) {
 		}
 	}
 	return e, wait
+}
+
+// storageError extracts code and message from an object store's XML error
+// (S3, GCS and Azure all answer <Error><Code>…</Code><Message>…</Message>),
+// leaving out the rest: a signature error also echoes the string to sign and
+// the canonical request, credential scope and query string included.
+func storageError(b []byte) (string, bool) {
+	var x struct {
+		XMLName xml.Name
+		Code    string `xml:"Code"`
+		Message string `xml:"Message"`
+	}
+	if xml.Unmarshal(b, &x) != nil || x.XMLName.Local != "Error" || strings.TrimSpace(x.Code) == "" {
+		return "", false
+	}
+	msg := strings.TrimSpace(x.Code)
+	if m := strings.Join(strings.Fields(x.Message), " "); m != "" {
+		msg += ": " + m
+	}
+	return msg, true
+}
+
+// redactURLError strips credentials from the URL of a *url.Error in err (a
+// transport failure reports the whole request URL): the query of a
+// presigned storage URL (X-Amz-Credential, X-Amz-Security-Token and
+// X-Amz-Signature; a SAS signature) and the signed capability of a gateway
+// upload path.
+func redactURLError(err error) {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		ue.URL = redactURL(ue.URL)
+	}
+}
+
+// redactURL returns raw without its query, fragment, user info and the
+// token of a /uploads/{token} path.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "(invalid URL)"
+	}
+	hadQuery := u.RawQuery != "" || u.ForceQuery
+	u.User, u.RawQuery, u.ForceQuery, u.Fragment, u.RawFragment = nil, "", false, "", ""
+	suffix := ""
+	if i := strings.LastIndex(u.Path, "/uploads/"); i >= 0 {
+		u.Path, u.RawPath, suffix = u.Path[:i], "", "/uploads/[redacted]"
+	}
+	out := u.String() + suffix
+	if hadQuery {
+		out += "?[redacted]"
+	}
+	return out
 }
 
 // retryBase is the first retry delay (a variable so tests can shorten it).

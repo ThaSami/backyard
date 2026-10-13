@@ -28,6 +28,7 @@ function text(body: string, status = 200): Response {
 
 async function readyz(env: Env): Promise<Response> {
   const cfg = getConfig(env);
+  if (cfg.fatal) return text(`not ready: ${cfg.fatal}\n`, 503);
   if (!cfg.secret) return text("not ready: BACKYARD_SECRET is not set\n", 503);
   try {
     const r = await registry(env).ping();
@@ -67,6 +68,12 @@ async function handle(req: Request, env: Env, ectx: ExecutionContext): Promise<R
   if (url.pathname === HEALTHZ || /^\/s\/[^/]+\/__backyard\/healthz$/.test(url.pathname)) return text("ok\n");
   if (url.pathname === READYZ || /^\/s\/[^/]+\/__backyard\/readyz$/.test(url.pathname)) return readyz(env);
   const cfg = getConfig(env);
+  if (cfg.fatal) {
+    // Fail closed: never serve with a configuration that may have been meant
+    // to require sign-in (the details are logged: npx wrangler tail).
+    const err = new HttpError(503, "internal", `this Backyard is not configured correctly (${cfg.fatal}); its operator can see the details with npx wrangler tail`);
+    return renderError(err, req, undefined, cfg.publicURL || url.origin);
+  }
   let ctx: RequestContext | undefined;
   let res: Response;
   try {

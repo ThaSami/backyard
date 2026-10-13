@@ -16,8 +16,14 @@ import (
 //     strings and 'array'/'object' for composites. Every comparison is guarded
 //     by a json_type check so that only values of the filter's JSON type match.
 //   - json_extract returns booleans as 0/1 integers, numbers as INTEGER/REAL
-//     (compared numerically) and strings as TEXT (BINARY collation, i.e. byte
-//     order).
+//     and strings as TEXT (BINARY collation, i.e. byte order).
+//   - Number filters compare CAST(... AS REAL) with the float64 operand.
+//     Stored numbers are float64s written in their shortest round-trip form,
+//     so an integer-valued double between 2^53 and 2^63 is stored as integer
+//     digits that SQLite reads as an exact INTEGER which differs from the
+//     double (1760000000123456768 is written "1760000000123456800"), and
+//     SQLite compares INTEGER with REAL exactly. Converting to REAL rounds to
+//     the nearest double, which recovers the stored double exactly.
 //   - Ordering emits a type rank (missing/null 0, boolean 1, number 2, string 3,
 //     array 4, object 5) followed by the scalar value, both in the requested
 //     direction; arrays and objects tie.
@@ -156,7 +162,7 @@ func (b *builder) dataCompare(path, field string, op docstore.Op, v any) {
 			b.sql(`(json_type(data, ?) IN ('true', 'false') AND json_extract(data, ?) `+sqlOp+` ?)`, path, path, boolInt(bv))
 		}
 	case docstore.KindNumber:
-		b.sql(`(json_type(data, ?) IN ('integer', 'real') AND json_extract(data, ?) `+sqlOp+` ?)`, path, path, val)
+		b.sql(`(json_type(data, ?) IN ('integer', 'real') AND CAST(json_extract(data, ?) AS REAL) `+sqlOp+` ?)`, path, path, val)
 	case docstore.KindString:
 		b.sql(`(json_type(data, ?) = 'text' AND json_extract(data, ?) `+sqlOp+` ?)`, path, path, val)
 	default:
@@ -176,7 +182,7 @@ func (b *builder) contains(path, field string, v any) {
 		bv, _ := val.(bool)
 		cond, args = `e.type = ?`, []any{boolType(bv)}
 	case docstore.KindNumber:
-		cond, args = `e.type IN ('integer', 'real') AND e.value = ?`, []any{val}
+		cond, args = `e.type IN ('integer', 'real') AND CAST(e.value AS REAL) = ?`, []any{val}
 	case docstore.KindString:
 		cond, args = `e.type = 'text' AND e.value = ?`, []any{val}
 	default:

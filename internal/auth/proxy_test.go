@@ -135,12 +135,19 @@ func TestIAPRejects(t *testing.T) {
 			}
 		})
 	}
-	// Proxy modes have no login URL and only serve /cli.
+	// Proxy modes have no login URL; /login only redirects to rd (the proxy
+	// signs the browser in), and there is no callback or logout.
 	if e.a.LoginURL("https://x") != "" || e.a.Mode() != ModeIAP {
 		t.Fatal("iap login/mode")
 	}
-	if res := serve(e.a.Handler(), req("GET", "https://backyard.test"+LoginPath)); res.StatusCode != http.StatusNotFound {
-		t.Fatalf("login = %d", res.StatusCode)
+	if res := serve(e.a.Handler(), req("GET", "https://backyard.test"+LoginPath+"?rd=%2Fdocs")); res.StatusCode != http.StatusFound ||
+		res.Header.Get("Location") != "https://backyard.test/docs" {
+		t.Fatalf("login = %d %q", res.StatusCode, res.Header.Get("Location"))
+	}
+	for _, p := range []string{CallbackPath, LogoutPath} {
+		if res := serve(e.a.Handler(), req("GET", "https://backyard.test"+p)); res.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s = %d", p, res.StatusCode)
+		}
 	}
 }
 

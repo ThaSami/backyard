@@ -449,6 +449,44 @@
     }
   }
 
+  /** A readable label for a User (SPEC §4): "Name (id)", or just the id. */
+  function userLabel(u) {
+    if (!u || typeof u !== "object") return "an unknown account";
+    const id = typeof u.id === "string" ? u.id.trim() : "";
+    const name = typeof u.name === "string" ? u.name.trim() : "";
+    if (u.anonymous) return "an anonymous guest" + (id ? " (" + id + ")" : "");
+    if (name && id && name !== id) return name + " (" + id + ")";
+    return id || name || "an unknown account";
+  }
+
+  /**
+   * The confirmation asked before a deploy token handed over in a link
+   * (#token=…) is used: a link must never switch the identity deploys and
+   * deletes run as without the visitor's consent. owner is the token's User
+   * (GET G/me with the token), or null when the server could not tell
+   * (problem says why); me is the visitor's own User, if known.
+   * Returns { title, body }.
+   */
+  function handedTokenPrompt(owner, me, problem) {
+    const signedIn = !!me && !me.anonymous && !!me.id;
+    if (!owner) {
+      return {
+        title: "Use a deploy token from a link?",
+        body:
+          "The link you opened carries a deploy token, but Backyard could not check whose it is" +
+          (problem ? " (" + problem + ")" : "") +
+          ". If you use it, deploys and deletes from this page use that token" +
+          (signedIn ? " instead of your own sign-in (" + userLabel(me) + ")." : "."),
+      };
+    }
+    const who = userLabel(owner);
+    let body = "The link you opened carries the deploy token of " + who + ". ";
+    if (signedIn && owner.id === me.id) body += "It is a token of your own account: deploys and deletes from this page use it instead of your sign-in.";
+    else if (signedIn) body += "If you use it, deploys and deletes from this page run as " + who + ", not as you (" + userLabel(me) + ").";
+    else body += "If you use it, deploys and deletes from this page run as " + who + ".";
+    return { title: "Use the deploy token of " + who + "?", body };
+  }
+
   /** Returns url if it is an http(s) URL or a same-origin absolute path, else "#". */
   function safeHref(url) {
     const u = String(url || "").trim();
@@ -1010,6 +1048,24 @@
     );
   }
 
+  /**
+   * Asks the deploy gateway whose token this is (GET G/me with the token as
+   * the bearer, SPEC §7.2), before a token handed over in a link is used.
+   * Resolves with the User; rejects with a HubError (status 401 or 403: the
+   * token was rejected).
+   */
+  async function tokenOwner(opts) {
+    const token = String(opts.token || "");
+    // Only visible ASCII can be a bearer token (anything else cannot even be sent).
+    if (!/^[\x21-\x7e]+$/.test(token)) throw new HubError("not a valid deploy token", { status: 401, code: "unauthenticated" });
+    const fetchImpl = opts.fetch || ((...a) => globalThis.fetch(...a));
+    const u = await gatewayCall(fetchImpl, trimSlash(opts.gateway) + "/me", { method: "GET", headers: gatewayHeaders(token, false) }, "Checking the deploy token");
+    if (!u || typeof u !== "object" || typeof u.id !== "string" || !u.id) {
+      throw new HubError("Checking the deploy token failed: the server did not return an account", { status: 200, code: "bad_response" });
+    }
+    return u;
+  }
+
   /** Filters and sorts sites for the directory (newest first). */
   function filterSites(sites, query) {
     const q = String(query || "")
@@ -1041,6 +1097,9 @@
     siteURLFor,
     cliCommands,
     tokenFromHash,
+    userLabel,
+    handedTokenPrompt,
+    tokenOwner,
     safeHref,
     isSafeRedirect,
     loginURLFor,
@@ -1678,6 +1737,53 @@
     }
   }
 
+  // --- a deploy token handed over in a link (#token=…)
+
+  /** The token from the link while its confirmation dialog is open. */
+  let handoff = "";
+
+  /**
+   * Asks before a token from a link is used: a link (anyone can send one)
+   * must not silently switch whom deploys and deletes run as. check is the
+   * settled tokenOwner() result. A rejected token is never offered.
+   */
+  function offerHandedToken(token, check) {
+    const err = check.ok ? null : check.err || {};
+    if (err && (err.status === 401 || err.status === 403)) {
+      banner("The deploy token in the link you opened was rejected by the server, so it is not used.");
+      return;
+    }
+    const prompt = handedTokenPrompt(check.ok ? check.user : null, state.me, err ? String(err.message || "unknown error") : "");
+    $("handoff-title").textContent = prompt.title;
+    $("handoff-body").textContent = prompt.body;
+    handoff = token;
+    const dlg = $("handoff-dialog");
+    if (typeof dlg.showModal === "function") dlg.showModal();
+    else dlg.setAttribute("open", "");
+    $("handoff-ignore").focus(); // not using it is the default
+  }
+
+  /** Closes the token dialog; only an explicit "use" adopts (and may persist) the token. */
+  function closeHandoff(use) {
+    const token = handoff;
+    handoff = "";
+    const dlg = $("handoff-dialog");
+    if (dlg.open) {
+      if (typeof dlg.close === "function") dlg.close();
+      else dlg.removeAttribute("open");
+    }
+    if (!token) return;
+    if (!use) {
+      toast("The deploy token from the link was not used");
+      return;
+    }
+    state.token = token;
+    saveToken();
+    renderTokenBox();
+    renderSites(); // delete buttons depend on the token
+    toast(remembering() ? "Deploy token saved in this browser" : "Deploy token set for this visit");
+  }
+
   // --- wiring
 
   function wire() {
@@ -1788,11 +1894,19 @@
     });
     $("delete-form").addEventListener("submit", onDeleteSubmit);
     $("delete-cancel").addEventListener("click", closeDelete);
+
+    $("handoff-form").addEventListener("submit", (e) => {
+      e.preventDefault();
+      closeHandoff(true);
+    });
+    $("handoff-ignore").addEventListener("click", () => closeHandoff(false));
+    $("handoff-dialog").addEventListener("close", () => closeHandoff(false)); // Escape
   }
 
   async function boot() {
     // A deploy token can be handed over in the URL fragment (never sent to the
-    // server); it is persisted once the URL mode is known (see saveToken).
+    // server). Anyone can send such a link, so the token is used (and
+    // persisted, see saveToken) only once the visitor confirms whose it is.
     const handed = tokenFromHash(location.hash);
     if (handed) {
       try {
@@ -1803,26 +1917,32 @@
     }
     const rememberChoice = load(REMEMBER_KEY);
     state.remember = rememberChoice === "1" ? true : rememberChoice === "0" ? false : null;
-    state.token = handed || load(TOKEN_KEY);
+    state.token = load(TOKEN_KEY);
     state.view = load(VIEW_KEY) === "list" ? "list" : "grid";
     $("view-grid").setAttribute("aria-pressed", String(state.view === "grid"));
     $("view-list").setAttribute("aria-pressed", String(state.view === "list"));
     wire();
     renderCLI();
     updateDeployButton();
+    // The token already in use needs no confirmation.
+    const check =
+      handed && handed !== state.token
+        ? tokenOwner({ gateway: GATEWAY, token: handed }).then(
+            (user) => ({ ok: true, user }),
+            (err) => ({ ok: false, err }),
+          )
+        : null;
     const [info, me] = await Promise.allSettled([getJSON(API + "/info"), getJSON(API + "/me")]);
     if (info.status === "fulfilled") state.info = info.value;
     else banner("Server info is unavailable (" + ((info.reason && info.reason.message) || "error") + "). Deploys from the hub may not work.");
-    if (handed) {
-      saveToken();
-      toast(remembering() ? "Deploy token saved in this browser" : "Deploy token set for this visit");
-    }
     if (me.status === "fulfilled") state.me = me.value;
     renderHeader();
     renderCLI();
     renderTokenBox();
     renderName();
-    await loadSites();
+    const sites = loadSites();
+    if (check) offerHandedToken(handed, await check);
+    await sites;
     setInterval(refreshTimes, 60000);
   }
 

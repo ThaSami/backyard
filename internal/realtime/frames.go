@@ -163,6 +163,19 @@ func mustJSON(v any) []byte {
 	return b
 }
 
+// marshalUnescaped encodes v as compact JSON without HTML escaping, so that
+// '<', '>' and '&' in documents take one byte rather than six (json.Marshal
+// would grow an HTML document up to sixfold on its way to subscribers).
+func marshalUnescaped(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+}
+
 // normalizeID validates the optional client correlation id: a JSON string or
 // number of at most maxIDBytes. null/absent → nil.
 func normalizeID(raw json.RawMessage) (json.RawMessage, *wireError) {

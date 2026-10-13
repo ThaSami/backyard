@@ -65,12 +65,23 @@ Global settings: `ai.max_tokens` (8192; requests without `max_tokens` get min(40
 | `bedrock` (Converse API) | yes (any text model) | yes | Nova Canvas, Titan Image, Stability | Titan Text Embeddings, Cohere Embed |
 | `gemini` (AI Studio, Vertex AI) | yes | yes | Imagen, Gemini image models | yes |
 
-Calling a capability a provider lacks answers `501 unsupported`. Image URLs in messages must be
-absolute and public (or `data:` URLs): they are passed as URLs to OpenAI, Azure OpenAI and the
-first-party Claude API, and every other provider gets the bytes, downloaded by Backyard's
-SSRF-guarded fetcher (public addresses only, 20 MiB per image, 64 MiB per request). Pages send
-images they hold (uploads, canvases) as data URLs. Generated images are stored as site files.
-End-user ids are sent to providers as keyed, opaque hashes.
+Calling a capability a provider lacks answers `501 unsupported`. An image in a chat message is
+inline data (base64 or a `data:` URL), the URL of one of the site's own uploads, or an absolute
+public URL:
+
+- **Uploads of the site** — the `url` that `backyard.files.upload` (or `backyard.ai.image`)
+  returns, site-relative or on the site's own origin — are read by Backyard from storage and
+  sent to the provider as bytes, so the provider never needs to reach your internal site. The
+  type is detected from the bytes (png, jpeg, gif or webp). Another site's file, an unknown file
+  or any other site-relative URL is a `400`.
+- **Other URLs** are passed as URLs to OpenAI, Azure OpenAI and the first-party Claude API;
+  every other provider gets the bytes, downloaded by Backyard's SSRF-guarded fetcher (public
+  addresses only).
+
+Images are limited to 20 MiB each, and the images Backyard loads from URLs (uploads and
+downloads together) to 64 MiB per request. Images a page holds that are not uploads (a canvas,
+a picked file) go as data URLs. Generated images are stored as site files. End-user ids are sent
+to providers as keyed, opaque hashes.
 
 ## Anthropic (Claude)
 
@@ -270,9 +281,19 @@ models; JSON mode sets `responseMimeType: application/json`. The
 | AI not configured | `501 unsupported` |
 | Unknown alias | `404 not_found`; an alias of the wrong kind → `400 bad_request` |
 | User over `ai_per_minute` / `ai_tokens_per_day` | `429 rate_limited` with `Retry-After` |
-| Provider rejects the request (unsupported parameter, unreadable image) | `400 bad_request` with a sanitized message |
-| Provider throttles the server's account | `429` when the provider says when to retry, else `503 upstream_error` |
-| Provider timeout / outage / bad credentials | `504` / `502 upstream_error` (details only in the server log) |
+| Request over the per-request limits (below) | `400 bad_request` |
+| Provider rejects the request (`400`/`422`: unsupported parameter, unreadable image) | `400 bad_request` with a sanitized message |
+| Provider rejects the request as too large (`413`) | `413 too_large` with a sanitized message |
+| Provider throttles the server's account (`429`) | `429 rate_limited` with `Retry-After` when the provider says when to retry (at most an hour), else `503 upstream_error` |
+| Provider timeout (`504`, `408`, or `ai.request_timeout`) | `504 upstream_error` |
+| Provider outage, bad credentials, malformed answer | `502 upstream_error` (details only in the server log) |
+
+The Cloudflare edition maps provider answers the same way. Per-request limits:
+
+| Limit | Go server | Cloudflare edition |
+|---|---|---|
+| Images per `/ai/image` request (`n`) | 10 | 4 |
+| Strings per `/ai/embed` request | 2048 (8 MiB in total) | 100 |
 
 When a provider reports no usage, Backyard estimates tokens so per-user budgets cannot be
 bypassed. Metrics: `backyard_ai_requests_total{model,result}` and

@@ -204,25 +204,53 @@ export function hubURL(vars, outputText) {
 }
 
 /**
- * Extracts the JSON array printed by `wrangler secret list --format json`.
- * Wrangler may print other lines first (e.g. "▲ [WARNING] Proxy environment
- * variables detected"), so the array is the first line-initial "[" from
- * which the rest parses.
+ * Extracts the secret names from the stdout of `wrangler secret list
+ * --format json`. Wrangler may print other lines around the array (e.g.
+ * "▲ [WARNING] Proxy environment variables detected", or "[…]" notices), so
+ * every line-initial "[" is tried with every line-final "]" after it, and only
+ * a JSON array of {name: "<non-empty string>"} objects counts (the same rules
+ * as deploy/cloudflare/scripts/setup.mjs).
+ *
+ * An empty result makes the deploy generate BACKYARD_SECRET, which would
+ * rotate it (and revoke every API token) on an existing Worker, so an empty
+ * list must never win by accident: a non-empty list anywhere in the output
+ * beats a stray "[]" line, and "[]" next to some other non-empty JSON array
+ * (a list in a format this parser does not know) is ambiguous and throws.
+ * Anything else throws too: never guess.
  */
 export function parseSecretList(output) {
   const s = String(output ?? "");
-  const end = s.lastIndexOf("]");
-  for (let i = s.indexOf("["); i >= 0 && i < end; i = s.indexOf("[", i + 1)) {
+  const lineFinal = (j) => {
+    let k = j + 1;
+    while (k < s.length && (s[k] === " " || s[k] === "\t" || s[k] === "\r")) k++;
+    return k === s.length || s[k] === "\n";
+  };
+  const isEntry = (x) => x !== null && typeof x === "object" && !Array.isArray(x) && typeof x.name === "string" && x.name !== "";
+  const ends = [];
+  for (let j = s.indexOf("]"); j >= 0; j = s.indexOf("]", j + 1)) if (lineFinal(j)) ends.push(j);
+  let empty = false;
+  let foreign = false;
+  for (let i = s.indexOf("["); i >= 0; i = s.indexOf("[", i + 1)) {
     if (i > 0 && s[i - 1] !== "\n") continue;
-    let list;
-    try {
-      list = JSON.parse(s.slice(i, end + 1));
-    } catch {
-      continue;
+    for (let k = ends.length - 1; k >= 0 && ends[k] > i; k--) {
+      let list;
+      try {
+        list = JSON.parse(s.slice(i, ends[k] + 1));
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(list)) continue;
+      if (list.length === 0) empty = true;
+      else if (list.every(isEntry)) return new Set(list.map((x) => x.name));
+      else foreign = true;
     }
-    if (Array.isArray(list)) return new Set(list.map((x) => x?.name).filter(Boolean));
   }
-  throw new CIError("unexpected `wrangler secret list` output");
+  if (empty && !foreign) return new Set();
+  throw new CIError(
+    foreign
+      ? "unexpected `wrangler secret list` output (a JSON array that is not a list of {name} objects)"
+      : "unexpected `wrangler secret list` output (no JSON list of secrets)",
+  );
 }
 
 /**

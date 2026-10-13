@@ -75,6 +75,9 @@ resource "azurerm_postgresql_flexible_server_database" "backyard" {
 }
 
 # Public mode: 0.0.0.0-0.0.0.0 is Azure's special "allow Azure services" rule.
+# It admits every IP Azure allocates, other customers' subscriptions included
+# (Container Apps on the Consumption plan has no stable outbound IP, so a
+# narrower rule cannot be written); hence the check below.
 resource "azurerm_postgresql_flexible_server_firewall_rule" "azure_services" {
   count = local.create_postgres && !var.vnet_integration && var.postgres_allow_azure_services ? 1 : 0
 
@@ -91,4 +94,14 @@ resource "azurerm_postgresql_flexible_server_firewall_rule" "extra" {
   server_id        = azurerm_postgresql_flexible_server.this[0].id
   start_ip_address = each.value.start
   end_ip_address   = each.value.end
+}
+
+# Warning (not an error): with the defaults the admin login is reachable from
+# anywhere in Azure, guarded only by TLS and the generated password, so a
+# leaked DATABASE_URL or Terraform state is usable from any tenant's VM.
+check "postgres_open_to_all_of_azure" {
+  assert {
+    condition     = !(local.create_postgres && !var.vnet_integration && var.postgres_allow_azure_services)
+    error_message = "The Postgres server has a public endpoint with the AllowAllAzureServicesAndResourcesWithinAzureIps firewall rule (postgres_allow_azure_services = true), which admits connections from any Azure IP, including other customers' subscriptions; only TLS and the generated password protect it. For production set vnet_integration = true (private access only), or bring your own server with database_url."
+  }
 }

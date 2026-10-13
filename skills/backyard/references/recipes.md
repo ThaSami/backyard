@@ -44,7 +44,8 @@ rejected) and `votes` (one doc per person per day: id `<day>.<user>`).
   <title>Lunch Vote</title>
   <meta name="description" content="Vote where the team eats today, live">
   <style>
-    :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; --accent: #2a78d6; --line: #8884; }
+    :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; --accent: #2266c8; --danger: #bf3434; --line: #8884; }
+    @media (prefers-color-scheme: dark) { :root { --accent: #4b93ea; --danger: #e5605f; } }
     body { max-width: 560px; margin: 2rem auto; padding: 0 1rem; }
     button, input { font: inherit; }
     ul { list-style: none; padding: 0; }
@@ -54,7 +55,7 @@ rejected) and `votes` (one doc per person per day: id `<day>.<user>`).
     li.mine b::after { content: " ✓"; color: var(--accent); }
     .bar { height: 6px; margin-top: .35rem; border-radius: 3px; background: var(--accent); transition: width .3s; }
     form { display: flex; gap: .5rem; } input { flex: 1; }
-    #error { color: #d03b3b; }
+    #error { color: var(--danger); }
   </style>
 </head>
 <body>
@@ -143,7 +144,8 @@ per round).
   <title>Live Poll</title>
   <meta name="description" content="Ask the room a question and watch the answers arrive">
   <style>
-    :root { color-scheme: light dark; font: 17px/1.5 system-ui, sans-serif; --accent: #2a78d6; --line: #8884; }
+    :root { color-scheme: light dark; font: 17px/1.5 system-ui, sans-serif; --accent: #2266c8; --line: #8884; }
+    @media (prefers-color-scheme: dark) { :root { --accent: #4b93ea; } }
     body { max-width: 680px; margin: 2rem auto; padding: 0 1rem; }
     button, input, textarea { font: inherit; }
     textarea, input { width: 100%; box-sizing: border-box; margin: .25rem 0 .75rem; }
@@ -268,7 +270,7 @@ are throttled to 20/s with a trailing update so the last position is never lost.
 
   <script src="/__backyard/backyard.js"></script>
   <script type="module">
-    const palette = ["#2a78d6", "#eb6834", "#1baf7a", "#6250d6", "#e87ba4", "#008300", "#e34948", "#eda100"];
+    const palette = ["#2266c8", "#c4501d", "#0f7f57", "#6250d6", "#b8467a", "#007a00", "#c62f2e", "#9a6500"];  // white text stays ≥ 4.5:1
     const colorFor = (s) => palette[[...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 0) % palette.length];
     const room = backyard.socket.room("cursors", { state: { x: -1, y: -1 } });
     const cursors = new Map();                                           // cid → element
@@ -337,7 +339,8 @@ who is typing. The typing flag is only sent when it changes.
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Team Chat</title>
   <style>
-    :root { color-scheme: light dark; font: 15px/1.45 system-ui, sans-serif; --accent: #2a78d6; --line: #8884; }
+    :root { color-scheme: light dark; font: 15px/1.45 system-ui, sans-serif; --accent: #2266c8; --accent-ink: #fff; --line: #8884; }
+    @media (prefers-color-scheme: dark) { :root { --accent: #4b93ea; --accent-ink: #0b1b30; } }
     body { max-width: 720px; height: 100vh; margin: 0 auto; display: flex; flex-direction: column; padding: 0 1rem; box-sizing: border-box; }
     header { padding: .75rem 0; border-bottom: 1px solid var(--line); }
     #people { font-size: .85em; opacity: .75; }
@@ -346,7 +349,7 @@ who is typing. The typing flag is only sent when it changes.
     .msg.mine { margin-left: auto; text-align: right; }
     .msg .meta { font-size: .75em; opacity: .65; }
     .msg .text { display: inline-block; padding: .4rem .75rem; border-radius: 14px; background: #8882; white-space: pre-wrap; text-align: left; }
-    .msg.mine .text { background: var(--accent); color: #fff; }
+    .msg.mine .text { background: var(--accent); color: var(--accent-ink); }
     #typing { min-height: 1.3em; font-size: .85em; opacity: .7; }
     form { display: flex; gap: .5rem; padding: .5rem 0 1rem; }
     input { flex: 1; font: inherit; padding: .5rem .75rem; } button { font: inherit; }
@@ -419,13 +422,13 @@ and rate-limit cases.
   <title>Summarizer</title>
   <meta name="description" content="Paste a doc or thread, get a summary">
   <style>
-    :root { color-scheme: light dark; font: 16px/1.55 system-ui, sans-serif; --accent: #2a78d6; --line: #8884; }
+    :root { color-scheme: light dark; font: 16px/1.55 system-ui, sans-serif; --line: #8884; }
     body { max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
     textarea, select, button { font: inherit; }
     textarea { width: 100%; box-sizing: border-box; padding: .75rem; border-radius: 10px; }
     .bar { display: flex; gap: .5rem; margin: .5rem 0 1rem; }
     #out { white-space: pre-wrap; min-height: 3em; padding: 1rem; border: 1px solid var(--line); border-radius: 10px; }
-    #out:empty::before { content: "The summary appears here."; opacity: .5; }
+    #out:empty::before { content: "The summary appears here."; opacity: .7; }
     #meta { font-size: .8em; opacity: .65; }
   </style>
 </head>
@@ -565,10 +568,11 @@ gallery updates live for everyone; deleting removes both the file and the docume
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>File Drop</title>
   <style>
-    :root { color-scheme: light dark; font: 15px/1.45 system-ui, sans-serif; --accent: #2a78d6; --line: #8884; }
+    :root { color-scheme: light dark; font: 15px/1.45 system-ui, sans-serif; --accent: #2266c8; --line: #8884; }
+    @media (prefers-color-scheme: dark) { :root { --accent: #4b93ea; } }
     body { max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
     #zone { display: block; padding: 2.5rem; text-align: center; border: 2px dashed var(--line); border-radius: 14px; cursor: pointer; }
-    #zone.over { border-color: var(--accent); background: #2a78d611; }
+    #zone.over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
     #zone input { display: none; }
     #status { min-height: 1.4em; opacity: .75; }
     #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: .75rem; }
@@ -655,7 +659,8 @@ lands at the bottom).
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Team Board</title>
   <style>
-    :root { color-scheme: light dark; font: 15px/1.4 system-ui, sans-serif; --accent: #2a78d6; --line: #8884; }
+    :root { color-scheme: light dark; font: 15px/1.4 system-ui, sans-serif; --accent: #2266c8; --line: #8884; }
+    @media (prefers-color-scheme: dark) { :root { --accent: #4b93ea; } }
     body { margin: 2rem auto; max-width: 1100px; padding: 0 1rem; }
     form { display: flex; gap: .5rem; margin-bottom: 1rem; } input { flex: 1; font: inherit; padding: .5rem; } button { font: inherit; }
     #board { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; }
@@ -665,7 +670,7 @@ lands at the bottom).
     .card { display: flex; gap: .5rem; align-items: start; background: Canvas; border: 1px solid var(--line); border-radius: 8px;
             padding: .5rem .6rem; margin: .4rem 0; cursor: grab; }
     .card span { flex: 1; } .card small { display: block; opacity: .6; }
-    .card button { border: 0; background: none; cursor: pointer; opacity: .5; }
+    .card button { border: 0; background: none; cursor: pointer; opacity: .7; }
   </style>
 </head>
 <body>
@@ -757,12 +762,12 @@ warehouse:
   <title>Signups KPI</title>
   <style>
     :root { color-scheme: light dark; font: 15px/1.45 system-ui, sans-serif;
-            --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781; --grid: #e1e0d9; --series: #2a78d6; }
+            --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #6b6a65; --grid: #e1e0d9; --series: #2266c8; }
     @media (prefers-color-scheme: dark) {
-      :root { --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --grid: #2c2c2a; --series: #3987e5; }
+      :root { --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781; --grid: #2c2c2a; --series: #4b93ea; }
     }
     body { max-width: 900px; margin: 2rem auto; padding: 0 1rem; background: var(--surface); color: var(--ink); }
-    .note { padding: .6rem .9rem; border-radius: 8px; background: #eda10022; color: var(--ink-2); }
+    .note { padding: .6rem .9rem; border-radius: 8px; background: color-mix(in srgb, #9a6500 14%, transparent); color: var(--ink-2); }
     .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin: 1rem 0; }
     .tile .label { color: var(--ink-2); font-size: .85em; } .tile .value { font-size: 2rem; font-weight: 600; }
     #chart { position: relative; } svg { display: block; width: 100%; height: auto; }
@@ -868,8 +873,8 @@ login), newest first, delete your own entries.
     form { display: flex; gap: .5rem; } input { flex: 1; font: inherit; padding: .5rem; } button { font: inherit; }
     ol { list-style: none; padding: 0; }
     li { display: flex; gap: .75rem; padding: .75rem 0; border-bottom: 1px solid var(--line); }
-    .avatar { width: 36px; height: 36px; border-radius: 50%; flex: none; display: grid; place-items: center; background: #2a78d6; color: #fff; object-fit: cover; }
-    li div { flex: 1; } small { opacity: .6; } li button { border: 0; background: none; cursor: pointer; opacity: .5; }
+    .avatar { width: 36px; height: 36px; border-radius: 50%; flex: none; display: grid; place-items: center; background: #2266c8; color: #fff; object-fit: cover; }
+    li div { flex: 1; } small { opacity: .6; } li button { border: 0; background: none; cursor: pointer; opacity: .7; }
   </style>
 </head>
 <body>
@@ -936,10 +941,11 @@ best score), so the leaderboard is a simple sorted query; a room shows who is pl
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Click Frenzy</title>
   <style>
-    :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; --accent: #2a78d6; --line: #8884; }
+    :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; --accent: #2266c8; --accent-ink: #fff; --line: #8884; }
+    @media (prefers-color-scheme: dark) { :root { --accent: #4b93ea; --accent-ink: #0b1b30; } }
     body { max-width: 760px; margin: 2rem auto; padding: 0 1rem; display: grid; grid-template-columns: 1fr 260px; gap: 2rem; }
     @media (max-width: 640px) { body { grid-template-columns: 1fr; } }
-    #pad { width: 100%; aspect-ratio: 1; border: 0; border-radius: 24px; font: 700 2.5rem system-ui; color: #fff; background: var(--accent); cursor: pointer; user-select: none; }
+    #pad { width: 100%; aspect-ratio: 1; border: 0; border-radius: 24px; font: 700 2.5rem system-ui; color: var(--accent-ink); background: var(--accent); cursor: pointer; user-select: none; }
     #pad:active { transform: scale(.98); }
     ol { padding-left: 1.4rem; } li { padding: .2rem 0; } li.me { font-weight: 700; }
     li span { float: right; font-variant-numeric: tabular-nums; }

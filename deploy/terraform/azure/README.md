@@ -240,7 +240,13 @@ Direct deploys (`backyard deploy --method azure`, which runs
 for the deploying users/groups/CI identities (`storage_deployer_principal_ids`)
 and Entra auth in the Azure CLI: `export AZURE_STORAGE_AUTH_MODE=login`. The
 CLI calls the gateway's refresh endpoint afterwards so the hub picks up the
-change.
+change. The module adds an ABAC condition to those role assignments: blob
+reads, writes, deletes and listings are limited to `<storage_prefix>sites/`, so
+deployers can publish any site's files but cannot read or change `_meta/`
+(site owners, manifests) or anyone's uploads. Conditions do not cover the
+role's container-level permissions (a deployer could still delete the whole
+container); container soft delete (`storage_soft_delete_days`, 7 by default)
+makes that recoverable.
 
 ## Database and networking
 
@@ -253,9 +259,13 @@ SKU's `max_connections`. Use a General Purpose SKU with
 `postgres_high_availability = true` for zone-redundant HA.
 
 * **Public mode (default):** the server has a public endpoint with the
-  *allow Azure services* firewall rule (`postgres_allow_azure_services`);
-  connections require TLS (`sslmode=require`) and the generated 40-character
-  password.
+  *allow Azure services* firewall rule (`postgres_allow_azure_services`), which
+  is how Container Apps without a VNet (no stable outbound IP) reach it. That
+  rule admits **every Azure IP, including other customers' subscriptions**:
+  only TLS (`sslmode=require`) and the generated 40-character password protect
+  the admin login, so a leaked `DATABASE_URL` or Terraform state can be used from
+  any VM in Azure. The plan warns about it (check
+  `postgres_open_to_all_of_azure`); use VNet integration for production.
 * **VNet integration (`vnet_integration = true`):** the module creates a
   virtual network with a Container Apps subnet (`/23` default, `/27` minimum,
   delegated to `Microsoft.App/environments`) and a Postgres subnet delegated to
@@ -337,7 +347,9 @@ single quotes or line breaks; the variables validate this).
   check the `X-Azure-FDID` header, so another tenant's Front Door could still
   reach the origin (bypassing your WAF, not authentication). Changes to the
   service-tag list also change `server.trusted_proxies`, which rolls out a
-  new revision.
+  new revision. Set `vnet_integration = true` so Postgres has no public
+  endpoint: in the default public mode its firewall admits all of Azure (see
+  [Database and networking](#database-and-networking)).
 * **Verify the edge** after the first apply: `curl -s https://<domain>/__backyard/api/info`
   should report your `public_url`, and a deployed site must load at
   `https://<site>.<domain>/`. If sites answer with the hub or a "not found"
@@ -406,12 +418,14 @@ combinations — Front Door host mode with Entra ID and managed certificates
 restriction and sticky sessions, `edge = "containerapp"` with Okta, an
 existing database and VNet integration, existing subnets in peered VNets, an
 existing resource group with an ACR image, and a lab without a domain using
-Azure OpenAI — asserting the resources and that every key of the rendered
-`backyard.yaml` exists in Backyard's schema (and that no credentials are
-rendered into it), and checks that invalid inputs fail at plan time.
+Azure OpenAI — asserting the resources (and that no credentials are rendered
+into `backyard.yaml`), and checks that invalid inputs fail at plan time.
 
-When `internal/config` changes, re-check the template: Backyard decodes the
-YAML strictly, so a renamed or removed key breaks startup. A quick check is to
-take `backyard_config_yaml` from `terraform test -verbose` and run it through
-`backyard config validate` with `BACKYARD_SECRET`, `DATABASE_URL` and the
-referenced secrets set.
+Backyard decodes `backyard.yaml` strictly, so a renamed or removed key breaks
+startup. `configcheck/` therefore loads the configuration every run gives the
+Container App with Backyard's own config loader, in the container's
+environment (CI runs it; `make tf-configcheck` runs all modules'):
+
+```sh
+BACKYARD_TEST_TERRAFORM=1 go test ./deploy/terraform/azure/configcheck/   # from the repository root
+```

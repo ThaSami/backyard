@@ -23,10 +23,18 @@ export interface SiteRecord {
   owners: string[];
 }
 
-/** One counter to charge: key ("ai|user:alice") and daily limit (0 = unlimited). */
+/** One counter to charge: key ("ai|user:alice"), daily limit (0 = unlimited) and amount (default 1). */
 export interface Charge {
   key: string;
   limit: number;
+  /** Units this request uses (e.g. the number of images generated); default 1. */
+  amount?: number;
+}
+
+/** The amount of a charge: a positive integer, 1 when unset. */
+export function chargeAmount(c: Charge): number {
+  const n = c.amount ?? 1;
+  return Number.isSafeInteger(n) && n > 0 ? n : 1;
 }
 
 /** Result of charging counters. */
@@ -57,6 +65,27 @@ export class RegistryDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS counters (key TEXT PRIMARY KEY, day TEXT NOT NULL, n INTEGER NOT NULL)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT NOT NULL, data TEXT NOT NULL, updated_at INTEGER NOT NULL)`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS users_email ON users (email)`);
+    // Slots of max_sites held by first deploys between their commit and putSite.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS site_reservations (name TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)`);
+  }
+
+  /** Sites plus live reservations of names that are not sites yet. */
+  private siteSlots(now: number): number {
+    const sites = (this.sql.exec("SELECT COUNT(*) AS n FROM sites").one() as { n: number }).n;
+    const held = (
+      this.sql.exec("SELECT COUNT(*) AS n FROM site_reservations WHERE expires_at > ? AND name NOT IN (SELECT name FROM sites)", now).one() as {
+        n: number;
+      }
+    ).n;
+    return sites + held;
+  }
+
+  private siteExists(name: string): boolean {
+    return this.sql.exec("SELECT 1 FROM sites WHERE name = ?", name).toArray().length > 0;
+  }
+
+  private reserved(name: string, now: number): boolean {
+    return this.sql.exec("SELECT 1 FROM site_reservations WHERE name = ? AND expires_at > ?", name, now).toArray().length > 0;
   }
 
   /** All sites, sorted by name. */
@@ -79,10 +108,11 @@ export class RegistryDO extends DurableObject<Env> {
     }
   }
 
-  /** Creates or replaces a site's metadata. */
+  /** Creates or replaces a site's metadata (and ends its reservation). */
   async putSite(meta: SiteRecord): Promise<Result<null>> {
     try {
       this.sql.exec("INSERT OR REPLACE INTO sites (name, meta, updated_at) VALUES (?, ?, ?)", meta.name, JSON.stringify(meta), meta.updated_at);
+      this.sql.exec("DELETE FROM site_reservations WHERE name = ?", meta.name);
       return ok(null);
     } catch (e) {
       return failure(e, "saving the site");
@@ -92,6 +122,7 @@ export class RegistryDO extends DurableObject<Env> {
   /** Removes a site; reports whether it existed. */
   async deleteSite(name: string): Promise<Result<boolean>> {
     try {
+      this.sql.exec("DELETE FROM site_reservations WHERE name = ?", name);
       return ok(this.sql.exec("DELETE FROM sites WHERE name = ?", name).rowsWritten > 0);
     } catch (e) {
       return failure(e, "deleting the site");
@@ -100,21 +131,54 @@ export class RegistryDO extends DurableObject<Env> {
 
   /**
    * Checks the platform-wide site cap for a deploy to name: allowed when the
-   * site exists or fewer than maxSites sites exist (0 = unlimited).
+   * site exists (or is reserved) or fewer than maxSites sites and
+   * reservations exist (0 = unlimited). Only a fast path: reserveSite decides.
    */
   async canCreateSite(name: string, maxSites: number): Promise<Result<{ allowed: boolean; count: number }>> {
     try {
-      const exists = this.sql.exec("SELECT 1 FROM sites WHERE name = ?", name).toArray().length > 0;
-      const count = (this.sql.exec("SELECT COUNT(*) AS n FROM sites").one() as { n: number }).n;
-      return ok({ allowed: exists || maxSites <= 0 || count < maxSites, count });
+      const now = Date.now();
+      const count = this.siteSlots(now);
+      return ok({ allowed: maxSites <= 0 || this.siteExists(name) || this.reserved(name, now) || count < maxSites, count });
     } catch (e) {
       return failure(e, "checking the site cap");
     }
   }
 
   /**
-   * Charges every counter by one for today (UTC) if none would exceed its
-   * limit; otherwise charges nothing and reports the exhausted counter.
+   * Takes one of the platform's maxSites slots for a new site before its first
+   * commit, until putSite records the site (or ttlMs passes, or releaseSite):
+   * the check and the reservation run without an await in between, so
+   * concurrent first deploys can never exceed the cap (0 = unlimited). An
+   * existing or already reserved name needs no new slot.
+   */
+  async reserveSite(name: string, maxSites: number, ttlMs: number): Promise<Result<{ allowed: boolean }>> {
+    try {
+      if (maxSites <= 0 || this.siteExists(name)) return ok({ allowed: true });
+      const now = Date.now();
+      this.sql.exec("DELETE FROM site_reservations WHERE expires_at <= ?", now);
+      if (!this.reserved(name, now) && this.siteSlots(now) >= maxSites) return ok({ allowed: false });
+      this.sql.exec("INSERT OR REPLACE INTO site_reservations (name, expires_at) VALUES (?, ?)", name, now + Math.max(1000, ttlMs));
+      return ok({ allowed: true });
+    } catch (e) {
+      return failure(e, "checking the site cap");
+    }
+  }
+
+  /** Gives a reservation back (a first commit that failed). */
+  async releaseSite(name: string): Promise<Result<null>> {
+    try {
+      this.sql.exec("DELETE FROM site_reservations WHERE name = ?", name);
+      return ok(null);
+    } catch (e) {
+      return failure(e, "releasing the site slot");
+    }
+  }
+
+  /**
+   * Charges every counter by its amount for today (UTC) if none would exceed
+   * its limit; otherwise charges nothing and reports the exhausted counter.
+   * Check and update run without an await in between, so concurrent charges
+   * can never overshoot a limit.
    */
   async charge(charges: Charge[]): Promise<Result<ChargeResult>> {
     try {
@@ -126,7 +190,7 @@ export class RegistryDO extends DurableObject<Env> {
       });
       for (let i = 0; i < charges.length; i++) {
         const c = charges[i]!;
-        if (c.limit > 0 && current[i]! >= c.limit) {
+        if (c.limit > 0 && current[i]! + chargeAmount(c) > c.limit) {
           const d = new Date(now);
           const next = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1);
           return ok({ allowed: false, exhausted: c.key, retryAfter: Math.max(1, Math.ceil((next - now) / 1000)) });
@@ -134,7 +198,7 @@ export class RegistryDO extends DurableObject<Env> {
       }
       this.ctx.storage.transactionSync(() => {
         for (let i = 0; i < charges.length; i++) {
-          this.sql.exec("INSERT OR REPLACE INTO counters (key, day, n) VALUES (?, ?, ?)", charges[i]!.key, day, current[i]! + 1);
+          this.sql.exec("INSERT OR REPLACE INTO counters (key, day, n) VALUES (?, ?, ?)", charges[i]!.key, day, current[i]! + chargeAmount(charges[i]!));
         }
       });
       if (Math.random() < 0.01) this.sql.exec("DELETE FROM counters WHERE day < ?", day);

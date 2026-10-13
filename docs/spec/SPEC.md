@@ -76,11 +76,14 @@ Go packages (module `github.com/thasami/backyard`):
 ## 2. URLs and routing
 
 * `server.base_domain` e.g. `backyard.acme.com`; `server.public_url` e.g. `https://backyard.acme.com`.
-* **Host mode** (default): hub at `https://<base_domain>/`, site `foo` at `https://foo.<base_domain>/`.
-  Only single-label subdomains are sites. `foo.localhost` works out of the box for local dev
+  The hub answers on `base_domain` and on the host of `public_url`.
+* **Host mode** (default): hub at `public_url`, site `foo` at
+  `<scheme>://foo.<base_domain>[:<port>]/` with the scheme and port of `public_url`. Sites are
+  always named under `base_domain`, also when the host of `public_url` differs from it. Only
+  single-label subdomains are sites. `foo.localhost` works out of the box for local dev
   (browsers resolve `*.localhost` to loopback) when `base_domain: localhost`.
 * **Path mode** (`server.url_mode: path`, for environments without wildcard DNS/TLS): site `foo`
-  at `https://<base_domain>/s/foo/`. Sites then share an origin (documented trade-off).
+  at `<public_url>/s/foo/`. Sites then share an origin (documented trade-off).
 * Request host is taken from `Host` (or `X-Forwarded-Host` only when the peer is in
   `server.trusted_proxies`). Port is ignored for matching. Any other host → `404` ("unknown
   host").
@@ -90,7 +93,21 @@ Go packages (module `github.com/thasami/backyard`):
   use a local dev server as its own origin.
 * Reserved path prefix on **every** host: `/__backyard/`. Site files can never shadow it.
 * Non-canonical paths (`//`, `/./`, `/../`) are redirected to the cleaned path (`301`, GET/HEAD)
-  or rejected (`400`) before routing.
+  or rejected (`400`) before routing. The Cloudflare Workers runtime resolves dot segments
+  (`/./`, `/../`, also percent-encoded as `%2e`) before the Worker sees a request, so on that
+  edition such a request is handled as its cleaned path instead (no redirect; a write is not
+  rejected); `//` is redirected or rejected as above. Either way no handler ever sees a
+  non-canonical path.
+
+Every site URL that either edition, the CLI, the hub or the MCP server produces (`SiteMeta.url`,
+the deploy commit's `url`, the URLs they print) follows these rules:
+
+| `public_url` | `base_domain` | `url_mode` | Site `foo` |
+|---|---|---|---|
+| `https://backyard.acme.com` | `backyard.acme.com` | `host` | `https://foo.backyard.acme.com/` |
+| `https://hub.acme.com` | `apps.acme.com` | `host` | `https://foo.apps.acme.com/` |
+| `http://localhost:8080` | `localhost` | `host` | `http://foo.localhost:8080/` |
+| `https://backyard.acme.com` | `backyard.acme.com` | `path` | `https://backyard.acme.com/s/foo/` |
 
 Site host (`foo.<base>` or `/s/foo` prefix):
 
@@ -169,6 +186,13 @@ nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `X-Request-Id`. **
 `X-Frame-Options` (embedding sites in sites is a feature). `HEAD` supported. Range requests
 supported. Methods other than GET/HEAD → `405`.
 
+On Cloud Run (detected by `K_SERVICE`), whose HTTP/1 front end rejects responses that declare a
+`Content-Length` above 32 MiB, the Go server adapts larger HTTP/1 responses of site files and
+uploads: a full response is streamed without a `Content-Length` (chunked), and a `206` range
+response is shortened to the first 32 MiB of the requested range — its `Content-Range` names
+the bytes actually sent, and clients request the rest (RFC 9110 §15.3.7). HTTP/2 requests are
+not affected.
+
 Uploaded files (`/__backyard/files/{id}/{name}`, §5.3) are authenticated like site files and
 served with `Content-Disposition: inline; filename=…` and `Cache-Control: private, no-cache`.
 Active content — `text/html`, `application/xhtml+xml`, `image/svg+xml`, `text/xml`,
@@ -220,6 +244,10 @@ Common rules:
   Otherwise `403 forbidden`. The SDK always sends the header.
 * `401` responses include `"login_url"` inside `error` when a browser login is possible.
 * Rate limits (§11) return `429` with `Retry-After`.
+* Every response (API or not) carries `X-Request-Id`: the request's own `X-Request-Id` when it
+  is 8–128 characters of `A-Z a-z 0-9 . _ -` (so an id set by a proxy in front is kept), else a
+  generated one. Logs use the same id, and server-side failures whose details are withheld
+  from the client name it (§5.5).
 * Unknown endpoints → `404 not_found`; a known path with the wrong method → `405` with code
   `bad_request` and an `Allow` header. A feature that is not configured (AI, warehouse,
   realtime, tokens) → `501 unsupported`.
@@ -341,24 +369,44 @@ against `db_writes_per_minute`. Serving rules: §3.
   sends SSE comment lines `: ping` (every 15 s) to keep proxies from timing out; clients must
   ignore lines starting with `:`.
 * `stop_reason` normalized to: `end_turn`, `max_tokens`, `stop_sequence`, `refusal`, `other`.
-* Image parts: `data` (base64, or a `data:` URL) with `media_type`, or `url` — a `data:` URL or an
-  **absolute public** http(s) URL. URLs are passed to providers that fetch them (OpenAI, Azure
-  OpenAI, the first-party Claude API) or downloaded by an SSRF-guarded fetcher (public
-  addresses only); a site-relative `/__backyard/files/…` URL is rejected. Inline images ≤ 20 MiB
-  each, downloaded images ≤ 64 MiB per request.
+* Image parts: `data` (base64, or a `data:` URL) with `media_type`, or `url` — a `data:` URL, the
+  URL of one of the site's own uploads, or an **absolute public** http(s) URL.
+  * A URL of one of the site's own uploads is read server-side, from storage, with no fetch:
+    the site-relative `/__backyard/files/{id}/{name}` that `files.upload` returns (path mode:
+    with `/s/{site}` in front), or the same path as an absolute URL on the site's own origin.
+    Any other site-relative URL, an unknown file or another site's file (`/s/{other}/…`) →
+    `400 bad_request`. The media type of an upload is detected from its bytes (png, jpeg, gif,
+    webp; anything else → `400`), not taken from its stored `content_type`.
+  * Other URLs are passed to providers that fetch them (OpenAI, Azure OpenAI, the first-party
+    Claude API) or downloaded by an SSRF-guarded fetcher (public addresses only).
+  * Inline images ≤ 20 MiB each; images loaded from URLs (uploads and downloads together) ≤ 64
+    MiB per request, and ≤ 20 MiB each.
 * `max_tokens` is capped by `ai.max_tokens` and a smaller per-alias `max_tokens`; without one
   the request gets min(4096, cap). `model` in responses is always the alias. An unknown alias →
   `404 not_found`; an alias of the wrong kind → `400 bad_request`; AI not configured → `501
-  unsupported`; provider failures → `502`/`504 upstream_error` (a provider throttling the
-  server → `429` with `Retry-After` when known, else `503`).
+  unsupported`.
+* Provider failures are mapped by the provider's HTTP status (in a stream: an `error` event with
+  the same code):
+
+  | Provider answer | Response |
+  |---|---|
+  | `504`, `408`, or no answer within `ai.request_timeout` | `504 upstream_error` |
+  | `429` (the provider throttles the server's account, which all users share) | `429 rate_limited` with `Retry-After` when the provider said when to retry (≤ 1 h), else `503 upstream_error` |
+  | `400`, `422` (the provider rejected the request) | `400 bad_request` |
+  | `413` | `413 too_large` |
+  | anything else (credentials, outages, malformed responses) | `502 upstream_error` |
+
+  Provider messages are sanitized before they reach the client.
 
 `POST /ai/image` `{prompt, model?, size?: "1024x1024", n?: 1}` →
 `{"model": "image", "images": [{"id": "01J…", "url": "/__backyard/files/01J…/image-1.png", "content_type": "image/png"}]}`.
-Images are stored as site files (`id` is the file id; they appear in `GET /files`).
+Images are stored as site files (`id` is the file id; they appear in `GET /files`). `n` is at
+most 10 on the Go server and 4 on the Cloudflare edition (more → `400 bad_request`).
 
 `POST /ai/embed` `{input: string | string[], model?}` →
 `{"model": "embed", "embeddings": [[…], …], "usage": {"input_tokens": 8, "output_tokens": 0}}` —
-one vector per input string (a single string yields one vector).
+one vector per input string (a single string yields one vector). At most 2048 strings (8 MiB in
+total) on the Go server and 100 on the Cloudflare edition (more → `400 bad_request`).
 
 `GET /ai/models` → `{"default": "smart", "models": [ModelInfo]}` with
 `ModelInfo = {name, kind: "chat"|"image"|"embedding", provider, model?, description?}`; `model`
@@ -381,9 +429,13 @@ Clients choose **aliases**, never raw provider model ids, unless `ai.allow_raw_m
 * `GET /warehouse` → `{"sources": [{name, type, description}], "queries": [{name, description, params: [..], source}]}`.
 * Errors: no warehouse configured → `501 unsupported`; raw SQL disabled or statement rejected →
   `403 forbidden`; unknown source or named query → `404 not_found`; missing/unknown named
-  parameters or a placeholder/param count mismatch → `400 bad_request`; engine failures and
-  timeouts → `502`/`504 upstream_error`. Results are capped at `warehouse.max_rows` (then
-  `truncated: true`) and bounded by `warehouse.timeout`.
+  parameters or a placeholder/param count mismatch → `400 bad_request`; timeouts → `504
+  upstream_error`; engine and connection failures → `502 upstream_error` (other server-side
+  failures `500 internal`). Messages of `4xx` errors describe the caller's query (syntax errors,
+  unknown columns, missing parameters) and are passed on; `502`/`500` messages are generic and
+  name the request id (`X-Request-Id`, §5) under which the server logged the cause, because
+  engine and connection errors can reveal host, user and database names. Results are capped at
+  `warehouse.max_rows` (then `truncated: true`) and bounded by `warehouse.timeout`.
 
 ### 5.6 JavaScript SDK (`window.backyard`)
 
@@ -569,22 +621,40 @@ is a short opaque id of the last deploy (`d_<hex>`), not the signed deploy token
    the same sha256 **and** the manifest-recorded etag+size still match storage (detects
    out-of-band syncs). Ownership: in `sites.ownership: owner` mode the first deployer becomes
    owner; later deploys require being an owner or admin.
-2. Client `PUT`s each upload URL with the given headers and the raw bytes. Upload URLs are either
-   presigned storage URLs (s3/gcs/azure) or `G/uploads/{signed-token}` (fs storage, or
-   `deploy.presign: false`). The self-hosted upload endpoint verifies size + sha256.
+2. Client `PUT`s each upload URL with **all** the given headers and the raw bytes. Upload URLs
+   are either presigned storage URLs (s3/gcs/azure) or `G/uploads/{signed-token}` (fs storage,
+   `deploy.presign: false`, or credentials that cannot presign). Every upload is bound to the
+   declared `size` and `sha256` as far as the store can enforce it:
+   * the self-hosted upload endpoint streams the body through a verifier; a body of another size
+     or digest fails the request and is never stored;
+   * an S3 URL signs the size (a signed `Content-Length`, or for an empty file the `Content-MD5`
+     of the empty body) and, when flexible checksums are enabled (AWS S3 by default; a custom
+     endpoint only when `AWS_REQUEST_CHECKSUM_CALCULATION` asks for them, since many
+     S3-compatible stores reject the header), the SHA-256 as `x-amz-checksum-sha256`, so S3
+     rejects any other body;
+   * a GCS URL pins the size with a signed `x-goog-content-length-range: <size>,<size>` (GCS
+     cannot verify a SHA-256);
+   * an Azure SAS URL cannot restrict the body at all; the commit's size check (step 3) covers
+     it.
 3. `POST G/sites/{site}/deploys/{deploy_id}/commit` `{"files": [... same list ...]}` → verifies
    every listed file exists with the right size, deletes objects under `sites/<site>/` not in the
    list, writes manifest + SiteMeta → `{"site": SiteMeta, "url": "https://site.base/", "deleted": 3}`.
-   A listed file whose stored size differs (and is not the previously committed version) is
-   deleted and the commit fails with `409 conflict` naming the paths.
+   A listed file that is missing or stored with another size fails the commit with `409
+   conflict` naming the paths (the first 10). A stored object of the wrong size that is not the
+   version the previous manifest recorded is deleted first, so no unverified object outlives a
+   commit attempt (a previously committed version that this deploy did not replace is kept).
+   Digests are not re-read at commit.
 
 `deploy_id` is an HMAC-signed, expiring (1 h) token binding site + actor; commit rejects a
-mismatched actor or site. Deploys are not atomic (same as rsync); the commit makes deletions last
-so a site is never empty mid-deploy. Presigned uploads bind what the backend can enforce: the
-size and SHA-256 on S3, the size on GCS (`x-goog-content-length-range`); Azure SAS URLs cannot
-restrict the body, which the commit-time size check covers. State-changing gateway requests
-need `X-Backyard: 1` unless they carry a bearer token without browser cross-site signals
-(`Origin`, `Sec-Fetch-Site`); upload URLs are exempt (the signed token is the capability).
+mismatched actor or site; upload URLs expire with it. Deploys are not atomic (same as rsync);
+the commit makes deletions last so a site is never empty mid-deploy. Uploads write directly to
+`sites/<site>/<path>`, so the uploads of a deploy that is never committed stay in storage: a path
+of the current manifest is replaced in place (as rsync would), and a new path becomes an object
+that is served like any other file of the site but is not in the manifest (never `unchanged`)
+until a later commit deletes it as unlisted, a refresh adopts it, or the site is deleted. The
+Cloudflare edition differs here (§16). State-changing gateway requests need `X-Backyard: 1`
+unless they carry a bearer token without browser cross-site signals (`Origin`,
+`Sec-Fetch-Site`); upload URLs are exempt (the signed token is the capability).
 Creates and refreshes (not commits) count against `ratelimit.deploys_per_hour` per actor
 (anonymous: per client IP).
 
@@ -608,6 +678,12 @@ only when those are absent (in mode `none` an invalid bearer token is always `40
   enforce allowed domains/groups → session cookie `backyard_session` (AES-GCM sealed JSON
   `{user, exp}`, key derived from `server.secret`; `Domain=.<base_domain>` in host mode, none in
   path mode; `HttpOnly; Secure; SameSite=Lax; Path=/`; TTL `auth.oidc.session_ttl`, default 12h).
+* In host mode site hosts only see the session through that `Domain` cookie, so `oidc` with
+  `url_mode: host` requires a `base_domain` that browsers accept as a cookie domain — not
+  `localhost`, `*.localhost`, an IP address or a single-label name (§8.3) — and a `public_url`
+  whose host is `base_domain` or one of its subdomains. Configuration validation rejects other
+  combinations (otherwise every site page would bounce through the IdP endlessly); use path
+  mode, or for local tests a real domain whose subdomains resolve to loopback (`lvh.me`).
 * `GET /__backyard/auth/logout` → clears cookie → IdP `end_session_endpoint` if advertised, else hub.
 * Unauthenticated browser `GET` of HTML on any host → `302` to login with `rd` = original URL.
   API requests → `401` JSON with `login_url`.
@@ -635,14 +711,21 @@ only when those are absent (in mode `none` an invalid bearer token is always `40
 * Behind these proxies the CLI gets a token by opening `/__backyard/auth/cli` in the browser
   (the proxy authenticates the browser); deploy traffic goes to a gateway path that the proxy
   exempts (ALB rule / separate GCP backend service) or to the standalone gateway (Lambda).
+* In these modes and in `none` (and always on the Cloudflare edition) Backyard does not run a
+  login itself: the proxy in front authenticates page loads. `GET
+  /__backyard/auth/login?rd=<url>` therefore answers `302` straight to `rd` (`Cache-Control:
+  no-store`), sanitized by the rules of §8.1, so that a `login_url` always leads somewhere
+  useful. (On the Go server `/callback` and `/logout` exist only in `oidc` mode.)
 
 ### 8.3 Backyard API tokens
 
 **Key derivation.** Every secret-keyed component uses its own key
 `keys.Derive(server.secret, label)` = HKDF-SHA256(ikm = secret, salt = `"backyard"`,
 info = label, 32 bytes) with the labels `backyard/session/v1`, `backyard/oauth-state/v1`,
-`backyard/api-token/v1`, `backyard/deploy/v1`, `backyard/upload/v1` and `backyard/anon/v1`.
-Both editions derive keys identically, so tokens interoperate given the same secret.
+`backyard/api-token/v1`, `backyard/deploy/v1`, `backyard/upload/v1`, `backyard/anon/v1` and
+`backyard/cli-confirm/v1`. Both editions derive keys identically, so tokens interoperate given
+the same secret. (`backyard/cli-confirm/v1` only signs CLI login confirmation forms, which never
+leave the deployment that issued them, so it is not required to interoperate between editions.)
 
 HS256 JWTs signed with `keys.Derive(secret, "backyard/api-token/v1")`:
 `{iss: "backyard", sub: user.id, email, name, groups, admin, scope: "api", jti, iat, exp}`
@@ -655,12 +738,36 @@ rotate `server.secret`. Static tokens: `auth.tokens: [{name, sha256, admin?}]` (
 token string; `backyard token hash` prints it); they authenticate as
 `{id: "token:<name>", name, admin: <bool>}` and cannot mint API tokens.
 
-CLI login (`/__backyard/auth/cli?redirect_uri=http://127.0.0.1:PORT/callback&state=…`): requires an
-authenticated browser user (session cookie or proxy identity — bearer tokens are not accepted,
-so a token cannot renew itself); `redirect_uri` must be
-`http://127.0.0.1|localhost|[::1]:<port>/…`; redirects to
-`redirect_uri?token=…&expires_at=…&state=…`. With `?mode=display` the token is shown on a page for
-copy/paste (headless machines).
+CLI login (`GET /__backyard/auth/cli?redirect_uri=http://127.0.0.1:PORT/callback&state=…`):
+requires an authenticated browser user (session cookie or proxy identity — bearer tokens are not
+accepted, so a token cannot renew itself); `redirect_uri` must be
+`http://127.0.0.1|localhost|[::1]:<port>/…` and `state` (≤ 1 KiB, required with a
+`redirect_uri`) is passed back; answers `302` (`Cache-Control: no-store`,
+`Referrer-Policy: no-referrer`) to `redirect_uri?token=…&expires_at=…&state=…`. With
+`?mode=display` the token is shown on a page for copy/paste (headless machines). Methods other than `GET` and `POST` → `405`.
+
+**Cross-site confirmation.** Any web page can navigate a signed-in browser to this URL, and
+whatever listens on the loopback port (not necessarily the CLI the user started) would receive
+the token. So a request that another site may have started mints nothing — with a
+`redirect_uri` and with `mode=display` alike — and answers `200` with a confirmation page
+instead. That is a `GET` whose `Sec-Fetch-Site` is present and neither `none` (a navigation the
+user started, as when the CLI opens the URL) nor `same-origin` — `same-site` included, because
+sites are subdomains of the hub — or, without `Sec-Fetch-Site`, whose `Referer` has another
+origin than the hub (or the request's own). The page names the user and the loopback origin and
+holds an `application/x-www-form-urlencoded` form (≤ 16 KiB) that `POST`s `redirect_uri`,
+`state`, `mode` and a CSRF token `csrf` back to `/__backyard/auth/cli`. The page is served with
+`Referrer-Policy: no-referrer` and a CSP whose `form-action` allows only `'self'` and the
+loopback origin (`http:` for `[::1]`, which CSP cannot name), so the form's redirect may reach
+the CLI and nothing else. The CSRF token is `<unix expiry>.<base64url HMAC-SHA256>`, keyed with
+`backyard/cli-confirm/v1`, over the user id, the browser session where there is one (the Go
+server in `oidc` mode binds the session cookie; elsewhere the proxy or guest cookie identifies
+the browser on every request, and the user id alone binds it), `redirect_uri`, `state`, `mode`
+and the expiry, 10 minutes after the page was rendered. A `POST` is refused with `403` when its
+`Sec-Fetch-Site` is present and not `same-origin`, when its `Origin` is present and neither the
+hub's (or the request's own) nor `null` (what the page's referrer policy produces), or when its
+CSRF token does not verify for the current user, session and request. A verified `POST` mints
+the API token like a direct request and answers `303` to the loopback URL (or shows the token
+for `mode=display`).
 
 Cookies are `HttpOnly; SameSite=Lax; Path=/` and `Secure` when `server.public_url` is https. Their
 `Domain` is `.<base_domain>` in host mode, and host-only in path mode and for `localhost`, IP or
@@ -693,10 +800,11 @@ calls, default 600), `db_writes_per_minute` (document writes and file deletes, d
 `ai_per_minute` (default 20), `ai_tokens_per_day` (default 2,000,000 input+output tokens, reset
 at 00:00 UTC), `warehouse_per_minute` (default 30), `uploads_per_minute` (default 60) and
 `deploys_per_hour` (enforced by the deploy gateway, default 60). `ratelimit.disabled` turns them
-off; a negative value disables a single limit (0 selects the default). With N instances the
-effective limits are up to N times higher. Per-site storage limits: `database.max_docs_per_site`
-(default 100,000), `database.max_doc_bytes`; per-site deploy limits: `sites.max_site_bytes`,
-`sites.max_files`, `sites.max_file_bytes`.
+off; a negative value disables a single limit — `ai_tokens_per_day` included — and 0 (or leaving
+the key out) selects the default. With N instances the effective limits are up to N times
+higher. Per-site storage limits: `database.max_docs_per_site` (default 100,000; negative =
+unlimited; a soft quota, as instances count independently), `database.max_doc_bytes`; per-site
+deploy limits: `sites.max_site_bytes`, `sites.max_files`, `sites.max_file_bytes`.
 
 ## 12. Configuration
 
@@ -715,6 +823,12 @@ true`) fills in: `base_domain: localhost`, `auth.mode: none`, fs storage + sqlit
 `./.backyard-data`, memory pubsub, `deploy.allow_anonymous: true` (with `auth.mode: none`), a
 random (ephemeral) secret unless one is configured, and text logs; it also enables the dev host
 rules of §2.
+
+Validation reports every problem at once and also rejects inconsistent combinations, among
+them `auth.mode: oidc` with `url_mode: host` unless `base_domain` can carry a cookie `Domain`
+(not `localhost`, `*.localhost`, an IP address or a single-label name) and the host of
+`public_url` is `base_domain` or one of its subdomains (§8.1), and `deploy.allow_anonymous`
+without `auth.mode: none`.
 
 ## 13. CLI
 
@@ -783,16 +897,22 @@ external gateway advertised in `info.gateway_url` is adopted when reachable.
   `commands/`, MCP server `backyard mcp`).
 * MCP tools (`backyard mcp`): `backyard_docs`, `backyard_init`, `backyard_deploy`,
   `backyard_list_sites`, `backyard_site_files`, `backyard_read_site_file`, `backyard_whoami`,
-  `backyard_open_url`.
+  `backyard_open_url`. `backyard_init` and `backyard_deploy` use folders inside the working
+  directory; any other folder only when named by the absolute path of an existing directory,
+  and never the filesystem root, the home directory or a folder that holds credentials (the
+  CLI's config folder, hidden folders of the home directory such as `~/.ssh`).
+  `backyard_read_site_file` refuses binary file types without downloading them and
+  returns at most 256 KiB of text, which is untrusted data. Tool results and errors never
+  contain tokens or signed upload URLs.
 * Hub serves `/llms.txt` and `/llms-full.txt`.
 
 ## 15. Observability
 
 `log/slog` JSON (or text) logs; `telemetry.access_log` adds one line per request (with
-`request_id`, also returned as `X-Request-Id`). Audit events (logins, CLI and API token issuance,
-deploy create/commit, refresh, site deletion, owner changes) are logged with `"audit": true`; the
-server also stores API token issuance records in `_system/_audit` (best effort). Prometheus
-metrics (prefix `backyard_`): `http_requests_total{area,code}`,
+`request_id`, the `X-Request-Id` of every response, §5). Audit events (logins, CLI and API
+token issuance, deploy create/commit, refresh, site deletion, owner changes) are logged with
+`"audit": true`; the server also stores API token issuance records in `_system/_audit` (best
+effort). Prometheus metrics (prefix `backyard_`): `http_requests_total{area,code}`,
 `http_request_duration_seconds{area}`, `deploys_total{method=api|sync,result}`,
 `db_ops_total{op,result}`, `ai_requests_total{model,result}`, `ai_tokens_total{model,direction}`,
 `ws_connections`, `ws_messages_total{dir}`, `warehouse_queries_total{source,result}`,
@@ -817,13 +937,17 @@ storage are available on free); R2 and paid features are optional.
 * **Storage:** files ≤ `FILE_INLINE_MAX` (default 5 MiB) stored chunked in DO SQLite (chunks <
   2 MB); larger files go to the optional `R2` binding (`sites/<site>/…`, `uploads/<site>/…`);
   the per-file cap is 25 MiB without R2 and 95 MiB with it (100 MB request limit). Deploy uploads
-  use self-hosted upload URLs (§7.3).
+  use self-hosted upload URLs (§7.3), verified (size + SHA-256) before anything is stored. Site
+  files are content-addressed: the commit switches the site's whole file list in one
+  transaction (so deploys are atomic on this edition), and content uploaded by deploys that
+  never commit is garbage-collected by a later commit once it is an hour old.
 * **Database:** documents in the site DO's SQLite with the exact query semantics of §5.2
   (shared conformance tests). Realtime is local to the site DO (single instance per site).
 * **AI:** `workers-ai` provider via the `AI` binding (free daily allowance) with configurable
   aliases (`AI_MODELS` JSON var); optional `anthropic`/`openai`(-compatible) providers via
   secrets (optionally through Cloudflare AI Gateway). Image generation via Workers AI image
-  models. Embeddings via Workers AI.
+  models. Embeddings via Workers AI. Smaller per-request limits than the Go server (§5.4): at
+  most 4 images per `/ai/image` request and 100 inputs per `/ai/embed` request.
 * **Warehouse:** not available on Cloudflare (`501 unsupported`) unless `WAREHOUSE_URL` points
   to a Backyard Go server's warehouse API (proxy) — optional.
 * **Auth:** `AUTH_MODE` = `none` (anonymous cookie identity; deploys need `DEPLOY_TOKEN` unless
@@ -831,6 +955,9 @@ storage are available on free); R2 and paid features are optional.
   against `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs` with `ACCESS_AUD`; Okta,
   Entra ID, Google etc. are configured as Access identity providers). Backyard API tokens (§8.3,
   HS256 with `BACKYARD_SECRET`) and the `/__backyard/auth/cli` browser flow work identically.
+  Unlike the Go server's proxy modes (§8.2), `/__backyard/auth/logout` (`GET`/`POST`) exists in
+  both modes: it clears the guest cookie (`none`) or redirects to `/cdn-cgi/access/logout`
+  (`access`).
   Access must bypass `/__backyard/api/deploy/*` (service tokens or a Bypass policy) — Terraform
   in `deploy/terraform/cloudflare` sets this up.
 * **Guardrails (free tier):** per-user/IP daily caps for AI calls, deploys and uploads, and a

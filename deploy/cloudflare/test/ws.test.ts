@@ -1,6 +1,15 @@
 /** Realtime websocket protocol (SPEC §6) on the site Durable Object. */
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import type { Env } from "../src/env";
 import { anonCookie, apiHeaders, call, uniqueSite } from "./helpers";
+
+/** The site's Durable Object stub. */
+function siteObject(site: string): DurableObjectStub {
+  const ns = (env as unknown as Env).SITE;
+  return ns.get(ns.idFromName(site)) as unknown as DurableObjectStub;
+}
 
 type Frame = Record<string, unknown> & { t: string };
 
@@ -214,5 +223,89 @@ describe("websocket protocol", () => {
     res.webSocket!.close(1000, "bye");
     res = await call(`/s/${site}/__backyard/api/ws`, { headers: { Cookie: cookie } });
     expect(res.status).toBe(426);
+  });
+
+  it("treats __proto__, constructor and toString as room names, never as members of Object.prototype", async () => {
+    const site = uniqueSite("proto");
+    const a = await connect(site, await guestCookie());
+    const b = await connect(site, await guestCookie());
+    const helloA = await a.t("hello");
+    const helloB = await b.t("hello");
+    // Not a member: state and send are refused (they used to reach every
+    // connection of the site and set Object.prototype.state).
+    a.send({ t: "state", id: "s0", room: "__proto__", state: { evil: true } });
+    expect(await a.t("error")).toMatchObject({ id: "s0", error: { code: "not_found" } });
+    for (const room of ["constructor", "toString", "hasOwnProperty"]) {
+      a.send({ t: "send", id: `m-${room}`, room, data: "x" });
+      expect(await a.t("error"), room).toMatchObject({ id: `m-${room}`, error: { code: "not_found" } });
+      a.send({ t: "state", id: `s-${room}`, room, state: { evil: true } });
+      expect(await a.t("error"), room).toMatchObject({ id: `s-${room}`, error: { code: "not_found" } });
+    }
+    // They are ordinary rooms: members are only the connections that joined.
+    a.send({ t: "join", id: "j1", room: "__proto__", state: { x: 1 } });
+    expect(await a.t("joined")).toMatchObject({ id: "j1", room: "__proto__", members: [] });
+    b.send({ t: "join", id: "j2", room: "constructor" });
+    const jb = await b.t("joined");
+    expect(jb).toMatchObject({ id: "j2", room: "constructor", members: [] });
+    expect((jb.self as { state: unknown }).state).toEqual({});
+    b.send({ t: "join", id: "j3", room: "__proto__" });
+    const jb2 = await b.t("joined");
+    expect((jb2.members as { cid: string; state: unknown }[]).map((m) => [m.cid, m.state])).toEqual([[helloA.cid, { x: 1 }]]);
+    expect(await a.t("presence")).toMatchObject({ room: "__proto__", op: "join", member: { cid: helloB.cid, state: {} } });
+    b.send({ t: "send", id: "m", room: "__proto__", data: "hi" });
+    expect(await a.t("msg")).toMatchObject({ room: "__proto__", data: "hi" });
+    expect(await b.t("ack")).toEqual({ t: "ack", id: "m" });
+    expect(b.frames.filter((f) => f.t === "presence" || f.t === "msg")).toEqual([]);
+    // Nothing reached Object.prototype, in the test or in the object.
+    expect(await runInDurableObject(siteObject(site), () => Object.prototype.hasOwnProperty.call(Object.prototype, "state"))).toBe(false);
+    // The rooms survive hibernation (rebuilt from the attachments) and stay rooms.
+    await evictDurableObject(siteObject(site));
+    a.send({ t: "state", id: "s1", room: "__proto__", state: { x: 2 } });
+    expect(await a.t("ack")).toEqual({ t: "ack", id: "s1" });
+    expect(await b.t("presence")).toMatchObject({ room: "__proto__", op: "update", member: { cid: helloA.cid, state: { x: 2 } } });
+    a.send({ t: "state", id: "s2", room: "constructor", state: {} });
+    expect(await a.t("error")).toMatchObject({ id: "s2", error: { code: "not_found" } });
+    a.ws.close(1000, "bye");
+    b.ws.close(1000, "bye");
+  });
+
+  it("keeps connection state that does not fit an attachment once serialized (two-byte text, numbers)", async () => {
+    const site = uniqueSite("bigstate");
+    const a = await connect(site, await guestCookie());
+    const b = await connect(site, await guestCookie());
+    const helloA = await a.t("hello");
+    await b.t("hello");
+    // About 8 KB of UTF-8 per room (under ws_max_presence_bytes), but 2 bytes
+    // per character in the serialized attachment: the third join used to fail
+    // silently ("attachment cannot be larger than 16384 bytes").
+    const text = "中".repeat(2700);
+    for (let i = 0; i < 4; i++) {
+      b.send({ t: "join", id: `b${i}`, room: `r${i}` });
+      await b.t("joined");
+    }
+    for (let i = 0; i < 4; i++) {
+      a.send({ t: "join", id: `a${i}`, room: `r${i}`, state: { s: text } });
+      expect(await a.t("joined"), `join r${i}`).toMatchObject({ id: `a${i}`, room: `r${i}` });
+      expect(await b.t("presence"), `presence r${i}`).toMatchObject({ room: `r${i}`, op: "join", member: { cid: helloA.cid } });
+    }
+    // Numbers: 9 bytes each serialized, about 4 characters of JSON.
+    a.send({ t: "join", id: "n", room: "nums", state: { v: new Array(1900).fill(0.5) } });
+    expect(await a.t("joined")).toMatchObject({ id: "n", room: "nums" });
+    // After hibernation the state is what memory had.
+    await evictDurableObject(siteObject(site));
+    a.send({ t: "leave", id: "l2", room: "r2" });
+    expect(await a.t("ack")).toEqual({ t: "ack", id: "l2" });
+    expect(await b.t("presence")).toMatchObject({ room: "r2", op: "leave", member: { cid: helloA.cid } });
+    for (const [room, member] of [["r0", true], ["r2", false], ["r3", true]] as const) {
+      b.send({ t: "join", id: `again-${room}`, room });
+      const j = await b.t("joined", (f) => f.id === `again-${room}`);
+      const m = (j.members as { cid: string; state: { s?: string } }[]).find((x) => x.cid === helloA.cid);
+      expect(!!m, room).toBe(member);
+      if (m) expect(m.state.s).toBe(text);
+    }
+    a.send({ t: "sub", id: "sub1", collection: "posts" });
+    expect(await a.t("ack")).toEqual({ t: "ack", id: "sub1" });
+    a.ws.close(1000, "bye");
+    b.ws.close(1000, "bye");
   });
 });

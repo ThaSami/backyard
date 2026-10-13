@@ -13,6 +13,8 @@ export const KeyLabel = {
   Deploy: "backyard/deploy/v1",
   Upload: "backyard/upload/v1",
   Anon: "backyard/anon/v1",
+  /** Signs the confirmation form of a cross-site CLI login (like Go's keys.CLIConfirm). */
+  CLIConfirm: "backyard/cli-confirm/v1",
 } as const;
 
 const enc = new TextEncoder();
@@ -101,13 +103,56 @@ export function b64urlDecode(s: string): Uint8Array | null {
   }
 }
 
-/** Standard base64 encoding of bytes. */
+/** Uint8Array.prototype.toBase64 (TC39 base64 proposal) where the runtime has it. */
+type WithToBase64 = Uint8Array & { toBase64?: () => string };
+
+/**
+ * Standard base64 encoding of bytes. Uses the runtime's native encoder when
+ * there is one; otherwise builds the binary string a chunk at a time with
+ * String.fromCharCode.apply (spreading a typed array into the call goes
+ * through the iterator protocol and is several times slower: CPU time is
+ * scarce in a Worker).
+ */
 export function base64Encode(bytes: Uint8Array): string {
-  let s = "";
+  const native = (bytes as WithToBase64).toBase64;
+  if (typeof native === "function") return native.call(bytes);
+  const parts: string[] = [];
   for (let i = 0; i < bytes.length; i += 0x8000) {
-    s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000) as unknown as number[]));
   }
-  return btoa(s);
+  return btoa(parts.join(""));
+}
+
+const STD_BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+const BASE64_BODY_RE = /^[A-Za-z0-9+/]*$/;
+
+/**
+ * Standard, padded base64 of a base64 text in the standard or URL-safe
+ * alphabet, padded or not, possibly with white space; null when it is not
+ * base64. Text that already is standard padded base64 (what clients send) is
+ * returned as is, without a copy or decoding it: it can be passed on.
+ */
+export function normalizeBase64(s: string): string | null {
+  if (s.length % 4 === 0 && STD_BASE64_RE.test(s)) return s;
+  const t = s.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+  if (!BASE64_BODY_RE.test(t) || t.length % 4 === 1) return null;
+  return t + "===".slice((t.length + 3) % 4);
+}
+
+/** Decoded size in bytes of standard padded base64 (see normalizeBase64). */
+export function base64Size(b64: string): number {
+  const pad = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
+  return (b64.length / 4) * 3 - pad;
+}
+
+/** The first n (at most) decoded bytes of standard padded base64, without decoding the rest. */
+export function base64Head(b64: string, n: number): Uint8Array {
+  const chars = Math.min(b64.length, Math.ceil(n / 3) * 4);
+  try {
+    return base64Decode(b64.slice(0, chars)).subarray(0, n);
+  } catch {
+    return new Uint8Array(0);
+  }
 }
 
 /** Decodes standard base64 (throws on invalid input). */

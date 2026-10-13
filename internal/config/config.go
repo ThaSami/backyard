@@ -259,7 +259,8 @@ type DatabaseConfig struct {
 	MaxDocBytes int `yaml:"max_doc_bytes"`
 	// MaxList caps query limit (default 1000).
 	MaxList int `yaml:"max_list"`
-	// MaxDocsPerSite caps documents per site (default 100000, 0 = unlimited).
+	// MaxDocsPerSite caps documents per site (default 100000; 0 selects the
+	// default, a negative value = unlimited).
 	MaxDocsPerSite int `yaml:"max_docs_per_site"`
 }
 
@@ -455,16 +456,20 @@ type DeployConfig struct {
 	EmbeddedGateway *bool `yaml:"embedded_gateway"`
 }
 
-// RateLimitConfig sets per-user limits (per instance).
+// RateLimitConfig sets per-user limits (per instance). For every limit, 0
+// selects the default and a negative value = unlimited (that limit is
+// disabled); Disabled turns all of them off.
 type RateLimitConfig struct {
-	Disabled           bool  `yaml:"disabled"`
-	APIPerMinute       int   `yaml:"api_per_minute"`
-	DBWritesPerMinute  int   `yaml:"db_writes_per_minute"`
-	AIPerMinute        int   `yaml:"ai_per_minute"`
+	Disabled          bool `yaml:"disabled"`
+	APIPerMinute      int  `yaml:"api_per_minute"`       // default 600
+	DBWritesPerMinute int  `yaml:"db_writes_per_minute"` // default 300
+	AIPerMinute       int  `yaml:"ai_per_minute"`        // default 20
+	// AITokensPerDay caps input+output AI tokens per user per UTC day
+	// (default 2000000; negative = unlimited).
 	AITokensPerDay     int64 `yaml:"ai_tokens_per_day"`
-	DeploysPerHour     int   `yaml:"deploys_per_hour"`
-	UploadsPerMinute   int   `yaml:"uploads_per_minute"`
-	WarehousePerMinute int   `yaml:"warehouse_per_minute"`
+	DeploysPerHour     int   `yaml:"deploys_per_hour"`     // default 60
+	UploadsPerMinute   int   `yaml:"uploads_per_minute"`   // default 60
+	WarehousePerMinute int   `yaml:"warehouse_per_minute"` // default 30
 }
 
 // RealtimeConfig controls websockets.
@@ -1139,6 +1144,25 @@ func (c *Config) Validate() error {
 			add("deploy.methods: unknown method %q", m)
 		}
 	}
+	if a.Mode == "oidc" && s.URLMode == "host" && s.BaseDomain != "" {
+		// The session cookie is set by the hub with Domain=.<base_domain> so
+		// that site hosts see it. Without such a cookie every site page sends
+		// the browser through the IdP and back, endlessly.
+		bd := bareHost(s.BaseDomain)
+		if !CookieDomainCapable(bd) {
+			add("server.base_domain %q cannot carry a cookie Domain (browsers refuse localhost, *.localhost, IP addresses "+
+				"and single-label names), so with auth.mode=oidc in host mode the sign-in session never reaches site hosts "+
+				"and every site redirects to the login endlessly: set server.url_mode: path, or use a real domain "+
+				"(for local testing e.g. lvh.me, whose subdomains resolve to 127.0.0.1)", s.BaseDomain)
+		} else if u, err := url.Parse(s.PublicURL); err == nil && u.Hostname() != "" {
+			if hub := bareHost(u.Hostname()); hub != bd && !strings.HasSuffix(hub, "."+bd) {
+				add("server.public_url host %q must be server.base_domain %q or one of its subdomains with auth.mode=oidc "+
+					"in host mode: the hub sets the sign-in session cookie for .<base_domain>, and from another host site "+
+					"hosts never receive it (every site would redirect to the login endlessly); or set server.url_mode: path",
+					hub, bd)
+			}
+		}
+	}
 	if c.Deploy.AllowAnonymous && c.Auth.Mode != "none" {
 		add("deploy.allow_anonymous is only allowed with auth.mode=none")
 	}
@@ -1170,18 +1194,60 @@ func (a AuthConfig) IsAdmin(id, email string, groups []string) bool {
 	return false
 }
 
-// SiteURL returns the public URL of a site (with trailing slash).
+// SiteURL returns the public URL of a site (with trailing slash). In host
+// mode that is <scheme>://<site>.<base_domain>[:<port>]/ with the scheme and
+// port of server.public_url: sites are routed by base_domain, whose name may
+// differ from the public URL's host (public_url https://hub.acme.com with
+// base_domain apps.acme.com puts site foo at https://foo.apps.acme.com/). In
+// path mode it is <public_url>/s/<site>/.
 func (c *Config) SiteURL(site string) string {
-	u, err := url.Parse(c.Server.PublicURL)
+	u, err := url.Parse(strings.TrimSpace(c.Server.PublicURL))
 	if err != nil {
 		return ""
 	}
 	if c.Server.URLMode == "path" {
-		return strings.TrimSuffix(c.Server.PublicURL, "/") + "/s/" + site + "/"
+		return strings.TrimSuffix(strings.TrimSpace(c.Server.PublicURL), "/") + "/s/" + site + "/"
 	}
-	u.Host = site + "." + u.Host
-	u.Path = "/"
-	return u.String()
+	base := bareHost(c.Server.BaseDomain)
+	if base == "" {
+		base = strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	}
+	if base == "" {
+		return ""
+	}
+	host := site + "." + base
+	if p := u.Port(); p != "" {
+		host = net.JoinHostPort(host, p)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme == "" {
+		scheme = "https"
+	}
+	return (&url.URL{Scheme: scheme, Host: host, Path: "/"}).String()
+}
+
+// bareHost normalizes a host name: trimmed, lowercased, without a trailing
+// dot or a port.
+func bareHost(h string) string {
+	h = strings.ToLower(strings.TrimSpace(h))
+	if hh, _, err := net.SplitHostPort(h); err == nil {
+		h = hh
+	}
+	return strings.TrimSuffix(strings.Trim(h, "[]"), ".")
+}
+
+// CookieDomainCapable reports whether browsers accept ".<host>" as a cookie
+// Domain attribute, which host-mode sessions need to reach site hosts. They
+// refuse localhost, *.localhost, IP literals and single-label names.
+// (Public suffixes such as co.uk are refused too but are not detected here.)
+func CookieDomainCapable(host string) bool {
+	h := bareHost(host)
+	switch {
+	case h == "", h == "localhost", strings.HasSuffix(h, ".localhost"),
+		net.ParseIP(h) != nil, !strings.Contains(h, "."):
+		return false
+	}
+	return true
 }
 
 // HubHost returns the host (with port, if any) of the public URL.

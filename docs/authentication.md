@@ -73,7 +73,17 @@ auth:
 Endpoints on the hub: `/__backyard/auth/login?rd=<url>` (start; `rd` must point at the hub or a
 site, anything else is replaced by the hub URL), `/__backyard/auth/callback` (the redirect URI)
 and `/__backyard/auth/logout` (clears the session and calls the IdP's `end_session_endpoint`
-with `post_logout_redirect_uri` = the hub URL when the IdP advertises one).
+with `post_logout_redirect_uri` = the hub URL when the IdP advertises one). In the other modes
+the proxy in front signs people in, so `/__backyard/auth/login?rd=<url>` simply redirects to
+`rd` (same rules) and there is no callback or logout endpoint.
+
+**Host mode needs a cookie domain.** The session cookie is set for `.<base_domain>` so that site
+hosts receive it. Browsers refuse that for `localhost`, `*.localhost`, IP addresses and
+single-label names, and a hub outside `base_domain` could not set it at all — every site visit
+would bounce through the IdP forever. So with `auth.mode: oidc` in host mode, the server refuses
+to start unless `server.base_domain` is a real domain and the host of `server.public_url` is
+that domain or one of its subdomains. For local tests use `server.url_mode: path`, or a domain
+whose subdomains resolve to 127.0.0.1 such as `lvh.me`.
 
 ### Okta, step by step
 
@@ -363,6 +373,11 @@ flow:
 
 The browser hand-off only accepts loopback redirect URIs (`127.0.0.1`, `localhost`, `[::1]`)
 and requires a browser session or proxy identity — a bearer token can never renew itself.
+Because any web page could navigate a signed-in browser to that URL, a request that arrives as
+a cross-site navigation does not mint a token right away: Backyard first asks you to confirm on
+its own page, and issues the token only when you do (the same holds for the `--no-browser`
+page that displays a token). The URL the CLI opens itself needs no confirmation.
+
 Credentials are stored per profile in `~/.config/backyard/config.json` (mode `0600`).
 
 ### Behind an identity-aware proxy

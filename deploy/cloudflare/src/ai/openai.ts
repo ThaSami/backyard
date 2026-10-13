@@ -9,8 +9,11 @@ import { HttpError } from "../http";
 import { sniff } from "../mime";
 import { readSSE } from "./sse";
 import {
-  dataURL,
+  errorBodyMessage,
+  imageURL,
+  isTimeout,
   opaqueUserID,
+  retryAfterHeader,
   stripCodeFences,
   systemWithJSON,
   upstreamError,
@@ -76,20 +79,19 @@ export class OpenAIProvider implements Provider {
       try {
         res = await send();
       } catch (e) {
-        throw upstreamError(this.name, (e as Error).message || "request failed");
+        throw upstreamError(this.name, (e as Error).message || "request failed", isTimeout(e) ? 504 : 0);
       }
       if (res.ok) return res;
-      let msg = `HTTP ${res.status}`;
+      let text = "";
       try {
-        const j = (await res.json()) as { error?: { message?: string } | string };
-        const m = typeof j.error === "string" ? j.error : j.error?.message;
-        if (m) msg = m;
+        text = (await res.text()).slice(0, 64 << 10);
       } catch {
         /* keep the status */
       }
+      const msg = errorBodyMessage(text);
       if (res.status === 400 && this.adapt(body, msg)) continue;
-      if (res.status === 400) throw new HttpError(400, "bad_request", `AI provider rejected the request: ${msg.slice(0, 500)}`);
-      throw upstreamError(this.name, msg, res.status === 429 ? 429 : res.status === 504 ? 504 : 502);
+      // Mapped by the provider's status like the Go server (SPEC §5.4).
+      throw upstreamError(this.name, msg, res.status, retryAfterHeader(res));
     }
     throw upstreamError(this.name, "the provider kept rejecting the request");
   }
@@ -128,7 +130,7 @@ export class OpenAIProvider implements Provider {
           ? m.content.map((p) =>
               p.type === "text"
                 ? { type: "text", text: p.text ?? "" }
-                : { type: "image_url", image_url: { url: p.data ? dataURL(p.data, p.media_type || "image/png") : (p.url ?? "") } },
+                : { type: "image_url", image_url: { url: imageURL(p) } },
             )
           : m.content.map((p) => p.text ?? "").join(""),
       });
@@ -173,7 +175,7 @@ export class OpenAIProvider implements Provider {
       } catch {
         return;
       }
-      if (j.error) throw upstreamError(this.name, JSON.stringify(j.error).slice(0, 500));
+      if (j.error) throw upstreamError(this.name, errorBodyMessage(JSON.stringify({ error: j.error })));
       const choice = (j.choices as AnyRecord[] | undefined)?.[0];
       const delta = choice?.delta as AnyRecord | undefined;
       if (choice?.finish_reason) stop = choice.finish_reason;

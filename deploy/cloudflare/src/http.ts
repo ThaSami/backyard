@@ -196,6 +196,23 @@ export function getCookie(req: Request, name: string): string | null {
   return null;
 }
 
+/**
+ * Values of every cookie called name, in the order the browser sent them
+ * (cookies with longer paths first). Several can arrive: a site's page in
+ * host mode can set one for the parent domain or a longer path next to ours.
+ */
+export function getCookies(req: Request, name: string): string[] {
+  const header = req.headers.get("Cookie");
+  if (!header) return [];
+  const out: string[] = [];
+  for (const part of header.split(";")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    if (part.slice(0, i).trim() === name) out.push(part.slice(i + 1).trim());
+  }
+  return out;
+}
+
 /** Bearer token of the Authorization header, or "" when absent. */
 export function bearerToken(req: Request): string {
   const h = (req.headers.get("Authorization") ?? "").trim();
@@ -219,12 +236,25 @@ const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,128}$/;
  * a random one.
  */
 export function requestID(req: Request): string {
+  // The same id for the whole request: handlers name it in error messages
+  // ("the details are in the server log (request id …)") and the response
+  // carries it as X-Request-Id.
+  const known = requestIDs.get(req);
+  if (known) return known;
+  let id = "";
   for (const v of [req.headers.get("X-Request-Id"), req.headers.get("CF-Ray")]) {
-    if (v && REQUEST_ID_RE.test(v)) return v;
+    if (v && REQUEST_ID_RE.test(v)) {
+      id = v;
+      break;
+    }
   }
-  const b = crypto.getRandomValues(new Uint8Array(12));
-  return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+  if (!id) id = [...crypto.getRandomValues(new Uint8Array(12))].map((x) => x.toString(16).padStart(2, "0")).join("");
+  requestIDs.set(req, id);
+  return id;
 }
+
+/** Request ids by request (see requestID). */
+const requestIDs = new WeakMap<Request, string>();
 
 /**
  * Wraps a response with the headers every Backyard response carries: the

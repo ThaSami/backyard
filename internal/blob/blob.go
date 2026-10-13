@@ -109,6 +109,22 @@ type Store interface {
 	Close() error
 }
 
+// DigestReporter is optionally implemented by stores whose service keeps a
+// SHA-256 it verified itself for some objects, so callers can learn an
+// object's digest without reading it: S3 objects uploaded with
+// x-amz-checksum-sha256 (as presigned uploads are where flexible checksums
+// are enabled, see PresignPutOptions).
+type DigestReporter interface {
+	// StatSHA256 returns the object's metadata (as Stat) together with the
+	// lowercase hex SHA-256 of its full content as verified by the storage
+	// service, or "" when the service holds no such digest for this object
+	// version. A digest always describes the object the returned info
+	// describes. It returns ErrNotFound for a missing object and
+	// ErrNotSupported when the store cannot report digests at all (callers
+	// then read the object).
+	StatSHA256(ctx context.Context, key string) (*ObjectInfo, string, error)
+}
+
 // Description is the public storage description included in /info.
 type Description struct {
 	Type      string `json:"type"`

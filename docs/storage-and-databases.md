@@ -76,8 +76,9 @@ storage:
 ```
 
 Credentials come from the default AWS chain (IRSA, ECS task role, instance profile,
-environment) unless static keys are set. Presigned uploads sign the exact size and — on AWS —
-the SHA-256 (`x-amz-checksum-sha256`), so S3 rejects any other body. With a custom `endpoint`,
+environment) unless static keys are set. Presigned uploads sign the exact size (a signed
+`Content-Length`, or the `Content-MD5` of the empty body for an empty file) and — on AWS — the
+SHA-256 (`x-amz-checksum-sha256`), so S3 rejects any other body. With a custom `endpoint`,
 path-style addressing is used and only required checksums are sent (many S3-compatible stores
 reject the newer checksum headers; `AWS_REQUEST_CHECKSUM_CALCULATION` overrides this). The
 bucket needs CORS for `PUT` from the hub origin if you use drag-and-drop deploys.
@@ -99,7 +100,7 @@ storage:
 On Cloud Run and GKE there is no private key, so upload URLs are signed through the IAM
 Credentials API as `signer_email` (default: the detected service account), which needs
 `roles/iam.serviceAccountTokenCreator` on itself. Presigned uploads pin the size
-(`x-goog-content-length-range`); GCS cannot verify SHA-256, so the commit re-checks sizes.
+(`x-goog-content-length-range`); GCS cannot verify a SHA-256 digest.
 
 ### `azure` — Azure Blob Storage
 
@@ -116,8 +117,27 @@ Authentication: `connection_string`, else `account` + `account_key`, else
 `DefaultAzureCredential` (managed identity, workload identity, Azure CLI). Upload URLs are
 service SAS URLs (shared key) or user-delegation SAS URLs (the identity needs *Storage Blob
 Delegator*, included in *Storage Blob Data Contributor*). A SAS cannot restrict the uploaded
-body, so the gateway compares sizes at commit and deletes mismatching objects. Directory
+body at all, so only the commit's size check guards these uploads (see below). Directory
 placeholder blobs of hierarchical-namespace (ADLS Gen2) accounts are ignored.
+
+### Upload integrity
+
+Deploys through the gateway (`api`) upload each file to a URL bound to the size and SHA-256
+the deploy plan declared, as far as the store can enforce it:
+
+| Store | Upload URL | Enforced by the store |
+|---|---|---|
+| `fs` (or `deploy.presign: false`) | the gateway's own `…/uploads/<token>` | size and SHA-256 (a mismatching body is never stored) |
+| `s3` | presigned PUT | size; SHA-256 on AWS (and on custom endpoints with `AWS_REQUEST_CHECKSUM_CALCULATION=when_supported`) |
+| `gcs` | V4 signed URL | size |
+| `azure` | SAS URL | nothing |
+
+The commit is the second line of defence: every listed file must exist with its declared size.
+A stored object of the wrong size that is not the version the previous manifest recorded is
+deleted, and the commit fails with `409 conflict` naming the paths. Uploads write straight to
+`sites/<site>/<path>` (deploys are not atomic, like rsync), so the uploads of a deploy that is
+never committed stay until a later commit deletes them as unlisted (or the site is deleted).
+See [SPEC §7.3](spec/SPEC.md#73-deploy-diffed-rsync-semantics).
 
 ## Document store
 
@@ -128,7 +148,8 @@ against each of them and against the Cloudflare edition. See
 [SPEC §5.2](spec/SPEC.md#52-database).
 
 Limits: `database.max_doc_bytes` (256 KiB per document), `database.max_list` (1000 per page)
-and `database.max_docs_per_site` (100,000 per site, a soft quota).
+and `database.max_docs_per_site` (100,000 per site, a soft quota; a negative value means
+unlimited).
 
 ### `sqlite` — single node, zero setup
 
@@ -156,7 +177,9 @@ database:
 ```
 
 Works with RDS, Aurora, Cloud SQL, AlloyDB, Azure Database for PostgreSQL Flexible Server,
-Neon and self-hosted PostgreSQL. Documents live in `<schema>.backyard_docs` (JSONB);
+Neon and self-hosted PostgreSQL. Each instance keeps a pool of up to `max_conns` connections
+(default 20; it takes precedence over a `pool_max_conns` parameter in the DSN), plus those of
+Postgres pub/sub if you use it (below). Documents live in `<schema>.backyard_docs` (JSONB);
 migrations run on start, serialized across instances with an advisory lock and recorded in
 `<schema>.backyard_schema_version`. Queries run in SQL with bound parameters. PostgreSQL cannot
 store the NUL character in JSONB strings, so such documents are rejected.
@@ -202,7 +225,7 @@ reconnecting).
 | Type | Configuration | Notes |
 |---|---|---|
 | `memory` | — | Single instance only. |
-| `postgres` | `pubsub.postgres.dsn` (default: `database.postgres.dsn`), `channel` (`backyard_events`) | LISTEN/NOTIFY; no extra infrastructure when documents are in Postgres. Messages over the 8000-byte NOTIFY limit spill into the `backyard_pubsub_spill` table. Needs a direct (session-mode) connection, not a transaction-pooling proxy. |
+| `postgres` | `pubsub.postgres.dsn` (default: `database.postgres.dsn`), `channel` (`backyard_events`) | LISTEN/NOTIFY; no extra infrastructure when documents are in Postgres. Messages over the 8000-byte NOTIFY limit spill into the `backyard_pubsub_spill` table. Needs a direct (session-mode) connection, not a transaction-pooling proxy. Each instance opens one LISTEN connection plus a publishing pool of 2–4 connections (half the CPU count, clamped); a `pool_max_conns` parameter in the DSN sets that pool's size instead — also when the DSN is inherited from `database.postgres.dsn` (whose document store pool follows `max_conns` regardless). |
 | `redis` | `pubsub.redis.url` (`redis://` or `rediss://`) | Redis, Valkey, ElastiCache, Memorystore. Channels are prefixed `backyard:` (or `backyard:<db>:`), so several installs can share a server. |
 
 ## Testing backends locally

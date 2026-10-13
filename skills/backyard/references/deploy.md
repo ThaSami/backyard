@@ -98,7 +98,9 @@ backyard deploy -y --open             # no confirmation prompt, open the site af
 
 Manage sites: `backyard sites list [filter]`, `backyard sites info <site>`,
 `backyard sites delete <site>`, `backyard pull <site> [dir]` (download to study, fork or
-back up), `backyard open <site>`.
+back up), `backyard open <site>`. `pull` never writes what a deploy never publishes (dotfiles
+such as `.git/` or `.claude/`, `node_modules/`, `.backyard.json`, `CLAUDE.md`, `AGENTS.md`),
+even if the site holds such files: it lists them as skipped.
 
 ## Project files
 
@@ -113,7 +115,7 @@ Written by `backyard init`; found by searching the current folder and its parent
 | Field | Meaning |
 |---|---|
 | `site` | Site name to deploy to. |
-| `dir` | Folder to deploy, relative to the file (e.g. `"dist"` for build output). Default `"."`. |
+| `dir` | Folder to deploy, relative to the file (e.g. `"dist"` for build output). Default `"."`. It must stay inside the file's folder (no absolute paths, `..` or symlinks leading out). |
 | `method` | Preferred deploy method (`auto`, `api`, `s3`, `gcs`, `azure`, `rsync`). |
 | `ignore` | Extra gitignore-style patterns to exclude. |
 
@@ -140,16 +142,22 @@ drafts/
 | Method | How | Needs |
 |---|---|---|
 | `api` | Backyard deploy gateway protocol (diffed uploads to presigned URLs, then commit) | a login/token (or anonymous deploys) |
-| `s3` | `aws s3 sync <dir> s3://<bucket>/<prefix>sites/<site>/ --delete --exclude …` | AWS CLI + credentials for the bucket |
-| `gcs` | `gcloud storage rsync <dir> gs://<bucket>/<prefix>sites/<site> --recursive --delete-unmatched-destination-objects --exclude=…` (falls back to `gsutil -m rsync -r -d -x`) | gcloud + bucket access |
+| `s3` | `aws s3 sync <dir> s3://<bucket>/<prefix>sites/<site>/ --delete --no-follow-symlinks --exclude …` | AWS CLI + credentials for the bucket |
+| `gcs` | `gcloud storage rsync <dir> gs://<bucket>/<prefix>sites/<site> --recursive --delete-unmatched-destination-objects --exclude=…` (falls back to `gsutil -m rsync -r -d -e -x`) | gcloud + bucket access |
 | `azure` | `az storage blob sync --account-name <a> -c <container> -s <dir> -d <prefix>sites/<site> --delete-destination true --exclude-pattern …` | Azure CLI + storage access |
-| `rsync` | `rsync -az --delete --exclude … <dir>/ <rsync_target>/<site>/` | SSH access to the server's `deploy.rsync_target` |
+| `rsync` | `rsync -az --delete --delete-excluded --exclude … <dir>/ <rsync_target>/<site>/` | SSH access to the server's `deploy.rsync_target` |
 | `auto` (default) | `api` when the gateway is reachable and you are logged in (or anonymous deploys are allowed); otherwise the first direct method the server advertises whose tool is installed | |
 
 Bucket names, prefixes and the rsync target come from the server (`GET
-/__backyard/api/deploy/info`); you never type them. After a direct sync the CLI asks the server
-to refresh the site's metadata. Direct methods suit people who already have bucket access
-(platform teams, CI with cloud credentials); everyone else uses `api`.
+/__backyard/api/deploy/info`); you never type them. The ignore rules are applied exactly as
+with `api` (the excludes are computed from the folder) and symlinks leading out of the folder
+are never followed. The sync tools never delete files their excludes match, so after the sync
+the CLI lists the site through the gateway and removes the files the ignore rules exclude
+(`aws s3 rm`, `gcloud storage rm`, `az storage blob delete`; rsync does it with
+`--delete-excluded`), then asks the server to refresh the site's metadata. Without a reachable
+gateway and a login, such files stay published: deploy once with `--method api`. Direct methods
+suit people who already have bucket access (platform teams, CI with cloud credentials); everyone
+else uses `api`.
 
 ## Host mode and path mode
 
@@ -175,7 +183,10 @@ backyard dev --config backyard.yaml   # use AI providers / warehouse sources fro
 Serves the folder live (edit, then reload) with a complete local backend: database, realtime,
 files, and AI/warehouse when configured. Data is kept in `./.backyard-data` (dotfolder: never
 deployed; add it to `.gitignore`). Sign-in is anonymous ("Guest 1a2b"). `*.localhost`
-resolves to your machine in all modern browsers. Stop it with Ctrl+C.
+resolves to your machine in all modern browsers and in curl, but often not in other tools
+(Node `fetch`, wget, Python) in containers and CI: check a running preview from scripts with
+`curl -s -H 'Host: <site>.localhost:4321' http://127.0.0.1:4321/` (`http://localhost:4321/` is
+the dev hub, not the site). Stop it with Ctrl+C.
 
 ## Cloudflare edition (free tier)
 
@@ -274,7 +285,12 @@ bucket credentials and no Backyard token.
   `{"mcpServers": {"backyard": {"command": "backyard", "args": ["mcp"]}}}`. Tools:
   `backyard_docs`, `backyard_init`, `backyard_deploy`, `backyard_list_sites`,
   `backyard_site_files`, `backyard_read_site_file`, `backyard_whoami`, `backyard_open_url`.
-  It uses the CLI's login.
+  It uses the CLI's login and never returns tokens. `backyard_init` and `backyard_deploy` work
+  in folders inside the directory the agent was started in; a folder elsewhere must be passed
+  as the absolute path of an existing directory (never `/`, the home directory, hidden folders
+  such as `~/.ssh` or `~/.config`, or the CLI's own config folder). `backyard_deploy` without
+  `dir` publishes the current project like `backyard deploy` (the folder `.backyard.json`
+  names, e.g. `dist`).
 - **Other agents:** `backyard init --agents claude,codex,cursor,copilot` writes `CLAUDE.md`,
   `AGENTS.md`, `.cursor/rules/backyard.mdc` and `.github/copilot-instructions.md`.
 - **Docs for LLMs:** `https://backyard.example.com/llms.txt` and `/llms-full.txt`.

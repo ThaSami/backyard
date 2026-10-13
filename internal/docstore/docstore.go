@@ -58,6 +58,12 @@ type Meta struct {
 
 // MarshalJSON renders the flattened wire shape: {"id", ...data, "_meta": {...}}.
 func (d *Doc) MarshalJSON() ([]byte, error) {
+	return json.Marshal(d.Wire())
+}
+
+// Wire returns the flattened wire shape that MarshalJSON encodes:
+// {"id", ...data, "_meta": Meta}. The data values are shared with d.
+func (d *Doc) Wire() map[string]any {
 	m := make(map[string]any, len(d.Data)+2)
 	for k, v := range d.Data {
 		m[k] = v
@@ -67,7 +73,7 @@ func (d *Doc) MarshalJSON() ([]byte, error) {
 		CreatedAt: d.CreatedAt.UTC(), UpdatedAt: d.UpdatedAt.UTC(),
 		CreatedBy: d.CreatedBy, UpdatedBy: d.UpdatedBy, Version: d.Version,
 	}
-	return json.Marshal(m)
+	return m
 }
 
 // Op is a filter operator.
@@ -346,6 +352,10 @@ func NormalizeValue(v any) any {
 
 // PrepareData strips reserved keys ("id", "_meta") from a write body,
 // normalises numbers and enforces maxBytes on the JSON encoding.
+//
+// The size is that of the compact encoding backends store, which does not
+// HTML-escape: '<', '>' and '&' count one byte each (json.Marshal would write
+// six), like the Cloudflare edition counts them.
 func PrepareData(data map[string]any, maxBytes int) (map[string]any, error) {
 	out := make(map[string]any, len(data))
 	for k, v := range data {
@@ -355,15 +365,35 @@ func PrepareData(data map[string]any, maxBytes int) (map[string]any, error) {
 		out[k] = NormalizeValue(v)
 	}
 	if maxBytes > 0 {
-		b, err := json.Marshal(out)
+		n, err := encodedSize(out)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrInvalid, err)
 		}
-		if len(b) > maxBytes {
+		if n > maxBytes {
 			return nil, ErrTooLarge
 		}
 	}
 	return out, nil
+}
+
+// encodedSize returns the length in bytes of v's compact JSON encoding
+// without HTML escaping (the stored form of a document body).
+func encodedSize(v any) (int, error) {
+	var cw countingWriter
+	enc := json.NewEncoder(&cw)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return 0, err
+	}
+	return cw.n - 1, nil // Encode terminates the value with a newline
+}
+
+// countingWriter counts the bytes written to it.
+type countingWriter struct{ n int }
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.n += len(p)
+	return len(p), nil
 }
 
 // ---------------------------------------------------------------------------

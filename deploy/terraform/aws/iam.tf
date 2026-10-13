@@ -285,6 +285,28 @@ data "aws_iam_policy_document" "gateway" {
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
     resources = ["${aws_cloudwatch_log_group.gateway[0].arn}:*"]
   }
+
+  # server.secret, read at cold start (BACKYARD_SECRET_ARN, see lambda.tf).
+  statement {
+    sid       = "ServerSecret"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.backyard_secret.arn]
+  }
+
+  dynamic "statement" {
+    for_each = var.kms_key_arn == null ? [] : [var.kms_key_arn]
+    content {
+      sid       = "ServerSecretKms"
+      actions   = ["kms:Decrypt"]
+      resources = [statement.value]
+
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values   = ["secretsmanager.${local.region}.${data.aws_partition.current.dns_suffix}"]
+      }
+    }
+  }
 }
 
 resource "aws_iam_role" "gateway" {

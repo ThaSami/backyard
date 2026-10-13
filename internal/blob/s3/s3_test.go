@@ -25,6 +25,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/johannesboyne/gofakes3"
@@ -105,8 +106,16 @@ func strictCompat(t *testing.T) func(http.Handler) http.Handler {
 // headers as received, so a body whose Content-Length differs from a signed
 // one fails with 403 SignatureDoesNotMatch; the expiry; and a signed
 // x-amz-checksum-sha256 against the body (400 BadDigest). gofakes3 itself
-// verifies Content-MD5.
+// verifies Content-MD5. Like S3, it keeps the SHA-256 checksum of an object
+// uploaded with one and returns it (x-amz-checksum-sha256, type FULL_OBJECT)
+// from a HeadObject with x-amz-checksum-mode: ENABLED, for as long as that
+// object version (its ETag) is current.
 func presignedS3(secret string) func(http.Handler) http.Handler {
+	type checksum struct{ sha, etag string }
+	var (
+		mu        sync.Mutex
+		checksums = map[string]checksum{} // by request path
+	)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Query().Has("X-Amz-Signature") {
@@ -115,7 +124,8 @@ func presignedS3(secret string) func(http.Handler) http.Handler {
 					return
 				}
 			}
-			if want := r.Header.Get("X-Amz-Checksum-Sha256"); want != "" {
+			want := r.Header.Get("X-Amz-Checksum-Sha256")
+			if want != "" {
 				body, err := io.ReadAll(r.Body)
 				if err != nil {
 					writeS3Error(w, http.StatusBadRequest, "IncompleteBody", err.Error())
@@ -128,9 +138,49 @@ func presignedS3(secret string) func(http.Handler) http.Handler {
 				}
 				r.Body = io.NopCloser(bytes.NewReader(body))
 			}
-			next.ServeHTTP(w, r)
+			switch {
+			case r.Method == http.MethodPut && want != "":
+				rec := httptest.NewRecorder()
+				next.ServeHTTP(rec, r)
+				if rec.Code == http.StatusOK {
+					mu.Lock()
+					checksums[r.URL.Path] = checksum{sha: want, etag: rec.Header().Get("ETag")}
+					mu.Unlock()
+				}
+				copyRecorded(w, rec)
+			case r.Method == http.MethodHead || r.Method == http.MethodGet:
+				rec := httptest.NewRecorder()
+				next.ServeHTTP(rec, r)
+				// gofakes3 echoes every x-amz-* header of the request that
+				// created an object as metadata, and keeps them across
+				// overwrites: drop the checksums and report only the one S3
+				// would keep for the current object version.
+				for k := range rec.Header() {
+					if strings.HasPrefix(strings.ToLower(k), "x-amz-checksum-") {
+						rec.Header().Del(k)
+					}
+				}
+				mu.Lock()
+				c, ok := checksums[r.URL.Path]
+				mu.Unlock()
+				if ok && rec.Code == http.StatusOK && c.etag != "" && rec.Header().Get("ETag") == c.etag &&
+					strings.EqualFold(r.Header.Get("X-Amz-Checksum-Mode"), "ENABLED") {
+					rec.Header().Set("X-Amz-Checksum-Sha256", c.sha)
+					rec.Header().Set("X-Amz-Checksum-Type", "FULL_OBJECT")
+				}
+				copyRecorded(w, rec)
+			default:
+				next.ServeHTTP(w, r)
+			}
 		})
 	}
+}
+
+// copyRecorded replays a recorded response.
+func copyRecorded(w http.ResponseWriter, rec *httptest.ResponseRecorder) {
+	maps.Copy(w.Header(), rec.Header())
+	w.WriteHeader(rec.Code)
+	_, _ = w.Write(rec.Body.Bytes())
 }
 
 func writeS3Error(w http.ResponseWriter, status int, code, msg string) {
@@ -325,7 +375,92 @@ func TestConformanceWithFlexibleChecksums(t *testing.T) {
 			t.Fatal("expected flexible checksums to be enabled")
 		}
 		return s
-	}, blobtest.PresignEnforcesSize(), blobtest.PresignEnforcesSHA256())
+	}, blobtest.PresignEnforcesSize(), blobtest.PresignEnforcesSHA256(), blobtest.ReportsPresignedDigests())
+}
+
+// StatSHA256 reads the SHA-256 that S3 verified for a presigned upload (a
+// HeadObject in checksum mode) and never sends the checksum-mode header to
+// S3-compatible endpoints without flexible checksums.
+func TestStatSHA256(t *testing.T) {
+	ctx := context.Background()
+	t.Run("flexible checksums", func(t *testing.T) {
+		t.Setenv("AWS_REQUEST_CHECKSUM_CALCULATION", "when_supported")
+		t.Setenv("AWS_RESPONSE_CHECKSUM_VALIDATION", "when_supported")
+		s := newTestStore(t, newFakeWith(t, presignedS3(testSecret)), "pre/fix")
+		data := []byte("<title>verified</title>")
+		sum := sha256.Sum256(data)
+		req, err := s.PresignPut(ctx, "site/index.html", blob.PresignPutOptions{ContentType: "text/html", Size: int64(len(data)), SHA256: hex.EncodeToString(sum[:])}, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hr, err := http.NewRequest(req.Method, req.URL, bytes.NewReader(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range req.Headers {
+			hr.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(hr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("presigned PUT status %d", resp.StatusCode)
+		}
+		info, got, err := s.StatSHA256(ctx, "site/index.html")
+		if err != nil || got != hex.EncodeToString(sum[:]) {
+			t.Fatalf("StatSHA256 = %q, %v; want %x", got, err, sum)
+		}
+		if st, _ := s.Stat(ctx, "site/index.html"); info.ETag != st.ETag || info.Size != int64(len(data)) || info.Key != "site/index.html" {
+			t.Errorf("StatSHA256 info = %+v, Stat = %+v", info, st)
+		}
+		if _, _, err := s.StatSHA256(ctx, "site/missing.html"); !errors.Is(err, blob.ErrNotFound) {
+			t.Errorf("StatSHA256(missing) err = %v", err)
+		}
+	})
+	t.Run("custom endpoint without flexible checksums", func(t *testing.T) {
+		t.Setenv("AWS_REQUEST_CHECKSUM_CALCULATION", "")
+		t.Setenv("AWS_RESPONSE_CHECKSUM_VALIDATION", "")
+		var requests atomic.Int64
+		f := newFakeWith(t, chain(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				next.ServeHTTP(w, r)
+			})
+		}, strictCompat(t)))
+		s := newTestStore(t, f, "")
+		if _, err := s.Put(ctx, "a.txt", strings.NewReader("a"), 1, ""); err != nil {
+			t.Fatal(err)
+		}
+		before := requests.Load()
+		if _, _, err := s.StatSHA256(ctx, "a.txt"); !errors.Is(err, blob.ErrNotSupported) {
+			t.Errorf("StatSHA256 err = %v, want ErrNotSupported", err)
+		}
+		if n := requests.Load() - before; n != 0 {
+			t.Errorf("StatSHA256 sent %d requests", n)
+		}
+	})
+}
+
+func TestFullObjectSHA256(t *testing.T) {
+	sum := sha256.Sum256([]byte("x"))
+	b64 := base64.StdEncoding.EncodeToString(sum[:])
+	for _, tc := range []struct {
+		out  awss3.HeadObjectOutput
+		want string
+	}{
+		{awss3.HeadObjectOutput{ChecksumSHA256: aws.String(b64), ChecksumType: types.ChecksumTypeFullObject}, hex.EncodeToString(sum[:])},
+		{awss3.HeadObjectOutput{ChecksumSHA256: aws.String(b64)}, hex.EncodeToString(sum[:])},
+		{awss3.HeadObjectOutput{ChecksumSHA256: aws.String(b64), ChecksumType: types.ChecksumTypeComposite}, ""},
+		{awss3.HeadObjectOutput{ChecksumSHA256: aws.String(b64 + "-3")}, ""},
+		{awss3.HeadObjectOutput{ChecksumSHA256: aws.String(base64.StdEncoding.EncodeToString([]byte("short")))}, ""},
+		{awss3.HeadObjectOutput{ChecksumCRC32: aws.String("AAAAAA==")}, ""},
+	} {
+		if got := fullObjectSHA256(&tc.out); got != tc.want {
+			t.Errorf("fullObjectSHA256(%+v) = %q, want %q", tc.out, got, tc.want)
+		}
+	}
 }
 
 func TestNewValidation(t *testing.T) {

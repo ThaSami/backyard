@@ -2,8 +2,11 @@ package cli
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -324,6 +327,172 @@ func TestDeployAutoMethodSelection(t *testing.T) {
 			t.Fatalf("stderr = %s", errOut)
 		}
 	})
+}
+
+// TestDeployToAnotherServerIgnoresTheProfilesCachedInfo: deploying to a
+// server named by --server or BACKYARD_SERVER that is unreachable must not
+// fall back to the stored profile's cached info, which describes the
+// profile's (production) bucket: the sync would overwrite and delete the
+// production copy of the site.
+func TestDeployToAnotherServerIgnoresTheProfilesCachedInfo(t *testing.T) {
+	prodInfo := &deploy.Info{PublicURL: "https://backyard.prod.example.com", URLMode: "path", Methods: []string{"api", "s3"},
+		Storage: &blob.Description{Type: "s3", Bucket: "prod-bucket"}}
+	setup := func(t *testing.T) *harness {
+		h := newHarness(t)
+		h.tools["aws"] = true
+		h.writeProfile("default", &clientconfig.Profile{Server: "https://backyard.prod.example.com", Token: "prod-token", Info: prodInfo}, true)
+		writeFiles(t, filepath.Join(h.cwd, "site"), map[string]string{"index.html": "staging build"})
+		return h
+	}
+	// The staging server is down: its proxy answers every request with 404.
+	down := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(down.Close)
+	staging := down.URL
+	for name, args := range map[string][]string{
+		"flag, s3":   {"deploy", "site", "--server", staging, "--method", "s3", "--site", "demo"},
+		"flag, auto": {"deploy", "site", "--server", staging, "--site", "demo"},
+		"env, s3":    {"deploy", "site", "--method", "s3", "--site", "demo"},
+		"env, auto":  {"deploy", "site", "--site", "demo"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := setup(t)
+			if strings.HasPrefix(name, "env") {
+				t.Setenv(clientconfig.EnvServer, staging)
+			}
+			errOut := h.mustFail(args...)
+			if calls := h.runner.Calls(); len(calls) != 0 {
+				t.Fatalf("ran %q against the profile's bucket", calls[0].Argv())
+			}
+			if strings.Contains(errOut, "prod-bucket") {
+				t.Fatalf("stderr = %s", errOut)
+			}
+		})
+	}
+	// The profile's own server still falls back to its cache.
+	h := setup(t)
+	h.writeProfile("default", &clientconfig.Profile{Server: staging, Token: "t", Info: prodInfo}, true)
+	h.mustRun("deploy", "site", "--method", "s3", "--site", "demo")
+	if calls := h.runner.Calls(); len(calls) != 1 || !slices.Contains(calls[0].Args, "s3://prod-bucket/sites/demo/") {
+		t.Fatalf("calls = %+v", calls)
+	}
+}
+
+// TestDeployRefusesProjectDirOutsideTheProject: a .backyard.json (e.g. one
+// that came with a pulled site or a cloned repository) cannot point a plain
+// `backyard deploy` at a folder outside the project.
+func TestDeployRefusesProjectDirOutsideTheProject(t *testing.T) {
+	h := newHarness(t)
+	g := loggedIn(t, h)
+	private := filepath.Join(h.cwd, "private")
+	writeFiles(t, private, map[string]string{"passwords.txt": "hunter2"})
+	proj := filepath.Join(h.cwd, "remix")
+	for _, dir := range []string{private, "../private", "dist/../../private"} {
+		b, _ := json.Marshal(map[string]string{"site": "loot", "dir": dir})
+		writeFiles(t, proj, map[string]string{"index.html": "x", ".backyard.json": string(b)})
+		h.cwd = proj
+		errOut := h.mustFail("deploy")
+		if !strings.Contains(errOut, ".backyard.json") || !strings.Contains(errOut, "inside") {
+			t.Fatalf("dir %q: stderr = %s", dir, errOut)
+		}
+		if g.SiteFiles("loot") != nil || g.Uploads() != 0 {
+			t.Fatalf("dir %q: published %v", dir, keys(g.SiteFiles("loot")))
+		}
+		// `backyard dev` refuses it as well.
+		if errOut := h.mustFail("dev", "--no-open"); !strings.Contains(errOut, "inside") {
+			t.Fatalf("dev: stderr = %s", errOut)
+		}
+	}
+	// An explicit folder argument is the user's choice and still works.
+	h.mustRun("deploy", private, "--site", "mine")
+	if g.SiteFiles("mine")["passwords.txt"] != "hunter2" {
+		t.Fatal("explicit dir argument")
+	}
+}
+
+// TestDirectDeployRemovesIgnoredFiles: the sync tools never delete
+// destination files their excludes match, so a file published earlier and
+// ignored now (drafts/, *.pem added to .backyardignore to unpublish it)
+// stayed online with the direct methods while the api method's commit
+// deletes it. The CLI now removes such files after the sync.
+func TestDirectDeployRemovesIgnoredFiles(t *testing.T) {
+	setup := func(t *testing.T) (*harness, *clitest.Gateway) {
+		h := newHarness(t)
+		g := loggedIn(t, h)
+		g.Info.Methods = []string{"api", "s3", "gcs"}
+		g.Info.Storage = &blob.Description{Type: "s3", Bucket: "acme-backyard", Prefix: "prod", Region: "us-east-1"}
+		h.tools["aws"] = true
+		g.AddSite("site", map[string]string{"index.html": "old", "drafts/plan.html": "plan", "key.pem": "KEY", "about.html": "a"}, alice.ID)
+		writeFiles(t, filepath.Join(h.cwd, "site"), map[string]string{
+			"index.html": "new", "drafts/plan.html": "plan", "key.pem": "KEY", ".backyardignore": "drafts/\n*.pem\n",
+		})
+		return h, g
+	}
+	wantRm := []string{"aws", "s3", "rm", "s3://acme-backyard/prod/sites/site/", "--recursive", "--region", "us-east-1",
+		"--exclude", "*", "--include", "drafts/plan.html", "--include", "key.pem"}
+
+	h, g := setup(t)
+	h.mustRun("deploy", "site", "-m", "s3", "--dry-run", "--json")
+	var dry deployOutput
+	if err := json.Unmarshal([]byte(h.out.String()), &dry); err != nil {
+		t.Fatal(err)
+	}
+	if len(dry.Cleanup) != 1 || !reflect.DeepEqual(dry.Cleanup[0], wantRm) || len(h.runner.Calls()) != 0 {
+		t.Fatalf("dry run cleanup = %q, calls %d", dry.Cleanup, len(h.runner.Calls()))
+	}
+
+	h.mustRun("deploy", "site", "-m", "s3")
+	calls := h.runner.Calls()
+	if len(calls) != 2 || calls[0].Args[1] != "sync" || !reflect.DeepEqual(calls[1].Argv(), wantRm) {
+		t.Fatalf("calls = %q", calls)
+	}
+	if g.Count("POST", "/sites/site/refresh") != 1 || !strings.Contains(h.err.String(), "Removing 2 published files") {
+		t.Fatalf("refresh=%d stderr=%s", g.Count("POST", "/refresh"), h.err.String())
+	}
+
+	// A failed removal fails the deploy: the files are still published.
+	h, g = setup(t)
+	h.runner.fn = func(c Command) error {
+		if c.Args[1] == "rm" {
+			return &ExitError{Code: 1, Err: os.ErrPermission}
+		}
+		return nil
+	}
+	if errOut := h.mustFail("deploy", "site", "-m", "s3"); !strings.Contains(errOut, "still published") {
+		t.Fatalf("stderr = %s", errOut)
+	}
+	if g.Count("POST", "/sites/site/refresh") != 1 {
+		t.Fatal("no refresh after the sync")
+	}
+
+	// gcs: the objects are named one by one.
+	h, g = setup(t)
+	g.Info.Storage = &blob.Description{Type: "gcs", Bucket: "acme-sites"}
+	h.tools["gcloud"] = true
+	h.mustRun("deploy", "site", "-m", "gcs")
+	calls = h.runner.Calls()
+	if len(calls) != 2 || !reflect.DeepEqual(calls[1].Argv(), []string{"gcloud", "storage", "rm",
+		"gs://acme-sites/sites/site/drafts/plan.html", "gs://acme-sites/sites/site/key.pem"}) {
+		t.Fatalf("calls = %q", calls)
+	}
+
+	// Without a usable gateway nothing can be listed: say so.
+	h, g = setup(t)
+	h.writeProfile("default", &clientconfig.Profile{Server: g.URL}, true) // logged out
+	h.mustRun("deploy", "site", "-m", "s3")
+	if len(h.runner.Calls()) != 1 || !strings.Contains(h.err.String(), "were not removed") {
+		t.Fatalf("calls = %q, stderr = %s", h.runner.Calls(), h.err.String())
+	}
+
+	// rsync deletes excluded files itself (--delete-excluded).
+	h, g = setup(t)
+	g.Info.Methods = []string{"api", "rsync"}
+	g.Info.RsyncTarget = "deploy@host:/srv/sites/"
+	h.tools["rsync"] = true
+	h.mustRun("deploy", "site", "-m", "rsync")
+	calls = h.runner.Calls()
+	if len(calls) != 1 || !slices.Contains(calls[0].Args, "--delete-excluded") || g.Count("GET", "/sites/site/files") != 0 {
+		t.Fatalf("calls = %q", calls)
+	}
 }
 
 func TestDeployDirectDryRunPrintsCommand(t *testing.T) {

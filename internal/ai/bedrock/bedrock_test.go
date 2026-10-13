@@ -241,6 +241,9 @@ func TestConverseErrors(t *testing.T) {
 	if !errors.As(err, &ue) || ue.Status != 429 || !strings.Contains(ue.Message, "Too many requests") || ue.Provider != "br" {
 		t.Fatalf("got %#v", err)
 	}
+	if ue.RetryAfter() != 0 {
+		t.Fatalf("RetryAfter = %v without a Retry-After header", ue.RetryAfter())
+	}
 	if strings.Contains(err.Error(), "SECRET") {
 		t.Fatal("error leaks secret")
 	}
@@ -253,6 +256,31 @@ func TestConverseErrors(t *testing.T) {
 		if _, err := p.Chat(context.Background(), req); !errors.Is(err, ai.ErrBadRequest) {
 			t.Errorf("case %d: %v", i, err)
 		}
+	}
+}
+
+// TestConverseErrorRetryAfter: a Retry-After sent with a throttling error
+// reaches the *ai.UpstreamError (for the HTTP layer's 429 Retry-After).
+func TestConverseErrorRetryAfter(t *testing.T) {
+	f := newFake(t, func(w http.ResponseWriter, r *http.Request, _ map[string]any) {
+		w.Header().Set("X-Amzn-ErrorType", "ThrottlingException")
+		w.Header().Set("Retry-After", "9")
+		writeJSON(w, 429, map[string]any{"message": "Rate exceeded"})
+	})
+	p := newProvider(t, f, config.ProviderConfig{})
+	msgs := []ai.Message{{Role: "user", Content: []ai.Part{{Type: "text", Text: "x"}}}}
+	_, err := p.Chat(context.Background(), ai.ChatRequest{Model: "m", Messages: msgs})
+	var ra interface{ RetryAfter() time.Duration }
+	if !errors.As(err, &ra) || ra.RetryAfter() != 9*time.Second {
+		t.Fatalf("chat: got %v", err)
+	}
+	_, err = p.ChatStream(context.Background(), ai.ChatRequest{Model: "m", Messages: msgs}, nil)
+	if !errors.As(err, &ra) || ra.RetryAfter() != 9*time.Second {
+		t.Fatalf("stream: got %v", err)
+	}
+	_, err = p.Embed(context.Background(), ai.EmbedRequest{Model: "amazon.titan-embed-text-v2:0", Input: []string{"x"}})
+	if !errors.As(err, &ra) || ra.RetryAfter() != 9*time.Second {
+		t.Fatalf("invoke: got %v", err)
 	}
 }
 

@@ -588,12 +588,13 @@ func TestDeployIDs(t *testing.T) {
 		e.store.Put(context.Background(), sites.SiteKey("ids", "index.html"), strings.NewReader("hello"), 5, "")
 		resp, body := commit("alice", "ids", cr.DeployID)
 		wantStatus(t, resp, body, 409, CodeConflict)
-		// Never committed before: the unverified object is deleted.
-		if !strings.Contains(string(body), "index.html (5 bytes in storage, expected 2; deleted)") {
+		// Every upload URL of this store binds the size, so the object is
+		// another deploy's verified upload or a direct sync: it stays.
+		if !strings.Contains(string(body), "index.html (5 bytes in storage, expected 2)") || strings.Contains(string(body), "deleted") {
 			t.Errorf("body = %s", body)
 		}
-		if b := e.object("ids", "index.html"); b != nil {
-			t.Errorf("object of the wrong size kept: %q", b)
+		if b := e.object("ids", "index.html"); string(b) != "hello" {
+			t.Errorf("object of the wrong size = %q, want it kept", b)
 		}
 	})
 	t.Run("file list revalidated", func(t *testing.T) {

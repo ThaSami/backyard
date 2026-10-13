@@ -46,6 +46,7 @@
     "URL_MODE": "path",
     // "none": anonymous cookie identities (deploys need DEPLOY_TOKEN unless
     // ALLOW_ANONYMOUS_DEPLOY); "access": Cloudflare Access (Zero Trust) in front.
+    // Any other value fails closed: every request but the health checks gets 503.
     "AUTH_MODE": "none",
     // Cloudflare Access team ("acme" or "acme.cloudflareaccess.com") and the
     // application AUD tag (Terraform output access_aud). Used when AUTH_MODE=access.
@@ -64,7 +65,8 @@
     // "model": "...", "kind": "chat"|"image"|"embedding", "description": "..."}}.
     // Empty = defaults (smart/fast/image/embed on Workers AI). See README.
     "AI_MODELS": "",
-    // Guardrails merged over the defaults, e.g. {"ai_per_day":100,"max_sites":200}.
+    // Guardrails merged over the defaults: a JSON string or object, e.g.
+    // {"ai_per_day":100,"max_sites":200}.
     "LIMITS": "",
     // Files larger than this (bytes) go to R2 when bound (default 5 MiB).
     "FILE_INLINE_MAX": "5242880"

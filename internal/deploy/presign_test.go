@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/thasami/backyard/internal/blob"
 	"github.com/thasami/backyard/internal/sites"
 	"github.com/thasami/backyard/internal/sites/sitestest"
 )
@@ -86,6 +87,7 @@ func TestPresignedUploadsBindDeclaredSizeAndDigest(t *testing.T) {
 func TestCommitDeletesWrongSizeUploads(t *testing.T) {
 	e := presignEnv(t)
 	e.store.SetLaxPresign(true)
+	e.store.Desc = blob.Description{Type: "azure"}
 	ctx := context.Background()
 	v1 := map[string]string{"index.html": "<title>V1</title>", "a.txt": "aaaa", "keep.txt": "keep"}
 	dir := t.TempDir()
@@ -186,6 +188,7 @@ func (failingDeletes) Delete(context.Context, string) error {
 // fails and says so.
 func TestCommitReportsUndeletableObjects(t *testing.T) {
 	ms := sitestest.NewMemStore()
+	ms.Desc = blob.Description{Type: "azure"} // presigned uploads cannot bind sizes
 	e := newEnv(t, withStore(failingDeletes{ms}))
 	files := map[string]string{"a.txt": "aa"}
 	cr := e.createDeploy("alice", "stuck", files)

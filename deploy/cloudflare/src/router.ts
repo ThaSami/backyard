@@ -48,6 +48,12 @@ export interface RequestContext {
   clientIP: string;
   /** Authenticated user (set by the auth step). */
   user?: User;
+  /**
+   * Expiry (Unix seconds) of the Backyard API token that authenticated the
+   * request as its bearer credential (set by the auth step; undefined for any
+   * other credential). A token minted with it must not outlive it.
+   */
+  bearerExp?: number;
   /** Set-Cookie values to add to the response. */
   setCookies: string[];
   waitUntil: (p: Promise<unknown>) => void;

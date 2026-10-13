@@ -16,6 +16,7 @@ import (
 
 	"github.com/thasami/backyard/internal/config"
 	"github.com/thasami/backyard/internal/identity"
+	"github.com/thasami/backyard/internal/keys"
 )
 
 // Normalized auth modes.
@@ -39,8 +40,13 @@ const (
 // Cookie names.
 const (
 	SessionCookie = "backyard_session"
-	OAuthCookie   = "backyard_oauth"
-	AnonCookie    = "backyard_anon"
+	// OAuthCookie holds the login state when server.public_url is http.
+	OAuthCookie = "backyard_oauth"
+	// OAuthHostCookie holds the login state when server.public_url is https:
+	// browsers accept a "__Host-" cookie only from the host itself (Secure,
+	// Path=/, no Domain), so a site's page cannot plant one on the hub.
+	OAuthHostCookie = "__Host-" + OAuthCookie
+	AnonCookie      = "backyard_anon"
 )
 
 const (
@@ -83,6 +89,8 @@ type authenticator struct {
 	static  []staticToken
 	idp     *idpBearer // nil when IdP bearer JWTs are not accepted
 	trusted []*net.IPNet
+
+	confirmKey []byte // signs CLI login confirmations
 
 	hub          *url.URL // parsed server.public_url (nil if unset)
 	cookieDomain string   // "" = host-only cookies
@@ -136,6 +144,7 @@ func newBase(cfg *config.Config, opts Options) (*authenticator, error) {
 	a.client = boundedClient(opts.HTTPClient)
 	a.tokens = NewTokens(cfg.Server.Secret, cfg.Auth.TokenTTL.D())
 	a.tokens.now = a.now
+	a.confirmKey = keys.Derive(cfg.Server.Secret, keys.CLIConfirm)
 
 	for i, st := range cfg.Auth.Tokens {
 		name := strings.TrimSpace(st.Name)
@@ -205,8 +214,7 @@ func cookieDomainFor(cfg *config.Config) string {
 			d = hub
 		}
 	}
-	if d == "" || !strings.Contains(d, ".") || d == "localhost" || strings.HasSuffix(d, ".localhost") ||
-		net.ParseIP(strings.Trim(d, "[]")) != nil {
+	if !config.CookieDomainCapable(d) {
 		return ""
 	}
 	return "." + d
@@ -282,7 +290,7 @@ func (a *authenticator) authenticateBrowser(w http.ResponseWriter, r *http.Reque
 	case ModeNone:
 		return a.authenticateAnon(w, r)
 	case ModeOIDC:
-		return a.authenticateSession(r)
+		return a.authenticateSession(w, r)
 	case ModeIAP:
 		return a.authenticateIAP(r)
 	case ModeALB:

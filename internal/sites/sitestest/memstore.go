@@ -2,7 +2,9 @@
 // registry and the deploy gateway: an in-memory blob.Store with optional
 // presigned uploads served by an http.Handler. Like S3, the handler rejects
 // a body whose size or SHA-256 differs from the PresignPutOptions (unless
-// SetLaxPresign makes it accept anything, like Azure SAS URLs).
+// SetLaxPresign makes it accept anything, like Azure SAS URLs) and, once
+// SetReportDigests is on, reports the verified SHA-256 of such uploads
+// through blob.DigestReporter.
 //
 // It is meant for tests only; production code never imports it.
 package sitestest
@@ -29,6 +31,9 @@ import (
 type memObject struct {
 	data []byte
 	info blob.ObjectInfo
+	// sha256 is the digest the presign handler verified for this object
+	// version ("" for objects written by Put or lax presigned uploads).
+	sha256 string
 }
 
 type presignGrant struct {
@@ -46,6 +51,7 @@ type MemStore struct {
 	grants  map[string]presignGrant
 	presign string // base URL for presigned PUTs ("" = unsupported)
 	lax     bool   // presigned PUTs accept any size and content
+	digests bool   // StatSHA256 reports verified digests
 	puts    int
 	gets    int
 	now     func() time.Time
@@ -57,7 +63,10 @@ type MemStore struct {
 	FailPut func(key string) error
 }
 
-var _ blob.Store = (*MemStore)(nil)
+var (
+	_ blob.Store          = (*MemStore)(nil)
+	_ blob.DigestReporter = (*MemStore)(nil)
+)
 
 // NewMemStore returns an empty store without presign support.
 func NewMemStore() *MemStore {
@@ -84,6 +93,17 @@ func (s *MemStore) SetLaxPresign(lax bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lax = lax
+}
+
+// SetReportDigests makes StatSHA256 report the SHA-256 that PresignHandler
+// verified for an object uploaded through a URL with a declared digest (as
+// S3 does for uploads with x-amz-checksum-sha256). Off by default:
+// StatSHA256 then returns blob.ErrNotSupported, as stores without such
+// digests do.
+func (s *MemStore) SetReportDigests(on bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.digests = on
 }
 
 // PresignHandler serves PUTs to URLs returned by PresignPut, mimicking a
@@ -127,12 +147,23 @@ func (s *MemStore) PresignHandler() http.Handler {
 			http.Error(w, "BadDigest: the SHA256 you specified did not match the calculated checksum", http.StatusBadRequest)
 			return
 		}
-		if _, err := s.Put(r.Context(), g.key, bytes.NewReader(body), int64(len(body)), g.contentType); err != nil {
+		verified := g.sha256
+		if lax {
+			verified = ""
+		}
+		if _, err := s.put(r.Context(), g.key, bytes.NewReader(body), int64(len(body)), g.contentType, verified); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
 	})
+}
+
+// GetCount returns the number of Get and GetRange calls so far.
+func (s *MemStore) GetCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.gets
 }
 
 // PutCount returns the number of successful Put calls so far.
@@ -230,8 +261,34 @@ func (s *MemStore) Stat(ctx context.Context, key string) (*blob.ObjectInfo, erro
 	return &info, nil
 }
 
+// StatSHA256 implements blob.DigestReporter (see SetReportDigests).
+func (s *MemStore) StatSHA256(ctx context.Context, key string) (*blob.ObjectInfo, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	if err := checkKey(key); err != nil {
+		return nil, "", err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.digests {
+		return nil, "", blob.ErrNotSupported
+	}
+	o, ok := s.objs[key]
+	if !ok {
+		return nil, "", fmt.Errorf("%w: %s", blob.ErrNotFound, key)
+	}
+	info := o.info
+	return &info, o.sha256, nil
+}
+
 // Put implements blob.Store.
 func (s *MemStore) Put(ctx context.Context, key string, r io.Reader, size int64, contentType string) (*blob.ObjectInfo, error) {
+	return s.put(ctx, key, r, size, contentType, "")
+}
+
+// put stores an object with the digest verified for it ("" = none).
+func (s *MemStore) put(ctx context.Context, key string, r io.Reader, size int64, contentType, verified string) (*blob.ObjectInfo, error) {
 	if err := checkKey(key); err != nil {
 		return nil, err
 	}
@@ -254,7 +311,7 @@ func (s *MemStore) Put(ctx context.Context, key string, r io.Reader, size int64,
 		contentType = blob.DetectContentType(key, buf.Bytes())
 	}
 	sum := sha256.Sum256(buf.Bytes())
-	o := &memObject{data: buf.Bytes(), info: blob.ObjectInfo{
+	o := &memObject{data: buf.Bytes(), sha256: verified, info: blob.ObjectInfo{
 		Key:         key,
 		Size:        int64(buf.Len()),
 		ETag:        `"` + hex.EncodeToString(sum[:16]) + `"`,

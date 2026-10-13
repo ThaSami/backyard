@@ -285,6 +285,44 @@ describe("scripts/setup.mjs", () => {
     assert.notEqual(r.code, 0);
     assert.match(r.out, /unknown option --bogus/);
   });
+  it("keeps a DEPLOY_TOKEN the Worker has when this machine does not know it (second machine, CI)", async () => {
+    const dir = newSandbox();
+    const accounts = '[{"id":"a","name":"A"}]';
+    // Set up from "laptop A".
+    let r = await run(dir, ["--var", `PUBLIC_URL:${hub}`], { FAKE_ACCOUNTS: accounts });
+    assert.equal(r.code, 0, r.out);
+    calls(dir);
+    const before = readFileSync(join(dir, "secrets.json"), "utf8");
+    const token = JSON.parse(before).DEPLOY_TOKEN;
+    // "Laptop B" or a CI runner: no state file.
+    rmSync(join(dir, "config"), { recursive: true, force: true });
+    r = await run(dir, ["--var", `PUBLIC_URL:${hub}`], { FAKE_ACCOUNTS: accounts, CI: "true" });
+    assert.equal(r.code, 0, r.out);
+    const c = calls(dir);
+    const deployCall = c.find((x) => x.args[0] === "deploy");
+    assert.ok(deployCall, "it still deploys");
+    assert.ok(!(deployCall.secretsFile ?? []).includes("DEPLOY_TOKEN"), "DEPLOY_TOKEN is not uploaded");
+    assert.ok(!c.some((x) => x.secret), "no secret is put");
+    assert.equal(readFileSync(join(dir, "secrets.json"), "utf8"), before, "the Worker's secrets are unchanged");
+    assert.match(r.out, /already has a DEPLOY_TOKEN that this machine does not know: keeping it/);
+    assert.match(r.out, /--token <DEPLOY_TOKEN>/);
+    assert.match(r.out, /No saved setup for backyard on this machine/);
+    assert.equal(state(dir).deployToken, undefined, "no token is remembered that is not the Worker's");
+    assert.ok(!r.out.includes(token));
+    // Telling it the token remembers it again, without rotating anything.
+    r = await run(dir, [], { FAKE_ACCOUNTS: accounts, DEPLOY_TOKEN: token });
+    assert.equal(r.code, 0, r.out);
+    calls(dir);
+    assert.equal(JSON.parse(readFileSync(join(dir, "secrets.json"), "utf8")).DEPLOY_TOKEN, token);
+    assert.equal(state(dir).deployToken, token);
+    // --rotate-token still issues a new one on purpose.
+    rmSync(join(dir, "config"), { recursive: true, force: true });
+    r = await run(dir, ["--rotate-token"], { FAKE_ACCOUNTS: accounts });
+    assert.equal(r.code, 0, r.out);
+    assert.deepEqual(calls(dir).find((x) => x.args[0] === "deploy").secretsFile, ["DEPLOY_TOKEN"]);
+    assert.notEqual(JSON.parse(readFileSync(join(dir, "secrets.json"), "utf8")).DEPLOY_TOKEN, token);
+  });
+
   it("keeps a broken state file and an unknown Worker from rotating anything", async () => {
     const dir = newSandbox();
     const accounts = '[{"id":"a","name":"A"}]';
@@ -332,6 +370,14 @@ describe("scripts/setup.mjs helpers", () => {
     for (const bad of ["", "garbage", "Listing secrets…", "x []", "[1, 2]", '[{"type":"secret_text"}]', "[] trailing", "{}"]) {
       assert.throws(() => parseSecretList(bad), /no JSON list/, JSON.stringify(bad));
     }
+    // A stray "[]" line before the real list is not the list (it would make
+    // setup believe the Worker has no BACKYARD_SECRET and replace it).
+    assert.deepEqual(names(`[]\n${list}\n`), ["BACKYARD_SECRET", "DEPLOY_TOKEN"]);
+    assert.deepEqual(names(`[]\n[]\n`), []);
+    assert.deepEqual(names(`${list}\n[]\n`), ["BACKYARD_SECRET", "DEPLOY_TOKEN"]);
+    // An empty list next to a foreign array is not trusted either.
+    assert.throws(() => parseSecretList('[]\n[{"type":"secret_text"}]'), /no JSON list/);
+    assert.throws(() => parseSecretList("[]\n[1, 2]\n"), /no JSON list/);
   });
 
   it("recognizes only wrangler's explicit missing-Worker errors", () => {

@@ -88,6 +88,7 @@ type tmplData struct {
 	Server     string // hub URL without trailing slash, or ""
 	HostURL    string // host-mode site URL guess ("" if unknown)
 	PathURL    string // path-mode site URL guess ("" if unknown)
+	SiteURL    string // the site URL when the server's URL mode is known
 	Template   string // blank | app
 	IndexFiles string // markdown list of the page files
 	Claude     bool   // the Claude skill is installed
@@ -143,6 +144,7 @@ func render(opts InitOptions) (map[string][]byte, error) {
 	}
 
 	data := newData(site, server, tmplName, agents)
+	data.setSiteURLs(site, server, opts.BaseDomain, opts.URLMode)
 	out := map[string][]byte{}
 
 	project, err := json.MarshalIndent(map[string]string{"site": site}, "", "  ")
@@ -298,19 +300,52 @@ func newData(site, server, tmplName string, agents []string) *tmplData {
 		names = append(names, "`"+f.out+"`")
 	}
 	d.IndexFiles = strings.Join(names, ", ")
-	if server != "" {
-		d.PathURL = server + "/s/" + site + "/"
-		// Sites are subdomains of the hub host, unless the hub has a path or
-		// is an IP address (path mode only).
-		if u, err := url.Parse(server); err == nil && u.Host != "" && u.Path == "" && net.ParseIP(u.Hostname()) == nil {
-			d.HostURL = u.Scheme + "://" + site + "." + u.Host + "/"
-		}
-	}
 	md := skills.SkillMarkdown()
 	d.CheatSheet = orFallback(firstFence(section(md, "API cheat sheet")))
 	d.Decision = orFallback(firstTable(section(md, "Which API for what")))
 	d.Limits = orFallback(firstTable(section(md, "Limits")))
 	return d
+}
+
+// hostnameRe accepts plain DNS names (safe in Markdown and HTML).
+var hostnameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$`)
+
+// setSiteURLs fills the site URLs. In path mode a site lives at
+// <hub>/s/<site>/; in host mode at <scheme>://<site>.<base_domain>[:port]/
+// with the hub's scheme and port — base_domain may differ from the hub's
+// host. Without the server's base_domain, the hub's host is assumed (no
+// host-mode URL for a hub with a path or an IP address); without its URL
+// mode, both forms are given.
+func (d *tmplData) setSiteURLs(site, server, baseDomain, urlMode string) {
+	if server == "" {
+		return
+	}
+	d.PathURL = server + "/s/" + site + "/"
+	u, err := url.Parse(server)
+	if err != nil || u.Host == "" {
+		return
+	}
+	base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(baseDomain)), ".")
+	if h, _, err := net.SplitHostPort(base); err == nil {
+		base = h
+	}
+	switch {
+	case urlMode == "path":
+	case base != "" && hostnameRe.MatchString(base) && net.ParseIP(base) == nil:
+		host := site + "." + base
+		if p := u.Port(); p != "" {
+			host = net.JoinHostPort(host, p)
+		}
+		d.HostURL = u.Scheme + "://" + host + "/"
+	case u.Path == "" && net.ParseIP(u.Hostname()) == nil:
+		d.HostURL = u.Scheme + "://" + site + "." + u.Host + "/"
+	}
+	switch urlMode {
+	case "path":
+		d.SiteURL = d.PathURL
+	case "host":
+		d.SiteURL = d.HostURL
+	}
 }
 
 // orFallback keeps the agent files useful even if SKILL.md is reorganized

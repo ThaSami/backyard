@@ -1,7 +1,7 @@
 /** Durable Object stubs and the guardrail helpers built on them. */
 import type { Env } from "./env";
 import { HttpError, unwrap } from "./http";
-import type { Charge, RegistryDO } from "./registry-do";
+import { chargeAmount, type Charge, type RegistryDO } from "./registry-do";
 import type { SiteDO } from "./site-do";
 
 /** Version reported by /info. */
@@ -48,8 +48,10 @@ export async function chargeOrThrow(env: Env, charges: Charge[]): Promise<void> 
   if (r.allowed) return;
   const kind = (r.exhausted ?? "").split("|")[0] ?? "";
   const label = LABELS[kind] ?? "daily limit";
-  const limit = active.find((c) => c.key === r.exhausted)?.limit;
-  throw new HttpError(429, "rate_limited", `${label} reached${limit ? ` (${limit} per day)` : ""}; it resets at midnight UTC`, {
+  const hit = active.find((c) => c.key === r.exhausted);
+  const limit = hit?.limit;
+  const needs = hit && chargeAmount(hit) > 1 ? `; this request needs ${chargeAmount(hit)}` : "";
+  throw new HttpError(429, "rate_limited", `${label} reached${limit ? ` (${limit} per day${needs})` : ""}; it resets at midnight UTC`, {
     retryAfter: r.retryAfter ?? 3600,
   });
 }

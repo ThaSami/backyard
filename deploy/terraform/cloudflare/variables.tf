@@ -123,11 +123,12 @@ variable "auto_redirect_to_identity" {
 }
 
 variable "bypass_paths" {
-  description = "Hub paths that skip Access because the Worker authenticates them itself: the deploy gateway (DEPLOY_TOKEN / API tokens, signed upload URLs, the public /info) and health checks. Change only if you know why."
+  description = "Hub paths that skip Access because the Worker authenticates them itself: the deploy gateway (DEPLOY_TOKEN / API tokens, signed upload URLs, the public /info), token minting for the CLI (backyard token create sends an API token; a minted token never outlives the one that asked) and health checks. Change only if you know why."
   type        = list(string)
   default = [
     "/__backyard/api/deploy",
     "/__backyard/api/deploy/*",
+    "/__backyard/api/tokens",
     "/__backyard/healthz",
     "/__backyard/readyz",
   ]

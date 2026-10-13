@@ -1,6 +1,6 @@
 #!/bin/sh
 # Start a throwaway local Backyard server, run a command against it, stop it.
-# Used by the conformance suite (scripts/conformance.sh), the browser
+# Used by the conformance suite (scripts/conformance.sh external), the browser
 # end-to-end test (make e2e) and CI, for both editions.
 #
 #   scripts/with-server.sh go     -- node --test web/test/e2e.test.mjs

@@ -3,10 +3,12 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
+	"math"
 	"net/http"
 	"path"
 	"regexp"
@@ -14,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/thasami/backyard/internal/auth"
 	"github.com/thasami/backyard/internal/identity"
 	"github.com/thasami/backyard/internal/sites"
 	"github.com/thasami/backyard/skills"
@@ -260,6 +263,12 @@ type tokenResponse struct {
 
 // handleTokens serves POST /__backyard/api/tokens: mint a personal API token
 // for the current (non-anonymous, non-static-token) user.
+//
+// A request authenticated with a Backyard API token gets a token that
+// expires no later than the one it presented (a token cannot renew itself;
+// see presentedAPIToken). A browser session, a proxy identity or an
+// IdP-issued bearer JWT (device flow) is a fresh authentication by the IdP
+// and gets the full lifetime.
 func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request) {
 	ri := info(r)
 	u := ri.user
@@ -275,6 +284,9 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request) {
 		s.writeAPIError(w, r, errForbidden("static tokens cannot create API tokens"))
 		return
 	}
+	// Read the presented token's expiry before the body: how long the body
+	// takes to arrive must not matter.
+	limit, bounded := presentedAPIToken(r, u)
 	var req tokenRequest
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
 	if err != nil {
@@ -311,13 +323,87 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request) {
 			ttl = time.Minute
 		}
 	}
+	if bounded {
+		// Whole seconds (token times are), minus one second for the clock
+		// Issue reads a moment later: the new token never outlives the
+		// presented one, so chaining tokens cannot extend access.
+		left := time.Until(limit).Truncate(time.Second) - time.Second
+		if left <= 0 {
+			s.writeAPIError(w, r, newError(http.StatusUnauthorized, codeUnauthenticated,
+				"the API token used for this request has expired; sign in again"))
+			return
+		}
+		if ttl <= 0 || ttl > left {
+			ttl = left
+		}
+	}
 	tok, exp, err := s.deps.Tokens.Issue(u, ttl)
+	if err == nil && bounded && exp.After(limit) {
+		err = errors.New("server: minted token would outlive the presented token")
+	}
 	if err != nil {
 		s.writeAPIError(w, r, errInternal(err, "issuing the token failed"))
 		return
 	}
-	s.audit(r.Context(), u, "token.issue", map[string]any{"name": req.Name, "expires_at": exp.UTC().Format(time.RFC3339)})
+	fields := map[string]any{"name": req.Name, "expires_at": exp.UTC().Format(time.RFC3339)}
+	if bounded {
+		fields["from_api_token"] = true
+	}
+	s.audit(r.Context(), u, "token.issue", fields)
 	writeJSON(w, http.StatusOK, tokenResponse{Token: tok, ExpiresAt: exp.UTC(), Name: req.Name})
+}
+
+// presentedAPIToken returns the expiry of the Backyard API token that r
+// presents as its bearer credential for u, and whether there is one.
+//
+// A token minted for such a request must not outlive that token. Otherwise
+// a token could renew itself forever, and keep a snapshot of the user's
+// groups and admin rights after the user leaves the IdP. Only rotating
+// server.secret would end that.
+//
+// The token is not verified again here, because Authenticate already did. A
+// bearer that did not authenticate the request can only shorten the token
+// the caller mints for itself: a forged one, or an expired one when a
+// session or proxy identity authenticated the request instead. IdP-issued
+// JWTs (iss is the IdP) and static tokens are not Backyard API tokens.
+func presentedAPIToken(r *http.Request, u *identity.User) (time.Time, bool) {
+	tok, ok := bearerCredential(r)
+	if !ok || u == nil {
+		return time.Time{}, false
+	}
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 {
+		return time.Time{}, false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return time.Time{}, false
+	}
+	var c struct {
+		Iss string   `json:"iss"`
+		Sub string   `json:"sub"`
+		Exp *float64 `json:"exp"`
+	}
+	if json.Unmarshal(raw, &c) != nil || c.Iss != auth.TokenIssuer || strings.TrimSpace(c.Sub) != u.ID {
+		return time.Time{}, false
+	}
+	if c.Exp == nil || math.IsNaN(*c.Exp) || math.IsInf(*c.Exp, 0) {
+		// Verify requires exp; treat a token without one as expired.
+		return time.Unix(0, 0), true
+	}
+	sec, frac := math.Modf(*c.Exp)
+	return time.Unix(int64(sec), int64(frac*1e9)), true
+}
+
+// bearerCredential returns the token of an "Authorization: Bearer" header
+// (parsed like the authenticator does).
+func bearerCredential(r *http.Request) (string, bool) {
+	scheme, rest, ok := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	tok := strings.TrimSpace(rest)
+	return tok, tok != ""
 }
 
 // audit logs an audit event and stores it in _system/_audit (best effort,

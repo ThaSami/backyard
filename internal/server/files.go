@@ -150,19 +150,38 @@ func sanitizeFileName(name string) string {
 	return name
 }
 
-// activeContent reports content types that browsers may execute; uploads of
-// these types are sandboxed when served.
+// passiveUploadTypes are the media types an upload is served as without a
+// sandbox: types browsers only display (raster images, plain text, PDF,
+// JSON) or download. audio/* and video/* are passive too (see
+// activeContent).
+var passiveUploadTypes = map[string]bool{
+	"image/png": true, "image/apng": true, "image/jpeg": true, "image/gif": true,
+	"image/webp": true, "image/avif": true, "image/bmp": true,
+	"image/x-icon": true, "image/vnd.microsoft.icon": true,
+	"text/plain": true, "text/csv": true,
+	"application/pdf": true, "application/json": true, "application/octet-stream": true,
+}
+
+// activeContent reports whether an upload of type ct is served with
+// "Content-Security-Policy: sandbox". It uses an allowlist: every type that
+// is not known to be passive is sandboxed. That covers HTML, SVG and XML in
+// all its forms (text/xsl, */*+xml, …), which browsers render as documents
+// that run script with the site's origin, and any other type a browser
+// might treat that way. The type comes from the uploading client, so it
+// cannot be trusted. audio/* and video/* subtypes are passive unless they
+// carry a structured-syntax suffix: a browser renders "video/x+xml" as XML.
 func activeContent(ct string) bool {
 	mt, _, err := mime.ParseMediaType(ct)
 	if err != nil {
 		return true
 	}
-	switch {
-	case mt == "text/html", mt == "application/xhtml+xml", mt == "image/svg+xml",
-		mt == "text/xml", mt == "application/xml", strings.HasSuffix(mt, "+xml"):
-		return true
+	if passiveUploadTypes[mt] {
+		return false
 	}
-	return false
+	if kind, sub, _ := strings.Cut(mt, "/"); (kind == "audio" || kind == "video") && sub != "" && !strings.Contains(sub, "+") {
+		return false
+	}
+	return true
 }
 
 // normalizeContentType validates a client-supplied media type.

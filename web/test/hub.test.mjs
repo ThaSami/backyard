@@ -225,6 +225,59 @@ test("tokenFromHash", () => {
   assert.equal(hub.tokenFromHash("#token=%E0%A4%A"), "");
 });
 
+test("userLabel", () => {
+  assert.equal(hub.userLabel({ id: "alice@acme.com", name: "Alice Smith" }), "Alice Smith (alice@acme.com)");
+  assert.equal(hub.userLabel({ id: "token:ci", name: "ci" }), "ci (token:ci)");
+  assert.equal(hub.userLabel({ id: "bob@acme.com", name: "bob@acme.com" }), "bob@acme.com");
+  assert.equal(hub.userLabel({ id: "anon:0123", name: "Guest 0123", anonymous: true }), "an anonymous guest (anon:0123)");
+  assert.equal(hub.userLabel({ name: 42 }), "an unknown account");
+  assert.equal(hub.userLabel(null), "an unknown account");
+});
+
+test("handedTokenPrompt names whose token a link carries and whom it replaces", () => {
+  const alice = { id: "alice@acme.com", name: "Alice", anonymous: false };
+  const mallory = { id: "token:mallory", name: "mallory", anonymous: false };
+  let p = hub.handedTokenPrompt(mallory, alice);
+  assert.equal(p.title, "Use the deploy token of mallory (token:mallory)?");
+  assert.equal(p.body, "The link you opened carries the deploy token of mallory (token:mallory). If you use it, deploys and deletes from this page run as mallory (token:mallory), not as you (Alice (alice@acme.com)).");
+  p = hub.handedTokenPrompt({ ...alice }, alice);
+  assert.match(p.body, /a token of your own account/);
+  for (const guest of [null, { id: "anon:1", name: "Guest 1", anonymous: true }]) {
+    p = hub.handedTokenPrompt(mallory, guest);
+    assert.equal(p.body, "The link you opened carries the deploy token of mallory (token:mallory). If you use it, deploys and deletes from this page run as mallory (token:mallory).");
+  }
+  p = hub.handedTokenPrompt(null, alice, "network error");
+  assert.equal(p.title, "Use a deploy token from a link?");
+  assert.equal(p.body, "The link you opened carries a deploy token, but Backyard could not check whose it is (network error). If you use it, deploys and deletes from this page use that token instead of your own sign-in (Alice (alice@acme.com)).");
+});
+
+test("tokenOwner asks the gateway whose token it is (GET G/me with the token)", async () => {
+  const calls = [];
+  const answer = (status, body) => async (url, init) => {
+    calls.push({ url, ...init });
+    return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+  };
+  const u = await hub.tokenOwner({ gateway: "/__backyard/api/deploy/", token: "m4l", fetch: answer(200, { id: "token:mallory", name: "mallory" }) });
+  assert.deepEqual(plain(u), { id: "token:mallory", name: "mallory" });
+  assert.deepEqual(plain(calls[0]), {
+    url: "/__backyard/api/deploy/me",
+    method: "GET",
+    headers: { Accept: "application/json", "X-Backyard": "1", Authorization: "Bearer m4l" },
+    credentials: "same-origin",
+  });
+  const rejected = answer(401, { error: { code: "unauthenticated", message: "invalid or expired token" } });
+  await assert.rejects(hub.tokenOwner({ gateway: "/g", token: "bogus", fetch: rejected }), (e) => e.status === 401 && /invalid or expired/.test(e.message));
+  await assert.rejects(hub.tokenOwner({ gateway: "/g", token: "x", fetch: answer(200, { name: "no id" }) }), (e) => e.code === "bad_response");
+  const offline = async () => {
+    throw new TypeError("Failed to fetch");
+  };
+  await assert.rejects(hub.tokenOwner({ gateway: "/g", token: "x", fetch: offline }), (e) => e.code === "network_error");
+  // Something that cannot be a bearer token is rejected without asking.
+  const n = calls.length;
+  for (const bad of ["", "a b", "tök", "a\nb"]) await assert.rejects(hub.tokenOwner({ gateway: "/g", token: bad, fetch: rejected }), (e) => e.status === 401, JSON.stringify(bad));
+  assert.equal(calls.length, n);
+});
+
 test("safeHref only lets http(s) and same-origin paths through", () => {
   const cases = [
     ["https://a.b/", "https://a.b/"],

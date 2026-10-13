@@ -38,6 +38,13 @@ then: backyard login --server {{ $publicURL }} --token "$TOKEN"
 {{- end }}
 {{- end }}
 
+{{- if and (eq (dig "auth" "mode" "none" .Values.config | default "none" | lower) "header") (not (dig "auth" "header" "jwt_header" "" .Values.config)) }}
+
+NOTE: config.auth.mode is "header" without jwt_header: any peer in config.server.trusted_proxies{{ if .Values.networkPolicy.enabled }}
+that networkPolicy.from admits{{ end }} can sign in as anyone by sending {{ dig "auth" "header" "email_header" "the identity headers" .Values.config }}.
+Every route through those peers must set or strip that header.
+{{- end }}
+
 {{- if and (eq (dig "storage" "type" "fs" .Values.config | default "fs") "fs") (not .Values.persistence.enabled) }}
 
 WARNING: persistence is disabled: sites, uploads and the database live in an emptyDir and are

@@ -491,7 +491,7 @@ variable "storage_prefix" {
 }
 
 variable "bucket_writer_members" {
-  description = "Principals allowed to deploy by syncing straight into the bucket (`backyard deploy --method gcs`, i.e. gcloud storage rsync), granted roles/storage.objectUser. When non-empty the gcs method and bucket details are advertised to CLIs."
+  description = "Principals allowed to deploy by syncing straight into the bucket (`backyard deploy --method gcs`, i.e. gcloud storage rsync), granted roles/storage.objectUser on objects below <storage_prefix>sites/ only (IAM condition) and bucket listing. When non-empty the gcs method and bucket details are advertised to CLIs."
   type        = list(string)
   default     = []
 

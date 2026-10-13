@@ -447,3 +447,46 @@ func TestLoginDeployTokenServer(t *testing.T) {
 		t.Fatalf("profile = %+v, stderr = %s", p, h.err.String())
 	}
 }
+
+// TestLoginNeverSendsASavedDeployTokenToAnotherServer: the deploy token
+// saved by `backyard cloudflare setup` is matched against the server the
+// user chose, never against the public_url a server reports in /info: a
+// server claiming to be the user's Worker must not receive its token.
+func TestLoginNeverSendsASavedDeployTokenToAnotherServer(t *testing.T) {
+	h := newHarness(t)
+	evil := clitest.NewGateway(t)
+	evil.Info.Auth = deploy.AuthInfo{Mode: "none"}
+	evil.Info.PublicURL = "https://backyard.acme.workers.dev"
+	evil.Tokens["byd_saved"] = alice // it would happily accept it
+	writeFiles(t, filepath.Join(h.home, ".config", "backyard", "cloudflare"), map[string]string{
+		"backyard.json": `{"url":"https://backyard.acme.workers.dev","deployToken":"byd_saved"}`,
+	})
+	errOut := h.mustFail("login", "--server", evil.URL)
+	if strings.Contains(errOut, "saved by the Cloudflare setup") || !strings.Contains(errOut, "DEPLOY_TOKEN") {
+		t.Fatalf("stderr = %s", errOut)
+	}
+	h.mustFail("login", "--gateway", evil.GatewayURL())
+	for _, r := range evil.Requests() {
+		if strings.Contains(r.Auth, "byd_saved") {
+			t.Fatalf("saved token sent to %s %s", r.Method, r.Path)
+		}
+	}
+	if p := h.loadConfig().Profile("default"); p != nil && p.Token != "" {
+		t.Fatalf("profile = %+v", p)
+	}
+
+	// The Worker the token was saved for is still logged in without
+	// asking, also when only its gateway is named.
+	g := clitest.NewGateway(t)
+	g.Info.Auth = deploy.AuthInfo{Mode: "none"}
+	g.Tokens["byd_mine"] = alice
+	writeFiles(t, filepath.Join(h.home, ".config", "backyard", "cloudflare"), map[string]string{
+		"mine.json": `{"url":"` + g.URL + `","deployToken":"byd_mine"}`,
+	})
+	for _, args := range [][]string{{"login", "--server", g.URL}, {"login", "--gateway", g.GatewayURL()}} {
+		h.mustRun(args...)
+		if p := h.loadConfig().Profile("default"); p == nil || p.Token != "byd_mine" {
+			t.Fatalf("%v: profile = %+v", args, p)
+		}
+	}
+}

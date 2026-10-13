@@ -156,7 +156,145 @@ describe("anonymous identity (AUTH_MODE=none)", () => {
     const html = await res.text();
     expect(html).toContain("backyard login --server https://backyard.test --token ey");
     expect(res.headers.get("Content-Security-Policy")).toContain("frame-ancestors 'none'");
-    expect((await call("/__backyard/auth/cli?mode=display", { method: "POST" })).status).toBe(405);
+    // GET, or POST from the confirmation page (a POST without its form is invalid).
+    res = await call("/__backyard/auth/cli?mode=display", { method: "PUT" });
+    expect(res.status).toBe(405);
+    expect(res.headers.get("Allow")).toBe("GET, POST");
+    expect((await call("/__backyard/auth/cli?mode=display", { method: "POST" })).status).toBe(400);
+  });
+
+  it("refuses guest cookies of different guests instead of picking the first (a site's page can plant its author's)", async () => {
+    const a = anonCookie(await call("/__backyard/api/me"));
+    const b = anonCookie(await call("/__backyard/api/me"));
+    const idOf = async (cookie: string) => ((await (await call("/__backyard/api/me", { headers: { Cookie: cookie } })).json()) as { id: string }).id;
+    const alice = await idOf(a);
+    expect(await idOf(b)).not.toBe(alice);
+    // The planted cookie (longer path) comes first: neither guest is picked.
+    const res = await call("/s/demo/__backyard/api/me", { headers: { Cookie: `${b}; ${a}` } });
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { error: { code: string; message: string } }).error.message).toContain("more than one account");
+    // Variants Backyard did not set are expired (here: host-only Path=/ is Backyard's own).
+    const sc = res.headers.getSetCookie();
+    const at = (path: string, domain = "") => sc.some((c) => c.startsWith(`backyard_anon=; Path=${path}; Max-Age=0;`) && (domain ? c.endsWith(`; Domain=${domain}`) : !c.includes("Domain=")));
+    expect(at("/s/demo/__backyard/api/me")).toBe(true);
+    expect(at("/s")).toBe(true);
+    expect(at("/s/")).toBe(true);
+    expect(at("/", "backyard.test")).toBe(true);
+    expect(at("/"), "Backyard's own cookie is kept").toBe(false);
+    // Invalid cookies are ignored, and the same guest twice is no conflict.
+    expect(await idOf(`backyard_anon=MDEyMzQ1Njc4OWFiY2RlZg.AAAA; ${a}`)).toBe(alice);
+    expect(await idOf(`${a}; ${a}`)).toBe(alice);
+  });
+});
+
+describe("CLI login confirmation of cross-site requests (SPEC §8.3, Go parity)", () => {
+  const cb = "http://127.0.0.1:43123/callback";
+  const cliURL = (extra = "") => `/__backyard/auth/cli?redirect_uri=${encodeURIComponent(cb)}&state=st4te${extra}`;
+  const formHeaders = (cookie: string, extra: Record<string, string> = {}) => ({
+    Cookie: cookie,
+    "Content-Type": "application/x-www-form-urlencoded",
+    "Sec-Fetch-Site": "same-origin",
+    Origin: "null",
+    ...extra,
+  });
+  const csrfOf = (html: string) => /name="csrf" value="([^"]+)"/.exec(html)?.[1] ?? "";
+
+  it("never mints for a request another site may have started: it asks first", async () => {
+    const cookie = anonCookie(await call("/__backyard/api/me"));
+    for (const headers of <Record<string, string>[]>[
+      { "Sec-Fetch-Site": "cross-site", Referer: "https://evil.example/" },
+      { "Sec-Fetch-Site": "same-site" },
+      { "Sec-Fetch-Site": "cross-site" },
+      { Referer: "https://evil.example/page" },
+      { Referer: "https://backyard.test.evil.example/" },
+    ]) {
+      const res = await call(cliURL(), { headers: { Cookie: cookie, ...headers } });
+      const what = JSON.stringify(headers);
+      expect(res.status, what).toBe(200);
+      expect(res.headers.get("Location"), what).toBeNull();
+      const html = await res.text();
+      expect(html, what).not.toContain("eyJ");
+      expect(html, what).toContain('<form method="post" action="/__backyard/auth/cli">');
+      expect(html, what).toContain(`name="redirect_uri" value="${cb}"`);
+      expect(html, what).toContain("http://127.0.0.1:43123");
+      expect(csrfOf(html), what).toMatch(/^\d+\.[A-Za-z0-9_-]{43}$/);
+      const csp = res.headers.get("Content-Security-Policy") ?? "";
+      expect(csp).toContain("form-action 'self' http://127.0.0.1:43123");
+      expect(csp).toContain("frame-ancestors 'none'");
+      expect(res.headers.get("X-Frame-Options")).toBe("DENY");
+      expect(res.headers.get("Cache-Control")).toContain("no-store");
+    }
+    // Navigations the user started, same-origin requests and our own Referer go ahead.
+    for (const headers of <Record<string, string>[]>[{ "Sec-Fetch-Site": "none" }, { "Sec-Fetch-Site": "same-origin" }, { Referer: "https://backyard.test/docs" }, {}]) {
+      const res = await call(cliURL(), { headers: { Cookie: cookie, ...headers } });
+      expect(res.status, JSON.stringify(headers)).toBe(302);
+      expect(new URL(res.headers.get("Location")!).searchParams.get("token")).toMatch(/^eyJ/);
+    }
+    // IPv6 loopback: CSP cannot name the host, so the form may go to "http:".
+    const v6 = await call(`/__backyard/auth/cli?redirect_uri=${encodeURIComponent("http://[::1]:5001/cb")}&state=s`, {
+      headers: { Cookie: cookie, "Sec-Fetch-Site": "cross-site" },
+    });
+    expect(v6.headers.get("Content-Security-Policy")).toMatch(/form-action 'self' http:$/);
+  });
+
+  it("mints only when the confirmation is posted back from its own page by the same user", async () => {
+    const cookie = anonCookie(await call("/__backyard/api/me"));
+    const me = ((await (await call("/__backyard/api/me", { headers: { Cookie: cookie } })).json()) as { id: string }).id;
+    const page = await call(cliURL(), { headers: { Cookie: cookie, "Sec-Fetch-Site": "cross-site" } });
+    const csrf = csrfOf(await page.text());
+    const form = (fields: Record<string, string>) => new URLSearchParams(fields).toString();
+    const good = { redirect_uri: cb, state: "st4te", csrf };
+
+    // Tampered, for another request, posted cross-site or from a foreign origin, or by another user: refused.
+    const reject = async (body: string, headers: Record<string, string>, status = 403) => {
+      const res = await call("/__backyard/auth/cli", { method: "POST", headers, body });
+      expect(res.status, `${body} ${JSON.stringify(headers)}`).toBe(status);
+      expect(res.headers.get("Location")).toBeNull();
+    };
+    // (The first character of the MAC: the last one also carries unused bits.)
+    const dot = csrf.indexOf(".") + 1;
+    await reject(form({ ...good, csrf: csrf.slice(0, dot) + (csrf[dot] === "A" ? "B" : "A") + csrf.slice(dot + 1) }), formHeaders(cookie));
+    await reject(form({ ...good, csrf: `${Number(csrf.slice(0, dot - 1)) + 1}.${csrf.slice(dot)}` }), formHeaders(cookie));
+    await reject(form({ ...good, redirect_uri: "http://127.0.0.1:9999/cb" }), formHeaders(cookie));
+    await reject(form({ ...good, state: "other" }), formHeaders(cookie));
+    await reject(form({ ...good, mode: "display" }), formHeaders(cookie));
+    await reject(form(good), formHeaders(cookie, { "Sec-Fetch-Site": "cross-site" }));
+    await reject(form(good), formHeaders(cookie, { "Sec-Fetch-Site": "same-site" }));
+    await reject(form(good), formHeaders(cookie, { Origin: "https://evil.example" }));
+    const other = anonCookie(await call("/__backyard/api/me"));
+    await reject(form(good), formHeaders(other));
+    // An expired confirmation, even with a valid signature.
+    const exp = Math.floor(Date.now() / 1000) - 5;
+    const { hmac } = await deriveKey(SECRET, "backyard/cli-confirm/v1");
+    const msg = new TextEncoder().encode(JSON.stringify(["cli-confirm", String(exp), me, "", cb, "st4te", ""]));
+    const old = `${exp}.${b64url(new Uint8Array(await crypto.subtle.sign("HMAC", hmac, msg)))}`;
+    await reject(form({ ...good, csrf: old }), formHeaders(cookie));
+    // The confirmation itself: a 303 to the loopback address with the token.
+    const res = await call("/__backyard/auth/cli", { method: "POST", headers: formHeaders(cookie), body: form(good) });
+    expect(res.status).toBe(303);
+    const loc = new URL(res.headers.get("Location")!);
+    expect(loc.origin + loc.pathname).toBe(cb);
+    expect(loc.searchParams.get("state")).toBe("st4te");
+    expect(res.headers.get("Referrer-Policy")).toBe("no-referrer");
+    const who = await call("/__backyard/api/me", { headers: bearer(loc.searchParams.get("token")!) });
+    expect(((await who.json()) as { id: string }).id).toBe(me);
+    // Without Fetch Metadata and Origin (older browsers) the token alone decides.
+    const plain = await call("/__backyard/auth/cli", { method: "POST", headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" }, body: form(good) });
+    expect(plain.status).toBe(303);
+  });
+
+  it("confirms display mode too", async () => {
+    const cookie = anonCookie(await call("/__backyard/api/me"));
+    const page = await call("/__backyard/auth/cli?mode=display", { headers: { Cookie: cookie, "Sec-Fetch-Site": "cross-site" } });
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).not.toContain("eyJ");
+    expect(html).toContain('name="mode" value="display"');
+    expect(page.headers.get("Content-Security-Policy")).toMatch(/form-action 'self'$/);
+    const body = new URLSearchParams({ mode: "display", csrf: csrfOf(html) }).toString();
+    const res = await call("/__backyard/auth/cli", { method: "POST", headers: formHeaders(cookie), body });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("backyard login --server https://backyard.test --token ey");
   });
 });
 
@@ -223,6 +361,81 @@ describe("Cloudflare Access (AUTH_MODE=access)", () => {
     expect(seen.filter((u) => u.endsWith("/get-identity"))).toHaveLength(1);
   });
 
+  it("refuses CF_Authorization cookies of different users instead of picking the first", async () => {
+    const { sign, claims } = await setup();
+    const alice = await sign(claims);
+    const mallory = await sign({ ...claims, email: "mallory@acme.com", sub: "u-2" });
+    const expired = await sign({ ...claims, email: "mallory@acme.com", sub: "u-2", exp: claims.iat - 120 });
+    const me = (cookie: string, headers: Record<string, string> = {}) =>
+      call("/__backyard/api/deploy/me", { headers: { Cookie: cookie, ...headers } }, accessEnv);
+    // Mallory's own valid Access JWT, planted by her site's page for a longer
+    // path of the bypassed deploy gateway, is sent first: neither user is picked.
+    let res = await me(`CF_Authorization=${mallory}; CF_Authorization=${alice}`);
+    expect(res.status).toBe(401);
+    const err = ((await res.json()) as { error: { code: string; message: string } }).error;
+    expect(err.code).toBe("unauthenticated");
+    expect(err.message).toContain("more than one account");
+    const sc = res.headers.getSetCookie();
+    expect(sc.some((c) => c.startsWith("CF_Authorization=; Path=/__backyard/api/deploy; Max-Age=0;"))).toBe(true);
+    expect(sc.some((c) => c.startsWith("CF_Authorization=; Path=/;")), "Access's own cookie is kept").toBe(false);
+    res = await me(`CF_Authorization=${alice}; CF_Authorization=${mallory}`);
+    expect(res.status).toBe(401);
+    // An invalid or expired planted cookie does not hide the user's own.
+    for (const planted of ["garbage", "a.b.c", expired]) {
+      res = await me(`CF_Authorization=${planted}; CF_Authorization=${alice}`);
+      expect(res.status, planted.slice(0, 16)).toBe(200);
+      expect(((await res.json()) as { id: string }).id).toBe("alice@acme.com");
+    }
+    // The same user twice is no conflict.
+    expect((await me(`CF_Authorization=${alice}; CF_Authorization=${await sign({ ...claims, identity_nonce: "n2" })}`)).status).toBe(200);
+    // With the header Access adds (the same token as its cookie), a planted
+    // cookie of another user is refused too, and an invalid one ignored.
+    const site = (cookie: string) => call("/s/demo/__backyard/api/me", { headers: { Cookie: cookie, "Cf-Access-Jwt-Assertion": alice } }, accessEnv);
+    res = await site(`CF_Authorization=${alice}`);
+    expect(((await res.json()) as { id: string }).id).toBe("alice@acme.com");
+    expect((await site(`CF_Authorization=${mallory}; CF_Authorization=${alice}`)).status).toBe(401);
+    expect((await site(`CF_Authorization=garbage; CF_Authorization=${alice}`)).status).toBe(200);
+    // Pages explain the conflict (signing in again would not help).
+    const page = await call("/", { headers: { Accept: "text/html", Cookie: `CF_Authorization=${mallory}`, "Cf-Access-Jwt-Assertion": alice } }, accessEnv);
+    expect(page.status).toBe(401);
+    expect(await page.text()).toContain("Conflicting sign-in cookies");
+  });
+
+  it("asks before minting a CLI token for a cross-site request, and gives Access identities the full token lifetime", async () => {
+    const { sign, claims } = await setup();
+    const jwt = await sign(claims);
+    const cb = "http://127.0.0.1:43124/cb";
+    const page = await call(
+      `/__backyard/auth/cli?state=s1&redirect_uri=${encodeURIComponent(cb)}`,
+      { headers: { "Cf-Access-Jwt-Assertion": jwt, "Sec-Fetch-Site": "cross-site", Referer: "https://evil.example/" } },
+      accessEnv,
+    );
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain("alice@acme.com");
+    const csrf = /name="csrf" value="([^"]+)"/.exec(html)![1]!;
+    const res = await call(
+      "/__backyard/auth/cli",
+      {
+        method: "POST",
+        headers: { "Cf-Access-Jwt-Assertion": jwt, "Content-Type": "application/x-www-form-urlencoded", "Sec-Fetch-Site": "same-origin", Origin: "null" },
+        body: new URLSearchParams({ redirect_uri: cb, state: "s1", csrf }).toString(),
+      },
+      accessEnv,
+    );
+    expect(res.status).toBe(303);
+    expect(new URL(res.headers.get("Location")!).searchParams.get("token")).toMatch(/^eyJ/);
+    // POST /tokens authenticated by Access (not by an API token): the full lifetime.
+    const mint = await call(
+      "/__backyard/api/tokens",
+      { method: "POST", headers: { "Cf-Access-Jwt-Assertion": jwt, "X-Backyard": "1", "Content-Type": "application/json" }, body: "{}" },
+      accessEnv,
+    );
+    expect(mint.status).toBe(200);
+    const p = decodePart(((await mint.json()) as { token: string }).token.split(".")[1]!);
+    expect((p.exp as number) - (p.iat as number)).toBe(720 * 3600);
+  });
+
   it("rejects missing, expired and foreign-audience tokens", async () => {
     const { sign, claims } = await setup();
     let res = await call("/s/demo/__backyard/api/me", {}, accessEnv);
@@ -245,6 +458,29 @@ describe("Cloudflare Access (AUTH_MODE=access)", () => {
     // Anonymous API tokens are not valid in access mode.
     const anon = await issueAPIToken(SECRET, { id: "anon:0123456789abcdef", name: "Guest", anonymous: true, admin: false }, 3600);
     expect((await call("/__backyard/api/me", { headers: bearer(anon.token) }, accessEnv)).status).toBe(401);
+  });
+
+  it("answers /login with an uncacheable 302 to the sanitized rd in both modes (like Go's proxy modes)", async () => {
+    for (const env of [{}, accessEnv]) {
+      const mode = "AUTH_MODE" in env ? "access" : "none";
+      for (const method of ["GET", "HEAD"]) {
+        const res = await call("/__backyard/auth/login?rd=%2Fdocs", { method }, env);
+        expect(res.status, `${mode} ${method}`).toBe(302);
+        expect(res.headers.get("Location")).toBe("https://backyard.test/docs");
+        // Like Go's noStore: a cached redirect must not outlive the session.
+        expect(res.headers.get("Cache-Control")).toBe("no-store, max-age=0");
+        expect(res.headers.get("Pragma")).toBe("no-cache");
+        expect(res.headers.get("Expires")).toBe("0");
+      }
+      // No rd, foreign targets and the login flow's own endpoints go to the hub.
+      for (const rd of ["", "https://evil.com/", "/__backyard/auth/callback", "/__backyard/auth/login/"]) {
+        const res = await call("/__backyard/auth/login?rd=" + encodeURIComponent(rd), {}, env);
+        expect(res.headers.get("Location"), `${mode} ${rd}`).toBe("https://backyard.test/");
+      }
+      const post = await call("/__backyard/auth/login", { method: "POST" }, env);
+      expect(post.status).toBe(405);
+      expect(post.headers.get("Allow")).toBe("GET, HEAD");
+    }
   });
 
   it("advertises the CLI login and mints tokens for Access users", async () => {

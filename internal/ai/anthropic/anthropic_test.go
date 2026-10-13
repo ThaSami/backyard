@@ -298,6 +298,54 @@ func TestUpstreamErrors(t *testing.T) {
 	if strings.Contains(ue.Error(), "sk-ant-test") {
 		t.Fatal("error leaks the API key")
 	}
+	if ue.RetryAfter() != 0 {
+		t.Fatalf("RetryAfter = %v without retry headers", ue.RetryAfter())
+	}
+}
+
+// TestUpstreamErrorRetryAfter: the provider's Retry-After (or, on a 429,
+// its rate-limit reset headers) reaches the *ai.UpstreamError, so the HTTP
+// layer can answer 429 with a Retry-After of its own.
+func TestUpstreamErrorRetryAfter(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		header map[string]string
+		want   time.Duration
+	}{
+		{"retry-after", 429, map[string]string{"Retry-After": "17"}, 17 * time.Second},
+		{"retry-after-ms", 429, map[string]string{"Retry-After-Ms": "2500", "Retry-After": "3"}, 2500 * time.Millisecond},
+		{"overloaded retry-after", 529, map[string]string{"Retry-After": "4"}, 4 * time.Second},
+		{"reset headers", 429, map[string]string{
+			"Anthropic-Ratelimit-Requests-Remaining": "0",
+			"Anthropic-Ratelimit-Requests-Reset":     time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		}, time.Hour},
+		{"reset headers ignored for 400", 400, map[string]string{
+			"Anthropic-Ratelimit-Requests-Remaining": "0",
+			"Anthropic-Ratelimit-Requests-Reset":     time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFake(t, func(w http.ResponseWriter, r *http.Request, _ map[string]any) {
+				for k, v := range tc.header {
+					w.Header().Set(k, v)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`))
+			})
+			p := newFirstParty(t, f, config.ProviderConfig{})
+			_, err := p.Chat(context.Background(), ai.ChatRequest{Model: "claude-opus-5-5", Messages: userText("x")})
+			var ue *ai.UpstreamError
+			if !errors.As(err, &ue) || ue.Status != tc.status {
+				t.Fatalf("got %#v", err)
+			}
+			// RFC 3339 has second precision: allow for the clock moving on.
+			if got := ue.RetryAfter(); got > tc.want || got < tc.want-2*time.Second {
+				t.Fatalf("RetryAfter = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestContextCancel(t *testing.T) {
@@ -422,6 +470,23 @@ func TestChatStreamRefusalAndErrors(t *testing.T) {
 		_, err := p.ChatStream(ctx, ai.ChatRequest{Model: "claude-opus-5-5", Messages: userText("x")}, func(string) error { return nil })
 		var ue *ai.UpstreamError
 		if !errors.As(err, &ue) || ue.Status != 529 || ue.Message != "Overloaded" {
+			t.Fatalf("got %#v", err)
+		}
+	})
+	t.Run("rate limit event ignores reset headers of the 200 stream", func(t *testing.T) {
+		f := newFake(t, func(w http.ResponseWriter, r *http.Request, _ map[string]any) {
+			// Reset headers describe every response; on a successful
+			// stream they say nothing about when to retry.
+			w.Header().Set("Anthropic-Ratelimit-Requests-Remaining", "0")
+			w.Header().Set("Anthropic-Ratelimit-Requests-Reset", time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+			ev := streamEvents("claude-opus-5-5", []string{"a"}, "end_turn")[:4]
+			ev = append(ev, [2]string{"error", `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`})
+			sse(w, ev...)
+		})
+		p := newFirstParty(t, f, config.ProviderConfig{})
+		_, err := p.ChatStream(ctx, ai.ChatRequest{Model: "claude-opus-5-5", Messages: userText("x")}, func(string) error { return nil })
+		var ue *ai.UpstreamError
+		if !errors.As(err, &ue) || ue.Status != 429 || ue.RetryAfter() != 0 {
 			t.Fatalf("got %#v", err)
 		}
 	})

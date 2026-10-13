@@ -5,12 +5,14 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
 	"net/url"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -115,6 +117,56 @@ func TestNewErrors(t *testing.T) {
 	}
 }
 
+// fakeRows yields n rows whose raw values are raw. Only Next and RawValues
+// are implemented.
+type fakeRows struct {
+	pgx.Rows
+	n, read int
+	raw     [][]byte
+}
+
+func (r *fakeRows) Next() bool {
+	if r.read == r.n {
+		return false
+	}
+	r.read++
+	return true
+}
+
+func (r *fakeRows) RawValues() [][]byte { return r.raw }
+
+func TestDrain(t *testing.T) {
+	row := func(n int) [][]byte { return [][]byte{make([]byte, n), nil} }
+	cases := []struct {
+		name              string
+		rows, size        int
+		wantDone          bool
+		wantRead          int
+		maxRows, maxBytes int
+	}{
+		{"small rest", 100, 1000, true, 100, 10000, 1 << 20},
+		{"row bound", 20000, 1, false, 10000, 10000, 1 << 20},
+		// Without the byte bound 10 000 rows of 50 KB (500 MB) would be
+		// read before canceling.
+		{"byte bound", 10000, 50000, false, 21, 10000, 1 << 20},
+	}
+	for _, c := range cases {
+		r := &fakeRows{n: c.rows, raw: row(c.size)}
+		if done := drain(r, c.maxRows, c.maxBytes); done != c.wantDone || r.read != c.wantRead {
+			t.Errorf("%s: drain = %v after %d rows, want %v after %d", c.name, done, r.read, c.wantDone, c.wantRead)
+		}
+	}
+}
+
+func TestBodyLimit(t *testing.T) {
+	if got := bodyLimit(32 << 20); got != 32<<20 {
+		t.Errorf("bodyLimit(32 MiB) = %d", got)
+	}
+	if got := bodyLimit(10); got != minBodyLen {
+		t.Errorf("bodyLimit(10) = %d", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests (BACKYARD_TEST_POSTGRES_DSN)
 
@@ -196,7 +248,7 @@ func query(t *testing.T, src *Source, sql string, args ...any) *warehouse.Result
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	res, err := src.Query(ctx, sql, args, 1000)
+	res, err := src.Query(ctx, sql, args, warehouse.Limits{MaxRows: 1000})
 	if err != nil {
 		t.Fatalf("Query(%q): %v", sql, err)
 	}
@@ -300,18 +352,18 @@ func TestIntegrationTruncation(t *testing.T) {
 	src, _ := fixture(t)
 	ctx := context.Background()
 
-	res, err := src.Query(ctx, "SELECT g FROM generate_series(1, 10) g", nil, 10)
+	res, err := src.Query(ctx, "SELECT g FROM generate_series(1, 10) g", nil, warehouse.Limits{MaxRows: 10})
 	if err != nil || res.Truncated || len(res.Rows) != 10 {
 		t.Fatalf("exact: %+v %v", res, err)
 	}
-	res, err = src.Query(ctx, "SELECT g FROM generate_series(1, 100) g", nil, 10)
+	res, err = src.Query(ctx, "SELECT g FROM generate_series(1, 100) g", nil, warehouse.Limits{MaxRows: 10})
 	if err != nil || !res.Truncated || len(res.Rows) != 10 || res.Rows[9]["g"] != int64(10) {
 		t.Fatalf("small overshoot: %+v %v", res, err)
 	}
 
 	// A huge result is canceled server-side instead of streamed.
 	start := time.Now()
-	res, err = src.Query(ctx, "SELECT generate_series(1, 200000000) AS g, repeat('x', 100) AS pad", nil, 5)
+	res, err = src.Query(ctx, "SELECT generate_series(1, 200000000) AS g, repeat('x', 100) AS pad", nil, warehouse.Limits{MaxRows: 5})
 	if err != nil || !res.Truncated || len(res.Rows) != 5 {
 		t.Fatalf("huge: %+v %v", res, err)
 	}
@@ -322,6 +374,78 @@ func TestIntegrationTruncation(t *testing.T) {
 	res = query(t, src, "SELECT 1 AS ok")
 	if res.Rows[0]["ok"] != int64(1) {
 		t.Fatalf("after cancel: %+v", res)
+	}
+}
+
+// TestIntegrationResultSize: results are capped by size while they are
+// read; a row too large for what is left of the cap is never buffered.
+func TestIntegrationResultSize(t *testing.T) {
+	src, _ := fixture(t)
+	ctx := context.Background()
+	const mib = 1 << 20
+	healthy := func(what string) {
+		t.Helper()
+		if res := query(t, src, "SELECT 1 AS ok"); res.Rows[0]["ok"] != int64(1) {
+			t.Fatalf("after %s: %+v", what, res)
+		}
+	}
+
+	// Wide rows stop at the last one that fits, well before the row cap.
+	res, err := src.Query(ctx, "SELECT g, repeat('x', 300000) AS pad FROM generate_series(1, 10) g", nil, warehouse.Limits{MaxRows: 100, MaxBytes: mib})
+	if err != nil || !res.Truncated || len(res.Rows) != 3 || res.RowCount != 3 || res.Rows[2]["g"] != int64(3) {
+		t.Fatalf("wide rows: %d rows, truncated %v, %v", len(res.Rows), res != nil && res.Truncated, err)
+	}
+	healthy("wide rows")
+
+	// A row larger than what is left of the cap ends the result without
+	// being read (pgx refuses the message and the connection is closed).
+	res, err = src.Query(ctx, "SELECT g, repeat('x', 700000) AS pad FROM generate_series(1, 5) g", nil, warehouse.Limits{MaxRows: 100, MaxBytes: mib})
+	if err != nil || !res.Truncated || len(res.Rows) != 1 || res.Columns[1].Name != "pad" {
+		t.Fatalf("second row too large: %+v %v", res, err)
+	}
+	healthy("an oversized row")
+
+	// A single 64 MiB row with a 1 MiB cap: nothing close to its size is
+	// allocated (pgx would otherwise buffer it whole, then copy it into a
+	// string). pgx learns the columns only with the first row, so there
+	// are none either.
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	res, err = src.Query(ctx, "SELECT repeat('x', 64 * 1024 * 1024) AS big", nil, warehouse.Limits{MaxRows: 100, MaxBytes: mib})
+	runtime.ReadMemStats(&after)
+	if err != nil || !res.Truncated || len(res.Rows) != 0 || res.Rows == nil || res.Columns == nil {
+		t.Fatalf("huge row: %+v %v", res, err)
+	}
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 16*mib {
+		t.Errorf("huge row: allocated %d MiB", alloc/mib)
+	}
+	healthy("a huge row")
+
+	// The default cap (32 MiB) applies when none is given: a few rows of
+	// 12 MiB each are cut after the second.
+	res, err = src.Query(ctx, "SELECT g, repeat('x', 12 * 1024 * 1024) AS pad FROM generate_series(1, 4) g", nil, warehouse.Limits{MaxRows: 100})
+	if err != nil || !res.Truncated || len(res.Rows) != 2 {
+		t.Fatalf("default cap: %d rows, truncated %v, %v", len(res.Rows), res != nil && res.Truncated, err)
+	}
+	healthy("the default cap")
+
+	// A refusal before the first row (here a 1000-column row description
+	// larger than the 64 KiB minimum message limit) also truncates.
+	cols := make([]string, 1000)
+	for i := range cols {
+		cols[i] = fmt.Sprintf(`1 AS "%s%04d"`, strings.Repeat("c", 55), i)
+	}
+	res, err = src.Query(ctx, "SELECT "+strings.Join(cols, ", "), nil, warehouse.Limits{MaxRows: 10, MaxBytes: 1})
+	if err != nil || !res.Truncated || len(res.Rows) != 0 || res.Rows == nil || res.Columns == nil {
+		t.Fatalf("large row description: %+v %v", res, err)
+	}
+	healthy("a large row description")
+
+	// Exactly fitting results are not truncated.
+	res, err = src.Query(ctx, "SELECT g, repeat('x', 1000) AS pad FROM generate_series(1, 10) g", nil, warehouse.Limits{MaxRows: 100, MaxBytes: mib})
+	if err != nil || res.Truncated || len(res.Rows) != 10 {
+		t.Fatalf("small result: %+v %v", res, err)
 	}
 }
 
@@ -338,24 +462,24 @@ func TestIntegrationReadOnly(t *testing.T) {
 		"SELECT * INTO " + schema + ".copy FROM " + schema + ".counter",
 	}
 	for _, sql := range stmts {
-		_, err := src.Query(ctx, sql, nil, 10)
+		_, err := src.Query(ctx, sql, nil, warehouse.Limits{MaxRows: 10})
 		if !errors.Is(err, warehouse.ErrForbidden) {
 			t.Errorf("%s: err = %v, want ErrForbidden", sql, err)
 		}
 	}
 	// Switching the transaction to read-write is refused, and COMMIT only
 	// ends the current read-only transaction.
-	if _, err := src.Query(ctx, "SET TRANSACTION READ WRITE", nil, 10); err == nil {
+	if _, err := src.Query(ctx, "SET TRANSACTION READ WRITE", nil, warehouse.Limits{MaxRows: 10}); err == nil {
 		t.Error("SET TRANSACTION READ WRITE succeeded")
 	}
-	if _, err := src.Query(ctx, "COMMIT", nil, 10); err != nil {
+	if _, err := src.Query(ctx, "COMMIT", nil, warehouse.Limits{MaxRows: 10}); err != nil {
 		t.Logf("COMMIT: %v", err)
 	}
-	if _, err := src.Query(ctx, "INSERT INTO "+schema+".counter VALUES (3)", nil, 10); !errors.Is(err, warehouse.ErrForbidden) {
+	if _, err := src.Query(ctx, "INSERT INTO "+schema+".counter VALUES (3)", nil, warehouse.Limits{MaxRows: 10}); !errors.Is(err, warehouse.ErrForbidden) {
 		t.Errorf("insert after COMMIT: %v", err)
 	}
 	// Multiple statements are impossible on the extended protocol.
-	if _, err := src.Query(ctx, "SELECT 1; INSERT INTO "+schema+".counter VALUES (4)", nil, 10); !errors.Is(err, warehouse.ErrBadRequest) {
+	if _, err := src.Query(ctx, "SELECT 1; INSERT INTO "+schema+".counter VALUES (4)", nil, warehouse.Limits{MaxRows: 10}); !errors.Is(err, warehouse.ErrBadRequest) {
 		t.Errorf("multi-statement: %v", err)
 	}
 	res := query(t, src, "SELECT count(*) AS n, sum(n) AS s FROM "+schema+".counter")
@@ -381,7 +505,7 @@ func TestIntegrationSimpleProtocolOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer src.Close()
-	_, err = src.Query(context.Background(), "SELECT 1; COMMIT; INSERT INTO "+schema+".counter VALUES (9)", nil, 10)
+	_, err = src.Query(context.Background(), "SELECT 1; COMMIT; INSERT INTO "+schema+".counter VALUES (9)", nil, warehouse.Limits{MaxRows: 10})
 	if err == nil {
 		t.Fatal("multi-statement string executed")
 	}
@@ -408,7 +532,7 @@ func TestIntegrationErrors(t *testing.T) {
 		{"SELECT $1::int, $2::int", []any{int64(1)}, warehouse.ErrBadRequest},
 	}
 	for _, c := range cases {
-		_, err := src.Query(ctx, c.sql, c.args, 10)
+		_, err := src.Query(ctx, c.sql, c.args, warehouse.Limits{MaxRows: 10})
 		if !errors.Is(err, c.want) {
 			t.Errorf("%s %v: err = %v, want %v", c.sql, c.args, err, c.want)
 		}
@@ -423,7 +547,7 @@ func TestIntegrationTimeoutAndCancel(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := src.Query(ctx, "SELECT pg_sleep(10)", nil, 10)
+	_, err := src.Query(ctx, "SELECT pg_sleep(10)", nil, warehouse.Limits{MaxRows: 10})
 	if !errors.Is(err, warehouse.ErrTimeout) {
 		t.Fatalf("timeout: err = %v", err)
 	}
@@ -435,7 +559,7 @@ func TestIntegrationTimeoutAndCancel(t *testing.T) {
 	ctx, cancel = context.WithCancel(context.Background())
 	time.AfterFunc(200*time.Millisecond, cancel)
 	start = time.Now()
-	_, err = src.Query(ctx, "SELECT pg_sleep(10)", nil, 10)
+	_, err = src.Query(ctx, "SELECT pg_sleep(10)", nil, warehouse.Limits{MaxRows: 10})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancel: err = %v", err)
 	}

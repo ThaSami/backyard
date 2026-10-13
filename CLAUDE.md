@@ -25,8 +25,8 @@ comes from `templates/files/agents/CLAUDE.md.tmpl` — a different thing.)
 | `templates/` | `backyard init` templates (agent files extract parts of `SKILL.md`) |
 | `deploy/cloudflare` | The Cloudflare Workers edition (TypeScript); `src/generated/` is generated, don't edit |
 | `deploy/{terraform,helm,docker-compose,systemd}` | Deployment kits |
-| `conformance/`, `e2e/` | Cross-edition black-box API suite (`node --test`) and browser tests |
-| `docs/` | User and operator documentation |
+| `conformance/`, `e2e/` | Cross-edition black-box API suite (`node --test`; `run-go.sh`, `run-worker.sh`) and the Playwright browser suite |
+| `docs/` | User and operator documentation; `docs_test.go` checks links, make targets and config keys, `contract_test.go` statements tied to code (key labels, site URLs, limits, MCP tools) |
 
 ## Invariants
 
@@ -65,7 +65,10 @@ make test                     # go test -race ./... (integration tests skip with
 make sdk-test                 # if web/ changed
 make cloudflare               # if deploy/cloudflare or the shared SDK/skill changed
 go test ./skills/... ./templates/...   # if skills/ or templates/ changed
+go test ./docs/               # if docs/, a top-level guide, a config key or a documented contract changed
 make validate-configs tf-validate helm-lint   # if deploy/ changed
+make conformance              # if the public contract changed (runs both editions)
+make e2e                      # if the hub, SDK, examples, templates or sign-in flows changed
 ```
 
 With the integration services (`make services-up`, see `CONTRIBUTING.md`), `make test` also

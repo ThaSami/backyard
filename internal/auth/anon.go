@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -45,15 +46,29 @@ func anonUser(id string) *identity.User {
 // backyard_anon cookie, minting a new id (and setting the cookie when w is
 // non-nil) when the cookie is missing or invalid. The new cookie is also
 // added to r so later Authenticate calls for the same request resolve the
-// same guest.
+// same guest. Valid cookies of different guests fail closed, as session
+// cookies do (see sessionFromCookies): a site's page can plant its author's
+// guest cookie in visitors' browsers.
 func (a *authenticator) authenticateAnon(w http.ResponseWriter, r *http.Request) (*identity.User, error) {
+	guest := ""
 	for _, c := range r.Cookies() {
 		if c.Name != AnonCookie {
 			continue
 		}
-		if id, ok := a.anon.parse(c.Value); ok {
-			return a.finalize(r.Context(), anonUser(id), srcAnon)
+		id, ok := a.anon.parse(c.Value)
+		switch {
+		case !ok:
+		case guest == "":
+			guest = id
+		case id != guest:
+			a.log.Warn("auth: request carries guest cookies of different guests; possibly planted by a site's page",
+				"host", r.Host, "path", truncate(r.URL.Path, 128), "audit", true)
+			a.expireForeignCookies(w, r, AnonCookie)
+			return nil, fmt.Errorf("%w: %w", ErrUnauthenticated, ErrCookieConflict)
 		}
+	}
+	if guest != "" {
+		return a.finalize(r.Context(), anonUser(guest), srcAnon)
 	}
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)

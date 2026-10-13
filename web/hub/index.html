@@ -244,6 +244,20 @@
       </form>
     </dialog>
 
+    <dialog id="handoff-dialog" aria-labelledby="handoff-title" aria-describedby="handoff-body">
+      <form method="dialog" id="handoff-form">
+        <h2 id="handoff-title">Use a deploy token from a link?</h2>
+        <p id="handoff-body"></p>
+        <p class="hint">
+          Only use it if you trust whoever gave you the link. You can remove it later under “Deploy token”.
+        </p>
+        <div class="dialog-actions">
+          <button type="button" class="btn" id="handoff-ignore">Don’t use it</button>
+          <button type="submit" class="btn primary" id="handoff-use" value="use">Use this token</button>
+        </div>
+      </form>
+    </dialog>
+
     <div class="toast" id="toast" role="status" hidden></div>
   </body>
 </html>

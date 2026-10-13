@@ -33,8 +33,9 @@ describe("X-Request-Id (SPEC §3, §15)", () => {
 describe("AI image parts (SPEC §5.4)", () => {
   const chatWith = (part: Record<string, unknown>) => () => parseChat({ messages: [{ role: "user", content: [{ type: "text", text: "look" }, part] }] }, "");
 
-  it("rejects image URLs that are not absolute http(s) URLs", () => {
-    for (const url of ["/__backyard/files/01J/x.png", "x.png", "ftp://example.com/x.png", "javascript:alert(1)", "data:image/png,notbase64", "https://", "https://e.com/" + "x".repeat(8192)]) {
+  it("rejects image URLs that are neither absolute http(s) URLs nor uploads of the site", () => {
+    // (A /__backyard/files/… URL names an upload: it is read when the request runs, see ai.test.ts.)
+    for (const url of ["/elsewhere/x.png", "//evil.example/__backyard/files/01J/x.png", "/\\evil.example/x.png", "x.png", "ftp://example.com/x.png", "javascript:alert(1)", "data:image/png,notbase64", "https://", "https://e.com/" + "x".repeat(8192)]) {
       let err: unknown;
       try {
         chatWith({ type: "image", url })();

@@ -100,7 +100,10 @@ type deployOutput struct {
 	Bytes     int64              `json:"bytes"`
 	Files     []deployOutputFile `json:"files,omitempty"`
 	Command   []string           `json:"command,omitempty"`
-	Meta      *sites.Meta        `json:"meta,omitempty"`
+	// Cleanup lists the commands (direct methods) removing published files
+	// that the ignore rules exclude.
+	Cleanup [][]string  `json:"cleanup,omitempty"`
+	Meta    *sites.Meta `json:"meta,omitempty"`
 }
 
 type deployOutputFile struct {
@@ -155,7 +158,9 @@ func (a *cliApp) planDeploy(ctx context.Context, dirArg string, fl deployFlags) 
 	}
 	p := &deployPlan{dir: absFrom(cwd, dirArg)}
 	if dirArg == "" && pf != nil {
-		p.dir = pf.DeployDir()
+		if p.dir, err = pf.DeployDir(); err != nil {
+			return nil, err
+		}
 	}
 	if st, err := os.Stat(p.dir); err != nil || !st.IsDir() {
 		return nil, fmt.Errorf("%s is not a directory", p.dir)
@@ -195,7 +200,10 @@ func (a *cliApp) planDeploy(ctx context.Context, dirArg string, fl deployFlags) 
 			s.CacheInfo(p.info)
 		} else {
 			a.log.Debug("gateway unreachable", "gateway", s.Gateway, "error", p.infoErr)
-			p.info = s.Profile.Info
+			// Only the profile's own server may fall back to its cached
+			// info: with --server/BACKYARD_SERVER pointing elsewhere it
+			// would describe another server's storage.
+			p.info = s.CachedInfo()
 		}
 	} else {
 		p.infoErr = clientconfig.ErrNoServer
@@ -360,18 +368,24 @@ func (a *cliApp) deployAPI(ctx context.Context, p *deployPlan, fl deployFlags) (
 	return out, nil
 }
 
-// deployDirect runs the storage tool, then asks the gateway to refresh the
-// site's metadata (best effort).
+// deployDirect runs the storage tool, removes files published earlier that
+// the ignore rules exclude (which the tools' excludes protect from their
+// --delete), then asks the gateway to refresh the site's metadata (best
+// effort).
 func (a *cliApp) deployDirect(ctx context.Context, p *deployPlan, fl deployFlags) (*deployOutput, error) {
-	var st = p.info.Storage
-	cmd, err := buildSyncCommand(syncTarget{
-		Method: p.method, Dir: p.dir, Site: p.site, Storage: st, RsyncTarget: p.info.RsyncTarget, Patterns: p.patterns,
-	}, p.tool)
+	target := syncTarget{
+		Method: p.method, Dir: p.dir, Site: p.site, Storage: p.info.Storage, RsyncTarget: p.info.RsyncTarget, Patterns: p.patterns,
+	}
+	cmd, err := buildSyncCommand(target, p.tool)
 	if err != nil {
 		return nil, err
 	}
 	out := &deployOutput{Site: p.site, Method: p.method, DryRun: fl.dryRun, Command: cmd.Argv(),
 		URL: clientconfig.SiteURL(p.info, p.session.Server, p.site)}
+	// The gateway lists the site's stored files (to find ignored ones) and
+	// refreshes its metadata, when it can be used.
+	gatewayOK := p.infoErr == nil && (p.session.Token != "" || p.info.Auth.AnonymousDeploy)
+	prune := gatewayOK && p.method != clientconfig.MethodRsync // rsync runs with --delete-excluded
 	if fl.dryRun {
 		files, err := deploy.CollectFiles(p.dir, p.ignore)
 		if err != nil {
@@ -382,19 +396,27 @@ func (a *cliApp) deployDirect(ctx context.Context, p *deployPlan, fl deployFlags
 			out.Bytes += f.Size
 		}
 		out.Uploaded = len(files)
+		if prune {
+			if stale, err := a.ignoredSiteFiles(ctx, p); err == nil {
+				cmds, _ := buildPruneCommands(target, p.tool, stale)
+				for _, c := range cmds {
+					out.Cleanup = append(out.Cleanup, c.Argv())
+				}
+			}
+		}
 		return out, nil
 	}
 	if !a.g.json {
 		a.errf("$ %s\n", cmd.String())
 	}
-	cmd.Stdout, cmd.Stderr = a.streams.Out, a.streams.ErrOut
-	if a.g.json {
-		cmd.Stdout = a.streams.ErrOut // keep stdout machine-readable
-	}
-	if err := a.deps.runner.Run(ctx, cmd); err != nil {
+	if err := a.runTool(ctx, cmd); err != nil {
 		return nil, fmt.Errorf("%s sync failed: %w", p.method, err)
 	}
-	if p.infoErr == nil && (p.session.Token != "" || p.info.Auth.AnonymousDeploy) {
+	var pruneErr error
+	if prune {
+		pruneErr = a.pruneIgnored(ctx, p, target, out)
+	}
+	if gatewayOK {
 		rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		meta, err := p.client.Refresh(rctx, p.site)
 		cancel()
@@ -409,8 +431,84 @@ func (a *cliApp) deployDirect(ctx context.Context, p *deployPlan, fl deployFlags
 		}
 	} else if !a.g.json {
 		a.errf("Note: the hub will show updated site details after the next refresh (gateway not reachable).\n")
+		if p.method != clientconfig.MethodRsync {
+			a.errf("Note: files published earlier that the ignore rules now exclude were not removed: %s never deletes "+
+				"what its excludes match, and the gateway could not list the site. A deploy with --method api removes them.\n",
+				p.tool)
+		}
+	}
+	if pruneErr != nil {
+		return nil, pruneErr
 	}
 	return out, nil
+}
+
+// runTool runs a storage tool command with the CLI's output streams (stdout
+// goes to stderr with --json, keeping stdout machine-readable).
+func (a *cliApp) runTool(ctx context.Context, cmd Command) error {
+	cmd.Stdout, cmd.Stderr = a.streams.Out, a.streams.ErrOut
+	if a.g.json {
+		cmd.Stdout = a.streams.ErrOut
+	}
+	return a.deps.runner.Run(ctx, cmd)
+}
+
+// ignoredSiteFiles lists the site's stored files that the deploy's ignore
+// rules exclude, sorted.
+func (a *cliApp) ignoredSiteFiles(ctx context.Context, p *deployPlan) ([]string, error) {
+	lctx, cancel := context.WithTimeout(ctx, apiTimeout)
+	defer cancel()
+	files, err := p.client.SiteFiles(lctx, p.site)
+	var ae *deploy.APIError
+	if errors.As(err, &ae) && ae.Status == http.StatusNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	m := deploy.NewMatcher(p.patterns)
+	var stale []string
+	for _, f := range files {
+		if deploy.ValidatePath(f.Path) == "" && m.Ignored(f.Path, false) {
+			stale = append(stale, f.Path)
+		}
+	}
+	slices.Sort(stale)
+	return stale, nil
+}
+
+// pruneIgnored deletes the site's stored files that the ignore rules
+// exclude, with the method's tool. The deploy fails when some stay
+// published: whoever added a rule (e.g. *.pem) expects them gone.
+func (a *cliApp) pruneIgnored(ctx context.Context, p *deployPlan, t syncTarget, out *deployOutput) error {
+	stale, err := a.ignoredSiteFiles(ctx, p)
+	if err != nil {
+		a.warnf("could not check the site for files the ignore rules exclude: %v", err)
+		return nil
+	}
+	if len(stale) == 0 {
+		return nil
+	}
+	cmds, skipped := buildPruneCommands(t, p.tool, stale)
+	if !a.g.json {
+		a.errf("Removing %d published files the ignore rules exclude:\n  %s\n", len(stale), strings.Join(stale, "\n  "))
+	}
+	for _, c := range cmds {
+		out.Cleanup = append(out.Cleanup, c.Argv())
+		if !a.g.json {
+			a.errf("$ %s\n", c.String())
+		}
+		if err := a.runTool(ctx, c); err != nil {
+			return fmt.Errorf("the files were synced, but removing those the ignore rules exclude failed (%w); "+
+				"they are still published: run the deploy again, or once with --method api", err)
+		}
+	}
+	if len(skipped) > 0 {
+		return fmt.Errorf("the files were synced, but %d files the ignore rules exclude are still published because %s "+
+			"cannot name them literally:\n  %s\nremove them with a deploy using --method api",
+			len(skipped), p.tool, strings.Join(skipped, "\n  "))
+	}
+	return nil
 }
 
 // localDryRun lists what a deploy would upload when the gateway cannot be
@@ -451,6 +549,12 @@ func (a *cliApp) printDeployResult(out *deployOutput) {
 		} else {
 			a.outf("%d files (%s) would be synced with:\n  %s\n", len(out.Files), humanBytes(out.Bytes),
 				Command{Name: out.Command[0], Args: out.Command[1:]}.String())
+			if len(out.Cleanup) > 0 {
+				a.outf("then published files the ignore rules exclude would be removed with:\n")
+				for _, c := range out.Cleanup {
+					a.outf("  %s\n", Command{Name: c[0], Args: c[1:]}.String())
+				}
+			}
 		}
 		if out.URL != "" {
 			a.outf("Site URL: %s\n", out.URL)

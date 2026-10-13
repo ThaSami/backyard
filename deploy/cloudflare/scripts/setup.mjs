@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Deploys (or upgrades) Backyard on your Cloudflare account, free plan included.
-// Safe to re-run: existing secrets are kept, the deploy token is remembered.
+// Safe to re-run: existing secrets are kept (a DEPLOY_TOKEN that only another
+// machine knows too), the deploy token is remembered.
 //
 //   npm run setup                         log in (browser) if needed, deploy, set secrets
 //                                         (and an R2 bucket for big files when R2 is enabled)
@@ -254,9 +255,14 @@ export function maskSecret(s) {
 /**
  * Extracts the secret names from the stdout of `wrangler secret list
  * --format json`. Wrangler may print other lines first (e.g. "▲ [WARNING]
- * Proxy environment variables detected", or "[…]" notices), so the array is
- * the first line starting with "[" from which a JSON array of {name} objects
- * parses (up to a line-final "]"). Anything else throws: never guess.
+ * Proxy environment variables detected", or "[…]" notices), so the list is
+ * looked for in every line starting with "[" from which a JSON array parses
+ * (up to a line-final "]"): the first non-empty array of {name} objects is
+ * the list. An empty array ("[]", no secrets) counts only when nothing else
+ * parses as a list: a stray "[]" line before the real list must never make
+ * the setup believe the Worker has no secrets (it would then replace
+ * BACKYARD_SECRET, revoking every API token). Anything else throws: never
+ * guess. (The same rules as scripts/cloudflare-ci.mjs.)
  */
 export function parseSecretList(stdout) {
   const s = String(stdout ?? "");
@@ -265,8 +271,11 @@ export function parseSecretList(stdout) {
     while (k < s.length && (s[k] === " " || s[k] === "\t" || s[k] === "\r")) k++;
     return k === s.length || s[k] === "\n";
   };
+  const isEntry = (x) => x !== null && typeof x === "object" && !Array.isArray(x) && typeof x.name === "string" && x.name !== "";
   const ends = [];
   for (let j = s.indexOf("]"); j >= 0; j = s.indexOf("]", j + 1)) if (lineFinal(j)) ends.push(j);
+  let empty = false;
+  let foreign = false;
   for (let i = s.indexOf("["); i >= 0; i = s.indexOf("[", i + 1)) {
     if (i > 0 && s[i - 1] !== "\n") continue;
     for (let k = ends.length - 1; k >= 0 && ends[k] > i; k--) {
@@ -276,12 +285,18 @@ export function parseSecretList(stdout) {
       } catch {
         continue;
       }
-      if (Array.isArray(list) && list.every((x) => x && typeof x === "object" && typeof x.name === "string" && x.name !== "")) {
-        return new Set(list.map((x) => x.name));
-      }
+      if (!Array.isArray(list)) continue;
+      if (list.length === 0) empty = true;
+      else if (list.every(isEntry)) return new Set(list.map((x) => x.name));
+      else foreign = true;
     }
   }
-  throw new Error("no JSON list of secrets in the output of wrangler secret list");
+  if (empty && !foreign) return new Set();
+  throw new Error(
+    foreign
+      ? "no JSON list of secrets in the output of wrangler secret list (a JSON array that is not a list of {name} objects)"
+      : "no JSON list of secrets in the output of wrangler secret list",
+  );
 }
 
 /**
@@ -479,7 +494,13 @@ async function main() {
   // revokes every API token. It is never printed.
   if (!have.has("BACKYARD_SECRET") || opts.rotateSecret) secrets.BACKYARD_SECRET = randomBytes(32).toString("hex");
   const newToken = () => "byd_" + randomBytes(24).toString("base64url");
-  let token;
+  // The deploy token: the one from the environment, a new one on request,
+  // the one remembered here, or a new one when the Worker has none. A token
+  // the Worker already has is never replaced just because this machine does
+  // not know it (another machine, a teammate, CI, a fresh $XDG_CONFIG_HOME):
+  // every CLI login and pipeline using it would stop working, and in CI
+  // nobody would ever learn the new one.
+  let token = "";
   if (process.env.DEPLOY_TOKEN) {
     token = process.env.DEPLOY_TOKEN; // explicit choice (e.g. CI)
     secrets.DEPLOY_TOKEN = token;
@@ -489,10 +510,20 @@ async function main() {
   } else if (state.deployToken) {
     token = state.deployToken;
     if (!have.has("DEPLOY_TOKEN")) secrets.DEPLOY_TOKEN = token;
-  } else {
+  } else if (!have.has("DEPLOY_TOKEN")) {
     token = newToken();
     secrets.DEPLOY_TOKEN = token;
-    if (have.has("DEPLOY_TOKEN")) console.log(`${yellow("!")} No saved deploy token for ${worker}: issuing a new DEPLOY_TOKEN (the old one stops working).`);
+  } else {
+    console.log(
+      `${yellow("!")} Worker ${worker} already has a DEPLOY_TOKEN that this machine does not know: keeping it. ` +
+        `Run with DEPLOY_TOKEN=<token> to remember it here, or with --rotate-token to issue a new one.`,
+    );
+  }
+  if (listed.exists && !state.updatedAt) {
+    console.log(
+      `${yellow("!")} No saved setup for ${worker} on this machine: variable overrides from earlier runs elsewhere ` +
+        `(--var, e.g. AUTH_MODE:access) are not known here and the deploy uses wrangler.jsonc plus this run's --var.`,
+    );
   }
 
   let url = state.url || "";
@@ -546,7 +577,7 @@ async function main() {
   if (publicURL) url = publicURL;
   else if (merged.BASE_DOMAIN) url = `https://${merged.BASE_DOMAIN}`;
 
-  state.deployToken = token;
+  state.deployToken = token || undefined;
   state.url = url || undefined;
   state.updatedAt = new Date().toISOString();
   const saved = saveState(worker, state);
@@ -559,7 +590,11 @@ async function main() {
 
   const hub = url || "https://<your-worker>.<your-subdomain>.workers.dev";
   console.log(`\n${green("✔")} Backyard is live at ${bold(cyan(hub))}\n`);
-  if (revealSecrets()) {
+  if (!token) {
+    // The Worker keeps a deploy token this machine does not know.
+    console.log("Connect the CLI with the Worker's existing deploy token (not known on this machine):\n");
+    console.log(`  ${bold(`backyard login --server ${hub} --token <DEPLOY_TOKEN>`)}\n`);
+  } else if (revealSecrets()) {
     console.log("Connect the CLI (keep the token secret — it can deploy and delete sites):\n");
     console.log(`  ${bold(`backyard login --server ${hub} --token ${token}`)}\n`);
   } else {
@@ -570,7 +605,7 @@ async function main() {
     console.log(`  ${bold(`backyard login --server ${hub} --token ${where}`)}\n`);
   }
   console.log(`Then: ${bold("backyard init my-site && cd my-site && backyard deploy")}`);
-  console.log(dim(`\nThe deploy token is saved in ${saved} (mode 0600).`));
+  if (token) console.log(dim(`\nThe deploy token is saved in ${saved} (mode 0600).`));
   console.log(dim(`AI runs on Workers AI (free daily allowance); caps: LIMITS in wrangler.jsonc.`));
   const noR2 = state.r2 === false ? "R2 is off (--r2 turns it on)" : "enable R2 on the account and re-run setup for files up to 95 MiB";
   console.log(dim(`Files: ${bucket ? `R2 bucket ${bucket} for files above FILE_INLINE_MAX` : `stored in Durable Objects (25 MiB per file); ${noR2}`}.`));

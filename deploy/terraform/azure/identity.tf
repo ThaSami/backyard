@@ -46,13 +46,64 @@ resource "azurerm_role_assignment" "app_blob_delegator" {
   description          = "Backyard: user-delegation SAS for presigned URLs"
 }
 
+# Direct-sync deployers (`backyard deploy --method azure`: az storage blob sync
+# into <prefix>sites/<site>, then POST .../refresh, after which the server
+# rebuilds _meta itself). Like the AWS deployer policy and the systemd rrsync
+# command, they may only touch blobs below <prefix>sites/: an ABAC condition
+# limits reads, writes and deletes to that path and listing to that prefix, so
+# _meta/ (site owners, manifests) and every site's uploads/ stay out of reach.
+locals {
+  # storage.azure.prefix as Backyard normalises it (internal/blob: no leading
+  # slash, one trailing slash).
+  storage_key_prefix    = trim(trimspace(var.storage_prefix), "/") == "" ? "" : "${trim(trimspace(var.storage_prefix), "/")}/"
+  deployer_sites_prefix = "${local.storage_key_prefix}sites/"
+
+  deployer_blob_condition = <<-EOT
+    (
+     (
+      !(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'} AND NOT SubOperationMatches{'Blob.List'})
+      AND
+      !(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'})
+      AND
+      !(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action'})
+      AND
+      !(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete'})
+     )
+     OR
+     (
+      @Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith '${local.deployer_sites_prefix}'
+     )
+    )
+    AND
+    (
+     (
+      !(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'} AND SubOperationMatches{'Blob.List'})
+     )
+     OR
+     (
+      @Request[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:prefix] StringStartsWith '${local.deployer_sites_prefix}'
+     )
+    )
+  EOT
+}
+
 resource "azurerm_role_assignment" "deployers_blob_data" {
   for_each = toset(var.storage_deployer_principal_ids)
 
   scope                = azurerm_storage_container.this.id
   role_definition_name = "Storage Blob Data Contributor"
   principal_id         = each.value
-  description          = "Backyard: direct deploys (az storage blob sync)"
+  description          = "Backyard: direct deploys (az storage blob sync) below ${local.deployer_sites_prefix}"
+  condition            = local.deployer_blob_condition
+  condition_version    = "2.0"
+
+  lifecycle {
+    precondition {
+      # The prefix is a quoted string in the ABAC condition.
+      condition     = !strcontains(local.deployer_sites_prefix, "'") && !strcontains(local.deployer_sites_prefix, "\\")
+      error_message = "storage_prefix must not contain quotes or backslashes when storage_deployer_principal_ids is set."
+    }
+  }
 }
 
 resource "azurerm_role_assignment" "app_openai" {

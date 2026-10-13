@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/thasami/backyard/internal/ai"
+	"github.com/thasami/backyard/internal/blob"
 	"github.com/thasami/backyard/internal/docstore"
 	"github.com/thasami/backyard/internal/ratelimit"
 )
@@ -146,8 +149,9 @@ func aiUpstreamError(err error, ue *ai.UpstreamError) *apiError {
 }
 
 // retryAfterer is implemented by errors that carry a provider's
-// Retry-After. ai.UpstreamError has no such field; a provider or the router
-// may put such an error in the chain.
+// Retry-After: *ai.UpstreamError (its RetryDelay, from the provider's
+// retry headers) and any other error a provider or the router puts in the
+// chain.
 type retryAfterer interface {
 	RetryAfter() time.Duration
 }
@@ -474,6 +478,7 @@ func (s *Server) handleAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 	ri := info(r)
 	req.User = ri.user.ID
+	req.ResolveImage = s.siteImageResolver(r, ri.site)
 	if body.Stream {
 		s.streamChat(w, r, body.Model, req)
 		return
@@ -487,6 +492,107 @@ func (s *Server) handleAIChat(w http.ResponseWriter, r *http.Request) {
 	s.observeAI(resp.Model, nil, &resp.Usage)
 	s.limiter.AddTokens(rateKey(r), int64(resp.Usage.InputTokens+resp.Usage.OutputTokens))
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// siteImageResolver returns the ai.ImageResolver of a chat request on site.
+// It reads images that the request references by the URL of one of the
+// site's own uploads (what files.upload returns) straight from storage, with
+// no fetch:
+//
+//   - a site-relative /__backyard/files/{id}/{name} (path mode: optionally
+//     with /s/{site} in front);
+//   - the same path as an absolute URL on the host the request was sent to.
+//
+// An absolute URL on another host, or a same-host URL outside
+// /__backyard/files/, is not local (ai.ErrNotLocal): it is handled like any
+// other remote image. Another site's URL (/s/{other}), any other
+// site-relative URL and an unknown file are bad requests. Files are looked
+// up in the site's own _files collection, whose keys are checked to lie under
+// uploads/{site}/, so another site's upload can never be read. The router
+// detects the media type from the bytes, so the stored content type is not
+// needed.
+func (s *Server) siteImageResolver(r *http.Request, site string) ai.ImageResolver {
+	ri := info(r)
+	reqHost := hostKey(ri.scheme, ri.hostPort)
+	return func(ctx context.Context, ref string, maxBytes int64) ([]byte, error) {
+		u, err := url.Parse(ref)
+		if err != nil {
+			if strings.HasPrefix(ref, "/") && !strings.HasPrefix(ref, "//") {
+				return nil, fmt.Errorf("%w: invalid image url", ai.ErrBadRequest)
+			}
+			return nil, ai.ErrNotLocal
+		}
+		abs := u.Scheme != "" || u.Host != ""
+		if abs {
+			switch strings.ToLower(u.Scheme) {
+			case "http", "https":
+			default:
+				return nil, ai.ErrNotLocal
+			}
+			if u.Host == "" || hostKey(u.Scheme, u.Host) != reqHost {
+				return nil, ai.ErrNotLocal
+			}
+		}
+		p := u.Path
+		if s.pathMode {
+			if rest, ok := strings.CutPrefix(p, sitePathPfx); ok {
+				name, tail, _ := strings.Cut(rest, "/")
+				if name != site {
+					return nil, fmt.Errorf("%w: image is not a file of this site", ai.ErrBadRequest)
+				}
+				p = "/" + tail
+			}
+		}
+		rest, ok := strings.CutPrefix(p, filesPfx)
+		if !ok {
+			if abs {
+				return nil, ai.ErrNotLocal
+			}
+			return nil, fmt.Errorf("%w: image url must be an upload of this site (/__backyard/files/…)", ai.ErrBadRequest)
+		}
+		id, _, _ := strings.Cut(rest, "/")
+		m, e := s.lookupFile(ctx, site, id)
+		if e != nil {
+			if e.Status == http.StatusNotFound {
+				return nil, fmt.Errorf("%w: image file not found", ai.ErrBadRequest)
+			}
+			if e.Err != nil {
+				return nil, fmt.Errorf("%s: %w", e.Message, e.Err)
+			}
+			return nil, errors.New(e.Message)
+		}
+		if m.size > maxBytes {
+			return nil, fmt.Errorf("%w: image exceeds the size limit", ai.ErrBadRequest)
+		}
+		// Read the object directly: loadBlob would cache whole objects
+		// with a context detached from this request.
+		rc, _, err := s.deps.Blob.Get(ctx, m.key)
+		if errors.Is(err, blob.ErrNotFound) {
+			return nil, fmt.Errorf("%w: image file not found", ai.ErrBadRequest)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read image: %w", err)
+		}
+		defer rc.Close()
+		data, err := io.ReadAll(io.LimitReader(rc, maxBytes+1))
+		if err != nil {
+			return nil, fmt.Errorf("read image: %w", err)
+		}
+		if int64(len(data)) > maxBytes {
+			return nil, fmt.Errorf("%w: image exceeds the size limit", ai.ErrBadRequest)
+		}
+		return data, nil
+	}
+}
+
+// hostKey is the host[:port] of a URL with the scheme's default port
+// removed, so "https://a.test:443" and "https://a.test" name the same host.
+func hostKey(scheme, hostPort string) string {
+	o := normalizeOrigin(scheme, hostPort)
+	if _, hp, ok := strings.Cut(o, "://"); ok {
+		return hp
+	}
+	return ""
 }
 
 // sseWriter serializes server-sent events (deltas and heartbeats).

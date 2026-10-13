@@ -202,6 +202,41 @@ func TestCollectFiles(t *testing.T) {
 	}
 }
 
+// A .backyardignore saved with a UTF-8 byte order mark (PowerShell 5's
+// Out-File -Encoding utf8, older Notepad) keeps its first rule, as in git.
+func TestIgnoreFileWithBOM(t *testing.T) {
+	dir := t.TempDir()
+	writeTree(t, dir, map[string]string{
+		"index.html":      "<html></html>",
+		"secrets/key.txt": "hunter2",
+		"notes.md":        "x",
+		IgnoreFile:        "\uFEFFsecrets/\r\nnotes.md\r\n",
+	})
+	files, err := CollectFiles(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, f := range files {
+		paths = append(paths, f.Path)
+	}
+	if !slices.Equal(paths, []string{"index.html"}) {
+		t.Errorf("paths = %v, want only index.html", paths)
+	}
+	pats, err := IgnorePatterns(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(pats, "secrets/") {
+		t.Errorf("IgnorePatterns = %q, want the BOM stripped from the first rule", pats)
+	}
+	// Only a leading BOM is a byte order mark.
+	writeTree(t, dir, map[string]string{IgnoreFile: "a\n\uFEFFb\n"})
+	if pats, _ := IgnorePatterns(dir, nil); !slices.Contains(pats, "\uFEFFb") {
+		t.Errorf("IgnorePatterns = %q, want a later U+FEFF kept", pats)
+	}
+}
+
 func TestCollectFilesErrors(t *testing.T) {
 	if _, err := CollectFiles(filepath.Join(t.TempDir(), "missing"), nil); err == nil {
 		t.Error("missing dir accepted")

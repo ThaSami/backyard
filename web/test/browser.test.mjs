@@ -235,6 +235,12 @@ test("hub: header, CLI commands, site directory, folder deploy with a deploy tok
     assert.equal(await page.textContent("#cmd-login"), `backyard login --server ${stub.url} --gateway https://deploy.example/gw`);
     assert.match(await page.textContent("#login-note"), /deploy token/);
     assert.equal(await page.textContent("#cmd-deploy"), "backyard init my-site && cd my-site && backyard deploy");
+    // It is used only once the visitor confirms whose token it is.
+    await page.waitForSelector("#handoff-dialog[open]");
+    assert.equal(await page.textContent("#handoff-title"), "Use the deploy token of deploy (token:deploy)?");
+    assert.equal(await page.inputValue("#deploy-token"), "");
+    await page.click("#handoff-use");
+    assert.equal(await page.textContent("#toast"), "Deploy token set for this visit");
     assert.equal(await page.isVisible("#token-box"), true);
     assert.equal(await page.inputValue("#deploy-token"), "t0k");
     // Path mode: sites share the hub's origin, so the token is not persisted unless asked.
@@ -303,6 +309,94 @@ test("hub: header, CLI commands, site directory, folder deploy with a deploy tok
     assert.equal(await docs.page.getAttribute('#doc-list a[data-doc="recipes"]', "aria-current"), "page");
     assert.equal(await docs.page.isVisible(".code-block .copy, #doc h2"), true);
     assert.deepEqual(problems.concat(docs.problems), []);
+  } finally {
+    await context.close();
+    await stub.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hub: a deploy token from a link is used only after the visitor confirms whose it is (no token fixation)", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  // Host mode: a confirmed token is remembered by default, so a silently
+  // adopted one would stick to this browser.
+  const stub = await startStub({
+    info: { url_mode: "host" },
+    tokens: { m4llory: { id: "token:mallory", name: "mallory", groups: [], anonymous: false, admin: false } },
+  });
+  const { dir, site } = makeSiteDir({ "index.html": "<!doctype html><title>V</title>victim" });
+  const context = await browser.newContext();
+  const stored = (page) => page.evaluate(() => localStorage.getItem("backyard.deployToken"));
+  const meChecks = () => stub.state.requests.filter((q) => q.path === "/deploy/me").map((q) => q.headers.authorization);
+  const deployAs = async (page) => {
+    await page.setInputFiles("#folder-input", site);
+    await page.waitForFunction(() => !document.getElementById("deploy-btn").disabled);
+    const before = stub.state.deploys.length;
+    await page.click("#deploy-btn");
+    await page.waitForSelector("#result:not([hidden])");
+    const create = stub.state.requests.filter((q) => q.path === "/deploy/sites/guest-site/deploys")[before];
+    return create.headers.authorization;
+  };
+  let visits = 0;
+  /** Loads the hub afresh (a hash-only navigation would not reload it). */
+  const reopen = async (page, hash) => {
+    await page.goto(`${stub.url}/?visit=${++visits}${hash}`);
+    assert.equal(new URL(page.url()).hash, "");
+  };
+  try {
+    // Mallory's link: the hub asks the gateway whose token it is and asks the
+    // visitor; nothing changes until then (not even in host mode).
+    const { page, problems } = await open(context, stub.url + "/#token=m4llory");
+    await page.waitForSelector("#handoff-dialog[open]");
+    assert.equal(page.url(), stub.url + "/", "the fragment is removed at once");
+    assert.equal(await page.textContent("#handoff-title"), "Use the deploy token of mallory (token:mallory)?");
+    assert.match(await page.textContent("#handoff-body"), /run as mallory \(token:mallory\), not as you \(Alice \(alice@acme\.com\)\)/);
+    assert.deepEqual(meChecks(), ["Bearer m4llory"]);
+    assert.equal(await page.evaluate(() => document.activeElement.id), "handoff-ignore", "not using it is the default");
+    assert.equal(await page.inputValue("#deploy-token"), "");
+    assert.equal(await stored(page), null);
+
+    // Declining keeps the visitor's own identity.
+    await page.click("#handoff-ignore");
+    assert.equal(await page.isVisible("#handoff-dialog"), false);
+    assert.equal(await page.textContent("#toast"), "The deploy token from the link was not used");
+    assert.equal(await page.inputValue("#deploy-token"), "");
+    assert.equal(await stored(page), null);
+    assert.equal(await deployAs(page), undefined, "the deploy runs as the signed-in visitor");
+    assert.equal(stub.state.sites.find((s) => s.name === "guest-site").updated_by, "alice@acme.com");
+
+    // Escape declines too.
+    await reopen(page, "#token=m4llory");
+    await page.waitForSelector("#handoff-dialog[open]");
+    await page.keyboard.press("Escape");
+    await page.waitForSelector("#handoff-dialog:not([open])", { state: "attached" });
+    assert.equal(await page.inputValue("#deploy-token"), "");
+    assert.equal(await stored(page), null);
+
+    // An explicit "use" adopts it (and, in host mode, remembers it).
+    await reopen(page, "#token=m4llory");
+    await page.waitForSelector("#handoff-dialog[open]");
+    await page.click("#handoff-use");
+    assert.equal(await page.textContent("#toast"), "Deploy token saved in this browser");
+    assert.equal(await stored(page), "m4llory");
+    assert.equal(await deployAs(page), "Bearer m4llory");
+
+    // The token already in use is not asked about again.
+    const checks = meChecks().length;
+    await reopen(page, "#token=m4llory");
+    await page.waitForSelector(".site");
+    await page.waitForLoadState("networkidle");
+    assert.equal(await page.isVisible("#handoff-dialog"), false);
+    assert.equal(meChecks().length, checks);
+
+    // A token the server rejects is never offered, and the one in use stays.
+    await reopen(page, "#token=bogus");
+    await page.waitForSelector("#banner:not([hidden])");
+    assert.equal(await page.textContent("#banner"), "The deploy token in the link you opened was rejected by the server, so it is not used.");
+    assert.equal(await page.isVisible("#handoff-dialog"), false);
+    assert.deepEqual(meChecks().slice(-1), ["Bearer bogus"]);
+    assert.equal(await stored(page), "m4llory");
+    assert.deepEqual(problems.filter((p) => !/status of 401/.test(p)), []);
   } finally {
     await context.close();
     await stub.close();

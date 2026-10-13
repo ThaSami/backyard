@@ -15,14 +15,18 @@ around the Worker:
 | `cloudflare_workers_route` for `base_domain/*` and `*.base_domain/*` | `url_mode = "host"` |
 | `cloudflare_certificate_pack` (advanced) for `*.base_domain` | host mode below the apex with `advanced_certificate` (paid ACM) |
 | Access application over the hub (and `*.base_domain` in host mode) with an allow policy | `enable_access` (default) |
-| Access application with a bypass policy for `/__backyard/api/deploy`, `/__backyard/api/deploy/*`, `/__backyard/healthz` and `/__backyard/readyz` | `enable_access` |
+| Access application with a bypass policy for `/__backyard/api/deploy`, `/__backyard/api/deploy/*`, `/__backyard/api/tokens`, `/__backyard/healthz` and `/__backyard/readyz` | `enable_access` |
 | Okta identity provider | `okta_account_url` set |
 
 The bypass is needed because the CLI talks to the deploy gateway with bearer tokens
 (`DEPLOY_TOKEN`, or API tokens minted through the browser login), and upload URLs are signed.
-The Worker authenticates those requests itself. Every other path requires an Access login.
-The Worker also verifies the Access JWT (`AUTH_MODE=access`), so the `workers.dev` URL is
-protected too.
+`backyard token create` likewise sends its API token to `/__backyard/api/tokens`; a token
+minted that way never expires later than the one that asked for it, so a token cannot renew
+itself: chaining tokens never keeps access past the token that `backyard login` minted through
+Access. The Worker authenticates those requests itself: bearer tokens, or the
+`CF_Authorization` cookie, whose Access JWT it verifies (browser requests on these paths carry
+no `Cf-Access-Jwt-Assertion`). Every other path requires an Access login. The Worker also
+verifies the Access JWT (`AUTH_MODE=access`), so the `workers.dev` URL is protected too.
 
 ## Usage
 
@@ -115,7 +119,7 @@ Certificate Manager (paid). A `check` block warns when neither applies.
 | `allowed_emails`, `allowed_email_domains`, `allowed_access_group_ids`, `allowed_okta_groups` | `[]` | Who may sign in (any match). At least one is required with Access. |
 | `identity_provider_ids` | `[]` | Login methods to offer (empty = all of the account's). |
 | `auto_redirect_to_identity` | auto | Skip the Access login page. Defaults to on when exactly one IdP is allowed. |
-| `bypass_paths` | gateway + health | Paths below `/__backyard/` that skip Access. |
+| `bypass_paths` | gateway + token minting + health | Paths below `/__backyard/` that skip Access. |
 | `okta_account_url`, `okta_client_id`, `okta_client_secret`, `okta_authorization_server_id`, `okta_idp_name` | `""` | Create an Okta identity provider. |
 | `okta_identity_provider_id` | `""` | Existing Okta provider for `allowed_okta_groups`. |
 

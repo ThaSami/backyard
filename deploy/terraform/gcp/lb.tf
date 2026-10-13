@@ -8,8 +8,12 @@
 #              /__backyard/api/deploy/info         (unauthenticated discovery)
 #              /__backyard/api/deploy/uploads/*    (self-authenticating signed URLs)
 #              /__backyard/api/deploy/*  with an Authorization header
-#            Browser calls to the gateway (the hub's drag-and-drop deploy)
-#            carry no Authorization header and stay behind IAP.
+#              /__backyard/api/tokens    with an Authorization header
+#                                        (`backyard token create`; a token
+#                                        minted with a token never outlives it)
+#            Browser calls to the gateway and the token API (the hub's
+#            drag-and-drop deploy and token page) carry no Authorization
+#            header and stay behind IAP.
 
 resource "google_compute_global_address" "ipv4" {
   project      = var.project_id
@@ -118,6 +122,7 @@ locals {
     { full_path = "/__backyard/api/deploy/info", prefix = null, needs_authorization = false },
     { full_path = null, prefix = "/__backyard/api/deploy/uploads/", needs_authorization = false },
     { full_path = null, prefix = "/__backyard/api/deploy/", needs_authorization = true },
+    { full_path = "/__backyard/api/tokens", prefix = null, needs_authorization = true },
   ]
 }
 

@@ -145,7 +145,9 @@ config file; the server still runs in dev mode on localhost.`,
 			}
 			dir := absFrom(cwd, arg)
 			if arg == "" && pf != nil {
-				dir = pf.DeployDir()
+				if dir, err = pf.DeployDir(); err != nil {
+					return err
+				}
 			}
 			if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 				return fmt.Errorf("%s is not a directory", dir)
@@ -175,6 +177,9 @@ config file; the server still runs in dev mode on localhost.`,
 			a.errf("Backyard dev server\n")
 			a.errf("  site:  %s\n", siteURL)
 			a.errf("  hub:   %s/\n", cfg.Server.PublicURL)
+			// Outside browsers and curl, *.localhost often does not
+			// resolve (containers, CI): name the site by Host header.
+			a.errf("  check: curl -s -H 'Host: %s.localhost:%d' http://127.0.0.1:%d/\n", site, port, port)
 			a.errf("  dir:   %s (served live)\n", dir)
 			if cfg.Storage.Type == "fs" {
 				a.errf("  data:  %s\n", cfg.Storage.FS.Root)

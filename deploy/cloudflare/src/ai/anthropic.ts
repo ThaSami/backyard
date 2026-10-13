@@ -7,10 +7,13 @@
  * fallbacks ("fallbacks": "default") for the models that support them.
  */
 import { HttpError } from "../http";
-import { base64Encode } from "../crypto";
 import { readSSE } from "./sse";
 import {
+  hasInlineImage,
+  isTimeout,
   opaqueUserID,
+  partBase64,
+  providerFailure,
   stripCodeFences,
   systemWithJSON,
   upstreamError,
@@ -28,6 +31,23 @@ type AnyRecord = Record<string, unknown>;
 const API_VERSION = "2023-06-01";
 const FALLBACK_BETA = "server-side-fallback-2026-07-01";
 const REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * HTTP statuses of the error types delivered inside an otherwise successful
+ * event stream (the Go provider's errorTypeStatus).
+ */
+const STREAM_ERROR_STATUS: Record<string, number> = {
+  invalid_request_error: 400,
+  authentication_error: 401,
+  billing_error: 402,
+  permission_error: 403,
+  not_found_error: 404,
+  request_too_large: 413,
+  rate_limit_error: 429,
+  api_error: 500,
+  timeout_error: 504,
+  overloaded_error: 529,
+};
 
 interface ClaudeVersion {
   family: string;
@@ -154,10 +174,10 @@ export class AnthropicProvider implements Provider {
         .filter((p) => p.type !== "text" || (p.text ?? "") !== "")
         .map((p) => {
           if (p.type === "text") return { type: "text", text: p.text };
-          if (p.data) {
+          if (hasInlineImage(p)) {
             const mt = (p.media_type || "image/png").toLowerCase().replace("image/jpg", "image/jpeg");
             if (!IMAGE_TYPES.has(mt)) throw new HttpError(400, "bad_request", `unsupported image type ${JSON.stringify(mt)} (png, jpeg, gif or webp)`);
-            return { type: "image", source: { type: "base64", media_type: mt, data: base64Encode(p.data) } };
+            return { type: "image", source: { type: "base64", media_type: mt, data: partBase64(p) } };
           }
           return { type: "image", source: { type: "url", url: p.url } };
         }),
@@ -192,19 +212,10 @@ export class AnthropicProvider implements Provider {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (e) {
-      throw upstreamError(this.name, (e as Error).message || "request failed", 502);
+      throw upstreamError(this.name, (e as Error).message || "request failed", isTimeout(e) ? 504 : 0);
     }
-    if (!res.ok) {
-      let msg = `HTTP ${res.status}`;
-      try {
-        const j = (await res.json()) as { error?: { message?: string; type?: string } };
-        if (j.error?.message) msg = j.error.message;
-      } catch {
-        /* keep the status */
-      }
-      if (res.status === 400) throw new HttpError(400, "bad_request", `AI provider rejected the request: ${msg.slice(0, 500)}`);
-      throw upstreamError(this.name, msg, res.status === 429 || res.status === 529 ? 429 : res.status === 504 ? 504 : 502);
-    }
+    // Mapped by the provider's status like the Go server (529 overloaded → 502).
+    if (!res.ok) throw await providerFailure(this.name, res);
     return res;
   }
 
@@ -257,8 +268,10 @@ export class AnthropicProvider implements Provider {
           break;
         }
         case "error": {
+          // An error inside a 200 stream carries only its type (Go's errorTypeStatus).
           const e = j.error as AnyRecord | undefined;
-          throw upstreamError(this.name, String(e?.message ?? "stream error"), e?.type === "overloaded_error" || e?.type === "rate_limit_error" ? 429 : 502);
+          const status = STREAM_ERROR_STATUS[String(e?.type ?? "")] ?? 0;
+          throw upstreamError(this.name, typeof e?.message === "string" && e.message ? e.message : "stream error", status);
         }
       }
     });
