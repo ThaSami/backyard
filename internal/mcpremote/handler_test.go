@@ -1,11 +1,14 @@
 package mcpremote
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -329,6 +332,44 @@ func TestDeadlinesBeforeBody(t *testing.T) {
 	if d := time.Until(w.read); d < 4*time.Minute || d > 5*time.Minute+time.Second {
 		t.Fatalf("read deadline in %v", d)
 	}
+	// Requests refused before the body is read (Origin, credentials) keep
+	// the server's timeouts.
+	for _, hdr := range [][]string{{"Origin", "https://evil.example"}, {"Authorization", ""}, {"Authorization", "Bearer byat_bad"}} {
+		read = false
+		r := request(initialize, hdr...)
+		w := &deadlineWriter{ResponseRecorder: httptest.NewRecorder(), bodyRead: &read}
+		e.h.ServeHTTP(w, r)
+		if w.Code < 400 || w.readSet || w.writeSet {
+			t.Errorf("%v: status %d, deadlines set: read %v, write %v", hdr, w.Code, w.readSet, w.writeSet)
+		}
+	}
+}
+
+// An unauthenticated client that sends headers and then trickles (or
+// withholds) its body is answered and let go within server.read_timeout,
+// not the 5-minute deadline of an authenticated publish.
+func TestUnauthenticatedSlowBody(t *testing.T) {
+	e := newTenv(t)
+	srv := httptest.NewUnstartedServer(e.h)
+	srv.Config.ReadTimeout = 300 * time.Millisecond
+	srv.Start()
+	t.Cleanup(srv.Close)
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, _ = fmt.Fprintf(conn, "POST /__backyard/mcp HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n", hubHost)
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	start := time.Now()
+	res, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("no answer within 5 s (%v): the unread body is drained under the 5-minute deadline", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusUnauthorized || time.Since(start) > 2*time.Second {
+		t.Fatalf("status %d after %v", res.StatusCode, time.Since(start))
+	}
 }
 
 func TestJSONRPCErrors(t *testing.T) {
@@ -399,7 +440,12 @@ func TestInitialize(t *testing.T) {
 			t.Fatalf("result is not compact or HTML-escaped: %s", res)
 		}
 	}
-	for _, params := range []any{nil, map[string]any{}, map[string]any{"protocolVersion": 20251125}, []any{1}} {
+	for _, params := range []any{
+		nil, map[string]any{}, map[string]any{"protocolVersion": 20251125}, []any{1},
+		map[string]any{"protocolVersion": nil},
+		// The member name is exact (encoding/json would match these to a struct field).
+		map[string]any{"ProtocolVersion": "2025-06-18"}, map[string]any{"PROTOCOLVERSION": "2025-06-18"},
+	} {
 		if _, rerr := e.rpc("initialize", params); rerr == nil || rerr.Code != codeInvalidParams || rerr.Message != "Invalid params" {
 			t.Errorf("initialize(%v) = %+v", params, rerr)
 		}

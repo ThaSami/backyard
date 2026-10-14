@@ -107,7 +107,7 @@ Tests detect capabilities instead of checking the edition:
   shared websocket limits (message rate, subscriptions, rooms, connections
   per user → `429` before the upgrade) and retries `429` answers elsewhere.
   Every client of the suite comes from `127.0.0.1` and the Go server limits
-  guests (and the Claude connector's OAuth endpoints) per IP, so `run-go.sh`
+  guests (and the Claude connector's OAuth requests that identify no one) per IP, so `run-go.sh`
   raises `ratelimit.api_per_minute` for the host and path passes: a websocket
   handshake cannot be retried.
 * **Dot segments** — `//` in a path is redirected (or `400` for writes) by both

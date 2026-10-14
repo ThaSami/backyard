@@ -37,9 +37,10 @@
 // and never read cookies or identity-proxy headers; they exist on the
 // canonical hub host only and answer 404 while the connector is off. The
 // sign-in and consent page /__backyard/auth/authorize is an auth endpoint
-// like the others, and /__backyard/api/mcp/grants a hub API. The OAuth
-// endpoints and authorize are rate limited per client IP, the MCP endpoint
-// per user.
+// like the others, and /__backyard/api/mcp/grants a hub API. Registration
+// and revocation are rate limited per client IP; authorize, the token
+// endpoint and the MCP endpoint per user (authorize and token: per client
+// IP for requests that identify no one).
 //
 // # Timeouts
 //

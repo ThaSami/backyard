@@ -134,8 +134,9 @@ type MCP struct {
 	cimdClient   *http.Client
 	cimdMu       sync.Mutex
 	cimd         map[string]*cimdEntry
-	bg           sync.WaitGroup // background pruning (tests wait for it)
-	pruneRunning chan struct{}  // a token: at most one prune at a time
+	limit        func(key string) (bool, time.Duration) // Options.MCPAllow
+	bg           sync.WaitGroup                         // background pruning (tests wait for it)
+	pruneRunning chan struct{}                          // a token: at most one prune at a time
 }
 
 // Grant is one connection: the consent of a user to one MCP client.
@@ -166,7 +167,11 @@ func newMCP(a *authenticator, opts Options) (*MCP, error) {
 		origins:      map[string]bool{},
 		family:       cfg.Auth.TokenTTL.D(),
 		cimd:         map[string]*cimdEntry{},
+		limit:        opts.MCPAllow,
 		pruneRunning: make(chan struct{}, 1),
+	}
+	if m.limit == nil {
+		m.limit = allowAll
 	}
 	if m.name == "" {
 		m.name = "Backyard"

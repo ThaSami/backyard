@@ -212,11 +212,11 @@ func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site string) 
 //
 // The connector's discovery documents come before everything that would
 // authenticate (they are hub-only: on a site host /.well-known/ is site
-// content), and its authorization endpoint before the other auth paths, to
-// add the per-IP rate limit. The machine paths (discovery, /__backyard/mcp,
-// /__backyard/oauth/*) never authenticate here, never check CSRF and get no
-// CORS headers: their handlers apply the rules of SPEC §8.4 themselves,
-// including the canonical host and the disabled 404.
+// content), and its authorization endpoint before the other auth paths. The
+// machine paths (discovery, /__backyard/mcp, /__backyard/oauth/*) never
+// authenticate here, never check CSRF and get no CORS headers: their
+// handlers apply the rules of SPEC §8.4 themselves, including the canonical
+// host and the disabled 404.
 func (s *Server) serveHub(w http.ResponseWriter, r *http.Request) {
 	ri := info(r)
 	p := r.URL.Path

@@ -40,9 +40,11 @@ All notable changes to Backyard are documented here. The format follows
   module's four IAP-less routes exempt the connector's machine paths; `config_overrides` (AWS;
   not passed to the Lambda gateway) and `extra_config_yaml` (GCP, Azure) accept an `mcp`
   section; the Cloudflare module has
-  `mcp_enabled`, which adds `--var MCP_ENABLED:true` to `setup_args`.
+  `mcp_enabled`, and its `setup_args` always carry `--var MCP_ENABLED:true` or `:false` (so
+  setting it back to `false` turns the connector off at the next `setup`).
 - `backyard cloudflare status` checks `access-connector`: the connector's paths in the Access
-  bypass application (pending before `MCP_ENABLED`, failed after).
+  bypass application (ok when they are there; when they are missing, pending while
+  `MCP_ENABLED` is off and failed once it is on).
 
 ### Changed
 

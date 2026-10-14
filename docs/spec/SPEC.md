@@ -1026,7 +1026,9 @@ endpoint — if and only if it is (a) byte-equal to an entry of the effective `m
 `MCP_REDIRECT_URIS` (https; default `https://claude.ai/api/mcp/auth_callback` and
 `https://claude.com/api/mcp/auth_callback`), or (b) a **loopback URI**: scheme `http`, host
 string exactly `localhost`, `127.0.0.1` or `[::1]`, an optional port, no userinfo, no fragment,
-any path and query. Nothing else, ever.
+any path and query — but no backslash, ASCII control character or Unicode white space (Go's
+`unicode.IsSpace`; U+FEFF is not one) anywhere, and no `%` before the query that does not start
+a two-hex-digit escape. Nothing else, ever.
 
 A requested `redirect_uri` matches a registered one when both are https and byte-equal, or both
 are loopback URIs with equal scheme, host string, path and query, the port being ignored on
@@ -1065,7 +1067,10 @@ Resource canonicalization (§8.4.1) with R = `https://hub.example/__backyard/mcp
 **`GET /__backyard/auth/authorize`.** The checks run in this order and the first failure
 decides:
 
-1. Go only: the per-IP rate limit (§11) → `429` page "Too many requests".
+1. Go only: the rate limit (§11), which applies to whichever answer the steps below give: a
+   request is charged to the person once step 6 has identified them (per client IP for a
+   guest), any other request to its client IP; a spent budget turns the answer into a `429`
+   page "Too many requests" with `Retry-After`.
 2. The raw request URI (path + query) is longer than 2048 bytes, the query cannot be parsed (a
    `;` separator or a malformed `%`-escape), or one of `response_type`, `client_id`,
    `redirect_uri`, `code_challenge`, `code_challenge_method`, `resource`, `scope`, `state`,
@@ -1152,7 +1157,7 @@ mode, `""` everywhere else.
 **`POST /__backyard/auth/authorize`** (the consent decision):
 
 1. The body must be `application/x-www-form-urlencoded`, ≤ 16 KiB, UTF-8 → else a `400` page.
-2. Go only: the per-IP rate limit, as for `GET`.
+2. Go only: the rate limit, as for `GET` (step 4 identifies the person).
 3. Browser signals → `403` page "This approval was not sent from the Backyard page", no
    redirect, when `Sec-Fetch-Site` is present and ≠ `same-origin`; or `Origin` is present and
    neither the hub origin, the request's own origin nor `null`; or `Sec-Fetch-Mode` is present
@@ -1161,7 +1166,10 @@ mode, `""` everywhere else.
    step 2 (the 2048-byte cap applies only to `GET`); redirect errors use **`303`**.
    `response_type`, `code_challenge_method` and `resource` are required in the form (a missing
    one fails as in step 5; a missing `resource` → `invalid_request` "resource is required"). Go
-   `oidc` without a session → `302` to the login with `rd` = the `GET` form of the request.
+   `oidc` without a session → `401` page "Your Backyard sign-in ended" with a link to the login
+   with `rd` = the `GET` form of the request (a link, not a redirect: the consent page's
+   `form-action` applies to every redirect of the form submission and would block the hop to
+   the IdP).
 5. `csrf` must verify for the current user, binding and fields, with `exp` ≥ now − 60 s → else
    `403` page "This approval page expired or was not issued to you. Go back to the app and
    connect again." (audit `mcp.consent_rejected`).
@@ -1181,11 +1189,16 @@ answer has `Content-Type: application/json`, `Cache-Control: no-store` and `Prag
 errors are `{"error":"<code>","error_description":"<text>"}` with status `400`, except
 `invalid_client` (`401`). Storage errors →
 `500 {"error":"server_error","error_description":"request <X-Request-Id>"}`. The Go server
-rate-limits it per client IP (`429` as for registration).
+rate-limits it (§11): a request whose `code` or `refresh_token` names a grant of the
+authenticated client is charged to the grant's user before anything changes (per client IP for
+a guest), any other request to its client IP; a spent budget turns the answer into a `429` as
+for registration (without `WWW-Authenticate`).
 
 **Client authentication** (public clients only): `client_id` is required, in the body or as
-`Authorization: Basic base64(client_id:)` with an **empty** password; when both are given they
-must be equal (else `invalid_request`). Any other `Authorization` header, a non-empty Basic
+`Authorization: Basic base64(client_id:)` with an **empty** password (the scheme in any case,
+exactly one space, padded standard base64; both parts form-urlencoded as in RFC 6749 §2.3.1);
+when both are given they must be equal (else `invalid_request`). Any other `Authorization`
+header (an unpadded value or more than one space included), a non-empty Basic
 password or a non-empty `client_secret` → `401 invalid_client` with
 `WWW-Authenticate: Basic realm="Backyard"` (so do two `Authorization` headers). A missing
 `client_id`, or one that is not an allowlisted CIMD URL or a `bydc_` id with a valid MAC
@@ -1404,8 +1417,9 @@ The Claude connector (§8.4) keeps its state in `_system` too (quotas do not app
 `_system/_mcp_grants/<gid>` (the grant record, `id` = the document id),
 `_system/_mcp_rotations/<gid>.<n>` (`{"gid","n","at":<unix ms>,"exp":<the grant family's
 exp>}`, created with an atomic `Create` so that a code is redeemed and a refresh token rotated
-exactly once) and `_system/_mcp_locks/<site>` (the publish lease `{"exp":<unix s>}`, §14.1). The
-Cloudflare edition keeps the same records in `RegistryDO` tables (§16).
+exactly once) and `_system/_mcp_locks/<site>` (the publish lease
+`{"exp":<unix s>,"holder":<32 hex>}`, §14.1). The Cloudflare edition keeps the same records in
+`RegistryDO` tables (§16).
 
 ## 11. Limits & rate limiting
 
@@ -1421,9 +1435,13 @@ higher. Per-site storage limits: `database.max_docs_per_site` (default 100,000; 
 unlimited; a soft quota, as instances count independently), `database.max_doc_bytes`; per-site
 deploy limits: `sites.max_site_bytes`, `sites.max_files`, `sites.max_file_bytes`.
 
-The Claude connector (§8.4, §14.1) adds no rate-limit keys on the Go server: the OAuth endpoints
-(register, token, revoke and authorize) are charged to `api_per_minute` keyed by client IP, the
-MCP endpoint to `api_per_minute` keyed by the connection's user (`429 rate_limited` with
+The Claude connector (§8.4, §14.1) adds no rate-limit keys on the Go server. Registration and
+revocation are charged to `api_per_minute` keyed by client IP. Authorize and the token endpoint
+are charged to `api_per_minute` keyed by the person a request identifies (the signed-in browser,
+the user of the grant a code or refresh token names; per client IP for guests) and by client IP
+when it identifies no one, so failed requests from one address (all of a proxy's clients when
+`trusted_proxies` cannot resolve them) never lock out the people who connect through it. The MCP
+endpoint is charged to `api_per_minute` keyed by the connection's user (`429 rate_limited` with
 `Retry-After`), and `backyard_publish` to `deploys_per_hour` keyed by that user (guests
 included). The Cloudflare edition's daily caps are in §16. Its fixed limits:
 
@@ -1618,8 +1636,9 @@ handling themselves, so they answer identically.
 the §5 envelope unless noted:
 
 1. The routing rules of §8.4.1 (canonical host; disabled → `404`).
-2. Go only: the connection's read and write deadlines become now + 5 min, before the body is
-   read.
+2. Go only: until step 9 the connection keeps `server.read_timeout` and `write_timeout`, so a
+   request refused before its body is read (whose unread body the server drains) is held no
+   longer than any other.
 3. **Origin.** Absent is fine. Present, it must equal (case-insensitively) the hub origin, the
    request's own origin, the origin of an https entry of the effective `mcp.redirect_uris` /
    `MCP_REDIRECT_URIS`, or the origin of an entry of `mcp.clients` / `MCP_CLIENTS` (by default
@@ -1653,12 +1672,16 @@ the §5 envelope unless noted:
    exceeds it while reading → `413`; both
    `{"error":{"code":"too_large","message":"MCP requests are limited to <N> bytes; publish over several calls"}}`.
    Go only: a body over 1 MiB or of unknown length needs one of 4 admission slots, waited for
-   ≤ 30 s, else `429 rate_limited` with `Retry-After: 5`.
+   ≤ 30 s, else `429 rate_limited` with `Retry-After: 5`; then the connection's read and write
+   deadlines become now + 5 min, and the body is read.
 10. **JSON-RPC parsing** (`400`, `id: null`): invalid JSON →
     `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}`; a JSON array →
     `-32600` "Invalid Request: JSON-RPC batches are not supported"; not an object, `jsonrpc` ≠
     `"2.0"`, a `method` that is not a string, or an `id` that is neither a string nor an integer
-    (`null`, fractional numbers and objects included) → `-32600` "Invalid Request".
+    (`null`, fractional numbers and objects included) → `-32600` "Invalid Request". Member
+    names are matched exactly (case-sensitively), and a string's unpaired surrogate escape
+    (`"\ud800"`) decodes to U+FFFD (as Go's `encoding/json` does); an echoed string `id` keeps
+    its surrogate escapes.
 11. **Dispatch.** A notification (`method` without `id`) or a client response (no `method`, a
     `result` or `error`) → `202` with an empty body. A request → `200`,
     `Content-Type: application/json`, `Cache-Control: no-store`, one JSON-RPC response echoing
@@ -1731,9 +1754,13 @@ makes the site exactly the given files. The steps, normative on both editions:
    (else E1; default: by extension). The decoded total must stay within the per-call cap (E11),
    and the `delete` paths must be valid (E8).
 5. Concurrency: Go takes a publish lease — `Create` of `_system/_mcp_locks/<site>` with
-   `exp` = now + 300 s; on a conflict an expired lease is deleted and the `Create` retried once,
-   otherwise E20; it is deleted when the publish ends. The Worker needs none (step 9 is one
-   transaction). CLI and hub deploys take no lease and keep the semantics of §7.3.
+   `exp` = now + 300 s and a random `holder`. On a conflict a live lease → E20; an expired one
+   is taken over with an `Update` to the same fields, which wins only when it is the very next
+   write to the document as read (same `created_at`, `version` + 1), else E20 (a lease gone in
+   between → the `Create` is retried once). No taker deletes a lease. When the publish ends the
+   lease is deleted if it still names its `holder` and has not expired (a lease left behind
+   expires by itself). The Worker needs none (step 9 is one transaction). CLI and hub deploys
+   take no lease and keep the semantics of §7.3.
 6. Ownership (`sites.ownership: owner` / `OWNERSHIP=owner`): the caller must be an owner or an
    admin (E15); guests are never owners; the first publisher of a new site becomes its owner
    unless anonymous.

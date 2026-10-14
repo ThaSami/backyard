@@ -6,7 +6,9 @@ package mcpremote
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -153,20 +155,28 @@ func decodeBase64(s string) ([]byte, bool) {
 // serializes the connector's publishes of one site across replicas: CLI
 // and hub deploys do not take it. The returned release must be called once
 // the publish returned. Without a document store there is no lease.
+//
+// The lease document carries a random holder. An expired lease is taken
+// over with an Update that must be the very next write to the document it
+// was read as (same CreatedAt, Version + 1): of concurrent takers exactly
+// one wins, and no taker ever deletes a lease another one holds.
 func (h *handler) acquireLease(ctx context.Context, site, actor string) (func(), *deploy.PublishError) {
 	if h.docs == nil {
 		return func() {}, nil
 	}
 	exp := h.now().Add(leaseTTL).Unix()
+	holder := newHolder()
+	lease := map[string]any{"exp": exp, "holder": holder}
+	release := func() { h.releaseLease(ctx, site, holder) }
 	busy := &deploy.PublishError{ID: "E20", Message: fmt.Sprintf("Another publish to %s is in progress; call backyard_publish again when it has finished.", site)}
 	failed := func(err error) (func(), *deploy.PublishError) {
 		h.log.ErrorContext(ctx, "mcp: publish lease", "site", site, "error", err)
 		return nil, &deploy.PublishError{ID: "E21"}
 	}
 	for attempt := 0; ; attempt++ {
-		_, err := h.docs.Create(ctx, docstore.SystemSite, lockCollection, site, map[string]any{"exp": exp}, actor)
+		_, err := h.docs.Create(ctx, docstore.SystemSite, lockCollection, site, lease, actor)
 		if err == nil {
-			return func() { h.releaseLease(ctx, site, exp) }, nil
+			return release, nil
 		}
 		if !errors.Is(err, docstore.ErrConflict) {
 			return failed(err)
@@ -183,22 +193,41 @@ func (h *handler) acquireLease(ctx context.Context, site, actor string) (func(),
 		case leaseExp(doc) >= h.now().Unix():
 			return nil, busy
 		}
-		// Expired: its holder died. Take it over.
-		if _, err := h.docs.Delete(ctx, docstore.SystemSite, lockCollection, site); err != nil {
+		// Expired: its holder died. Take it over, unless another taker
+		// (or a new lease) wrote the document first.
+		taken, err := h.docs.Update(ctx, docstore.SystemSite, lockCollection, site, lease, actor)
+		switch {
+		case errors.Is(err, docstore.ErrNotFound):
+			continue // released in between: try once more
+		case err != nil:
 			return failed(err)
+		case taken.Version != doc.Version+1 || !taken.CreatedAt.Equal(doc.CreatedAt):
+			return nil, busy
 		}
+		return release, nil
 	}
 }
 
-// releaseLease deletes the lease of site if it is still the one taken with
-// exp (one that expired and was taken over belongs to another publish).
-func (h *handler) releaseLease(ctx context.Context, site string, exp int64) {
+// newHolder returns a random lease holder id.
+func newHolder() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// releaseLease deletes the lease of site if this publish still holds it and
+// it has not expired (an expired one may be taken over at any moment and is
+// left to the next taker).
+func (h *handler) releaseLease(ctx context.Context, site, holder string) {
 	ctx = context.WithoutCancel(ctx)
 	doc, err := h.docs.Get(ctx, docstore.SystemSite, lockCollection, site)
 	switch {
 	case errors.Is(err, docstore.ErrNotFound):
 		return
-	case err == nil && leaseExp(doc) != exp:
+	case err != nil:
+		h.log.WarnContext(ctx, "mcp: release publish lease (it expires by itself)", "site", site, "error", err)
+		return
+	case doc.Data["holder"] != holder || leaseExp(doc) < h.now().Unix():
 		return
 	}
 	if _, err := h.docs.Delete(ctx, docstore.SystemSite, lockCollection, site); err != nil {

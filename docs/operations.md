@@ -71,8 +71,9 @@ kept), and every `5xx` failure is logged at error level with its request id — 
 Ship the log stream to your SIEM for retention. In addition, the server stores `token.issue`,
 `mcp.authorize`, `mcp.code_replay`, `mcp.refresh_reuse` and `mcp.revoke` records in the
 document store (site `_system`, collection `_audit`), which is not reachable through the site
-API. The Claude connector's connections live in the same site (`_mcp_grants`, `_mcp_rotations`,
-`_mcp_locks`); expired ones are pruned as new ones are created.
+API. The Claude connector's connections live in the same site (`_mcp_grants`, `_mcp_rotations`;
+expired ones are pruned as new ones are created), and so do its publish leases (`_mcp_locks`, one
+per site while a publish runs; a lease left behind by a crashed replica expires after 300 s).
 
 ## Backups
 

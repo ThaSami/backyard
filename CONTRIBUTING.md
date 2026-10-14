@@ -349,8 +349,12 @@ with the release candidate's package (`make cloudflare-pack`, then
    `BACKYARD_CF_CONFIRM_AUTH_CHANGE=true` (in `cloudflare-deploy.yml`: a manual run with the
    `confirm_auth_change` input checked; a push deploy never skips the guard).
 8. The release's `npm publish --provenance` succeeds.
-9. The Claude connector (`setup --var MCP_ENABLED:true`, docs/claude-connector.md): `status`
-   reports `access-connector` pending before `MCP_ENABLED` and ok after; behind Access (with
+9. The Claude connector (`setup --var MCP_ENABLED:true`, docs/claude-connector.md): with Access
+   on again (`access enable`; the check needs `AUTH_MODE=access` and a custom domain), `status`
+   reports `access-connector` ok both before and after `MCP_ENABLED`; with the four connector
+   destinations removed from the bypass application (as in one created before this release), it
+   is pending while `MCP_ENABLED` is off and failed once it is on, and `access enable` turns it
+   ok again; behind Access (with
    Okta as identity provider) authorize → Access login → consent → claude.ai works and the
    consent `POST` passes Access; on Workers Free, `backyard_publish` calls of 256 KiB, 1 MiB and
    2 MiB (text and base64) stay within the CPU limit (no error 1102, else lower

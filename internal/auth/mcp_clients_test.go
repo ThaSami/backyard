@@ -63,6 +63,9 @@ func TestMCPRegister(t *testing.T) {
 		"not json":             {`redirect_uris=http://localhost/cb`, "invalid_client_metadata"},
 		"trailing data":        {`{"redirect_uris":["http://localhost/cb"]} {}`, "invalid_client_metadata"},
 		"null":                 {`null`, "invalid_client_metadata"},
+		"leading BOM":          {"\ufeff" + `{"redirect_uris":["http://localhost/cb"]}`, "invalid_client_metadata"},
+		"malformed escape":     {`{"redirect_uris":["http://localhost/%zz"]}`, "invalid_redirect_uri"},
+		"control character":    {`{"redirect_uris":["http://localhost/a\u0001b"]}`, "invalid_redirect_uri"},
 		"name not a string":    {`{"client_name":5,"redirect_uris":["http://localhost/cb"]}`, "invalid_client_metadata"},
 		"client_id over limit": {`{"redirect_uris":["http://localhost/` + strings.Repeat("a", 490) + `","http://localhost/` + strings.Repeat("b", 490) + `"]}`, "invalid_client_metadata"},
 	}
@@ -218,6 +221,12 @@ func TestMCPRedirectPolicy(t *testing.T) {
 		"http://127.0.0.2/cb": false, "http://[::1]x/cb": false, "http://localhost.:5/cb": false,
 		"http://localhost/c b": false, "http://localhost\\@evil.example/": false, "https://localhost/cb": false,
 		"HTTP://localhost/cb": false, "javascript:alert(1)": false, "": false,
+		// Not RFC 3986 (url.Parse fails) or a space: refused on both editions.
+		"http://localhost/%zz": false, "http://localhost/a%2": false, "http://localhost/a\u0001b": false,
+		"http://localhost/a\u007fb": false, "http://localhost/a\u0085b": false, "http://localhost/?a=\u0001": false,
+		// Query escapes are not checked; U+FEFF is not a space.
+		"http://localhost/?a=%zz": true, "http://localhost?a=%zz": true, "http://localhost/a%2Fb": true,
+		"http://localhost/a\ufeffb": true,
 	} {
 		if got := e.m.redirectAllowed(uri); got != want {
 			t.Errorf("redirectAllowed(%q) = %v, want %v", uri, got, want)

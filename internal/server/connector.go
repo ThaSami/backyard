@@ -4,7 +4,7 @@ package server
 // served by the authorization server (auth.MCP: discovery documents,
 // /__backyard/oauth/*) and the MCP endpoint (Deps.MCPEndpoint), which apply
 // the canonical-host, method and disabled rules themselves; the server adds
-// the per-IP rate limits and the grants API.
+// the per-IP rate limit of registration and revocation and the grants API.
 
 import (
 	"context"
@@ -69,34 +69,25 @@ func (s *Server) AllowAPI(key string) (bool, time.Duration) {
 }
 
 // allowClientIP charges the API limit keyed by the client IP ("ip:<addr>"),
-// the key of the connector's unauthenticated endpoints.
+// the key of the connector's registration and revocation endpoints.
 func (s *Server) allowClientIP(r *http.Request) (bool, time.Duration) {
 	return s.AllowAPI(ratelimit.Key("", true, info(r).clientIP))
 }
 
-// serveAuthorize serves /__backyard/auth/authorize: the per-IP rate limit
-// (an HTML page, the endpoint is a browser page), then the authenticator,
-// which answers the disabled and wrong-host 404 pages itself.
+// serveAuthorize serves /__backyard/auth/authorize through the
+// authenticator, which answers the disabled and wrong-host 404 pages and
+// applies the endpoint's rate limit itself (per signed-in person, per
+// client IP for requests that identify no one; auth.Options.MCPAllow).
 func (s *Server) serveAuthorize(w http.ResponseWriter, r *http.Request) {
-	if s.deps.MCP != nil {
-		if ok, wait := s.allowClientIP(r); !ok {
-			e := newError(http.StatusTooManyRequests, codeRateLimited,
-				"Too many sign-in requests came from your network. Wait a minute, then go back to the app and connect again.")
-			e.Title = "Too many requests"
-			e.RetryAfter = wait
-			s.prepareError(w, r, e)
-			w.Header().Set("Referrer-Policy", "no-referrer")
-			s.writePage(w, r, e.Status, pageForError(e, s.publicURL))
-			return
-		}
-	}
 	s.deps.Auth.Handler().ServeHTTP(w, r)
 }
 
-// serveOAuth serves /__backyard/oauth/*: the per-IP rate limit, answered in
-// the OAuth error format (RFC 6749 §5.2), then the authorization server.
+// serveOAuth serves /__backyard/oauth/*: registration and revocation are
+// limited per client IP here, answered in the OAuth error format (RFC 6749
+// §5.2); the token endpoint charges the grant's user, or the client IP for
+// requests that name no grant, itself (auth.Options.MCPAllow).
 func (s *Server) serveOAuth(w http.ResponseWriter, r *http.Request) {
-	if s.deps.MCP != nil {
+	if s.deps.MCP != nil && r.URL.Path != auth.OAuthTokenPath {
 		if ok, wait := s.allowClientIP(r); !ok {
 			h := w.Header()
 			h.Set("Retry-After", strconv.Itoa(ratelimit.RetryAfterSeconds(wait)))

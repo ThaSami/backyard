@@ -565,7 +565,8 @@ describe("JSON-RPC (SPEC §14.1 steps 10–11)", () => {
         instructions: MCP_CATALOG.instructions,
       });
     }
-    for (const params of [{}, { protocolVersion: 20250618 }, { protocolVersion: null }, undefined, null, []]) {
+    // The member name is exact, as on the Go server.
+    for (const params of [{}, { protocolVersion: 20250618 }, { protocolVersion: null }, undefined, null, [], { ProtocolVersion: "2025-06-18" }]) {
       const r = await mcp.post(request("initialize", params));
       expect(r.status).toBe(200);
       expect(r.json.error, JSON.stringify(params)).toEqual({ code: -32602, message: "Invalid params" });
@@ -583,6 +584,23 @@ describe("JSON-RPC (SPEC §14.1 steps 10–11)", () => {
     expect(neg.text).toBe('{"jsonrpc":"2.0","id":-0,"result":{}}');
     const zero = await mcp.post('{"jsonrpc":"2.0","id":0,"method":"ping"}');
     expect(zero.text).toBe('{"jsonrpc":"2.0","id":0,"result":{}}');
+  });
+
+  it("decodes lone surrogate escapes as U+FFFD, like encoding/json, but echoes the id as sent", async () => {
+    const { mcp } = await guest();
+    const site = uniqueSite("surr");
+    const body = JSON.stringify({
+      jsonrpc: "2.0",
+      id: "idSURR",
+      method: "tools/call",
+      params: { name: "backyard_publish", arguments: { site, files: [{ path: "index.html", content: "x" }, { path: "aSURR.html", content: "y" }] } },
+    }).replaceAll("SURR", "\\ud800");
+    const r = await mcp.post(body);
+    expect(r.status).toBe(200);
+    expect(r.text.startsWith('{"jsonrpc":"2.0","id":"id\\ud800","result":')).toBe(true);
+    expect(r.json.result.isError, r.text).toBeUndefined();
+    expect(JSON.parse(r.json.result.content[0].text)).toMatchObject({ site, files: 2 });
+    expect(await mcp.text("backyard_read_site_file", { site, path: "a\ufffd.html" })).toBe("y");
   });
 
   it("lists the catalog verbatim and refuses other methods", async () => {

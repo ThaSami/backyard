@@ -2,8 +2,9 @@
 // (@modelcontextprotocol/sdk, Streamable HTTP with an OAuthClientProvider)
 // registers itself, the browser signs in at the mock IdP and approves on
 // Backyard's consent page, and the client publishes a site. Then a second
-// connection, Cancel, a person outside the allowed domains, and the hub card's
-// Disconnect, after which the client is cut off at once.
+// connection, Cancel, a sign-out before Allow, a person outside the allowed
+// domains, and the hub card's Disconnect, after which the client is cut off
+// at once.
 //
 // Runs on an oidc server of its own (mcp.enabled, path mode on 127.0.0.1)
 // with a mock IdP of its own, so the shared oidc server keeps its
@@ -320,6 +321,31 @@ test("connecting again while signed in shows the consent page again; Cancel answ
   expect(back.searchParams.get("state")).toBe(provider.lastState);
   expect(back.searchParams.get("iss")).toBe(HUB);
   expect(back.searchParams.has("code")).toBe(false);
+});
+
+test("signed out before Allow: the approval offers a sign-in link that leads back to the consent page", async ({ newUser, pageProblems }) => {
+  pageProblems.allow(/the server responded with a status of 401/); // the "sign-in ended" page itself
+  const ctx = await person(newUser, "alice");
+  const page = await ctx.newPage();
+  const provider = new TestProvider(`E2E signed out ${rand()}`);
+  const { url } = await startConnecting(provider, []);
+  await page.goto(url.href);
+  await expect(page).toHaveURL(AUTHORIZE_URL);
+  await expect(page.locator("#allow")).toBeVisible();
+  // The Backyard session ends (session_ttl, or a sign-out in another tab).
+  await ctx.clearCookies({ name: "backyard_session" });
+  await page.locator("#allow").click();
+  // No redirect: the consent page's form-action would block the hop to the IdP.
+  await expect(page.locator("h1")).toHaveText("Your Backyard sign-in ended");
+  const { hit: callback } = interceptCallback();
+  await page.getByRole("link", { name: "Sign in again" }).click();
+  await expect(page).toHaveURL(AUTHORIZE_URL); // signed in again at the IdP, consent asked again
+  await expect(page.locator("body")).toContainText(provider.name);
+  await expect(page.locator("#allow")).toBeVisible();
+  await page.locator("#allow").click();
+  const back = await callback;
+  expect(back.searchParams.get("code")).toMatch(/^byac_/);
+  expect(back.searchParams.get("state")).toBe(provider.lastState);
 });
 
 test("a person outside the allowed domains gets Access denied and the client nothing", async ({ newUser, pageProblems }) => {

@@ -66,6 +66,7 @@ func (a *authenticator) serveAuthorize(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusNotFound, "Claude connector not enabled", "The Claude connector is not enabled on this server.", "", "")
 		return
 	}
+	w = m.limited(w, r, authorizeTooMany)
 	if !m.onCanonicalHost(r) {
 		renderError(w, http.StatusNotFound, "Wrong address", "Use "+m.resource+" to connect an app to this Backyard.", "", "")
 		return
@@ -105,7 +106,7 @@ func (m *MCP) authorizeGET(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	u, ok := m.consentUser(w, r, m.issuer+uri)
+	u, ok := m.consentUser(w, r, m.issuer+uri, false)
 	if !ok {
 		return
 	}
@@ -136,7 +137,7 @@ func (m *MCP) authorizePOST(w http.ResponseWriter, r *http.Request) {
 	// Signed out meanwhile (oidc): come back to the GET form of the
 	// request, which asks for consent again once signed in.
 	back := m.issuer + AuthorizePath + "?" + encodeFields(req.fields(resource))
-	u, ok := m.consentUser(w, r, back)
+	u, ok := m.consentUser(w, r, back, true)
 	if !ok {
 		return
 	}
@@ -297,10 +298,14 @@ func (m *MCP) parseAuthorize(w http.ResponseWriter, r *http.Request, q url.Value
 
 // consentUser authenticates the browser at the authorize endpoint (SPEC §8.4.5 step
 // 6) with the mode's own credentials, never a bearer token. back is where
-// an oidc login returns to. On failure it writes the response.
-func (m *MCP) consentUser(w http.ResponseWriter, r *http.Request, back string) (*identity.User, bool) {
+// an oidc login returns to; formPost marks the consent form's submission.
+// On failure it writes the response.
+func (m *MCP) consentUser(w http.ResponseWriter, r *http.Request, back string, formPost bool) (*identity.User, bool) {
 	a := m.a
 	u, err := a.authenticateBrowser(w, r)
+	if err == nil && !chargeUser(w, u.ID, u.Anonymous) {
+		return nil, false
+	}
 	if err != nil {
 		switch {
 		case !errors.Is(err, ErrForbidden) && !errors.Is(err, ErrUnauthenticated):
@@ -317,6 +322,13 @@ func (m *MCP) consentUser(w http.ResponseWriter, r *http.Request, back string) (
 				"Your browser sent Backyard sign-in cookies of more than one account, so Backyard cannot tell who you are. "+
 					"Cookies that Backyard did not set have been removed where possible: reload this page. "+
 					"If this keeps happening, clear this browser's cookies for this domain.", "", "")
+		case a.oidc != nil && formPost:
+			// Not a redirect: the consent page's form-action CSP binds every
+			// redirect of the form submission, and the login goes on to the
+			// IdP's origin. A link starts a new navigation.
+			renderError(w, http.StatusUnauthorized, "Your Backyard sign-in ended",
+				"You were signed out of Backyard before you allowed the app. Sign in again to continue connecting it.",
+				a.LoginURL(back), "Sign in again")
 		case a.oidc != nil:
 			noStore(w)
 			http.Redirect(w, r, a.LoginURL(back), http.StatusFound)

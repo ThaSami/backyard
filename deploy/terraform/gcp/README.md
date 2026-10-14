@@ -286,7 +286,11 @@ source IPs. Deploys still need a token (`static_tokens`).
   client-supplied `X-Forwarded-Host` through, and Backyard trusts X-Forwarded-Host
   and X-Forwarded-For together, so trusting the platform would let a page spoof the
   site host. As a result, anonymous rate limits (`auth_mode = "none"`) are shared
-  per instance. Authenticated users are rate-limited per user.
+  per instance. Authenticated users are rate-limited per user. The Claude
+  connector's sign-in and token requests are charged to the person they identify;
+  the ones that identify no one (failed or junk requests from the internet, which
+  bypass IAP) and app registrations share one budget per instance, so a flood of
+  them makes those answer `429` but never locks out people who connect or refresh.
 - **Path mode.** `url_mode = "path"` serves sites at `https://<domain>/s/<site>/`
   with a single, non-wildcard certificate and DNS record. All sites then share one
   origin.

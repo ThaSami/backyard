@@ -157,6 +157,20 @@ function connectorSuite() {
     return value.slice(0, i) + (value[i] === "A" ? "B" : "A") + value.slice(i + 1);
   }
 
+  /**
+   * Basic for a public client with the base64 padding stripped: the first
+   * k characters of the client_id are %-escaped (servers unescape them) until
+   * the padded form has padding to strip.
+   */
+  function unpaddedBasic(clientId) {
+    for (let k = 0; k < 3; k++) {
+      const user = [...clientId.slice(0, k)].map((c) => "%" + c.charCodeAt(0).toString(16).padStart(2, "0")).join("") + clientId.slice(k);
+      const b64 = Buffer.from(`${user}:`).toString("base64");
+      if (b64.endsWith("=")) return `Basic ${b64.replace(/=+$/, "")}`;
+    }
+    throw new Error("unreachable");
+  }
+
   // ---------------------------------------------------------------------------
 
   describe("connector discovery (SPEC §8.4.2, §14.1)", () => {
@@ -368,6 +382,9 @@ function connectorSuite() {
         "http://localhost.evil.example/callback",
         "http://127.0.0.2/callback",
         "https://localhost/callback",
+        // Not an RFC 3986 URI: a malformed escape, a control character.
+        "http://127.0.0.1:9/%zz",
+        "http://127.0.0.1:9/a\u0001b",
       ]) {
         const r = await oauth.register(P, { client_name: "Refused", redirect_uris: [LOOPBACK, uri] });
         const b = oauth.assertOAuthError(r, 400, "invalid_redirect_uri", uri);
@@ -390,6 +407,7 @@ function connectorSuite() {
         ["5 redirect URIs", { raw: JSON.stringify({ redirect_uris: [1, 2, 3, 4, 5].map((n) => `http://127.0.0.1:${n}/cb`) }) }, either],
         ["a 513-byte redirect URI", { raw: JSON.stringify({ redirect_uris: [long] }) }, either],
         ["a client_id over 1024 bytes", { raw: JSON.stringify({ redirect_uris: [1, 2, 3, 4].map((n) => `http://127.0.0.1/${n}${"a".repeat(470)}`) }) }, ["invalid_client_metadata"]],
+        ["a UTF-8 BOM before the JSON", { raw: "\ufeff" + JSON.stringify({ redirect_uris: [LOOPBACK] }) }, ["invalid_client_metadata"]],
       ]) {
         const r = await oauth.register(P, null, opts);
         assert.equal(r.status, 400, `${what}: ${r}`);
@@ -705,6 +723,12 @@ function connectorSuite() {
         ["a client_secret", { form: { ...base, client_secret: "x" } }, 401, ["invalid_client"]],
         ["Basic with a password", { form: base, headers: { Authorization: oauth.basicAuth(client.client_id, "x") } }, 401, ["invalid_client"]],
         ["a Bearer Authorization", { form: base, headers: { Authorization: "Bearer x" } }, 401, ["invalid_client"]],
+        // Basic is the scheme, one space and padded standard base64 (as Go's Request.BasicAuth).
+        ["Basic without base64 padding", { form: base, headers: { Authorization: unpaddedBasic(client.client_id) } }, 401, ["invalid_client"]],
+        ["Basic followed by two spaces", { form: base, headers: { Authorization: oauth.basicAuth(client.client_id).replace(" ", "  ") } }, 401, ["invalid_client"]],
+        ["Basic followed by a tab", { form: base, headers: { Authorization: oauth.basicAuth(client.client_id).replace(" ", "\t") } }, 401, ["invalid_client"]],
+        // A BOM is part of the first parameter's name, so grant_type is missing.
+        ["a UTF-8 BOM before the form", { raw: "\ufeff" + new URLSearchParams(base).toString() }, 400, ["invalid_request"]],
         ["Basic naming another client", { form: base, headers: { Authorization: oauth.basicAuth(other.client_id) } }, 400, ["invalid_request"]],
         ["a tampered client_id", { form: { ...base, client_id: tamper(client.client_id) } }, 401, ["invalid_client"]],
         ["a client metadata URL that is not allowlisted", { form: { ...base, client_id: "https://example.com/x" } }, 401, ["invalid_client"]],
@@ -938,7 +962,8 @@ function connectorSuite() {
         assert.equal(typeof res.serverInfo.version, "string");
         if (catalog) assert.equal(res.instructions, catalog.instructions, "the catalog's instructions");
       }
-      for (const params of [{}, { protocolVersion: 20250618 }, undefined]) {
+      // The member name is exact: no case-insensitive match.
+      for (const params of [{}, { protocolVersion: 20250618 }, undefined, { ProtocolVersion: "2025-06-18" }]) {
         const r = await mcp.post(mcp.request("initialize", params));
         assertRPCError(r, { code: -32602, message: "Invalid params", what: `initialize ${JSON.stringify(params)}` });
       }
@@ -999,6 +1024,7 @@ function connectorSuite() {
     let who;
     const site = uniqueSite("mcp");
     const site2 = uniqueSite("mcp2");
+    const site3 = uniqueSite("mcp3");
     const index = `<!doctype html><html><head><title>MCP ${site}</title><meta name="description" content="from the connector"></head><body>héllo ${site}</body></html>\n`;
     const png = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d2a5b20000000049454e44ae426082", "hex");
     const files = () => [
@@ -1016,7 +1042,7 @@ function connectorSuite() {
 
     after(async () => {
       const cleaner = new Client();
-      for (const s of [site, site2]) await deleteSiteQuietly(cleaner, env, s);
+      for (const s of [site, site2, site3]) await deleteSiteQuietly(cleaner, env, s);
     });
 
     /** GET of a site file with the person's browser. */
@@ -1063,6 +1089,19 @@ function connectorSuite() {
       assert.equal(logo.status, 200, `${logo}`);
       assert.match(logo.header("content-type") || "", /^image\/png\b/);
       assert.deepEqual(logo.body, png, "logo.png bytes");
+    });
+
+    test("a lone surrogate escape in a path reads as U+FFFD (as encoding/json decodes it)", async (t) => {
+      if (signInSkip) return t.skip(signInSkip);
+      const msg = mcp.request("tools/call", {
+        name: "backyard_publish",
+        arguments: { site: site3, files: [{ path: "index.html", content: "x" }, { path: "aSURR.html", content: "y" }] },
+      });
+      const r = await mcp.post(JSON.stringify(msg).replace("SURR", "\\ud800"));
+      assert.equal(r.status, 200, `${r}`);
+      assert.ok(!r.json.result.isError, `published: ${r}`);
+      assert.equal(JSON.parse(r.json.result.content[0].text).files, 2, `${r}`);
+      assert.equal(await mcp.callText("backyard_read_site_file", { site: site3, path: "a\ufffd.html" }), "y");
     });
 
     test("the read tools: list_sites, site_files, read_site_file and docs", async (t) => {

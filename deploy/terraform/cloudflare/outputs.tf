@@ -34,12 +34,14 @@ locals {
       BASE_DOMAIN = var.base_domain
       URL_MODE    = var.url_mode
       AUTH_MODE   = var.enable_access ? "access" : "none"
+      # Always set: setup keeps the variables of earlier runs (and adopts a
+      # live Worker's), so leaving it out could not turn the connector off.
+      MCP_ENABLED = var.mcp_enabled ? "true" : "false"
     },
     var.enable_access ? {
       ACCESS_TEAM_DOMAIN = data.cloudflare_zero_trust_organization.this[0].auth_domain
       ACCESS_AUD         = cloudflare_zero_trust_access_application.backyard[0].aud
     } : {},
-    var.mcp_enabled ? { MCP_ENABLED = "true" } : {},
   )
 }
 

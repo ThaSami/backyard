@@ -193,12 +193,20 @@ function parseMessage(body: Uint8Array): Message {
   // The source text of numeric "id" members (JSON.parse source text access):
   // an id must be an integer as written, and is echoed as written.
   const idSources = new Map<object, string>();
+  // String "id" members as sent: an id is echoed, never decoded.
+  const idStrings = new Map<object, string>();
   let v: unknown;
   try {
     // ignoreBOM: a byte order mark is no JSON, as on the Go server.
     const text = new TextDecoder("utf-8", { fatal: false, ignoreBOM: true }).decode(body);
     v = JSON.parse(text, function (this: unknown, key: string, value: unknown, context?: { source?: string }) {
       if (key === "id" && typeof value === "number" && typeof context?.source === "string") idSources.set(this as object, context.source);
+      // Lone surrogate escapes ("\ud800") become U+FFFD, as encoding/json
+      // decodes them, so paths and other arguments read as on the Go server.
+      if (typeof value === "string" && !value.isWellFormed()) {
+        if (key === "id") idStrings.set(this as object, value);
+        return value.toWellFormed();
+      }
       return value;
     } as (this: unknown, key: string, value: unknown) => unknown);
   } catch {
@@ -211,7 +219,7 @@ function parseMessage(body: Uint8Array): Message {
   let id = "";
   if (Object.hasOwn(v, "id")) {
     if (typeof v.id === "string") {
-      id = JSON.stringify(v.id);
+      id = JSON.stringify(idStrings.get(v) ?? v.id);
     } else if (typeof v.id === "number") {
       const src = idSources.get(v);
       if (src !== undefined ? !INTEGER_RE.test(src) : !Number.isSafeInteger(v.id)) return invalid;

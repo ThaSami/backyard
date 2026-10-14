@@ -31,6 +31,11 @@ type Options struct {
 	// metadata documents (tests only). Redirects are never followed and the
 	// 5 s timeout applies either way.
 	MCPHTTPClient *http.Client
+	// MCPAllow charges one request of the general API limit
+	// (ratelimit.api_per_minute) for key at the connector's authorize and
+	// token endpoints and reports how long to wait when it is spent (nil:
+	// no limit). The server passes its AllowAPI.
+	MCPAllow func(key string) (bool, time.Duration)
 }
 
 // New builds the authenticator for cfg.Auth.Mode. For mode "oidc" it performs

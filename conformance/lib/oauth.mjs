@@ -96,8 +96,8 @@ function request1(url, { method, headers, body, timeout }) {
 
 /**
  * A request with manual redirects, a buffered body and retries of 429 answers
- * (the Go server rate-limits the OAuth endpoints per client IP, and the whole
- * suite shares one address). Sends no cookies unless headers carry them, and
+ * (the Go server rate-limits OAuth requests that identify no one per client
+ * IP, and the whole suite shares one address). Sends no cookies unless headers carry them, and
  * no header that was not given.
  */
 export async function send(url, { method = "GET", headers = {}, body, retry = true, timeout = 60_000 } = {}) {

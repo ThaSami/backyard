@@ -236,11 +236,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "not found") // as the OAuth paths and the Worker
 		return
 	}
-	// 2. Deadlines, before anything reads the body.
-	rc := http.NewResponseController(w)
-	deadline := time.Now().Add(requestDeadline)
-	_ = rc.SetReadDeadline(deadline)
-	_ = rc.SetWriteDeadline(deadline)
+	// 2. Until the body is read (step 9) the server's read and write
+	// timeouts apply, also while an early rejection drains an unread body.
 	// 3. Origin.
 	if origin := r.Header.Get("Origin"); origin != "" && !h.originAllowed(origin, reqOrigin) {
 		writeError(w, http.StatusForbidden, "forbidden", "requests from this origin are not accepted")
@@ -323,6 +320,11 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer func() { <-h.slots }()
 	}
+	// Authenticated and admitted: the deadlines of a large publish.
+	rc := http.NewResponseController(w)
+	deadline := time.Now().Add(requestDeadline)
+	_ = rc.SetReadDeadline(deadline)
+	_ = rc.SetWriteDeadline(deadline)
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, h.maxBody))
 	if err != nil {
 		var mbe *http.MaxBytesError
@@ -403,13 +405,14 @@ func internalError(c *call) *rpcError {
 
 // initialize negotiates the protocol version.
 func (h *handler) initialize(params json.RawMessage) (any, *rpcError) {
-	var p struct {
-		ProtocolVersion *string `json:"protocolVersion"`
-	}
-	if !isJSONObject(params) || json.Unmarshal(params, &p) != nil || p.ProtocolVersion == nil {
+	// A map, not a struct: encoding/json would match "ProtocolVersion" too,
+	// and the member is the exact key (as on the Worker).
+	var p map[string]json.RawMessage
+	var v string
+	if !isJSONObject(params) || json.Unmarshal(params, &p) != nil ||
+		!isJSONString(p["protocolVersion"]) || json.Unmarshal(p["protocolVersion"], &v) != nil {
 		return nil, newRPCError(codeInvalidParams, "Invalid params")
 	}
-	v := *p.ProtocolVersion
 	if !supported(v) {
 		v = versionLatest
 	}

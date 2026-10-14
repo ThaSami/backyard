@@ -105,6 +105,7 @@ run "path_mode_with_access" {
       BASE_DOMAIN        = "backyard.example.com"
       URL_MODE           = "path"
       AUTH_MODE          = "access"
+      MCP_ENABLED        = "false"
       ACCESS_TEAM_DOMAIN = "acme.cloudflareaccess.com"
       ACCESS_AUD         = "737646a56ab1df6ec9bddc7e5ca84eaf3b0768850f3ffb5d74f1534911fe3893"
     }
@@ -125,6 +126,7 @@ run "path_mode_with_access" {
       "--var ACCESS_TEAM_DOMAIN:acme.cloudflareaccess.com",
       "--var AUTH_MODE:access",
       "--var BASE_DOMAIN:backyard.example.com",
+      "--var MCP_ENABLED:false",
       "--var URL_MODE:path",
     ])
     error_message = "setup_args are the arguments of setup (backyard cloudflare setup / npx backyard-cloudflare setup), without npm run setup --"
@@ -239,11 +241,11 @@ run "without_access" {
     error_message = "no Access resources"
   }
   assert {
-    condition     = output.worker_vars == { BASE_DOMAIN = "backyard.example.com", URL_MODE = "path", AUTH_MODE = "none" } && output.access_aud == ""
+    condition     = output.worker_vars == { BASE_DOMAIN = "backyard.example.com", URL_MODE = "path", AUTH_MODE = "none", MCP_ENABLED = "false" } && output.access_aud == ""
     error_message = "the Worker runs with AUTH_MODE=none"
   }
   assert {
-    condition     = output.setup_args == "--worker-name backyard --var AUTH_MODE:none --var BASE_DOMAIN:backyard.example.com --var URL_MODE:path"
+    condition     = output.setup_args == "--worker-name backyard --var AUTH_MODE:none --var BASE_DOMAIN:backyard.example.com --var MCP_ENABLED:false --var URL_MODE:path"
     error_message = "setup_args carry the variables without Access"
   }
 }
@@ -352,7 +354,7 @@ run "mcp_disabled_by_default" {
   command = apply
 
   assert {
-    condition     = !contains(keys(output.worker_vars), "MCP_ENABLED") && !strcontains(output.setup_args, "MCP_ENABLED")
-    error_message = "the connector is opt-in: no MCP_ENABLED without mcp_enabled"
+    condition     = output.worker_vars.MCP_ENABLED == "false" && strcontains(output.setup_args, "--var MCP_ENABLED:false")
+    error_message = "the connector is opt-in, and mcp_enabled = false turns it off: setup_args always carry MCP_ENABLED (setup keeps variables it is not given)"
   }
 }

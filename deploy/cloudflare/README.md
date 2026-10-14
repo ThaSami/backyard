@@ -502,7 +502,8 @@ backyard cloudflare setup --var MCP_ENABLED:true
 ```
 
 With the [Terraform module](#with-terraform-optional-infrastructure-as-code), set
-`mcp_enabled = true`: `MCP_ENABLED` then appears in its `worker_vars` and `setup_args` outputs.
+`mcp_enabled = true`: its `worker_vars` and `setup_args` outputs always carry `MCP_ENABLED`
+(`true`, or `false`, which turns the connector off at the next `setup`).
 
 - **Publishing from Claude needs a sign-in.** With `AUTH_MODE=access` the consent page shows the
   person Access signed in, and Claude publishes as them. With `AUTH_MODE=none` the connector is

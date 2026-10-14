@@ -107,8 +107,9 @@ backyard cloudflare setup --var MCP_ENABLED:true
 # or, in deploy/cloudflare of a checkout: npm run setup -- --var MCP_ENABLED:true
 ```
 
-With the optional Terraform module, set `mcp_enabled = true`; it adds `MCP_ENABLED` to the
-`worker_vars` and `setup_args` outputs. With Cloudflare Access, re-run
+With the optional Terraform module, set `mcp_enabled = true`: its `worker_vars` and `setup_args`
+outputs always carry `MCP_ENABLED` (`true` or `false`), so `mcp_enabled = false` and a `setup`
+run with the new `setup_args` turn the connector off again. With Cloudflare Access, re-run
 `backyard cloudflare access enable` (or `terraform apply`) once after upgrading: the bypass
 application then lets nine paths through, the four machine paths included, and
 `backyard cloudflare status` reports a check `access-connector` (pending while they are missing
@@ -220,7 +221,7 @@ URLs or the server secret.
 | Files per call | 1,000 in `files`, 1,000 in `delete` | same |
 | Tool calls | `ratelimit.api_per_minute` per user | `LIMITS.mcp_calls_per_day` (5,000) per user |
 | Publishes | `ratelimit.deploys_per_hour` per user (guests included) | `LIMITS.deploys_per_day` per user |
-| Sign-in endpoints | `ratelimit.api_per_minute` per client IP | — |
+| Sign-in endpoints | `ratelimit.api_per_minute` per person (sign-in page, code and refresh exchanges), per client IP for requests that identify no one and for app registration | — |
 
 **One call carries at most that much file content.** Claude writes files into the conversation,
 so expect a few hundred KB per call in practice. A bigger site goes over several calls, one after

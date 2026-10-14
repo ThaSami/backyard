@@ -83,6 +83,16 @@ function tamper(s: string): string {
   return s.slice(0, i) + (s[i] === "A" ? "B" : "A") + s.slice(i + 1);
 }
 
+/** Basic for a public client with the base64 padding stripped (leading characters %-escaped until there is padding). */
+function unpaddedBasic(clientId: string): string {
+  for (let k = 0; k < 3; k++) {
+    const user = [...clientId.slice(0, k)].map((c) => "%" + c.charCodeAt(0).toString(16).padStart(2, "0")).join("") + clientId.slice(k);
+    const b64 = btoa(user + ":");
+    if (b64.endsWith("=")) return "Basic " + b64.replace(/=+$/, "");
+  }
+  throw new Error("unreachable");
+}
+
 /** Signs a token like the server does (the tests know the secret). */
 async function forge(prefix: string, label: string, payload: unknown): Promise<string> {
   return prefix + (await signValue((await deriveKey(SECRET, label)).hmac, JSON.stringify(payload)));
@@ -447,6 +457,8 @@ describe("registration (SPEC §8.4.3)", () => {
       ["a 513-byte URI", JSON.stringify({ redirect_uris: [long] }), undefined, "invalid_redirect_uri"],
       ["a client_name object", JSON.stringify({ redirect_uris: [LOOPBACK], client_name: { a: 1 } }), undefined, "invalid_client_metadata"],
       ["a client_id over 1024 bytes", JSON.stringify({ redirect_uris: [1, 2, 3, 4].map((n) => `http://127.0.0.1/${n}${"a".repeat(470)}`) }), undefined, "invalid_client_metadata"],
+      // The BOM is kept, as on Go, so the body is not JSON.
+      ["a UTF-8 BOM", "\ufeff" + JSON.stringify({ redirect_uris: [LOOPBACK] }), undefined, "invalid_client_metadata"],
     ] as const) {
       const r = await register(body, headers ?? { "Content-Type": "application/json" });
       const b = await expectOAuthError(r, 400, error, what);
@@ -509,6 +521,14 @@ describe("redirect and resource rules (SPEC §8.4.4)", () => {
     expect(parseLoopbackURI("http://[::1]")).toEqual({ host: "[::1]", port: "", rest: "" });
     for (const u of ["http://LOCALHOST/cb", "http://localhost:/cb", "http://localhost:x/cb", "http://127.1/cb", "http://localhost\\@evil/cb", "http://local host/cb"]) {
       expect(parseLoopbackURI(u), u).toBeNull();
+    }
+    // As Go's url.Parse and unicode.IsSpace: malformed path escapes, control
+    // characters and U+0085 are refused; query escapes and U+FEFF are not.
+    for (const u of ["http://localhost/%zz", "http://localhost/a%2", "http://localhost/a\u0001b", "http://localhost/a\u007fb", "http://localhost/a\u0085b", "http://localhost/?a=\u0001"]) {
+      expect(parseLoopbackURI(u), JSON.stringify(u)).toBeNull();
+    }
+    for (const u of ["http://localhost/?a=%zz", "http://localhost?a=%zz", "http://localhost/a%2Fb", "http://localhost/a\ufeffb"]) {
+      expect(parseLoopbackURI(u), JSON.stringify(u)).not.toBeNull();
     }
   });
 
@@ -1099,6 +1119,12 @@ describe("the token endpoint (SPEC §8.4.6)", () => {
       ["Basic with a password", tokenRequest(base, { headers: { Authorization: "Basic " + btoa(a.clientId + ":x") } }), 401, "invalid_client"],
       ["Basic without a colon", tokenRequest(base, { headers: { Authorization: "Basic " + btoa(a.clientId) } }), 401, "invalid_client"],
       ["Basic that is not base64", tokenRequest(base, { headers: { Authorization: "Basic !!!" } }), 401, "invalid_client"],
+      // As Go's Request.BasicAuth: one space after the scheme, padded base64.
+      ["Basic without base64 padding", tokenRequest(base, { headers: { Authorization: unpaddedBasic(a.clientId) } }), 401, "invalid_client"],
+      ["Basic followed by two spaces", tokenRequest(base, { headers: { Authorization: "Basic  " + btoa(a.clientId + ":") } }), 401, "invalid_client"],
+      ["Basic followed by a tab", tokenRequest(base, { headers: { Authorization: "Basic\t" + btoa(a.clientId + ":") } }), 401, "invalid_client"],
+      // A BOM stays part of the first parameter's name (as on Go), so grant_type is missing.
+      ["a UTF-8 BOM before the form (no grant_type)", raw("\ufeff" + new URLSearchParams(base).toString(), form), 400, "invalid_request"],
       ["a Bearer Authorization", tokenRequest(base, { headers: { Authorization: "Bearer x" } }), 401, "invalid_client"],
       ["Basic naming another client", tokenRequest(base, { headers: { Authorization: "Basic " + btoa(other.client_id + ":") } }), 400, "invalid_request"],
       ["a tampered client_id", tokenRequest({ ...base, client_id: tamper(a.clientId) }), 401, "invalid_client"],

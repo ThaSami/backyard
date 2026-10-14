@@ -63,7 +63,8 @@ terraform init && terraform apply
 # 3. Point the Worker at the domain and turn on Access verification (remembered by setup).
 terraform output -raw setup_command
 #   npm run setup -- --worker-name backyard --var ACCESS_AUD:… --var ACCESS_TEAM_DOMAIN:acme.cloudflareaccess.com
-#                    --var AUTH_MODE:access --var BASE_DOMAIN:backyard.example.com --var URL_MODE:path
+#                    --var AUTH_MODE:access --var BASE_DOMAIN:backyard.example.com --var MCP_ENABLED:false
+#                    --var URL_MODE:path
 cd ../../../../cloudflare && <run it>          # in a checkout of deploy/cloudflare
 
 # 4. Sign in from the CLI (browser login through Access).
@@ -79,9 +80,10 @@ backyard cloudflare setup $(terraform output -raw setup_args)
 npx backyard-cloudflare@latest setup $(terraform output -raw setup_args)   # the same without the backyard CLI (once on npm)
 ```
 
-With `mcp_enabled = true` they include `--var MCP_ENABLED:true`, which turns on the
-[Claude connector](../../../docs/claude-connector.md) (publishing from Claude with the Access
-sign-in).
+They always include `--var MCP_ENABLED:true` or `--var MCP_ENABLED:false`: `mcp_enabled = true`
+turns on the [Claude connector](../../../docs/claude-connector.md) (publishing from Claude with
+the Access sign-in), and setting it back to `false` and running `setup` again turns it off (setup
+keeps the variables it is not given, so the module never leaves this one out).
 
 These variables are then managed by Terraform: `setup` deploys and remembers them, and the
 CLI's `domain add` and `access enable` refuse to take them over (exit 2, with how to drop them
@@ -158,7 +160,7 @@ domains, so they leave the module's alone. Leave `routes` out of `wrangler.jsonc
 | `identity_provider_ids` | `[]` | Login methods to offer (empty = all of the account's). |
 | `auto_redirect_to_identity` | auto | Skip the Access login page. Defaults to on when exactly one IdP is allowed. |
 | `bypass_paths` | gateway + token minting + health + the Claude connector's four machine paths (nine paths) | Paths below `/__backyard/` (or one of the two OAuth discovery documents) that skip Access. |
-| `mcp_enabled` | `false` | Turn on the [Claude connector](../../../docs/claude-connector.md): adds `MCP_ENABLED=true` to `worker_vars` and `setup_args`. |
+| `mcp_enabled` | `false` | Turn on the [Claude connector](../../../docs/claude-connector.md): `MCP_ENABLED=true` in `worker_vars` and `setup_args` (`false` otherwise, which turns a connector that was on off at the next `setup`). |
 | `okta_account_url`, `okta_client_id`, `okta_client_secret`, `okta_authorization_server_id`, `okta_idp_name` | `""` | Create an Okta identity provider. |
 | `okta_identity_provider_id` | `""` | Existing Okta provider for `allowed_okta_groups`. |
 

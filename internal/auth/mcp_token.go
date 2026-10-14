@@ -249,6 +249,11 @@ func (m *MCP) exchangeCode(w http.ResponseWriter, r *http.Request, form url.Valu
 		invalid("the authorization code was issued to another client")
 		return
 	}
+	// The code names a grant of this client: from here on the request is
+	// the grant user's (SPEC §11), charged before anything changes.
+	if !chargeUser(w, g.User.ID, g.User.Anonymous) {
+		return
+	}
 	if !m.redirectAllowed(g.RedirectURI) {
 		invalid(errRedirectGone)
 		return
@@ -315,6 +320,9 @@ func (m *MCP) refreshToken(w http.ResponseWriter, r *http.Request, form url.Valu
 	}
 	if g.ClientID != clientID {
 		invalid("the refresh token was issued to another client")
+		return
+	}
+	if !chargeUser(w, g.User.ID, g.User.Anonymous) {
 		return
 	}
 	if !m.redirectAllowed(g.RedirectURI) {

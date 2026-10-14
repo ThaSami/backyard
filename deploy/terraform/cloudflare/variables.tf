@@ -146,7 +146,7 @@ variable "bypass_paths" {
 # --- Claude connector (remote MCP) ----------------------------------------------
 
 variable "mcp_enabled" {
-  description = "Serve the Claude connector (remote MCP, SPEC §8.4): adds MCP_ENABLED=true to worker_vars and setup_args, so Claude can publish sites with the user's sign-in. The bypass application already lets its machine paths through."
+  description = "Serve the Claude connector (remote MCP, SPEC §8.4): MCP_ENABLED=true in worker_vars and setup_args (false otherwise, so setting it back turns the connector off at the next setup), so Claude can publish sites with the user's sign-in. The bypass application already lets its machine paths through."
   type        = bool
   default     = false
 }

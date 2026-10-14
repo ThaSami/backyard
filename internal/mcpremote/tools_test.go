@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/thasami/backyard/internal/config"
 	"github.com/thasami/backyard/internal/deploy"
 	"github.com/thasami/backyard/internal/docstore"
+	"github.com/thasami/backyard/internal/docstore/memory"
 	"github.com/thasami/backyard/internal/sites"
 )
 
@@ -532,17 +534,83 @@ func TestLeaseExpiryAndRelease(t *testing.T) {
 	if _, err := e.docs.Get(ctx, docstore.SystemSite, lockCollection, "s1"); !errors.Is(err, docstore.ErrNotFound) {
 		t.Fatalf("lease not released after a refusal: %v", err)
 	}
-	// A lease taken over after ours expired is not released by us.
+	// A lease another publish holds is not released by us, even with the
+	// same exp (taken in the same second).
 	exp := now.Add(leaseTTL).Unix()
-	if _, err := e.docs.Create(ctx, docstore.SystemSite, lockCollection, "s2", map[string]any{"exp": exp + 1}, "other"); err != nil {
+	if _, err := e.docs.Create(ctx, docstore.SystemSite, lockCollection, "s2", map[string]any{"exp": exp, "holder": "other"}, "other"); err != nil {
 		t.Fatal(err)
 	}
-	e.h.releaseLease(ctx, "s2", exp)
+	e.h.releaseLease(ctx, "s2", "mine")
 	if _, err := e.docs.Get(ctx, docstore.SystemSite, lockCollection, "s2"); err != nil {
 		t.Fatalf("another publish's lease was released: %v", err)
 	}
 	// Overwrite with the user's agreement.
 	e.toolOK(bobToken, "backyard_publish", map[string]any{"site": "s1", "files": files("index.html", "y"), "overwrite": true}, nil)
+}
+
+// pausingDocs holds the first lease write (the takeover of whoever arms
+// it) until proceed is closed.
+type pausingDocs struct {
+	docstore.Store
+	armed            atomic.Bool
+	blocked, proceed chan struct{}
+}
+
+func (p *pausingDocs) pause(collection string) {
+	if collection == lockCollection && p.armed.CompareAndSwap(true, false) {
+		close(p.blocked)
+		<-p.proceed
+	}
+}
+
+func (p *pausingDocs) Update(ctx context.Context, site, collection, id string, patch map[string]any, actor string) (*docstore.Doc, error) {
+	p.pause(collection)
+	return p.Store.Update(ctx, site, collection, id, patch, actor)
+}
+
+func (p *pausingDocs) Delete(ctx context.Context, site, collection, id string) (bool, error) {
+	p.pause(collection)
+	return p.Store.Delete(ctx, site, collection, id)
+}
+
+// Two replicas taking over one expired lease at once: exactly one gets it,
+// and the loser never removes the winner's lease.
+func TestLeaseContestedTakeover(t *testing.T) {
+	docs := &pausingDocs{Store: memory.New(), blocked: make(chan struct{}), proceed: make(chan struct{})}
+	r1 := newTenv(t, tenvOption{opts: func(o *Options) { o.Docs = docs }})
+	r2 := newTenv(t, tenvOption{opts: func(o *Options) { o.Docs = docs }})
+	ctx := context.Background()
+	if _, err := docs.Create(ctx, docstore.SystemSite, lockCollection, "s", map[string]any{"exp": time.Now().Unix() - 60, "holder": "dead"}, "x"); err != nil {
+		t.Fatal(err)
+	}
+	docs.armed.Store(true)
+	type result struct {
+		release func()
+		err     *deploy.PublishError
+	}
+	slow := make(chan result)
+	go func() {
+		release, err := r2.h.acquireLease(ctx, "s", "bob")
+		slow <- result{release, err}
+	}()
+	<-docs.blocked // r2 read the expired lease and is about to take it over
+	release1, err1 := r1.h.acquireLease(ctx, "s", "alice")
+	close(docs.proceed)
+	r := <-slow
+	if (err1 == nil) == (r.err == nil) {
+		t.Fatalf("both or neither replica got the lease: r1 %v, r2 %v", err1, r.err)
+	}
+	if err1 != nil || r.err.ID != "E20" {
+		t.Fatalf("r1 = %v, r2 = %v; want r1 to hold the lease and r2 E20", err1, r.err)
+	}
+	if _, err := docs.Get(ctx, docstore.SystemSite, lockCollection, "s"); err != nil {
+		t.Fatalf("the lease r1 holds is gone: %v", err)
+	}
+	// While r1 holds it, nobody else gets it.
+	if _, err := r2.h.acquireLease(ctx, "s", "bob"); err == nil || err.ID != "E20" {
+		t.Fatalf("a third publish got the lease: %v", err)
+	}
+	release1()
 }
 
 func TestScrub(t *testing.T) {

@@ -406,7 +406,8 @@ The two Claude client metadata URLs are `https://claude.ai/oauth/mcp-oauth-clien
 and `https://claude.ai/oauth/claude-code-client-metadata`. Leaving a list out keeps its
 default; an explicit `[]` stays empty. Entries are compared byte for byte, so write them exactly
 (their case is kept). The connector also uses `auth.token_ttl` (how long a connection lasts),
-`ratelimit.api_per_minute` (OAuth requests per client IP, MCP requests per user),
+`ratelimit.api_per_minute` (sign-in and token requests per person, OAuth requests that identify
+no one and app registrations per client IP, MCP requests per user),
 `ratelimit.deploys_per_hour` (publishes per user), `server.name` (the name in the discovery
 document), `deploy.allow_anonymous` and `deploy.embedded_gateway`. A standalone gateway
 validates the section but ignores it.
@@ -434,7 +435,7 @@ default; a negative value means unlimited (that one limit is off).
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `ratelimit.disabled` | bool | `false` | Turn every limit off. |
-| `ratelimit.api_per_minute` | int | `600` | All site and hub API calls, and the Claude connector's requests (OAuth per client IP, MCP per user); negative = unlimited. |
+| `ratelimit.api_per_minute` | int | `600` | All site and hub API calls, and the Claude connector's requests (sign-in, token and MCP per user; registration and requests that identify no one per client IP); negative = unlimited. |
 | `ratelimit.db_writes_per_minute` | int | `300` | Document writes and file deletes; negative = unlimited. |
 | `ratelimit.ai_per_minute` | int | `20` | AI calls; negative = unlimited. |
 | `ratelimit.ai_tokens_per_day` | int | `2000000` | Input + output AI tokens per user per day (resets 00:00 UTC); negative = unlimited. |

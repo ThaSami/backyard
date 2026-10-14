@@ -75,7 +75,10 @@ func withConnector(cn *connector, mutate func(*config.Config)) option {
 		cn.clock = &connClock{}
 		cn.clock.ns.Store(time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC).UnixNano())
 		cn.docs = memory.New()
-		authn, err := auth.New(context.Background(), c, auth.Options{Docs: cn.docs, Logger: d.Logger, Now: cn.clock.Now})
+		authn, err := auth.New(context.Background(), c, auth.Options{
+			Docs: cn.docs, Logger: d.Logger, Now: cn.clock.Now,
+			MCPAllow: func(k string) (bool, time.Duration) { return h.srv.AllowAPI(k) },
+		})
 		if err != nil {
 			h.t.Fatalf("auth.New: %v", err)
 		}
@@ -162,18 +165,41 @@ func (cn *connector) connect(email, app string) tokens {
 	t := cn.h.t
 	t.Helper()
 	id := cn.register(app)
-	vb := make([]byte, 32)
-	_, _ = rand.Read(vb)
-	verifier := base64.RawURLEncoding.EncodeToString(vb)
+	code, verifier := cn.code(email, id)
+	w := cn.do("POST", hubURL+"/__backyard/oauth/token", cn.exchangeForm(id, code, verifier), map[string]string{"Content-Type": "application/x-www-form-urlencoded"})
+	expectStatus(t, w, http.StatusOK)
+	var out struct {
+		Access  string `json:"access_token"`
+		Refresh string `json:"refresh_token"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil || out.Access == "" {
+		t.Fatalf("token: %v %s", err, w.Body.String())
+	}
+	cn.clock.advance(2 * time.Second) // distinct created_at for the next connection
+	return tokens{clientID: id, access: out.Access, refresh: out.Refresh}
+}
+
+// authorizeQuery is the query of an authorization request of client id.
+func authorizeQuery(id, verifier string) url.Values {
 	sum := sha256.Sum256([]byte(verifier))
-	q := url.Values{
+	return url.Values{
 		"response_type": {"code"}, "client_id": {id}, "redirect_uri": {connRedirect},
 		"code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}, "code_challenge_method": {"S256"},
 		"resource": {connResource}, "scope": {"mcp offline_access"}, "state": {"st"},
 	}
+}
+
+// code runs authorize → consent as email for client id and returns the
+// code and its PKCE verifier.
+func (cn *connector) code(email, id string) (code, verifier string) {
+	t := cn.h.t
+	t.Helper()
+	vb := make([]byte, 32)
+	_, _ = rand.Read(vb)
+	verifier = base64.RawURLEncoding.EncodeToString(vb)
 	hdr := as(email)
 	hdr["Sec-Fetch-Site"] = "cross-site"
-	w := cn.do("GET", hubURL+auth.AuthorizePath+"?"+q.Encode(), "", hdr)
+	w := cn.do("GET", hubURL+auth.AuthorizePath+"?"+authorizeQuery(id, verifier).Encode(), "", hdr)
 	expectStatus(t, w, http.StatusOK)
 	form := url.Values{}
 	for _, m := range connHiddenRe.FindAllStringSubmatch(w.Body.String(), -1) {
@@ -195,21 +221,15 @@ func (cn *connector) connect(email, app string) tokens {
 	if err != nil || loc.Query().Get("code") == "" {
 		t.Fatalf("allow redirect = %q", w.Header().Get("Location"))
 	}
-	tok := url.Values{
-		"grant_type": {"authorization_code"}, "code": {loc.Query().Get("code")}, "code_verifier": {verifier},
+	return loc.Query().Get("code"), verifier
+}
+
+// exchangeForm is the token request that redeems code.
+func (cn *connector) exchangeForm(id, code, verifier string) string {
+	return url.Values{
+		"grant_type": {"authorization_code"}, "code": {code}, "code_verifier": {verifier},
 		"client_id": {id}, "redirect_uri": {connRedirect}, "resource": {connResource},
-	}
-	w = cn.do("POST", hubURL+"/__backyard/oauth/token", tok.Encode(), map[string]string{"Content-Type": "application/x-www-form-urlencoded"})
-	expectStatus(t, w, http.StatusOK)
-	var out struct {
-		Access  string `json:"access_token"`
-		Refresh string `json:"refresh_token"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil || out.Access == "" {
-		t.Fatalf("token: %v %s", err, w.Body.String())
-	}
-	cn.clock.advance(2 * time.Second) // distinct created_at for the next connection
-	return tokens{clientID: id, access: out.Access, refresh: out.Refresh}
+	}.Encode()
 }
 
 // mcpCall sends a JSON-RPC ping to the MCP endpoint with an access token.
@@ -576,7 +596,7 @@ func TestConnectorRateLimits(t *testing.T) {
 		if !strings.HasPrefix(w.Header().Get("Content-Type"), "text/html") || !strings.Contains(w.Body.String(), "Too many requests") {
 			t.Fatalf("429 page: %q %s", w.Header().Get("Content-Type"), truncate(w.Body.String(), 300))
 		}
-		if w.Header().Get("Retry-After") == "" || w.Header().Get("Cache-Control") != "no-store" {
+		if w.Header().Get("Retry-After") == "" || !strings.HasPrefix(w.Header().Get("Cache-Control"), "no-store") {
 			t.Errorf("headers = %v", w.Header())
 		}
 		// The consent POST shares the limit.
@@ -591,6 +611,48 @@ func TestConnectorRateLimits(t *testing.T) {
 	if !strings.Contains(scrape(t, h), `backyard_rate_limited_total{category="api"} 5`) {
 		t.Errorf("rejections not counted:\n%s", scrape(t, h))
 	}
+}
+
+// Behind one shared address (a proxy that is not trusted, as on Cloud
+// Run), junk sign-in requests that identify no one exhaust only the
+// address's budget: code exchanges, refreshes and the authorize page of a
+// signed-in person are charged to that person (SPEC §11).
+func TestConnectorRateLimitsSharedAddress(t *testing.T) {
+	cn := newConnector(t, func(c *config.Config) { c.RateLimit.APIPerMinute = 10 })
+	junk := func() *httptest.ResponseRecorder {
+		return cn.do("POST", hubURL+"/__backyard/oauth/token", "grant_type=refresh_token&refresh_token=x&client_id=y",
+			map[string]string{"Content-Type": "application/x-www-form-urlencoded"})
+	}
+	alice := cn.connect("alice@acme.com", "App") // a live connection
+	id := cn.register("Second app")
+	code, verifier := cn.code("alice@acme.com", id)
+	limited := false
+	for range 20 {
+		if w := junk(); w.Code == http.StatusTooManyRequests {
+			if got := strings.TrimSpace(w.Body.String()); got != `{"error":"invalid_request","error_description":"too many requests"}` ||
+				w.Header().Get("Retry-After") == "" || w.Header().Get("WWW-Authenticate") != "" {
+				t.Fatalf("429 = %v %s", w.Header(), got)
+			}
+			limited = true
+			break
+		}
+	}
+	if !limited {
+		t.Fatal("junk token requests were never limited")
+	}
+	form := map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
+	expectStatus(t, cn.do("POST", hubURL+"/__backyard/oauth/token", cn.exchangeForm(id, code, verifier), form), http.StatusOK)
+	refresh := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {alice.refresh}, "client_id": {alice.clientID}}
+	expectStatus(t, cn.do("POST", hubURL+"/__backyard/oauth/token", refresh.Encode(), form), http.StatusOK)
+	hdr := as("alice@acme.com")
+	hdr["Sec-Fetch-Site"] = "cross-site"
+	expectStatus(t, cn.do("GET", hubURL+auth.AuthorizePath+"?"+authorizeQuery(id, "v").Encode(), "", hdr), http.StatusOK)
+	// Requests that identify no one stay limited: junk, an authorization
+	// request that fails before the person is asked, a registration.
+	expectStatus(t, junk(), http.StatusTooManyRequests)
+	expectStatus(t, cn.do("GET", hubURL+auth.AuthorizePath+"?client_id=x", "", as("bob@acme.com")), http.StatusTooManyRequests)
+	expectStatus(t, cn.do("POST", hubURL+"/__backyard/oauth/register", `{"redirect_uris":["`+connRedirect+`"]}`,
+		map[string]string{"Content-Type": "application/json"}), http.StatusTooManyRequests)
 }
 
 func TestAllowAPI(t *testing.T) {

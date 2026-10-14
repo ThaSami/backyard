@@ -3,8 +3,10 @@ package auth
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -166,6 +168,15 @@ func TestMCPTokenRequestRules(t *testing.T) {
 	big := base()
 	big.Set("pad", strings.Repeat("x", 16<<10))
 	oauthErr(t, e.do(oauthPost(OAuthTokenPath, big)), http.StatusBadRequest, "invalid_request")
+	// A BOM stays part of the first name, so grant_type is missing (as on the Worker).
+	bom := oauthPost(OAuthTokenPath, base())
+	noGT := base()
+	noGT.Del("grant_type")
+	bom.Body = io.NopCloser(strings.NewReader("\ufeffgrant_type=authorization_code&" + noGT.Encode()))
+	bom.ContentLength = -1
+	if m := oauthErr(t, e.do(bom), http.StatusBadRequest, "invalid_request"); m["error_description"] != "grant_type is required" {
+		t.Errorf("BOM: %v", m)
+	}
 	// Bodies url.ParseQuery refuses (the Worker refuses the same ones).
 	for _, tail := range []string{"&pad=%zz", "&pad=a;b"} {
 		r := oauthPost(OAuthTokenPath, base())
@@ -183,6 +194,10 @@ func TestMCPTokenRequestRules(t *testing.T) {
 		},
 		"basic with password": func(r *http.Request) { r.SetBasicAuth(url.QueryEscape(id), "secret") },
 		"bearer":              func(r *http.Request) { r.Header.Set("Authorization", "Bearer x") },
+		// Exactly one space and padded base64 (the Worker parses the same way).
+		"basic unpadded":   func(r *http.Request) { r.Header.Set("Authorization", unpaddedBasic(id)) },
+		"basic two spaces": func(r *http.Request) { r.Header.Set("Authorization", "Basic  "+basic(id, "")) },
+		"basic tab":        func(r *http.Request) { r.Header.Set("Authorization", "Basic\t"+basic(id, "")) },
 		"two headers": func(r *http.Request) {
 			r.Header.Add("Authorization", "Basic "+basic(id, ""))
 			r.Header.Add("Authorization", "Basic "+basic(id, ""))
@@ -226,6 +241,22 @@ func basic(user, pass string) string {
 	r, _ := http.NewRequest("GET", "/", nil)
 	r.SetBasicAuth(url.QueryEscape(user), pass)
 	return strings.TrimPrefix(r.Header.Get("Authorization"), "Basic ")
+}
+
+// unpaddedBasic is Basic for a public client with the base64 padding
+// stripped: leading characters of the id are %-escaped (the server
+// unescapes them) until the padded form has padding to strip.
+func unpaddedBasic(id string) string {
+	for k := 0; k < 3; k++ {
+		user := ""
+		for _, c := range []byte(id[:k]) {
+			user += fmt.Sprintf("%%%02x", c)
+		}
+		if b := base64.StdEncoding.EncodeToString([]byte(user + id[k:] + ":")); strings.HasSuffix(b, "=") {
+			return "Basic " + strings.TrimRight(b, "=")
+		}
+	}
+	panic("unreachable")
 }
 
 func TestMCPRefresh(t *testing.T) {
@@ -275,6 +306,55 @@ func TestMCPRefresh(t *testing.T) {
 		oauthErr(t, e.refresh(f, m4["refresh_token"].(string), nil), http.StatusBadRequest, "invalid_grant")
 		if _, _, err := e.m.VerifyAccessToken(context.Background(), m4["access_token"].(string)); !isDesc(err, descRevoked) {
 			t.Errorf("access token after reuse: %v", err)
+		}
+		if acts := strings.Join(e.auditActions(), ","); !strings.Contains(acts, "mcp.refresh_reuse") {
+			t.Errorf("audit = %v", acts)
+		}
+	})
+}
+
+// A lower auth.token_ttl after redemption must not shorten the rotation
+// markers of an existing family: they carry the grant's stored exp, so
+// pruning keeps them and a replayed rotated refresh token still revokes.
+func TestMCPRefreshReuseAfterTTLChange(t *testing.T) {
+	storeVariants(t, func(t *testing.T, opts ...func(*Options)) {
+		e := newMCPEnv(t, ModeNone, nil, opts...)
+		id := e.register("App", loopbackCB)
+		f := newFlow(id, loopbackCB)
+		at, r1 := e.tokens(newBrowser(), f)
+		gid := gidOfAccess(t, e, at)
+		e.m.waitBackground()
+		g, err := e.m.loadGrant(context.Background(), gid)
+		if err != nil || g == nil {
+			t.Fatalf("grant: %v %v", g, err)
+		}
+
+		e.clock.Advance(48 * time.Hour)
+		e.m.family = 24 * time.Hour // a restart with a lower auth.token_ttl
+		r2 := jsonBody(t, e.refresh(f, r1, nil))["refresh_token"].(string)
+		e.clock.Advance(2 * time.Minute)
+		if m := jsonBody(t, e.refresh(f, r2, nil)); m["refresh_token"] == nil {
+			t.Fatalf("R2 → R3: %v", m)
+		}
+		e.code(newBrowser(), newFlow(id, loopbackCB)) // triggers a prune
+		e.m.waitBackground()
+
+		q := docstore.Query{Where: []docstore.Filter{{Field: "gid", Op: docstore.OpEq, Value: gid}}, Limit: 100}
+		_ = q.Normalize(100)
+		page, err := e.docs.Query(context.Background(), docstore.SystemSite, rotationsCollection, q)
+		if err != nil || len(page.Docs) != 3 {
+			t.Fatalf("rotation markers after pruning: %d %v", len(page.Docs), err)
+		}
+		for _, d := range page.Docs {
+			if intValue(d.Data["exp"]) != g.Exp {
+				t.Errorf("marker %s exp = %v, want the grant's %d", d.ID, d.Data["exp"], g.Exp)
+			}
+		}
+
+		e.clock.Advance(2 * time.Minute)
+		oauthErr(t, e.refresh(f, r2, nil), http.StatusBadRequest, "invalid_grant")
+		if g, _ := e.m.loadGrant(context.Background(), gid); g != nil {
+			t.Fatal("a replayed rotated refresh token did not revoke the grant")
 		}
 		if acts := strings.Join(e.auditActions(), ","); !strings.Contains(acts, "mcp.refresh_reuse") {
 			t.Errorf("audit = %v", acts)

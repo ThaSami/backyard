@@ -118,6 +118,7 @@ func (m *MCP) serveOAuth(w http.ResponseWriter, r *http.Request) {
 		h = m.serveRegister
 	case OAuthTokenPath:
 		h = m.serveToken
+		w = m.limited(w, r, oauthTooMany)
 	case OAuthRevokePath:
 		h = m.serveRevoke
 	default:

@@ -130,7 +130,16 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (_ *App, err err
 	}
 	// The connector's grants live in the same document store as the audit
 	// records (_system), unwrapped like the server's own system writes.
-	authOpts := auth.Options{Directory: dir, Logger: log, Docs: a.docs}
+	// The hub and the authorization server are built before the server, so
+	// frame metrics and rate limits reach the server through a pointer that
+	// is filled in once it exists.
+	var srvRef atomic.Pointer[server.Server]
+	authOpts := auth.Options{
+		Directory: dir, Logger: log, Docs: a.docs,
+		MCPAllow: func(key string) (bool, time.Duration) {
+			return srvRef.Load().AllowAPI(key) // nil-safe until the server exists
+		},
+	}
 	if opts.authOptions != nil {
 		opts.authOptions(&authOpts)
 	}
@@ -143,9 +152,6 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (_ *App, err err
 		log.Warn("mcp: auth.mode none: every connector connection is an anonymous guest")
 	}
 
-	// The hub is built before the server, so frame metrics reach the server
-	// through a pointer that is filled in once it exists.
-	var srvRef atomic.Pointer[server.Server]
 	if !cfg.Realtime.Disabled {
 		instance, _ := os.Hostname()
 		a.hub = realtime.New(a.broker, realtime.Options{

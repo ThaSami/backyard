@@ -252,7 +252,13 @@ func (m *MCP) rotate(ctx context.Context, gid string, from int64, grace bool) (s
 	if g == nil || g.Exp <= now.Unix() || (from >= 1 && g.RedeemedAt == 0) {
 		return rotateMissing, nil, nil
 	}
-	familyExp := g.CreatedAt + int64(m.family/time.Second)
+	// The family's exp is fixed at redemption (created_at + the token TTL
+	// then in force) and never extended; refresh markers carry it as stored,
+	// so a later, lower auth.token_ttl cannot prune them before the grant.
+	familyExp := g.Exp
+	if from == 0 {
+		familyExp = g.CreatedAt + int64(m.family/time.Second)
+	}
 	sctx, cancel := storeCtx(ctx)
 	defer cancel()
 	marker := map[string]any{"gid": gid, "n": from + 1, "at": now.UnixMilli(), "exp": familyExp}

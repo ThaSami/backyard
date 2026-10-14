@@ -129,7 +129,9 @@ export type McpTokenError =
 export type McpTokenResult = { ok: true; user: User; grant: McpGrant } | { ok: false; error: McpTokenError };
 
 const enc = new TextEncoder();
-const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
+// ignoreBOM keeps a leading U+FEFF in the text, so a BOM-prefixed body fails
+// or parses exactly as on the Go server (which never strips it).
+const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 function nowSec(): number {
   return Math.floor(Date.now() / 1000);
@@ -428,10 +430,12 @@ async function tokenClient(ctx: RequestContext, form: URLSearchParams): Promise<
   let id = form.get("client_id") ?? "";
   const auth = ctx.req.headers.get("Authorization");
   if (auth !== null) {
-    const m = /^basic\s+([A-Za-z0-9+/=]+)\s*$/i.exec(auth.trim());
+    // As Go's Request.BasicAuth: the scheme, exactly one space and padded
+    // standard base64 (Headers.get already strips surrounding whitespace).
+    const m = /^basic ([A-Za-z0-9+/]*={0,2})$/i.exec(auth);
     let user: string | null = null;
     let pass: string | null = null;
-    if (m) {
+    if (m && m[1]!.length % 4 === 0) {
       try {
         const raw = utf8.decode(Uint8Array.from(atob(m[1]!), (c) => c.charCodeAt(0)));
         const colon = raw.indexOf(":");
@@ -679,12 +683,23 @@ interface LoopbackURI {
 }
 
 /**
+ * Characters a loopback redirect URI must not contain, as on the Go server:
+ * '#', backslash, the ASCII control characters (url.Parse refuses them anywhere)
+ * and Go's unicode.IsSpace set (which, unlike \s, has U+0085 and not U+FEFF).
+ */
+const loopbackRefused = /[#\\\u0000-\u0020\u007f\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/;
+
+/**
  * Parses an http loopback URI: scheme http, host exactly localhost,
  * 127.0.0.1 or [::1], an optional port, no userinfo or fragment, any path
  * and query; null otherwise.
  */
 export function parseLoopbackURI(raw: string): LoopbackURI | null {
-  if (!raw.startsWith("http://") || /[#\\\s]/.test(raw)) return null;
+  if (!raw.startsWith("http://") || loopbackRefused.test(raw)) return null;
+  // Like url.Parse, a malformed %-escape fails before the query (whose
+  // escapes Go leaves unchecked); WHATWG URL would keep it.
+  const q = raw.indexOf("?");
+  if (/%(?![0-9A-Fa-f]{2})/.test(q >= 0 ? raw.slice(0, q) : raw)) return null;
   try {
     new URL(raw);
   } catch {

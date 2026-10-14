@@ -2,8 +2,10 @@ package auth
 
 import (
 	"context"
+	"html"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -547,14 +549,22 @@ func TestMCPConsentPostOIDC(t *testing.T) {
 	if res.StatusCode != http.StatusForbidden || !strings.Contains(body(t, res), "expired or was not issued to you") {
 		t.Errorf("another session: %d", res.StatusCode)
 	}
-	// Signed out: back to the login, returning to the GET form.
+	// Signed out: a page that links to the login, returning to the GET
+	// form (no redirect: the consent page's form-action would block the
+	// hop to the IdP).
 	res = e.consentPost(newBrowser(), fields, "allow")
-	loc := res.Header.Get("Location")
+	page := body(t, res)
+	links := regexp.MustCompile(`<a href="([^"]+)"`).FindStringSubmatch(page)
+	if res.StatusCode != http.StatusUnauthorized || res.Header.Get("Location") != "" || len(links) != 2 ||
+		!strings.Contains(page, "Sign in again") || !strings.Contains(res.Header.Get("Cache-Control"), "no-store") {
+		t.Fatalf("signed out: %d %v %s", res.StatusCode, res.Header, page)
+	}
+	loc := html.UnescapeString(links[1])
 	lu, _ := url.Parse(loc)
 	rd := lu.Query().Get("rd")
-	if res.StatusCode != http.StatusFound || !strings.HasPrefix(rd, testIssuer+AuthorizePath+"?response_type=code&client_id=") ||
+	if lu.Path != LoginPath || !strings.HasPrefix(rd, testIssuer+AuthorizePath+"?response_type=code&client_id=") ||
 		strings.Contains(rd, "csrf") || strings.Contains(rd, "decision") || e.a.sanitizeRedirect(rd) != rd {
-		t.Fatalf("signed out: %d %q", res.StatusCode, loc)
+		t.Fatalf("signed out: link %q", loc)
 	}
 	back, _ := url.Parse(rd)
 	if back.Query().Get("state") != f.state || back.Query().Get("resource") != testResource {
