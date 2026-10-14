@@ -147,6 +147,17 @@ export const httpGet = (url, headers = {}) => httpRequest("GET", url, { headers 
 
 /** Fails with a readable list of the WCAG 2.1 A/AA violations axe-core finds on page. */
 export async function expectAccessible(page, what) {
+  // axe measures the colors on screen: an element still fading in (an
+  // entrance animation or a transition) reads as low contrast. Let the finite
+  // ones finish; endless ones (a blinking cursor) are left alone.
+  await page.evaluate(() =>
+    Promise.all(
+      document
+        .getAnimations()
+        .filter((a) => a.effect?.getComputedTiming().endTime !== Infinity)
+        .map((a) => a.finished.catch(() => {})),
+    ),
+  );
   const { violations } = await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"]).analyze();
   const found = violations.flatMap((v) =>
     v.nodes.slice(0, 5).map((n) => `${v.id} (${v.impact}) at ${n.target.join(" ")}: ${n.failureSummary.split("\n").slice(1).join(" ").trim()}`),

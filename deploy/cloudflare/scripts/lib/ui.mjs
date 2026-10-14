@@ -182,7 +182,6 @@ export function createPrompt(o) {
     async askHidden(question, { flag = "" } = {}) {
       if (!o.interactive || typeof input.setRawMode !== "function") throw needInput(question, flag);
       return new Promise((resolveHidden, reject) => {
-        output.write(`${question} `);
         const wasRaw = Boolean(input.isRaw);
         let value = "";
         const done = () => {
@@ -208,7 +207,10 @@ export function createPrompt(o) {
             else value += ch;
           }
         };
+        // Echo goes off before the prompt shows: whatever is typed or pasted
+        // as soon as it appears must never reach the screen.
         input.setRawMode(true);
+        output.write(`${question} `);
         input.setEncoding("utf8");
         input.on("data", onData);
         input.resume();
