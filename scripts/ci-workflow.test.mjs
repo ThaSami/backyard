@@ -211,6 +211,7 @@ test("the npm job publishes the release's own package with provenance, only when
   const npm = job("npm", "release.yml");
   assert.match(npm, /^ {4}needs: goreleaser$/m);
   assert.match(npm, /^ {4}if: vars\.BACKYARD_NPM_PUBLISH == 'true'$/m);
+  assert.match(npm, /^ {4}environment:\n {6}name: npm$/m, "NPM_TOKEN can be a secret of the npm environment");
   assert.match(npm, /^ {6}id-token: write\b/m);
   assert.match(npm, /^ {6}contents: read$/m);
   assert.doesNotMatch(npm, /contents: write|actions\/checkout|npm pack|make /, "npm gets the release asset, not a rebuild");
@@ -228,6 +229,13 @@ test("the npm job publishes the release's own package with provenance, only when
   assert.match(list[publish], /npm publish "\.\/pkg\/backyard-cloudflare-\$\{GITHUB_REF_NAME#v\}\.tgz" --provenance --access public --tag "\$tag"/);
   assert.match(list[publish], /case "\$GITHUB_REF_NAME" in \*-\*\) tag=next ;; esac/, "pre-releases do not move latest");
   assert.ok(node < download && download < verify && verify < publish, "download → verify → publish");
+});
+
+test("only the npm job runs in the npm environment, whose NPM_TOKEN no other job may read", () => {
+  for (const name of jobNames("release.yml")) {
+    if (name === "npm") continue;
+    assert.doesNotMatch(job(name, "release.yml"), /^ {4}environment:/m, `job ${name}`);
+  }
 });
 
 test("npm publish gets a file path npm cannot mistake for a GitHub repository", () => {

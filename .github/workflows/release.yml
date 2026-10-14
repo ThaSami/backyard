@@ -14,7 +14,8 @@ name: Release
 # release. When vars.BACKYARD_NPM_PUBLISH is 'true', the npm job then
 # publishes the same bytes, downloaded from the release and checked against
 # checksums.txt, to npm (with provenance, which needs a public repository),
-# using the NPM_TOKEN secret. See CONTRIBUTING.md, "Releases".
+# using the NPM_TOKEN secret of the "npm" environment (or of the repository).
+# See CONTRIBUTING.md, "Releases".
 
 on:
   push:
@@ -134,12 +135,21 @@ jobs:
   # The npm package is published only after the GitHub release exists, from
   # the release's own asset, so npm and the release hold the same bytes. The
   # ./ matters: npm reads "pkg/<name>.tgz" as the GitHub repository pkg/<name>.
+  #
+  # The job runs in the "npm" environment, so NPM_TOKEN can be a secret of
+  # that environment that no other job can read, and the environment can
+  # require an approval before anything is published. The switch must be a
+  # repository variable: this if: and the goreleaser job cannot read the
+  # variables of the npm environment.
   npm:
     name: Publish backyard-cloudflare to npm
     needs: goreleaser
     if: vars.BACKYARD_NPM_PUBLISH == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/backyard-cloudflare
     permissions:
       contents: read
       id-token: write # npm provenance
@@ -165,7 +175,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::error::vars.BACKYARD_NPM_PUBLISH is 'true' but the NPM_TOKEN secret is not set"
+            echo "::error::vars.BACKYARD_NPM_PUBLISH is 'true' but the NPM_TOKEN secret is not set (in the npm environment or the repository)"
             exit 1
           fi
           tag=latest; case "$GITHUB_REF_NAME" in *-*) tag=next ;; esac

@@ -276,9 +276,20 @@ When the repository variable `BACKYARD_NPM_PUBLISH` is `true`, the release's `np
 the package from the GitHub release, verifies it against `checksums.txt` and publishes exactly
 those bytes to npm as `backyard-cloudflare`, with provenance (dist-tag `latest`, or `next` for a
 pre-release tag such as `v1.2.0-rc.1`). It is the only job with an OIDC token
-(`id-token: write`). The guides show `npx backyard-cloudflare@latest setup` for people with only
-Node.js (saying it works once a release has published the package), so the canonical repository
-should publish:
+(`id-token: write`), and the only one that runs in the `npm` environment (Settings →
+Environments → New environment, named `npm`):
+
+- **`NPM_TOKEN`**: a secret of the `npm` environment, so no other job can read it (a repository
+  secret works too). The environment can also require a reviewer's approval before each publish;
+  if you limit its deployment branches and tags, allow the tags `v*`.
+- **`BACKYARD_NPM_PUBLISH`**: a **repository** variable (Settings → Secrets and variables →
+  Actions → Variables → Repository variables), not a variable of the `npm` environment. The
+  `npm` job's `if:` and the `goreleaser` job, which names the package in the release notes,
+  cannot read environment variables, so a switch set only in the environment leaves the job
+  skipped.
+
+The guides show `npx backyard-cloudflare@latest setup` for people with only Node.js (saying it
+works once a release has published the package), so the canonical repository should publish:
 
 1. **Public repository.** npm accepts `--provenance` only from a public source repository
    (private repositories are rejected even for public packages). Make the repository public
@@ -293,9 +304,9 @@ should publish:
    `backyard-cf` as well is optional, against typosquatting. Otherwise, a token limited to
    selected packages can name only packages that already exist, so the first `NPM_TOKEN` secret is a short-lived granular token (a few days) with read
    and write access to "All packages"; if the account requires two-factor authentication for
-   publishing, the token also needs "Bypass two-factor authentication". Add it, set the variable
-   `BACKYARD_NPM_PUBLISH` to `true` (Settings → Secrets and variables → Actions) and tag the
-   release. The job fails if the variable is on and the secret is missing. Check that this
+   publishing, the token also needs "Bypass two-factor authentication". Add it as the `NPM_TOKEN`
+   secret of the `npm` environment, set the repository variable `BACKYARD_NPM_PUBLISH` to `true`
+   and tag the release. The job fails if the variable is on and the secret is missing. Check that this
    first `npm publish --provenance` succeeds: provenance compares the package's `repository.url`
    (spelled `ThaSami/backyard`, as in the git remote) with the repository.
 
