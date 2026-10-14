@@ -46,6 +46,9 @@ type GatewayOptions struct {
 	Logger       *slog.Logger
 	// Version reported in Info.
 	Version string
+	// MCPURL is the remote MCP endpoint of the hub this gateway is embedded
+	// in (SPEC §14.1), reported as Info.MCPURL; "" omits it.
+	MCPURL string
 }
 
 // EmbeddedPath is where the server mounts the embedded gateway.
@@ -272,7 +275,8 @@ func (g *Gateway) info(base string) Info {
 			MaxFiles:     c.Sites.MaxFiles,
 			MaxFileBytes: c.Sites.MaxFileBytes,
 		},
-		Auth: AuthInfo{Mode: c.Auth.Mode, AnonymousDeploy: g.anonymousDeploy()},
+		Auth:   AuthInfo{Mode: c.Auth.Mode, AnonymousDeploy: g.anonymousDeploy()},
+		MCPURL: g.opts.MCPURL,
 	}
 	if gw := strings.TrimSuffix(c.Deploy.GatewayURL, "/"); gw != "" {
 		inf.GatewayURL = gw
@@ -425,6 +429,28 @@ func (g *Gateway) ownershipOn() bool { return g.cfg.Sites.Ownership == "owner" }
 // authorizeSite applies the ownership policy to a write on site and returns
 // the stored meta document (nil when none exists).
 func (g *Gateway) authorizeSite(ctx context.Context, u *identity.User, site string) (*sites.Meta, *apiError) {
+	meta, deny, err := g.checkOwnership(ctx, u, site)
+	switch {
+	case err != nil:
+		return nil, internalErr(err)
+	case deny == nil:
+		return meta, nil
+	case deny.corrupt:
+		return nil, forbidden("the metadata of site %q is unreadable, so its owners are unknown; an admin must redeploy, refresh or delete it", site)
+	}
+	return nil, forbidden("site %q is owned by %s; only owners and admins can change it", site, strings.Join(deny.owners, ", "))
+}
+
+// ownerDenial is why the ownership policy refuses a write.
+type ownerDenial struct {
+	owners  []string // the site's owners
+	corrupt bool     // the meta document is unreadable, so the owners are unknown
+}
+
+// checkOwnership applies the ownership policy to a write by u on site. It
+// returns the stored meta document (nil when none exists or it is unreadable
+// and the write may rewrite it), or why the write is refused.
+func (g *Gateway) checkOwnership(ctx context.Context, u *identity.User, site string) (*sites.Meta, *ownerDenial, error) {
 	meta, err := g.reg.GetMeta(ctx, site)
 	switch {
 	case errors.Is(err, sites.ErrNotFound):
@@ -434,20 +460,20 @@ func (g *Gateway) authorizeSite(ctx context.Context, u *identity.User, site stri
 		// write goes ahead and rewrites the document; otherwise fail closed.
 		g.log.WarnContext(ctx, "deploy: site metadata is unreadable", "site", site, "error", err)
 		if g.ownershipOn() && !g.isAdmin(u) {
-			return nil, forbidden("the metadata of site %q is unreadable, so its owners are unknown; an admin must redeploy, refresh or delete it", site)
+			return nil, &ownerDenial{corrupt: true}, nil
 		}
 		meta, err = nil, nil
 	}
 	if err != nil {
-		return nil, internalErr(err)
+		return nil, nil, err
 	}
 	if !g.ownershipOn() || g.isAdmin(u) || meta == nil || len(meta.Owners) == 0 {
-		return meta, nil
+		return meta, nil, nil
 	}
 	if !u.Anonymous && meta.IsOwner(u.ID, u.Email) {
-		return meta, nil
+		return meta, nil, nil
 	}
-	return nil, forbidden("site %q is owned by %s; only owners and admins can change it", site, strings.Join(meta.Owners, ", "))
+	return nil, &ownerDenial{owners: meta.Owners}, nil
 }
 
 // ownerID is the identifier recorded for u in Meta.Owners.
@@ -489,14 +515,20 @@ func registryErr(site string, err error) *apiError {
 
 // audit logs a security-relevant action.
 func (g *Gateway) audit(r *http.Request, u *identity.User, action, site string, attrs ...any) {
+	g.auditCtx(r.Context(), g.clientIP(r), u, action, site, attrs...)
+}
+
+// auditCtx is audit for callers without an HTTP request (Publish); ip is the
+// caller's address as the caller resolved it.
+func (g *Gateway) auditCtx(ctx context.Context, ip string, u *identity.User, action, site string, attrs ...any) {
 	args := append([]any{
 		"audit", true,
 		"action", action,
 		"actor", u.Actor(),
 		"site", site,
-		"ip", g.clientIP(r),
+		"ip", ip,
 	}, attrs...)
-	g.log.InfoContext(r.Context(), "audit: "+action, args...)
+	g.log.InfoContext(ctx, "audit: "+action, args...)
 }
 
 // clientIP returns the caller's address, honouring X-Forwarded-For only
@@ -549,10 +581,7 @@ func (g *Gateway) rateKey(r *http.Request, u *identity.User) string {
 // deploy and refreshing a site (the commit step of a direct sync, which
 // re-reads every file) are charged; commits are not, so a deploy costs one.
 func (g *Gateway) chargeDeploy(r *http.Request, u *identity.User) *apiError {
-	if g.limiter == nil {
-		return nil
-	}
-	ok, wait := g.limiter.allow(g.rateKey(r, u), g.now())
+	ok, wait := g.chargeKey(g.rateKey(r, u))
 	if ok {
 		return nil
 	}
@@ -560,6 +589,15 @@ func (g *Gateway) chargeDeploy(r *http.Request, u *identity.User) *apiError {
 		g.cfg.RateLimit.DeploysPerHour, wait.Round(time.Second))
 	e.retryAfter = wait
 	return e
+}
+
+// chargeKey takes one token from the deploys_per_hour bucket of key,
+// returning the wait until the next one when none is left.
+func (g *Gateway) chargeKey(key string) (bool, time.Duration) {
+	if g.limiter == nil {
+		return true, 0
+	}
+	return g.limiter.allow(key, g.now())
 }
 
 // decodeJSON reads a JSON body of at most limit bytes into v.

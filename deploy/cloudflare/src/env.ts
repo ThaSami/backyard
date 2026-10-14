@@ -50,6 +50,20 @@ export interface Env {
   TOKEN_TTL_HOURS?: string;
   /** Site API base of a Backyard Go server whose warehouse is proxied (optional). */
   WAREHOUSE_URL?: string;
+  /** "true" serves the Claude connector (remote MCP, SPEC §8.4, §14.1); unset = off. */
+  MCP_ENABLED?: string;
+  /**
+   * Client ID Metadata Document URLs that may connect (comma or whitespace
+   * separated). Unset: Claude's two documents; set but empty: none, so
+   * clients register themselves.
+   */
+  MCP_CLIENTS?: string;
+  /**
+   * Exact https addresses that may receive sign-in codes (comma or whitespace
+   * separated). Unset: Claude's two callbacks; set but empty: http loopback
+   * addresses only (always allowed).
+   */
+  MCP_REDIRECT_URIS?: string;
 
   // --- secrets
   BACKYARD_SECRET?: string;

@@ -19,6 +19,10 @@ export const PORTS = {
   warehouse: base + 5,
   /** A copy of the sites for the accessibility checks (they fill the sites with data). */
   a11y: base + 6,
+  /** An auth.mode oidc server with the Claude connector on (mcp.enabled), path mode on 127.0.0.1. */
+  mcp: base + 7,
+  /** The mock IdP of the connector server (issuer http://localhost:<port>). */
+  mcpIdP: base + 8,
 };
 
 /** Hub URLs. */

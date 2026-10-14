@@ -29,6 +29,7 @@ deploys straight to Cloudflare in a couple of minutes.
 - [What `setup` does](#what-setup-does)
 - [Your own domain](#your-own-domain)
 - [Company login (Cloudflare Access)](#company-login-cloudflare-access)
+- [Use Backyard in Claude](#use-backyard-in-claude)
 - [Command reference](#command-reference)
 - [Credentials and permissions](#credentials-and-permissions)
 - [State file](#state-file)
@@ -325,15 +326,22 @@ reaches it through `workers.dev` (it answers `401` there). User names and groups
 Access' `get-identity` endpoint, and `ADMIN_GROUPS` can name IdP groups.
 
 The deploy gateway (`/__backyard/api/deploy` and `/__backyard/api/deploy/*`), token minting
-(`/__backyard/api/tokens`, for `backyard token create`) and the health checks
-(`/__backyard/healthz`, `/__backyard/readyz`) must **bypass** Access. The CLI authenticates there
+(`/__backyard/api/tokens`, for `backyard token create`), the health checks
+(`/__backyard/healthz`, `/__backyard/readyz`) and the machine paths of the
+[Claude connector](#use-backyard-in-claude) (`/__backyard/mcp`, `/__backyard/oauth/*`,
+`/.well-known/oauth-authorization-server` and
+`/.well-known/oauth-protected-resource/__backyard/mcp`, which answer `404` until
+`MCP_ENABLED` is on) must **bypass** Access. The CLI authenticates there
 with bearer tokens (`DEPLOY_TOKEN`, or API tokens minted in the browser by `backyard login`), and
 upload URLs are signed. A token minted with an API token never expires later than that token: a
 token cannot renew itself, so chaining tokens never keeps access past the lifetime of the token
 that `backyard login` minted through Access. The hub's own requests to these paths carry the
 `CF_Authorization` cookie, whose Access JWT the Worker verifies itself; if a browser sends
 cookies of two different users (in host mode a site's page could plant its author's), the
-Worker refuses the request (`401`) instead of picking one. Everything else stays behind Access.
+Worker refuses the request (`401`) instead of picking one. The connector's paths accept only
+the connector's own tokens and never read cookies or Access headers. Everything else stays
+behind Access, `/__backyard/auth/authorize` (the connector's sign-in) included, and so does
+`/.well-known` on site hosts: the bypass names the hub host only.
 
 `backyard login` opens `/__backyard/auth/cli` in the browser. As on the Go server, a request
 for it that another site may have started (`Sec-Fetch-Site` other than `none` or `same-origin`,
@@ -353,7 +361,7 @@ backyard cloudflare access enable --allow-email-domain acme.com
 
 Access needs two self-hosted applications: **Backyard (&lt;worker&gt;)** for people, with an
 allow policy (who may sign in: `--allow-email`, `--allow-email-domain`, both repeatable), and
-**Backyard (&lt;worker&gt;) machine endpoints** with a Bypass policy for the five paths above.
+**Backyard (&lt;worker&gt;) machine endpoints** with a Bypass policy for the nine paths above.
 `access enable` creates them with an API token, or guides you through the dashboard; either
 way it verifies the result itself, so nothing has to be copied by hand.
 
@@ -397,6 +405,10 @@ Cloudflare Access needs two self-hosted applications
                         backyard.acme.com/__backyard/api/tokens
                         backyard.acme.com/__backyard/healthz
                         backyard.acme.com/__backyard/readyz
+                        backyard.acme.com/__backyard/mcp
+                        backyard.acme.com/__backyard/oauth/*
+                        backyard.acme.com/.well-known/oauth-authorization-server
+                        backyard.acme.com/.well-known/oauth-protected-resource/__backyard/mcp
      Policy:            Bypass · Include · Everyone
 ```
 
@@ -413,9 +425,10 @@ Applications you already have (made in the dashboard or by other tooling) are us
 
 1. **Edge verification**, before the Worker changes: the team's signing keys are published,
    `https://<host>/` redirects to the Access login of the expected team and application (in
-   host mode a site host too), and each of the five machine endpoints reaches the Worker. Any
-   failure ends with exit 4 and a precise message (for example "the bypass application is
-   missing backyard.acme.com/__backyard/api/tokens"), and the Worker is unchanged. Re-run
+   host mode a site host too), and each of the nine paths reaches the Worker (the four of the
+   Claude connector whether or not `MCP_ENABLED` is on). Any failure ends with exit 4 and a
+   precise message (for example "the bypass application is missing
+   backyard.acme.com/__backyard/api/tokens"), and the Worker is unchanged. Re-run
    `access enable` once it is fixed.
 2. It deploys with `AUTH_MODE=access`, `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`.
 3. **Post-checks:** `/__backyard/api/deploy/info` reports Access, `workers.dev` answers `401`,
@@ -474,6 +487,49 @@ it, it deletes the hub application, the bypass application, the allow policy and
 policy, only objects this tool created and recorded, and needs `BACKYARD_CF_API_TOKEN`; a later
 `access disable --delete-apps` also deletes what an earlier `access disable` left. Applications
 made in the dashboard are deleted there. Answering no changes nothing (exit 3).
+
+## Use Backyard in Claude
+
+The Claude connector turns the hub into a remote MCP server for Claude (claude.ai, Desktop,
+mobile, Cowork, Claude Code): people add `https://<hub>/__backyard/mcp` as a custom connector,
+sign in, approve Backyard's consent page, and Claude lists, reads and publishes sites as them.
+It is off until you turn it on:
+
+```sh
+backyard cloudflare setup --var MCP_ENABLED:true
+# npx backyard-cloudflare@latest setup --var MCP_ENABLED:true
+# npm run setup -- --var MCP_ENABLED:true        (in deploy/cloudflare of a checkout)
+```
+
+With the [Terraform module](#with-terraform-optional-infrastructure-as-code), set
+`mcp_enabled = true`: `MCP_ENABLED` then appears in its `worker_vars` and `setup_args` outputs.
+
+- **Publishing from Claude needs a sign-in.** With `AUTH_MODE=access` the consent page shows the
+  person Access signed in, and Claude publishes as them. With `AUTH_MODE=none` the connector is
+  the browser's anonymous guest: it can read sites, and publish only with
+  `ALLOW_ANONYMOUS_DEPLOY=true` (which lets anyone publish). `DEPLOY_TOKEN` plays no part in
+  the connector, and API tokens are not accepted by it.
+- **Access.** After upgrading, re-run `backyard cloudflare access enable` (or `terraform apply`)
+  once, so the bypass application holds all nine paths; `backyard cloudflare status` reports
+  `access-connector` until it does. `/__backyard/auth/authorize` stays behind Access: that login
+  is the connector's sign-in, with Okta or any other identity provider of Access.
+- **The URL** is shown on the hub's card "Use Backyard in Claude" (and as `mcp_url` in
+  `/__backyard/api/info`). The hub URL must be https: `workers.dev` and custom domains are.
+- **Limits.** One `backyard_publish` call carries at most 2 MiB of file content
+  (`LIMITS.mcp_publish_bytes`); a bigger site goes over several calls, one after another, and big
+  media go through the hub's drag-and-drop deploy or `backyard deploy`. Tool calls count against
+  `LIMITS.mcp_calls_per_day` (5000 per user) and publishes against `deploys_per_day`. Each
+  publish switches the site in one transaction, so parallel calls never lose each other's files.
+  On Workers Free, a publish near the cap uses noticeable CPU time; lower
+  `mcp_publish_bytes` if such calls fail.
+- **Connections** last `TOKEN_TTL_HOURS` (720 by default) from the consent. People disconnect on
+  the hub card; admins can disconnect a person there. Rotating `BACKYARD_SECRET` ends every
+  connection.
+- **Which apps.** `MCP_CLIENTS` and `MCP_REDIRECT_URIS` default to Claude's exact addresses; see
+  the [configuration reference](#configuration-reference).
+
+Adding the connector in Claude, the consent page, the tools and troubleshooting:
+[docs/claude-connector.md](../../docs/claude-connector.md).
 
 ## Command reference
 
@@ -553,8 +609,10 @@ without state it shows the live configuration.
 
 Its checks, each `ok`, `pending` or `failed` with a detail: `worker`, `workers-dev`, `hub`,
 `custom-domain`, `route`, `dns`, `tls`, `access-redirect`, `access-bypass`,
-`workers-dev-closed` and `deploy-token` (only when this machine knows the token). Only the
-checks that apply are listed.
+`access-connector` (the Claude connector's four bypass paths: `pending` while they are missing
+and the connector is off, `failed` once `MCP_ENABLED` is on), `workers-dev-closed` and
+`deploy-token` (only when this machine knows the token). Only the checks that apply are
+listed.
 
 Exit codes, the same for every command and for the Go CLI:
 
@@ -691,6 +749,8 @@ backyard cloudflare setup --var 'LIMITS:{"ai_per_day":50,"max_sites":100}'
 | `ws_rooms_per_conn` / `ws_subs_per_conn` | 50 / 100 | Rooms joined and database subscriptions per connection. |
 | `ws_messages_per_second` / `ws_message_burst` | 60 / 120 | Token bucket for client frames. |
 | `ws_max_message_bytes` / `ws_max_presence_bytes` | 64 KiB / 8 KiB | Frame and presence-state size. |
+| `mcp_publish_bytes` | 2 MiB | File content (decoded) per `backyard_publish` call of the [Claude connector](#use-backyard-in-claude). Its request bodies may be 2 × this + 1 MiB. |
+| `mcp_calls_per_day` | 5000 | Claude connector tool calls per user per day. Only `tools/call` requests that name a tool count (also when its arguments are invalid); `ping`, `tools/list` and other methods are free. |
 
 ## URL modes
 
@@ -790,6 +850,9 @@ the next `setup`; and don't deploy with a plain `wrangler deploy`, which would d
 | `FILE_INLINE_MAX` | `5242880` | Files above this size go to R2 when bound (max 25 MiB). |
 | `TOKEN_TTL_HOURS` | `720` | Longest lifetime of an API token. |
 | `AI_*`, `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL` | — | See [AI](#ai). |
+| `MCP_ENABLED` | `false` | `true` serves the [Claude connector](#use-backyard-in-claude) at `<hub>/__backyard/mcp` (needs an https hub URL). Unset or false: every connector path answers `404`. |
+| `MCP_CLIENTS` | Claude's two client metadata URLs | Client ID Metadata Document URLs that may connect (comma-separated, compared exactly; only these are fetched). Set but empty (`--var MCP_CLIENTS:,`) turns this off, so apps register automatically; `--var MCP_CLIENTS:` drops the override. |
+| `MCP_REDIRECT_URIS` | `https://claude.ai/api/mcp/auth_callback`, `https://claude.com/api/mcp/auth_callback` | Exact https addresses that may receive sign-in codes (comma-separated). http loopback addresses are always allowed. |
 | `WAREHOUSE_URL` | — | Optional: proxy `/warehouse/*` to a Backyard Go server's site API (secret `WAREHOUSE_TOKEN`). Its query errors (400/403/404/429/501) pass through; other failures answer `502`/`504 upstream_error` with a generic message naming the request id (details in the Worker log). |
 
 | Secret | Meaning |
@@ -799,7 +862,8 @@ the next `setup`; and don't deploy with a plain `wrangler deploy`, which would d
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | Optional AI providers. |
 
 Configuration problems (bad JSON, unknown `LIMITS` keys, missing Access settings, a variable of
-the wrong JSON type) are logged. Watch them with `npx wrangler tail <worker>`. Variables
+the wrong JSON type) are logged. Invalid `MCP_*` values turn only the Claude connector off and
+are listed by `/__backyard/readyz`. Watch them with `npx wrangler tail <worker>`. Variables
 written as JSON values (`"FILE_INLINE_MAX": 1000`, `"LIMITS": {…}`) are taken like their text.
 
 ## With Terraform (optional, infrastructure as code)
@@ -991,6 +1055,7 @@ npx needs the `./` (or `--package <path>`): `npx /absolute/path.tgz` does not wo
 | Uploads | Buffered by the server | Streamed: the site's Durable Object parses the multipart body and writes the file to SQLite or, above `FILE_INLINE_MAX`, to R2 in 10 MiB parts, so neither memory nor the Worker's CPU limit caps uploads below the file limits. |
 | Hub UI, SDK, docs | Embedded in the binary | Bundled into the Worker at build time from `web/` and `skills/` (prebuilt in the npm package). Redeploy to update. |
 | Site owners endpoint | Supported | Supported when `OWNERSHIP=owner`, otherwise `501`. |
+| Claude connector | `mcp.enabled`; 4 MiB per publish call (`mcp.max_publish_bytes`); per-minute rate limits; publishes of one site serialized by a lease | `MCP_ENABLED`; 2 MiB per publish call (`LIMITS.mcp_publish_bytes`); `mcp_calls_per_day`; each publish is one transaction of the site's Durable Object. Same tools, sign-in flow and wire format. |
 
 Everything a site or agent uses behaves the same on both editions: the `backyard.js` SDK and its
 preamble, `/__backyard/api/*` (CSRF rule, error envelope, flattened documents, the full query
@@ -1023,7 +1088,10 @@ other), `/llms.txt` and `/docs`.
 | "could not read the live configuration … so this deploy cannot be checked" | The credential cannot read the Worker's settings (a scoped token needs Account · Workers Scripts · Read, and `CLOUDFLARE_ACCOUNT_ID`). Fix the credential, or confirm with `--confirm-auth-change`. |
 | `domain add --host-mode` exits 4 and sites stay on `/s/<site>/` | The wildcard record does not resolve yet: add the printed `AAAA` record (proxied), or re-run with `BACKYARD_CF_API_TOKEN`. Resolvers may cache the old answer for a few minutes; re-run. |
 | "the certificate does not cover *.&lt;host&gt; yet" | Below the zone apex the sites need an Advanced Certificate (see [Your own domain](#your-own-domain)); at the apex Universal SSL can take a few minutes. |
-| `access enable` exits 4: "the bypass application is missing …" | The machine endpoints application lacks that path: add it in the dashboard, then re-run `access enable`. |
+| `access enable` exits 4: "the bypass application is missing …" | The machine endpoints application lacks that path: add it in the dashboard, then re-run `access enable`. After an upgrade an application made in the dashboard lacks the Claude connector's four paths: add them (the guided steps list all nine). |
+| `status`: `access-connector` pending or failed | The bypass application lacks the Claude connector's paths: re-run `access enable` (or `terraform apply` of the module). |
+| Claude cannot connect: `https://<hub>/__backyard/mcp` answers `404` | `MCP_ENABLED` is not on, the hub URL is not https, or an `MCP_*` value is invalid (`/__backyard/readyz` names it). See [Use Backyard in Claude](#use-backyard-in-claude). |
+| `backyard_publish` answers "… can only read" | `AUTH_MODE=none` without `ALLOW_ANONYMOUS_DEPLOY`: turn on Access (or allow anonymous deploys). `DEPLOY_TOKEN` does not help here. |
 | "Access in front of … belongs to team …" or an AUD mismatch | Another Access application covers the host: pass its `--team`/`--aud`, or fix the applications. |
 | "Zero Trust is not set up on this account" | Open <https://one.dash.cloudflare.com/> once, pick a team name and the Free plan, then re-run. |
 | "… is set with --var (e.g. by the Terraform module)" | Those variables are externally managed. Drop them with `setup --var BASE_DOMAIN: --var URL_MODE:` (or the `AUTH_MODE`/`ACCESS_*` keys), or keep managing them with Terraform. |

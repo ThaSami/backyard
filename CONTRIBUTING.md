@@ -337,7 +337,9 @@ with the release candidate's package (`make cloudflare-pack`, then
    guided wildcard DNS record and its detection, the certificate probe, and sites served with
    `URL_MODE=host`.
 4. `access enable`: in API mode (`BACKYARD_CF_API_TOKEN`) Cloudflare accepts the applications and
-   policies, all five machine endpoints bypass Access (including `/__backyard/api/deploy/*`) and
+   policies, all nine bypass paths (the five machine endpoints and the Claude connector's four)
+   bypass Access in one application (check the per-application destination limit; including
+   `/__backyard/api/deploy/*`, and `/__backyard/oauth/*` matching `/__backyard/oauth/token`) and
    the default one-time PIN login works; in guided mode the Access redirect carries the
    application's AUD.
 5. `access disable --delete-apps` deletes what `access enable` created.
@@ -347,3 +349,9 @@ with the release candidate's package (`make cloudflare-pack`, then
    `BACKYARD_CF_CONFIRM_AUTH_CHANGE=true` (in `cloudflare-deploy.yml`: a manual run with the
    `confirm_auth_change` input checked; a push deploy never skips the guard).
 8. The release's `npm publish --provenance` succeeds.
+9. The Claude connector (`setup --var MCP_ENABLED:true`, docs/claude-connector.md): `status`
+   reports `access-connector` pending before `MCP_ENABLED` and ok after; behind Access (with
+   Okta as identity provider) authorize → Access login → consent → claude.ai works and the
+   consent `POST` passes Access; on Workers Free, `backyard_publish` calls of 256 KiB, 1 MiB and
+   2 MiB (text and base64) stay within the CPU limit (no error 1102, else lower
+   `LIMITS.mcp_publish_bytes`); `/__backyard/readyz` names an invalid `MCP_CLIENTS`.

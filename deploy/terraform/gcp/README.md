@@ -46,7 +46,7 @@ What it creates:
                     │   ├─ /__backyard/api/deploy/info ─────────────────┤
                     │   ├─ /__backyard/api/deploy/uploads/* ────────────┤  backend "deploy"
                     │   ├─ /__backyard/api/deploy/* + Authorization ────┤  (no IAP; Backyard
-                    │   │                                                │   checks bearer tokens)
+                    │   ├─ Claude connector machine paths ──────────────┤   checks bearer tokens)
                     │   └─ everything else ─▶ backend "app" ─── IAP ────┤
                     │                         (Google sign-in, IAM:      │
                     │                          iap.httpsResourceAccessor)│
@@ -181,6 +181,14 @@ Backyard API tokens:
 The site APIs (`backyard.db`, `ai`, websockets and so on) always go through IAP:
 they are meant for browsers.
 
+**Claude connector.** The [Claude connector](#claude-connector)'s four machine paths —
+`/__backyard/mcp`, `/__backyard/oauth/*`, `/.well-known/oauth-authorization-server` and
+`/.well-known/oauth-protected-resource/__backyard/mcp` — also go to the deploy backend, with or
+without an `Authorization` header (Claude's first call and the OAuth calls carry none), and with
+the IAP headers stripped. Backyard checks its own tokens there and answers `404` until the
+connector is on. `/__backyard/auth/authorize` stays behind IAP: the IAP login is the connector's
+sign-in.
+
 **No IAP bypass via Cloud Run.** The service accepts traffic only from the load
 balancer (`INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER`) and its `run.app` URL is
 disabled (`disable_default_url`). The invoker IAM check is turned off because the
@@ -209,7 +217,7 @@ source IPs. Deploys still need a token (`static_tokens`).
     Secret Manager-backed variables at startup.
 
   To add sections the module does not generate (`identity`, `sites`, `files`,
-  `ratelimit`, `realtime`), use `extra_config_yaml`; it is appended verbatim and
+  `ratelimit`, `realtime`, `mcp`), use `extra_config_yaml`; it is appended verbatim and
   its `${ENV}` references are expanded at startup. Mount additional secrets with
   `extra_secret_env`. Everything the module renders itself is escaped, so a
   literal `${…}` in, say, a named query or the display name stays literal.
@@ -282,6 +290,31 @@ source IPs. Deploys still need a token (`static_tokens`).
 - **Path mode.** `url_mode = "path"` serves sites at `https://<domain>/s/<site>/`
   with a single, non-wildcard certificate and DNS record. All sites then share one
   origin.
+
+## Claude connector
+
+The [Claude connector](../../../docs/claude-connector.md) lets people publish sites from Claude
+with their Google (IAP) or OIDC sign-in. Turn it on with:
+
+```hcl
+extra_config_yaml = <<-EOT
+  mcp:
+    enabled: true
+EOT
+```
+
+The connector URL is `https://<domain>/__backyard/mcp`.
+
+- **`auth_mode = "iap"`**: the URL map routes the four machine paths to the deploy backend
+  without IAP (see [IAP notes](#iap-notes)). The routes exist whether or not the connector is on;
+  after upgrading the module, run `terraform apply`.
+- **`auth_mode = "oidc"`**: nothing else to do; the IdP application stays as it is.
+- **Cloud Armor**: hosted Claude calls the hub from `160.79.104.0/21` (IPv4). If
+  `security_policy` restricts source addresses, admit that range for the four machine paths.
+- **Egress**: Backyard fetches Claude's client metadata from `https://claude.ai` at the first
+  connect. Without outbound internet access from Cloud Run, add `clients: []` to the `mcp`
+  section.
+- **Size**: publish calls carry up to 9 MiB, well below Cloud Run's 32 MiB request limit.
 
 ## Costs
 

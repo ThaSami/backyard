@@ -12,8 +12,10 @@ import (
 const maxStateBytes = 1024
 
 // Handler implements Authenticator. It serves /__backyard/auth/cli and
-// /login in every mode and, in oidc mode, /callback (or the path of
-// auth.oidc.redirect_url) and /logout. Everything else is 404.
+// /login in every mode, /authorize (the MCP connector's authorization
+// endpoint; a 404 page while mcp.enabled is false) and, in oidc mode,
+// /callback (or the path of auth.oidc.redirect_url) and /logout. Everything
+// else is 404.
 func (a *authenticator) Handler() http.Handler {
 	return http.HandlerFunc(a.serveAuth)
 }
@@ -46,6 +48,8 @@ func (a *authenticator) serveAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.oidc.callback(w, r)
+	case p == AuthorizePath:
+		a.serveAuthorize(w, r)
 	case a.oidc != nil && p == LogoutPath:
 		if !allowMethods(w, r, http.MethodGet, http.MethodPost) {
 			return

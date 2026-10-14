@@ -43,7 +43,9 @@ its visitor everywhere on the platform. Host mode is strongly recommended.
 
 - **Authentication on every request.** Pages, uploads, APIs, websockets and the hub all go
   through the authenticator; only `/__backyard/healthz`, `/__backyard/readyz`, the SDK files,
-  `/__backyard/auth/*`, `/__backyard/api/info` and the gateway's signed upload URLs are public.
+  `/__backyard/auth/*`, `/__backyard/api/info` and the gateway's signed upload URLs are public,
+  plus — when the [Claude connector](#the-claude-connector) is on — its MCP endpoint and OAuth
+  endpoints, which check their own tokens.
 - **CSRF.** Every state-changing API request must carry `X-Backyard: 1`, and an `Origin`
   header, when present, must be the request's own origin (path mode: the hub's). Browsers cannot
   add custom headers to cross-site forms, and cross-origin `fetch` with a custom header needs a
@@ -118,8 +120,10 @@ tests.
 - **`server.secret`** (≥ 32 characters) is the root of every key. Each use derives its own
   32-byte key with HKDF-SHA256 (salt `backyard`, info `backyard/session/v1`,
   `backyard/oauth-state/v1`, `backyard/api-token/v1`, `backyard/deploy/v1`,
-  `backyard/upload/v1`, `backyard/anon/v1`, `backyard/cli-confirm/v1`), so a key for one purpose
-  can never forge another.
+  `backyard/upload/v1`, `backyard/anon/v1`, `backyard/cli-confirm/v1`, and for the
+  [Claude connector](#the-claude-connector) `backyard/mcp-client/v1`,
+  `backyard/mcp-consent/v1`, `backyard/mcp-code/v1`, `backyard/mcp-refresh/v1` and
+  `backyard/mcp-access/v1`), so a key for one purpose can never forge another.
   Store it in a secret manager; never in the config file.
 - **API tokens** are HS256 JWTs (issuer `backyard`, scope `api`) with the user's identity, valid
   for `auth.token_ttl` (720 h by default, also the maximum). Guests and static tokens cannot
@@ -135,7 +139,8 @@ tests.
   checks (`client_id`, `device_client_id`, `api_audiences`).
 - **Rotation.** Tokens are stateless, so revocation is global: rotating `server.secret` signs
   everyone out and invalidates every API token, deploy id and upload URL at once (also on the
-  Lambda gateway, which must share the secret). Keep automation tokens short-lived.
+  Lambda gateway, which must share the secret), and every connector connection. Keep automation
+  tokens short-lived.
 - Provider keys (AI, warehouse, storage) live only on the server; pages never see them.
 
 ## Rate limits and quotas
@@ -212,7 +217,12 @@ A site is written by whoever deployed it, so its files are untrusted on your mac
 
 ## Outbound requests (SSRF)
 
-Backyard fetches remote content in one place on behalf of users: image URLs in AI chat
+Backyard fetches remote content in two places. The [Claude connector](#the-claude-connector)
+fetches client metadata documents, but only the exact URLs an admin listed in `mcp.clients`
+(by default Claude's two documents), never a URL a request names: https only, no redirects, 5 s,
+at most 5 KiB (on the Go server through the same public-address guard as below), with failures
+throttled per URL.
+The other is on behalf of users: image URLs in AI chat
 messages, for providers that need bytes. That fetcher only allows http(s), refuses loopback,
 private, link-local, multicast and other non-public addresses **on the dialled IP** (so DNS
 rebinding cannot bypass it), caps each image at 20 MiB and each request at 64 MiB, and never
@@ -222,6 +232,70 @@ site-relative or on the site's own origin) is never fetched: the server reads th
 storage, and only from the requesting site's uploads — another site's file, an unknown file or
 any other site-relative URL is rejected (`400`). Its type is detected from the bytes (png,
 jpeg, gif or webp), and it counts against the same 20 MiB and 64 MiB limits.
+
+## The Claude connector
+
+With `mcp.enabled` (Cloudflare: `MCP_ENABLED`), Backyard is an OAuth 2.1 authorization server
+for its own MCP endpoint `/__backyard/mcp` ([SPEC §8.4](spec/SPEC.md#84-remote-mcp-connector-oauth-21-authorization-server),
+[setup](claude-connector.md)). It is off by default, so an upgrade adds no public endpoints.
+What it defends against, and how:
+
+- **Consent phishing and request forwarding.** Anyone can send a colleague an authorization link
+  that would connect *their* app. Backyard therefore shows its consent page on every
+  authorization (never remembered or auto-approved), naming the signed-in person, the app (and
+  whether its identity was verified), the exact host the approval goes to, what the app can do
+  and until when, with an explicit warning against links from others; every consent is audited
+  (`mcp.authorize`). The page cannot be framed (`frame-ancestors 'none'`, `X-Frame-Options:
+  DENY`), its buttons arm after 0.8 s (double-click hijacking), its form may only post to the
+  hub or the redirect origin, and the approval must be a same-origin top-level navigation with a
+  CSRF token bound to the user and, with `oidc`, to the session. This is a residual risk of
+  every hosted OAuth client: the mitigations make it visible, not impossible.
+- **Who may connect.** Apps identified by a metadata document (CIMD) are accepted only from the
+  exact URLs of `mcp.clients`; nothing else is fetched, so there is no SSRF surface and no
+  probing oracle. Self-registration (DCR) is stateless — the client id is HMAC-signed with
+  `backyard/mcp-client/v1` and nothing is stored — and its name is shown as unverified.
+- **Where codes go.** Only to an exact `mcp.redirect_uris` entry (default: Claude's two callback
+  URLs, never a whole host) or an http loopback address of the user's own machine; anything else
+  fails before a redirect happens, and redirect addresses on the hub or a site are rejected by
+  configuration validation.
+- **Codes and tokens.** PKCE with `S256` is required (`plain` and no challenge are refused).
+  Codes live 5 minutes and work once: a second valid redemption deletes the connection
+  (`mcp.code_replay`), but only after PKCE verified, so someone without the verifier cannot
+  revoke it. Refresh tokens rotate on every use; reusing an old one deletes the connection
+  (`mcp.refresh_reuse`), except within 60 s while its successor is unused (a client's lost
+  answer or parallel refresh). Access tokens live 1 hour. All values are opaque and HMAC-signed
+  with their own labels; logs, audit records and tool results never contain them.
+- **Audience isolation.** `/__backyard/mcp` accepts only the connector's access tokens issued for
+  this hub's MCP URL, and the connector's tokens are accepted nowhere else; API tokens, static
+  tokens, `DEPLOY_TOKEN`, IdP JWTs, proxy assertions and cookies are refused there. The machine
+  paths never read or set cookies and never read identity headers, so exempting them from a
+  proxy cannot let anyone assume an identity.
+- **Immediate revocation.** Every request looks the connection up (no cache), so a disconnect on
+  the hub card, through the grants API or RFC 7009 revocation takes effect at once. The Go server
+  also re-applies `allowed_domains`, `allowed_emails` and `allowed_groups` and recomputes admin
+  rights on every call, and deletes a connection that no longer passes.
+- **Offboarding lag.** On the Cloudflare edition, and on the Go server when no gate covers the
+  change, a person removed only at the IdP or the proxy keeps working connections until they
+  expire — at most `auth.token_ttl` (`TOKEN_TTL_HOURS`; 30 days by default) after consent, never
+  extended — unless an admin disconnects them ("Disconnect a person" on the hub, or
+  `DELETE /__backyard/api/mcp/grants?user=<id>`). That is the posture of CLI API tokens, plus a
+  revocation lever.
+- **Publishing.** `backyard_publish` follows the rules of every deploy (ownership, reserved
+  names, path rules, size limits, `deploys_per_hour`, audit with `via=mcp`) and refuses to change
+  a site someone else published last without an explicit `overwrite`. In mode `none` the
+  connector is a guest and publishes only with anonymous deploys allowed.
+- **Path mode.** In path mode the hub and every site share one origin, so a site's page can
+  drive the hub as its visitor — the consent page included, as it can already mint the visitor
+  an API token. Host mode keeps sites off the hub's origin (see
+  [host mode vs path mode](#host-mode-vs-path-mode)).
+
+Deliberate deviations from the standards (the full list is in SPEC §8.4.11): a plain-http
+issuer only on loopback hosts; the loopback redirect port is ignored for `localhost` too; a
+missing `MCP-Protocol-Version` means `2025-06-18`; the 60 s refresh grace; revocation answers
+`200` even for other clients' tokens (no oracle); CIMD only for allowlisted URLs; unknown scopes
+are ignored; the upstream login happens before the consent page (it creates only Backyard's own
+session, never a grant); `redirect_uri` is optional at the token endpoint (OAuth 2.1); a
+missing `code_challenge_method` is refused.
 
 ## Error messages
 
@@ -268,3 +342,7 @@ and the acting user and client IP; see [operations](operations.md#logs-and-audit
 - [ ] Metrics on a private `telemetry.metrics_listen`, not the public hub.
 - [ ] TLS everywhere (`server.public_url` with `https://` makes cookies `Secure`).
 - [ ] Backups of the database and the bucket (see [operations](operations.md#backups)).
+- [ ] The Claude connector (`mcp.enabled`) only with a sign-in (`oidc`, `iap`, `alb`, `header`;
+      Cloudflare Access), its four machine paths exempt from the proxy and
+      `/__backyard/auth/authorize` behind it, and `mcp.clients` / `mcp.redirect_uris` left at
+      Claude's exact defaults unless you add a client you trust.

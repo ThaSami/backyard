@@ -427,7 +427,9 @@ func gatewayErr(err error, sess *clientconfig.Session) error {
 	return err
 }
 
-func validSite(site string) error {
+// ValidSite checks a site name a tool was given (the DNS-label rule; the
+// reserved list is the server's to apply).
+func ValidSite(site string) error {
 	if err := sites.ValidateName(strings.TrimSpace(site), nil); err != nil {
 		return fmt.Errorf("invalid site name: %w", err)
 	}
@@ -582,7 +584,7 @@ func (s *server) deploy(ctx context.Context, _ *mcp.CallToolRequest, in DeployIn
 		}
 		site = clientconfig.SiteNameFromDir(base)
 	}
-	if err := validSite(site); err != nil {
+	if err := ValidSite(site); err != nil {
 		return nil, DeployOutput{}, fmt.Errorf("%w; pass a valid \"site\"", err)
 	}
 	if cfg, err := s.configPublished(dir, ignore); err != nil {
@@ -696,7 +698,7 @@ func (s *server) listSites(ctx context.Context, _ *mcp.CallToolRequest, in ListS
 }
 
 func (s *server) siteFiles(ctx context.Context, _ *mcp.CallToolRequest, in SiteInput) (*mcp.CallToolResult, SiteFilesOutput, error) {
-	if err := validSite(in.Site); err != nil {
+	if err := ValidSite(in.Site); err != nil {
 		return nil, SiteFilesOutput{}, err
 	}
 	sess, err := s.session(ctx)
@@ -726,14 +728,14 @@ func (s *server) siteFiles(ctx context.Context, _ *mcp.CallToolRequest, in SiteI
 }
 
 func (s *server) readSiteFile(ctx context.Context, _ *mcp.CallToolRequest, in ReadFileInput) (*mcp.CallToolResult, any, error) {
-	if err := validSite(in.Site); err != nil {
+	if err := ValidSite(in.Site); err != nil {
 		return nil, nil, err
 	}
 	p := strings.TrimPrefix(strings.TrimSpace(in.Path), "/")
 	if why := deploy.ValidatePath(p); why != "" {
 		return nil, nil, fmt.Errorf("invalid path %q: %s", in.Path, why)
 	}
-	if binaryExt(p) {
+	if BinaryExt(p) {
 		return nil, nil, fmt.Errorf("%s is a binary file type; only text files can be read (link to it by URL instead)", p)
 	}
 	sess, err := s.session(ctx)
@@ -790,7 +792,7 @@ func (s *server) openURL(ctx context.Context, _ *mcp.CallToolRequest, in OpenURL
 	if site == "" {
 		u = clientconfig.HubURL(info, sess.Server)
 	} else {
-		if err := validSite(site); err != nil {
+		if err := ValidSite(site); err != nil {
 			return nil, URLOutput{}, err
 		}
 		u = clientconfig.SiteURL(info, sess.Server, site)

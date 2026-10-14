@@ -37,7 +37,8 @@ security review. Backyard removes all of that:
 - **Saying no is a feature.** No server code, no cron, no custom backends — a small, fixed set
   of capabilities that a platform team can secure once.
 - **Agents can do it all.** Coding agents get the docs, a skill, an MCP server and templates,
-  so "build me a lunch-vote page" ends with a URL.
+  so "build me a lunch-vote page" ends with a URL — and with the Claude connector, so does a
+  chat in Claude.
 
 ## Features
 
@@ -51,6 +52,11 @@ security review. Backyard removes all of that:
 - **Sign-in**: Okta / any OIDC provider, Google IAP, AWS ALB, trusted proxy headers (oauth2-proxy,
   Pomerium, Azure Easy Auth, Cloudflare Access), or none for labs; API tokens, static CI tokens
   and the OAuth device flow for CLIs.
+- **Claude connector** (opt-in, both editions): add `https://<hub>/__backyard/mcp` to Claude
+  (web, Desktop, mobile, Cowork, Claude Code) as a custom connector; people sign in with the
+  company login, approve Backyard's consent page, and Claude finds, reads and publishes sites as
+  them. Backyard is the OAuth server; your IdP needs no change
+  ([guide](docs/claude-connector.md)).
 - **Deploy any way**: Backyard's diffed upload API (no cloud account needed), `aws s3 sync`,
   `gcloud storage rsync`, `az storage blob sync` or plain `rsync`.
 - **Pluggable everything**: storage (disk, S3, GCS, Azure Blob), database (SQLite, PostgreSQL,
@@ -204,6 +210,8 @@ Guides: [storage and databases](docs/storage-and-databases.md), [AI providers](d
 
 - **MCP server** — `backyard mcp` (e.g. `claude mcp add backyard -- backyard mcp`): tools to read
   the docs, scaffold, deploy, list sites and read other sites' code, with the CLI's login.
+- **Claude connector** — the hub as a remote MCP server at `/__backyard/mcp`, with the company
+  sign-in and no CLI: [docs/claude-connector.md](docs/claude-connector.md).
 - **Init templates** — `backyard init --agents claude,codex,cursor,copilot` writes `CLAUDE.md`,
   `AGENTS.md`, `.cursor/rules/backyard.mdc` and `.github/copilot-instructions.md`.
 - **`/llms.txt`, `/llms-full.txt`, `/docs`** on every hub.

@@ -54,6 +54,15 @@ const N = accessNames("backyard");
 const ENABLE = ["access", "enable", "--allow-email-domain", "acme.com", "--wait", "0"];
 const WITH_ADMIN = { BACKYARD_CF_API_TOKEN: ADMIN };
 
+/** The paths the Claude connector probes and what a Worker answers there with MCP_ENABLED off (SPEC §8.4). */
+const CONNECTOR_OFF = {
+  "/__backyard/mcp": 404,
+  "/__backyard/oauth/token": 404,
+  "/.well-known/oauth-authorization-server": 404,
+  "/.well-known/oauth-protected-resource/__backyard/mcp": 404,
+};
+const CONNECTOR_RULES = ["/__backyard/mcp", "/__backyard/oauth/*", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource/__backyard/mcp"];
+
 const deployOf = (calls) => calls.find((c) => c.args[0] === "deploy");
 const writesOf = (reqs) => reqs.filter((x) => x.method !== "GET");
 const accessReqs = (reqs) => reqs.filter((x) => x.path.includes("/access/"));
@@ -190,11 +199,13 @@ describe("backyard-cloudflare access enable (API mode)", () => {
     });
     assert.equal(sb.state().accessCreated, undefined);
     if (process.platform !== "win32") assert.equal(sb.stateMode(), "600");
-    // The edge was checked (all five machine paths), and the post-checks ran.
+    // The edge was checked (the machine paths and the Claude connector's four), and the post-checks ran.
     const edge = sb.fake.edgeRequests;
     for (const p of ["/__backyard/healthz", "/__backyard/readyz", "/__backyard/api/deploy/info", "/__backyard/api/deploy/me", "/__backyard/api/tokens"]) {
       assert.ok(edge.some((x) => x.host === HOST && x.path === p), p);
     }
+    for (const [p, status] of Object.entries(CONNECTOR_OFF)) assert.ok(edge.some((x) => x.host === HOST && x.path === p && x.status === status), p);
+    assert.match(r.out, /Cloudflare Access verified: login redirect to acme\.cloudflareaccess\.com, AUD [0-9a-f]{64}, 9 machine paths reach the Worker/);
     assert.ok(edge.some((x) => x.host === TEAM && x.path === "/cdn-cgi/access/certs" && x.status === 200));
     assert.ok(edge.some((x) => x.host === "backyard.acme.workers.dev" && x.path === "/" && x.status === 401), "workers.dev is closed");
     assert.ok(edge.some((x) => x.host === HOST && x.path === "/__backyard/api/deploy/me" && x.status === 200), "the deploy token still works");
@@ -248,6 +259,33 @@ describe("backyard-cloudflare access enable (API mode)", () => {
     assert.match(r.out, /the Access AUD changes from/);
     assert.equal(sb.cf().access.acc1.policies.length, 2);
     assert.equal(sb.cf().access.acc1.apps.length, 2);
+  });
+
+  it("adds the Claude connector's paths to a bypass application of an earlier version with one PUT", async () => {
+    const sb = await accessSandbox();
+    let r = await sb.run(ENABLE, WITH_ADMIN);
+    assert.equal(r.code, 0, r.out);
+    const ids = sb.state().access;
+    // What an earlier version created: the five machine paths only.
+    const old = ACCESS_BYPASS_PATHS.filter((p) => !CONNECTOR_RULES.includes(p));
+    assert.equal(old.length, 5);
+    sb.updateCf((s) => (s.access.acc1.apps.find((a) => a.id === ids.bypassAppId).destinations = old.map((p) => ({ type: "public", uri: HOST + p }))));
+    sb.requests();
+    r = await sb.run(ENABLE, WITH_ADMIN);
+    assert.equal(r.code, 0, r.out);
+    const w = writesOf(sb.requests());
+    assert.deepEqual(w.map((x) => `${x.method} ${x.path}`), [`PUT /accounts/acc1/access/apps/${ids.bypassAppId}`]);
+    assert.deepEqual(w[0].body.destinations.map((d) => d.uri), ACCESS_BYPASS_PATHS.map((p) => HOST + p));
+    assert.equal(w[0].body.domain, `${HOST}/__backyard/api/deploy`, "element 0 stays the domain");
+    assert.match(r.out, /Access application "Backyard \(backyard\) machine endpoints" updated \(destinations\)/);
+    assert.deepEqual(sb.state().access, ids, "the same objects, the same AUD");
+    // With the connector on, its paths answer through the bypass application too.
+    sb.updateCf((s) => (s.workers.backyard.vars.MCP_ENABLED = "true"));
+    sb.fake.edgeRequests.length = 0;
+    r = await sb.run(ENABLE, WITH_ADMIN);
+    assert.equal(r.code, 0, r.out);
+    const on = { "/__backyard/mcp": 401, "/__backyard/oauth/token": 405, "/.well-known/oauth-authorization-server": 200, "/.well-known/oauth-protected-resource/__backyard/mcp": 200 };
+    for (const [p, status] of Object.entries(on)) assert.ok(sb.fake.edgeRequests.some((x) => x.host === HOST && x.path === p && x.status === status), p);
   });
 
   it("keeps what an admin set in the dashboard when it updates a policy or an application", async () => {
@@ -583,6 +621,43 @@ describe("backyard-cloudflare access enable (guided and --team/--aud)", () => {
     assert.match(r.out, /--aud expects the 64-character Application Audience \(AUD\) tag/);
   });
 
+  it("fails the edge check for each Claude connector path the bypass application lacks, before changing the Worker", async () => {
+    const sb = await accessSandbox();
+    // An application made in the dashboard from an earlier version's steps.
+    seedDashboardApps(sb, { omit: CONNECTOR_RULES });
+    let r = await sb.run(["access", "enable", "--team", TEAM, "--aud", DASH_AUD, "--wait", "0"]);
+    assert.equal(r.code, 4, r.out);
+    for (const p of CONNECTOR_RULES) assert.ok(r.out.includes(`  - the bypass application is missing ${HOST}${p}\n`), `${p}\n${r.out}`);
+    assert.ok(!r.out.includes(`missing ${HOST}/__backyard/healthz`), r.out);
+    assert.match(r.out, /so the Worker was not changed/);
+    assert.ok(!deployOf(sb.calls()), "no deploy");
+    assert.equal(liveVars(sb).AUTH_MODE, "none");
+    // Only /__backyard/oauth/* missing: named alone.
+    sb.updateCf((s) => {
+      const app = s.access.acc1.apps.find((a) => a.id === "app-bypass");
+      for (const p of CONNECTOR_RULES.filter((x) => x !== "/__backyard/oauth/*")) app.destinations.push({ type: "public", uri: HOST + p });
+    });
+    r = await sb.run(["access", "enable", "--team", TEAM, "--aud", DASH_AUD, "--wait", "0"]);
+    assert.equal(r.code, 4, r.out);
+    assert.ok(r.out.includes(`the bypass application is missing ${HOST}/__backyard/oauth/*`), r.out);
+    assert.ok(!r.out.includes(`missing ${HOST}/__backyard/mcp`), r.out);
+    // All nine in place, and a Worker from before the connector (its hub page at the
+    // discovery documents, JSON 404s below /__backyard/): it passes.
+    sb.updateCf((s) => {
+      s.access.acc1.apps.find((a) => a.id === "app-bypass").destinations.push({ type: "public", uri: `${HOST}/__backyard/oauth/*` });
+      s.edge = { preConnector: true };
+    });
+    r = await sb.run(["access", "enable", "--team", TEAM, "--aud", DASH_AUD, "--wait", "0"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(liveVars(sb).AUTH_MODE, "access");
+    // Re-verified on the Worker in AUTH_MODE=access (its hub page answers 401 there).
+    sb.fake.edgeRequests.length = 0;
+    r = await sb.run(["access", "enable", "--wait", "0"]);
+    assert.equal(r.code, 0, r.out);
+    assert.ok(sb.fake.edgeRequests.some((x) => x.path === "/.well-known/oauth-authorization-server" && x.status === 401));
+    assert.ok(sb.fake.edgeRequests.some((x) => x.path === "/__backyard/oauth/token" && x.status === 404));
+  });
+
   it("asks who may sign in when it must, and confirms consumer mail domains", async () => {
     const sb = await accessSandbox();
     let r = await sb.run(["access", "enable", "--wait", "0"], WITH_ADMIN);
@@ -783,7 +858,18 @@ describe("scripts/lib/access-plan.mjs and the access helpers", () => {
     const text = readFileSync(new URL("../../scripts/lib/access-plan.mjs", import.meta.url), "utf8");
     const m = /export const ACCESS_BYPASS_PATHS = \[(.*?)\];/s.exec(text);
     assert.ok(m);
-    assert.deepEqual(JSON.parse(`[${m[1]}]`), ["/__backyard/api/deploy", "/__backyard/api/deploy/*", "/__backyard/api/tokens", "/__backyard/healthz", "/__backyard/readyz"]);
+    assert.deepEqual(JSON.parse(`[${m[1]}]`), [
+      "/__backyard/api/deploy",
+      "/__backyard/api/deploy/*",
+      "/__backyard/api/tokens",
+      "/__backyard/healthz",
+      "/__backyard/readyz",
+      "/__backyard/mcp",
+      "/__backyard/oauth/*",
+      "/.well-known/oauth-authorization-server",
+      "/.well-known/oauth-protected-resource/__backyard/mcp",
+    ]);
+    assert.deepEqual(ACCESS_BYPASS_PATHS.slice(-4), CONNECTOR_RULES, "the connector's paths come last");
   });
 
   it("prints the guided steps with the exact values (host mode lists *.<host>)", () => {
@@ -791,6 +877,17 @@ describe("scripts/lib/access-plan.mjs and the access helpers", () => {
     assert.ok(s.includes("     Public hostnames:  sites.acme.dev\n                        *.sites.acme.dev\n"), s);
     assert.ok(s.includes("     Policy:            Allow · Include · Emails ending in @acme.com, Emails a@acme.com\n"), s);
     assert.ok(s.includes("     Public hostnames:  sites.acme.dev/__backyard/api/deploy\n                        sites.acme.dev/__backyard/api/deploy/*\n"), s);
+    assert.ok(
+      s.includes(
+        "                        sites.acme.dev/__backyard/readyz\n" +
+          "                        sites.acme.dev/__backyard/mcp\n" +
+          "                        sites.acme.dev/__backyard/oauth/*\n" +
+          "                        sites.acme.dev/.well-known/oauth-authorization-server\n" +
+          "                        sites.acme.dev/.well-known/oauth-protected-resource/__backyard/mcp\n" +
+          "     Policy:            Bypass · Include · Everyone\n",
+      ),
+      s,
+    );
     assert.ok(s.includes("BACKYARD_CF_API_TOKEN=<token> npx backyard-cloudflare access enable --allow-email a@acme.com --allow-email-domain acme.com"), s);
     assert.equal(describeAllow([], []), "");
   });

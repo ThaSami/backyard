@@ -81,8 +81,20 @@ run "path_mode_with_access" {
       "backyard.example.com/__backyard/api/tokens",
       "backyard.example.com/__backyard/healthz",
       "backyard.example.com/__backyard/readyz",
+      "backyard.example.com/__backyard/mcp",
+      "backyard.example.com/__backyard/oauth/*",
+      "backyard.example.com/.well-known/oauth-authorization-server",
+      "backyard.example.com/.well-known/oauth-protected-resource/__backyard/mcp",
     ])
-    error_message = "the deploy gateway, token minting (backyard token create) and health checks bypass Access"
+    error_message = "the deploy gateway, token minting (backyard token create), health checks and the Claude connector's machine paths bypass Access"
+  }
+  assert {
+    condition     = length(cloudflare_zero_trust_access_application.bypass[0].destinations) == 9 && cloudflare_zero_trust_access_application.bypass[0].domain == "backyard.example.com/__backyard/api/deploy"
+    error_message = "nine bypass destinations; the first path stays the application's domain"
+  }
+  assert {
+    condition     = !contains([for d in cloudflare_zero_trust_access_application.bypass[0].destinations : d.uri], "backyard.example.com/__backyard/auth/authorize")
+    error_message = "the connector's sign-in (/__backyard/auth/authorize) stays behind Access"
   }
   assert {
     condition     = cloudflare_zero_trust_access_application.backyard[0].allowed_idps == null && cloudflare_zero_trust_access_application.backyard[0].auto_redirect_to_identity == false
@@ -274,4 +286,73 @@ run "bypass_paths_stay_internal" {
   }
 
   expect_failures = [var.bypass_paths]
+}
+
+run "bypass_paths_refuse_the_hub_root" {
+  command = plan
+
+  variables {
+    bypass_paths = ["/__backyard/healthz", "/"]
+  }
+
+  expect_failures = [var.bypass_paths]
+}
+
+run "bypass_paths_refuse_other_well_known_documents" {
+  command = plan
+
+  variables {
+    bypass_paths = ["/__backyard/healthz", "/.well-known/x"]
+  }
+
+  expect_failures = [var.bypass_paths]
+}
+
+run "bypass_paths_refuse_site_paths" {
+  command = plan
+
+  variables {
+    bypass_paths = ["/__backyard/healthz", "/s/x"]
+  }
+
+  expect_failures = [var.bypass_paths]
+}
+
+run "bypass_paths_accept_the_oauth_discovery_documents" {
+  command = plan
+
+  variables {
+    bypass_paths = ["/__backyard/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource/__backyard/mcp"]
+  }
+
+  assert {
+    condition     = length(cloudflare_zero_trust_access_application.bypass[0].destinations) == 3
+    error_message = "the two discovery documents are valid bypass paths"
+  }
+}
+
+run "mcp_enabled" {
+  command = apply
+
+  variables {
+    mcp_enabled = true
+  }
+
+  assert {
+    condition     = output.worker_vars.MCP_ENABLED == "true" && output.worker_vars.AUTH_MODE == "access"
+    error_message = "mcp_enabled adds MCP_ENABLED=true to worker_vars"
+  }
+  assert {
+    condition     = strcontains(output.setup_args, " --var MCP_ENABLED:true ") && output.setup_command == "npm run setup -- ${output.setup_args}"
+    error_message = "setup_args (and setup_command) carry --var MCP_ENABLED:true"
+  }
+}
+
+run "mcp_disabled_by_default" {
+  command = apply
+
+  assert {
+    condition     = !contains(keys(output.worker_vars), "MCP_ENABLED") && !strcontains(output.setup_args, "MCP_ENABLED")
+    error_message = "the connector is opt-in: no MCP_ENABLED without mcp_enabled"
+  }
 }

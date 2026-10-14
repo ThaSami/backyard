@@ -1,0 +1,525 @@
+package mcpremote
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/thasami/backyard/internal/auth"
+	"github.com/thasami/backyard/internal/docstore/memory"
+)
+
+const initialize = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`
+
+func wantResponse(t *testing.T, w *httptest.ResponseRecorder, status int, body string) {
+	t.Helper()
+	if w.Code != status {
+		t.Fatalf("status = %d, want %d; body %s", w.Code, status, w.Body)
+	}
+	if body != "" && strings.TrimSpace(w.Body.String()) != body {
+		t.Fatalf("body = %s\nwant   %s", w.Body, body)
+	}
+}
+
+func TestDisabled(t *testing.T) {
+	const want = `{"error":{"code":"not_found","message":"the Claude connector is not enabled on this server"}}`
+	for name, a := range map[string]AuthServer{"nil": nil, "nil *auth.MCP": (*auth.MCP)(nil)} {
+		t.Run(name, func(t *testing.T) {
+			e := newTenv(t, tenvOption{opts: func(o *Options) { o.Auth = a }})
+			wantResponse(t, e.post(initialize), http.StatusNotFound, want)
+			wantResponse(t, e.serve(httptest.NewRequest(http.MethodGet, "/__backyard/mcp", nil)), http.StatusNotFound, want)
+		})
+	}
+}
+
+func TestCanonicalHostOnly(t *testing.T) {
+	e := newTenv(t)
+	r := request(initialize)
+	r.Host = "other.backyard.test"
+	wantResponse(t, e.serve(r), http.StatusNotFound, `{"error":{"code":"not_found","message":"not found"}}`)
+	// The port and letter case of the host do not matter.
+	r = request(initialize)
+	r.Host = "HUB.backyard.test:8443"
+	wantResponse(t, e.serve(r), http.StatusOK, "")
+	// RequestOrigin (trusted proxy headers) decides when given.
+	e = newTenv(t, tenvOption{opts: func(o *Options) {
+		o.RequestOrigin = func(*http.Request) string { return "https://elsewhere.example" }
+	}})
+	wantResponse(t, e.post(initialize), http.StatusNotFound, "")
+}
+
+func TestOrigin(t *testing.T) {
+	e := newTenv(t)
+	for _, o := range []string{"", hubURL, "HTTPS://HUB.backyard.test:443", "https://claude.ai", "https://claude.com"} {
+		if w := e.post(initialize, "Origin", o); w.Code != http.StatusOK {
+			t.Errorf("Origin %q: status %d %s", o, w.Code, w.Body)
+		}
+	}
+	const forbidden = `{"error":{"code":"forbidden","message":"requests from this origin are not accepted"}}`
+	for _, o := range []string{"https://evil.example", "null", "https://claude.ai.evil.example", "https://hub.backyard.test.evil"} {
+		wantResponse(t, e.post(initialize, "Origin", o), http.StatusForbidden, forbidden)
+	}
+	// The request's own origin is accepted too (here plain http).
+	r := request(initialize, "Origin", "http://hub.backyard.test:8080")
+	r.TLS, r.Host = nil, "hub.backyard.test:8080"
+	wantResponse(t, e.serve(r), http.StatusOK, "")
+	wantResponse(t, e.post(initialize, "Origin", "http://hub.backyard.test:8080"), http.StatusForbidden, forbidden)
+	// The origin is checked before the credentials.
+	wantResponse(t, e.post(initialize, "Origin", "https://evil.example", "Authorization", ""), http.StatusForbidden, forbidden)
+}
+
+func TestCredentials(t *testing.T) {
+	e := newTenv(t)
+	const unauth = `{"error":{"code":"unauthenticated","message":"connect this app to Backyard to sign in"}}`
+	missing := `Bearer resource_metadata="` + prmURL + `", scope="mcp"`
+	for _, h := range []string{"", "Basic YWxpY2U6", "Bearer", "Bearer   ", "Token " + aliceToken} {
+		w := e.post(initialize, "Authorization", h)
+		wantResponse(t, w, http.StatusUnauthorized, unauth)
+		if got := w.Header().Get("WWW-Authenticate"); got != missing {
+			t.Errorf("Authorization %q: WWW-Authenticate = %q", h, got)
+		}
+	}
+	// The scheme is case-insensitive.
+	if w := e.post(initialize, "Authorization", "bEaReR "+aliceToken); w.Code != http.StatusOK {
+		t.Fatalf("lowercase scheme: %d", w.Code)
+	}
+
+	r := request(initialize)
+	r.Header.Add("Authorization", "Bearer "+bobToken)
+	w := e.serve(r)
+	wantResponse(t, w, http.StatusBadRequest, "")
+	if got := w.Header().Get("WWW-Authenticate"); got != `Bearer error="invalid_request", resource_metadata="`+prmURL+`"` {
+		t.Fatalf("WWW-Authenticate = %q", got)
+	}
+	if !strings.Contains(w.Body.String(), `"code":"bad_request"`) {
+		t.Fatalf("body = %s", w.Body)
+	}
+	// One value that joins two credentials (as a proxy or the Workers runtime
+	// does) counts as two headers; a credential with auth-params does not.
+	w = e.post(initialize, "Authorization", "Bearer "+aliceToken+", Bearer "+bobToken)
+	wantResponse(t, w, http.StatusBadRequest, "")
+	if got := w.Header().Get("WWW-Authenticate"); !strings.HasPrefix(got, `Bearer error="invalid_request"`) {
+		t.Fatalf("joined credentials: WWW-Authenticate = %q", got)
+	}
+	for v, want := range map[string]bool{"Bearer a, Bearer b": true, "Bearer a,Basic b": true, "Bearer a": false,
+		`Digest a=1, b=2`: false, "Bearer a, b": false} {
+		if got := severalCredentials(v); got != want {
+			t.Errorf("severalCredentials(%q) = %v", v, got)
+		}
+	}
+
+	for _, desc := range []string{"malformed token", "token expired", "token revoked", "token not issued for this server", "access removed by policy"} {
+		tok := "byat_" + strings.ReplaceAll(desc, " ", "-")
+		e.auth.bad[tok] = desc
+		w := e.post(initialize, "Authorization", "Bearer "+tok)
+		wantResponse(t, w, http.StatusUnauthorized, unauth)
+		want := `Bearer error="invalid_token", error_description="` + desc + `", resource_metadata="` + prmURL + `", scope="mcp"`
+		if got := w.Header().Get("WWW-Authenticate"); got != want {
+			t.Errorf("%s: WWW-Authenticate = %q\nwant %q", desc, got, want)
+		}
+	}
+	// API tokens, static tokens and JWTs are just malformed MCP tokens.
+	w = e.post(initialize, "Authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x")
+	if got := w.Header().Get("WWW-Authenticate"); w.Code != 401 || !strings.Contains(got, `error_description="malformed token"`) {
+		t.Fatalf("JWT: %d %q", w.Code, got)
+	}
+
+	e.auth.infra = errors.New("docstore down")
+	w = e.post(initialize)
+	if w.Code != http.StatusServiceUnavailable || strings.Contains(w.Body.String(), "docstore down") || w.Header().Get("WWW-Authenticate") != "" {
+		t.Fatalf("infrastructure failure: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestRateLimitPerUser(t *testing.T) {
+	var keys []string
+	e := newTenv(t, tenvOption{opts: func(o *Options) {
+		o.Allow = func(key string) (bool, time.Duration) {
+			keys = append(keys, key)
+			return key != "user:"+bob.ID, 1500 * time.Millisecond
+		}
+	}})
+	wantResponse(t, e.post(initialize), http.StatusOK, "")
+	w := e.post(initialize, "Authorization", "Bearer "+bobToken)
+	wantResponse(t, w, http.StatusTooManyRequests, "")
+	if w.Header().Get("Retry-After") != "2" || !strings.Contains(w.Body.String(), `"code":"rate_limited"`) {
+		t.Fatalf("429: %v %s", w.Header(), w.Body)
+	}
+	if strings.Join(keys, ",") != "user:alice@acme.com,user:bob@acme.com" {
+		t.Fatalf("keys = %v", keys)
+	}
+}
+
+func TestMethodAfterAuthentication(t *testing.T) {
+	e := newTenv(t)
+	const notAllowed = `{"error":{"code":"bad_request","message":"method not allowed"}}`
+	for _, m := range []string{http.MethodGet, http.MethodDelete, http.MethodOptions, http.MethodPut, http.MethodPatch, http.MethodHead} {
+		r := request("")
+		r.Method = m
+		w := e.serve(r)
+		if m == http.MethodHead {
+			wantResponse(t, w, http.StatusMethodNotAllowed, "")
+		} else {
+			wantResponse(t, w, http.StatusMethodNotAllowed, notAllowed)
+		}
+		if w.Header().Get("Allow") != "POST" || w.Header().Get("Access-Control-Allow-Origin") != "" {
+			t.Errorf("%s: headers %v", m, w.Header())
+		}
+	}
+	// Without a token the 401 comes first.
+	r := request("", "Authorization", "")
+	r.Method = http.MethodGet
+	wantResponse(t, e.serve(r), http.StatusUnauthorized, "")
+}
+
+func TestMediaTypes(t *testing.T) {
+	e := newTenv(t)
+	for _, ct := range []string{"", "text/plain", "application/x-www-form-urlencoded", "application/json-seq", "bad;;"} {
+		w := e.post(initialize, "Content-Type", ct)
+		wantResponse(t, w, http.StatusUnsupportedMediaType, "")
+		if !strings.Contains(w.Body.String(), `"code":"bad_request"`) {
+			t.Errorf("Content-Type %q: %s", ct, w.Body)
+		}
+	}
+	wantResponse(t, e.post(initialize, "Content-Type", "application/json; charset=utf-8"), http.StatusOK, "")
+	for _, a := range []string{"", "application/json", "*/*", "application/*", "text/event-stream, application/json;q=0.9"} {
+		if w := e.post(initialize, "Accept", a); w.Code != http.StatusOK {
+			t.Errorf("Accept %q: %d", a, w.Code)
+		}
+	}
+	for _, a := range []string{"text/event-stream", "text/html", "image/*"} {
+		w := e.post(initialize, "Accept", a)
+		wantResponse(t, w, http.StatusBadRequest, "")
+		if !strings.Contains(w.Body.String(), `"code":"bad_request"`) {
+			t.Errorf("Accept %q: %s", a, w.Body)
+		}
+	}
+}
+
+func TestProtocolVersionHeader(t *testing.T) {
+	e := newTenv(t)
+	for _, v := range []string{"", "2025-11-25", "2025-06-18"} {
+		wantResponse(t, e.post(initialize, "MCP-Protocol-Version", v), http.StatusOK, "")
+	}
+	for _, v := range []string{"2025-03-26", "2026-07-28", "2024-11-05", "latest"} {
+		w := e.post(initialize, "MCP-Protocol-Version", v)
+		wantResponse(t, w, http.StatusBadRequest,
+			`{"jsonrpc":"2.0","id":null,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2025-11-25","2025-06-18"],"requested":"`+v+`"}}}`)
+		if w.Header().Get("Content-Type") != "application/json" {
+			t.Fatalf("Content-Type = %q", w.Header().Get("Content-Type"))
+		}
+	}
+}
+
+func TestBodyLimit(t *testing.T) {
+	e := newTenv(t)
+	e.h.maxBody = 1024
+	const tooLarge = `{"error":{"code":"too_large","message":"MCP requests are limited to 1024 bytes; publish over several calls"}}`
+	big := `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":"` + strings.Repeat("a", 1024) + `"}}`
+	// By Content-Length, before reading.
+	r := request(big)
+	read := false
+	r.Body = io.NopCloser(readFunc(func(p []byte) (int, error) { read = true; return 0, io.EOF }))
+	wantResponse(t, e.serve(r), http.StatusRequestEntityTooLarge, tooLarge)
+	if read {
+		t.Fatal("the body was read despite its Content-Length")
+	}
+	// By stream, without a length.
+	r = request(big)
+	r.ContentLength = -1
+	wantResponse(t, e.serve(r), http.StatusRequestEntityTooLarge, tooLarge)
+	// Exactly at the limit.
+	ok := `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":"` + strings.Repeat("a", 1024-len(`{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":""}}`)) + `"}}`
+	if len(ok) != 1024 {
+		t.Fatalf("len = %d", len(ok))
+	}
+	wantResponse(t, e.post(ok), http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":{}}`)
+}
+
+type readFunc func([]byte) (int, error)
+
+func (f readFunc) Read(p []byte) (int, error) { return f(p) }
+
+func TestAdmission(t *testing.T) {
+	e := newTenv(t)
+	e.h.admitWait = 50 * time.Millisecond
+	var pipes []*io.PipeWriter
+	var wg sync.WaitGroup
+	for range admissionSlots {
+		pr, pw := io.Pipe()
+		pipes = append(pipes, pw)
+		r := request("")
+		r.Body, r.ContentLength = pr, -1
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := httptest.NewRecorder()
+			e.h.ServeHTTP(w, r)
+			if w.Code != http.StatusOK {
+				t.Errorf("admitted request: %d %s", w.Code, w.Body)
+			}
+		}()
+	}
+	// Wait until the four hold their slots.
+	for deadline := time.Now().Add(5 * time.Second); len(e.h.slots) < admissionSlots; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("slots not taken")
+		}
+	}
+	r := request(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+	r.ContentLength = -1
+	w := e.serve(r)
+	wantResponse(t, w, http.StatusTooManyRequests, "")
+	if w.Header().Get("Retry-After") != "5" || !strings.Contains(w.Body.String(), `"code":"rate_limited"`) {
+		t.Fatalf("429: %v %s", w.Header(), w.Body)
+	}
+	// Small bodies of known length need no slot.
+	wantResponse(t, e.post(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), http.StatusOK, "")
+	for _, pw := range pipes {
+		_, _ = pw.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+		_ = pw.Close()
+	}
+	wg.Wait()
+	if len(e.h.slots) != 0 {
+		t.Fatalf("%d slots still taken", len(e.h.slots))
+	}
+}
+
+// deadlineWriter records the deadlines set through http.ResponseController.
+type deadlineWriter struct {
+	*httptest.ResponseRecorder
+	bodyRead          *bool
+	readSet, writeSet bool
+	readBefore        bool
+	read, write       time.Time
+}
+
+func (d *deadlineWriter) SetReadDeadline(t time.Time) error {
+	d.readSet, d.read, d.readBefore = true, t, !*d.bodyRead
+	return nil
+}
+
+func (d *deadlineWriter) SetWriteDeadline(t time.Time) error {
+	d.writeSet, d.write = true, t
+	return nil
+}
+
+func TestDeadlinesBeforeBody(t *testing.T) {
+	e := newTenv(t)
+	read := false
+	r := request(initialize)
+	body := strings.NewReader(initialize)
+	r.Body = io.NopCloser(readFunc(func(p []byte) (int, error) { read = true; return body.Read(p) }))
+	w := &deadlineWriter{ResponseRecorder: httptest.NewRecorder(), bodyRead: &read}
+	e.h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK || !read {
+		t.Fatalf("status %d, body read %v", w.Code, read)
+	}
+	if !w.readSet || !w.writeSet || !w.readBefore {
+		t.Fatalf("deadlines: read %v (before body %v), write %v", w.readSet, w.readBefore, w.writeSet)
+	}
+	if d := time.Until(w.read); d < 4*time.Minute || d > 5*time.Minute+time.Second {
+		t.Fatalf("read deadline in %v", d)
+	}
+}
+
+func TestJSONRPCErrors(t *testing.T) {
+	e := newTenv(t)
+	const (
+		parseError = `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}`
+		invalid    = `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}}`
+	)
+	cases := []struct{ body, want string }{
+		{`{"jsonrpc":"2.0","id":1,"method":`, parseError},
+		{``, parseError},
+		{`[{"jsonrpc":"2.0","id":1,"method":"ping"}]`, `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request: JSON-RPC batches are not supported"}}`},
+		{`"ping"`, invalid},
+		{`{"jsonrpc":"1.0","id":1,"method":"ping"}`, invalid},
+		{`{"id":1,"method":"ping"}`, invalid},
+		{`{"jsonrpc":"2.0","id":1,"method":7}`, invalid},
+		{`{"jsonrpc":"2.0","id":null,"method":"ping"}`, invalid},
+		{`{"jsonrpc":"2.0","id":1.5,"method":"ping"}`, invalid},
+		{`{"jsonrpc":"2.0","id":1e3,"method":"ping"}`, invalid},
+		{`{"jsonrpc":"2.0","id":{"a":1},"method":"ping"}`, invalid},
+		{`{"jsonrpc":"2.0","id":1}`, invalid},
+		{`{"jsonrpc":"2.0","id":true,"method":"ping"}`, invalid},
+		{`{"jsonrpc":"2.0","id":"x","method":"ping","params":[1}`, parseError},
+		{"\n {\"jsonrpc\":\"2.0\",\"id\":\"a\",\"method\":\"ping\"} ", `{"jsonrpc":"2.0","id":"a","result":{}}`},
+	}
+	for _, c := range cases {
+		status := http.StatusBadRequest
+		if strings.Contains(c.want, `"result"`) {
+			status = http.StatusOK
+		}
+		wantResponse(t, e.post(c.body), status, c.want)
+	}
+	// Notifications and client responses: 202 without a body.
+	for _, body := range []string{
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}`,
+		`{"jsonrpc":"2.0","id":3,"result":{}}`,
+		`{"jsonrpc":"2.0","id":3,"error":{"code":1,"message":"x"}}`,
+	} {
+		w := e.post(body)
+		if w.Code != http.StatusAccepted || w.Body.Len() != 0 {
+			t.Errorf("%s: %d %q", body, w.Code, w.Body)
+		}
+	}
+}
+
+func TestInitialize(t *testing.T) {
+	e := newTenv(t)
+	for requested, want := range map[string]string{"2025-06-18": "2025-06-18", "2025-11-25": "2025-11-25", "2024-11-05": "2025-11-25", "x": "2025-11-25"} {
+		res, rerr := e.rpc("initialize", map[string]any{"protocolVersion": requested, "capabilities": map[string]any{}})
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		var got struct {
+			ProtocolVersion string          `json:"protocolVersion"`
+			Capabilities    json.RawMessage `json:"capabilities"`
+			ServerInfo      map[string]any  `json:"serverInfo"`
+			Instructions    string          `json:"instructions"`
+		}
+		if err := json.Unmarshal(res, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.ProtocolVersion != want || string(got.Capabilities) != `{"tools":{}}` || got.Instructions != e.h.cat.instructions ||
+			got.ServerInfo["name"] != "backyard" || got.ServerInfo["title"] != "Backyard" || got.ServerInfo["version"] != "1.2.3" {
+			t.Fatalf("initialize(%s) = %s", requested, res)
+		}
+		if !strings.HasPrefix(string(res), `{"protocolVersion":`) || !strings.Contains(string(res), `<script src=\"/__backyard/backyard.js\"></script>`) {
+			t.Fatalf("result is not compact or HTML-escaped: %s", res)
+		}
+	}
+	for _, params := range []any{nil, map[string]any{}, map[string]any{"protocolVersion": 20251125}, []any{1}} {
+		if _, rerr := e.rpc("initialize", params); rerr == nil || rerr.Code != codeInvalidParams || rerr.Message != "Invalid params" {
+			t.Errorf("initialize(%v) = %+v", params, rerr)
+		}
+	}
+	// No prior initialize is needed, and a session id is ignored.
+	if _, rerr := e.rpc("ping", nil, "Mcp-Session-Id", "abc", "Last-Event-ID", "5"); rerr != nil {
+		t.Fatal(rerr)
+	}
+}
+
+func TestPingListUnknown(t *testing.T) {
+	e := newTenv(t)
+	if res, rerr := e.rpc("ping", nil); rerr != nil || string(res) != "{}" {
+		t.Fatalf("ping = %s %v", res, rerr)
+	}
+	res, rerr := e.rpc("tools/list", map[string]any{"cursor": "x"})
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	var doc struct {
+		Tools json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(toolsJSON, &doc); err != nil {
+		t.Fatal(err)
+	}
+	var want bytes.Buffer
+	if err := json.Compact(&want, doc.Tools); err != nil {
+		t.Fatal(err)
+	}
+	if string(res) != `{"tools":`+want.String()+`}` {
+		t.Fatalf("tools/list is not the catalog verbatim:\n%s", res)
+	}
+	for _, m := range []string{"resources/list", "prompts/list", "logging/setLevel", "completion/complete", "server/discover", "tools/List"} {
+		if _, rerr := e.rpc(m, nil); rerr == nil || rerr.Code != codeMethodNotFound || rerr.Message != "Method not found" {
+			t.Errorf("%s = %+v", m, rerr)
+		}
+	}
+}
+
+func TestToolsCallParams(t *testing.T) {
+	e := newTenv(t)
+	for _, params := range []any{nil, []any{}, map[string]any{}, map[string]any{"name": 5}, map[string]any{"name": "backyard_whoami", "arguments": []any{}},
+		map[string]any{"name": "backyard_whoami", "arguments": "x"}, map[string]any{"name": "backyard_whoami", "arguments": nil}} {
+		if _, rerr := e.rpc("tools/call", params); rerr == nil || rerr.Code != codeInvalidParams || rerr.Message != "Invalid params" {
+			t.Errorf("tools/call %v = %+v", params, rerr)
+		}
+	}
+	if _, rerr := e.rpc("tools/call", map[string]any{"name": "nope"}); rerr == nil || rerr.Code != codeInvalidParams || rerr.Message != "Unknown tool: nope" {
+		t.Fatalf("unknown tool = %+v", rerr)
+	}
+	// Absent arguments are {}.
+	e.toolOK(aliceToken, "backyard_whoami", nil, nil)
+	// Schema violations are tool errors.
+	e.toolErr(aliceToken, "backyard_whoami", map[string]any{"x": 1}, "Invalid arguments: ")
+	e.toolErr(aliceToken, "backyard_docs", map[string]any{"topic": "secrets"}, "Invalid arguments: ")
+	e.toolErr(aliceToken, "backyard_site_files", map[string]any{"site": "Bad"}, "Invalid arguments: ")
+	e.toolErr(aliceToken, "backyard_publish", map[string]any{"site": "a"}, "Invalid arguments: ")
+	e.toolErr(aliceToken, "backyard_publish", map[string]any{"site": "a", "files": []any{map[string]any{"path": "a", "content": "x", "encoding": "hex"}}}, "Invalid arguments: ")
+	long := e.toolErr(aliceToken, "backyard_site_files", map[string]any{"site": strings.Repeat("A", 100_000)}, "Invalid arguments: ")
+	if len(long) > maxDetail+100 {
+		t.Fatalf("the detail is not bounded: %d bytes", len(long))
+	}
+}
+
+func TestPanicIsInternalError(t *testing.T) {
+	e := newTenv(t)
+	e.h.tools["backyard_whoami"] = func(context.Context, *call, json.RawMessage) toolResult { panic("boom") }
+	_, rerr := e.rpc("tools/call", map[string]any{"name": "backyard_whoami"})
+	if rerr == nil || rerr.Code != codeInternalError || !strings.HasPrefix(rerr.Message, "Internal error (request ") {
+		t.Fatalf("panic = %+v", rerr)
+	}
+}
+
+func TestRequestIDFromMiddleware(t *testing.T) {
+	e := newTenv(t)
+	e.h.tools["backyard_whoami"] = func(context.Context, *call, json.RawMessage) toolResult { panic("boom") }
+	w := httptest.NewRecorder()
+	w.Header().Set("X-Request-Id", "req-42")
+	e.h.ServeHTTP(w, request(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"backyard_whoami"}}`))
+	if !strings.Contains(w.Body.String(), "Internal error (request req-42)") {
+		t.Fatalf("body = %s", w.Body)
+	}
+}
+
+// TestRealAuthServer runs the gate against the authorization server of
+// internal/auth (the challenges and origins come from it).
+func TestRealAuthServer(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.Auth.Mode = auth.ModeNone
+	cfg.Server.PublicURL = "http://127.0.0.1:8080"
+	cfg.MCP.Enabled = true
+	cfg.ApplyDefaults()
+	a, err := auth.New(context.Background(), cfg, auth.Options{Docs: memory.New()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := auth.MCPOf(a)
+	if m == nil {
+		t.Fatal("MCPOf = nil with mcp.enabled")
+	}
+	h := New(Options{Config: cfg, Auth: m})
+	serve := func(hdr ...string) *httptest.ResponseRecorder {
+		r := request(initialize, hdr...)
+		r.TLS, r.Host = nil, "127.0.0.1:8080"
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	prm := "http://127.0.0.1:8080/.well-known/oauth-protected-resource/__backyard/mcp"
+	w := serve("Authorization", "")
+	if w.Code != http.StatusUnauthorized || w.Header().Get("WWW-Authenticate") != `Bearer resource_metadata="`+prm+`", scope="mcp"` {
+		t.Fatalf("missing token: %d %q", w.Code, w.Header().Get("WWW-Authenticate"))
+	}
+	w = serve("Authorization", "Bearer byat_garbage")
+	if want := `Bearer error="invalid_token", error_description="malformed token", resource_metadata="` + prm + `", scope="mcp"`; w.Code != http.StatusUnauthorized || w.Header().Get("WWW-Authenticate") != want {
+		t.Fatalf("garbage token: %d %q", w.Code, w.Header().Get("WWW-Authenticate"))
+	}
+	for origin, status := range map[string]int{"https://claude.ai": 401, "https://claude.com": 401, "http://127.0.0.1:8080": 401, "https://evil.example": 403} {
+		if w := serve("Origin", origin, "Authorization", ""); w.Code != status {
+			t.Errorf("Origin %s: %d", origin, w.Code)
+		}
+	}
+}

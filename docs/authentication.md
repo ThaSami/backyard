@@ -18,7 +18,8 @@ The Cloudflare edition has its own two modes: `none` and Cloudflare Access (see
 In every mode, the API and the deploy gateway also accept `Authorization: Bearer` tokens:
 [Backyard API tokens](#api-tokens) minted for a person, [static tokens](#static-tokens) for CI,
 and — when `auth.oidc.issuer` is configured — tokens issued by your IdP to the
-[CLI device flow](#device-flow).
+[CLI device flow](#device-flow). The [Claude connector](#claude-connector-remote-mcp) has
+tokens of its own, valid only at `/__backyard/mcp`.
 
 ## Identity, admins and gates
 
@@ -202,7 +203,11 @@ ingress "internal and load balancing", no public `run.app` URL).
 CLIs cannot pass IAP, so the [Google Cloud module](../deploy/terraform/gcp/README.md#iap-notes)
 adds a second backend service **without** IAP for `/__backyard/api/deploy/*` and
 `/__backyard/api/tokens` (`backyard token create`) requests that carry an `Authorization`
-header; Backyard itself rejects those without a valid token.
+header; Backyard itself rejects those without a valid token. The same backend service takes the
+[Claude connector's](#claude-connector-remote-mcp) four machine paths (`/__backyard/mcp`,
+`/__backyard/oauth/*`, `/.well-known/oauth-authorization-server`,
+`/.well-known/oauth-protected-resource/__backyard/mcp`), with or without an `Authorization`
+header.
 
 ## `alb`: AWS ALB with Okta (or any OIDC IdP)
 
@@ -219,8 +224,12 @@ The ALB runs the login (`authenticate-oidc`) and forwards a signed `X-Amzn-Oidc-
    authorization server plus the `groups` scope in the listener rule) if you use group rules.
 4. Listener rule: `authenticate-oidc` with the issuer, authorization, token and userinfo
    endpoints from the IdP's discovery document, then forward to Backyard. Exempt
-   `/__backyard/healthz`, `/__backyard/readyz` and — for CLIs and CI — `/__backyard/api/deploy/*`
-   and `/__backyard/api/tokens` (pass through when there is no ALB session).
+   `/__backyard/healthz`, `/__backyard/readyz`, the
+   [Claude connector's](#claude-connector-remote-mcp) machine paths (`/__backyard/mcp`,
+   `/__backyard/oauth/*`, `/.well-known/oauth-authorization-server`,
+   `/.well-known/oauth-protected-resource/__backyard/mcp`) and — for CLIs and CI —
+   `/__backyard/api/deploy/*` and `/__backyard/api/tokens` (pass through when there is no ALB
+   session).
 5. Configure:
 
    ```yaml
@@ -259,7 +268,13 @@ Run oauth2-proxy with `--pass-user-headers`, `--cookie-domain=.backyard.acme.com
 `/__backyard/api/deploy/*` and `/__backyard/api/tokens` requests that carry `Authorization:
 Bearer …` from your edge proxy straight to Backyard. Because that peer is **not** in
 `trusted_proxies`, Backyard only accepts the bearer token there and ignores any identity header
-a client might add.
+a client might add. For the [Claude connector](#claude-connector-remote-mcp), skip
+authentication on its machine paths (they never read identity headers):
+
+```sh
+--skip-auth-route='^/__backyard/(mcp|oauth/.*)$'
+--skip-auth-route='^/\.well-known/oauth-(authorization-server|protected-resource/__backyard/mcp)$'
+```
 
 `trusted_proxies` is what makes header mode safe: every listed peer can claim any identity.
 List only the proxies themselves. On Kubernetes the
@@ -319,7 +334,11 @@ Create a self-hosted Access application for `backyard.acme.com` and `*.backyard.
 your IdP (Okta, Entra ID, Google…), and a **Bypass** policy for `/__backyard/api/deploy/*`,
 `/__backyard/api/tokens` and `/__backyard/healthz` so CLIs can deploy and mint tokens with
 bearer tokens (drag-and-drop deploys on the hub then also need a token, which the hub asks
-for). Access JWTs carry the email but usually no groups.
+for). For the [Claude connector](#claude-connector-remote-mcp), add its four machine paths on
+the hub host to the bypass: `/__backyard/mcp`, `/__backyard/oauth/*`,
+`/.well-known/oauth-authorization-server` and
+`/.well-known/oauth-protected-resource/__backyard/mcp`. Access JWTs carry the email but usually
+no groups.
 
 The [Cloudflare edition](cloudflare.md) supports Access natively (`AUTH_MODE=access`).
 `backyard cloudflare access enable --allow-email-domain acme.com` sets it up from the terminal:
@@ -330,6 +349,58 @@ edge before it switches the Worker over (see the
 [edition's README](../deploy/cloudflare/README.md#company-login-cloudflare-access)). The
 optional [`deploy/terraform/cloudflare`](../deploy/terraform/cloudflare/README.md) module
 creates the same as infrastructure as code, plus an Okta identity provider.
+
+## Claude connector (remote MCP)
+
+With `mcp.enabled: true` (Cloudflare edition: `MCP_ENABLED`), Backyard is an OAuth 2.1
+authorization server for its own MCP endpoint, `<public_url>/__backyard/mcp`
+([SPEC §8.4](spec/SPEC.md#84-remote-mcp-connector-oauth-21-authorization-server)): Claude
+registers or identifies itself, the user signs in **in the browser** at
+`/__backyard/auth/authorize` — with whatever this page's mode uses for the hub — and approves
+Backyard's consent page, and Claude receives tokens that `/__backyard/mcp` alone accepts. Your
+IdP needs no change: with `oidc` the login goes through Backyard's existing OIDC application and
+`/__backyard/auth/callback`; behind IAP, an ALB or Access their login is the sign-in. Setting it
+up in Claude, the tools and the limits: [Claude connector](claude-connector.md).
+
+The sign-in at `/__backyard/auth/authorize` per mode:
+
+| Mode | Who you are on the consent page | Not signed in yet |
+|---|---|---|
+| `oidc` | your Backyard session (`backyard_session`) | redirected to `/__backyard/auth/login` (your IdP), then back |
+| `iap`, `alb`, `header` | the proxy's signed assertion or trusted header | `401` page: the proxy did not authenticate the request — `/__backyard/auth/authorize` must stay behind it |
+| `none` | the browser's guest (`backyard_anon`), so the connector acts as a guest | — |
+| Cloudflare `AUTH_MODE=access` | the Access JWT (`Cf-Access-Jwt-Assertion` / `CF_Authorization`) | `401` page, as above |
+| Cloudflare `AUTH_MODE=none` | the browser's guest | — |
+
+People outside `allowed_domains` / `allowed_emails` / `allowed_groups` get "Access denied"; a
+browser signed in with a static token, or a guest on a hub that has a sign-in, gets "This
+sign-in cannot connect apps". In `none`, the connector can publish only when
+`deploy.allow_anonymous` (Cloudflare: `ALLOW_ANONYMOUS_DEPLOY`) is on; static tokens and the
+Cloudflare `DEPLOY_TOKEN` cannot stand in for a sign-in. On the Go server every call re-checks
+the gates against the identity taken at consent (and recomputes admin rights), so removing
+someone from `allowed_emails` (or `allowed_domains`, `allowed_groups`) ends their connections on
+their next call. Someone removed only at the IdP or the proxy keeps working connections until
+they expire (`auth.token_ttl`) or an admin disconnects them on the hub.
+
+`/__backyard/mcp` accepts **only** the connector's access tokens: API tokens, static tokens,
+`DEPLOY_TOKEN`, IdP JWTs, proxy assertions and cookies are refused there, and the connector's
+tokens are refused everywhere else.
+
+**Proxies.** Four machine paths must reach Backyard without a login — Claude calls them from
+Anthropic's servers, without a browser session:
+
+- `/__backyard/mcp`
+- `/__backyard/oauth/*`
+- `/.well-known/oauth-authorization-server`
+- `/.well-known/oauth-protected-resource/__backyard/mcp`
+
+They never read cookies or identity headers, so exempting them — even through a
+`trusted_proxies` peer in `header` mode — cannot let anyone claim an identity, and while the
+connector is off Backyard answers them with `404`. `/__backyard/auth/authorize` must **stay
+behind** the proxy. The AWS (ALB rule `mcp`), Google Cloud (routes to the IAP-less backend
+service) and Cloudflare (Access bypass application) kits exempt the four paths already; for
+oauth2-proxy, Pomerium, Cloudflare Access in front of the Go server and Azure Easy Auth see
+the [recipes](claude-connector.md#machine-paths-and-identity-proxies).
 
 ## `none`
 

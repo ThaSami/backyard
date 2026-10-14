@@ -144,7 +144,7 @@ locals {
   deploy_via_gcs = length(var.bucket_writer_members) > 0
 
   config_sections       = ["server", "auth", "storage", "database", "pubsub", "deploy", "ai", "warehouse", "telemetry"]
-  extra_config_sections = ["identity", "sites", "files", "ratelimit", "realtime"]
+  extra_config_sections = ["identity", "sites", "files", "ratelimit", "realtime", "mcp"]
 
   # null when empty or invalid (the precondition below reports invalid YAML).
   # No conditional here: sections of different shapes have no common type.

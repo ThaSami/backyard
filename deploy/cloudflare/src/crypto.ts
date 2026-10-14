@@ -15,6 +15,19 @@ export const KeyLabel = {
   Anon: "backyard/anon/v1",
   /** Signs the confirmation form of a cross-site CLI login (like Go's keys.CLIConfirm). */
   CLIConfirm: "backyard/cli-confirm/v1",
+  // The Claude connector's authorization server (SPEC §8.4.8, like Go's
+  // keys.MCP*). These values reference per-deployment grant state, so they
+  // never interoperate between deployments or editions.
+  /** Stateless client_ids of dynamic registration (bydc_). */
+  MCPClient: "backyard/mcp-client/v1",
+  /** CSRF tokens of the consent page. */
+  MCPConsent: "backyard/mcp-consent/v1",
+  /** Authorization codes (byac_). */
+  MCPCode: "backyard/mcp-code/v1",
+  /** Refresh tokens (byrt_). */
+  MCPRefresh: "backyard/mcp-refresh/v1",
+  /** Access tokens (byat_). */
+  MCPAccess: "backyard/mcp-access/v1",
 } as const;
 
 const enc = new TextEncoder();

@@ -18,12 +18,28 @@
 // # Security
 //
 // Every other request is authenticated with the configured
-// auth.Authenticator, except the SDK files, the auth endpoints and the deploy
-// gateway (which authenticates by itself). Unauthenticated browser page loads
-// are redirected to the login URL; API calls get 401 JSON with "login_url".
-// State-changing API calls must carry "X-Backyard: 1" and, when present, an
-// Origin equal to the request's own origin (path mode: the hub origin).
-// Site API calls are rate limited per user (anonymous: per client IP).
+// auth.Authenticator, except the SDK files, the auth endpoints, the deploy
+// gateway (which authenticates by itself) and the machine paths of the
+// Claude connector. Unauthenticated browser page loads are redirected to the
+// login URL; API calls get 401 JSON with "login_url". State-changing API
+// calls must carry "X-Backyard: 1" and, when present, an Origin equal to the
+// request's own origin (path mode: the hub origin). Site API calls are rate
+// limited per user (anonymous: per client IP).
+//
+// # Claude connector
+//
+// With mcp.enabled (SPEC §8.4, §14.1) the hub also serves the remote MCP
+// endpoint /__backyard/mcp, the OAuth endpoints
+// /__backyard/oauth/{register,token,revoke} and the discovery documents
+// /.well-known/oauth-authorization-server and
+// /.well-known/oauth-protected-resource/__backyard/mcp. These machine paths
+// authenticate by themselves (the endpoint accepts only MCP access tokens)
+// and never read cookies or identity-proxy headers; they exist on the
+// canonical hub host only and answer 404 while the connector is off. The
+// sign-in and consent page /__backyard/auth/authorize is an auth endpoint
+// like the others, and /__backyard/api/mcp/grants a hub API. The OAuth
+// endpoints and authorize are rate limited per client IP, the MCP endpoint
+// per user.
 //
 // # Timeouts
 //
@@ -82,6 +98,13 @@ type Deps struct {
 	// on the hub host with that prefix stripped. GET /__backyard/api/info is
 	// served by forwarding to the gateway's /info.
 	Gateway http.Handler
+	// MCP is the Claude connector's authorization server (auth.MCPOf(Auth));
+	// nil while mcp.enabled is false. It serves the discovery documents and
+	// /__backyard/oauth/*, and backs the grants API.
+	MCP *auth.MCP
+	// MCPEndpoint serves POST /__backyard/mcp (internal/mcpremote); nil
+	// answers the disabled 404.
+	MCPEndpoint http.Handler
 	// DevSites maps site names to local directories served live (backyard dev).
 	// Like deploys, they never expose hidden paths (a segment starting with
 	// "." other than ".well-known").
@@ -278,7 +301,8 @@ func (s *Server) OnWSFrame(dir string) {
 
 // ObserveDeploy counts a deploy for the deploys_total metric. Deploys through
 // the embedded gateway are counted automatically; this is for other paths
-// (e.g. a standalone gateway sharing the process).
+// (the Claude connector's publishes, method "mcp"; a standalone gateway
+// sharing the process).
 func (s *Server) ObserveDeploy(method, result string) {
 	if s == nil || s.metrics == nil {
 		return

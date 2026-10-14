@@ -226,6 +226,19 @@ CI can deploy with static tokens: `backyard token hash <token>` prints the
 SHA-256 that goes into `static_tokens`; the token itself never reaches
 Terraform.
 
+## Claude connector
+
+The [Claude connector](../../../docs/claude-connector.md) lets people publish sites from Claude
+with their Entra ID or Okta sign-in. Turn it on with
+`extra_config_yaml = "mcp:\n  enabled: true\n"`; the connector URL is
+`https://<domain>/__backyard/mcp`. Front Door and Container Apps ingress do not sign people in
+(Backyard's own OIDC login does), so there are no proxy exemptions to add, and the IdP
+application stays as it is. A WAF policy attached to the Front Door profile must not inspect
+or cap the request body of `/__backyard/mcp` below 10 MiB (publish calls carry up to 9 MiB),
+and must admit Anthropic's `160.79.104.0/21` (IPv4) if it restricts sources. By default
+Backyard fetches Claude's client metadata from `https://claude.ai` at the first connect; without
+outbound internet access add `clients: []` to the `mcp` section.
+
 ## Storage
 
 Backyard uses its managed identity (`AZURE_CLIENT_ID`, picked up by
@@ -318,7 +331,7 @@ from the YAML as `'${VAR}'` and expanded at startup (so they must not contain
 single quotes or line breaks; the variables validate this).
 
 * `extra_config_yaml` appends sections the module does not render
-  (`identity`, `warehouse`, `sites`, `files`, `ratelimit`, `realtime`), e.g.
+  (`identity`, `warehouse`, `sites`, `files`, `ratelimit`, `realtime`, `mcp`), e.g.
   `sites:\n  ownership: owner\n`. Reference secrets as `${VAR}` and pass them
   with `extra_secret_env` (e.g. a warehouse DSN); plain values go in `extra_env`.
 * Terraform state contains the generated secrets — keep it in a private,

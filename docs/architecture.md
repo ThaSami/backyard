@@ -69,10 +69,17 @@ access log. Then:
 4. **Site requests** — `/__backyard/backyard.{js,mjs,d.ts}` (SDK with a per-request context
    preamble, no auth), `/__backyard/auth/*` (redirected to the hub), `/__backyard/api/*` (site
    API: authenticate → CSRF check → API rate limit → handler), `/__backyard/files/*` (uploads),
-   any other `/__backyard/*` (404), else a static file.
-5. **Hub requests** — SDK, `/__backyard/auth/*` (login flows), `/__backyard/api/info`,
-   `/__backyard/api/deploy/*` (gateway), `/__backyard/metrics`, `/__backyard/api/*` (hub API:
-   `me`, `sites`, `tokens`), else the hub UI, `/docs` and `/llms*.txt`.
+   any other `/__backyard/*` (404, including `/__backyard/mcp` and `/__backyard/oauth/*`), else
+   a static file (a site's `/.well-known/*` included).
+5. **Hub requests** — SDK, `/.well-known/oauth-*` (the Claude connector's discovery documents,
+   before anything authenticates), `/__backyard/auth/*` (login flows, and
+   `/__backyard/auth/authorize`, the connector's sign-in and consent page),
+   `/__backyard/mcp` (the connector's MCP endpoint, which accepts only its own access tokens),
+   `/__backyard/oauth/*` (its token, registration and revocation endpoints),
+   `/__backyard/api/info`, `/__backyard/api/deploy/*` (gateway), `/__backyard/metrics`,
+   `/__backyard/api/*` (hub API: `me`, `sites`, `tokens`, `mcp/grants`), else the hub UI,
+   `/docs` and `/llms*.txt`. The connector's paths answer `404` while `mcp.enabled` is false
+   (SPEC §8.4).
 
 **A page load:** the browser asks for `https://lunch-vote.backyard.acme.com/` → the
 authenticator resolves the user (session cookie, proxy assertion, header or bearer token) or

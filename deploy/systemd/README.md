@@ -178,6 +178,26 @@ server {
 }
 ```
 
+## Claude connector
+
+To let people publish sites from Claude with their sign-in, add to
+`/etc/backyard/backyard.yaml` and restart:
+
+```yaml
+mcp:
+  enabled: true
+```
+
+The connector URL is `https://<domain>/__backyard/mcp` (see the
+[Claude connector guide](../../docs/claude-connector.md)). The Caddy example has no body limit
+and the nginx example's `client_max_body_size 100m` is above the 10 MiB a publish call may need;
+a smaller limit must stay at `10m` or more. Publishing as a person needs single sign-on
+(`auth.mode: oidc`, or `header` behind a proxy); hosted Claude reaches the server from
+`160.79.104.0/21`. Behind an identity-aware proxy, exempt the four machine paths
+(`/__backyard/mcp`, `/__backyard/oauth/*`, `/.well-known/oauth-authorization-server`,
+`/.well-known/oauth-protected-resource/__backyard/mcp`) from its login and keep
+`/__backyard/auth/authorize` behind it.
+
 ## Deploying with rsync
 
 Next to the API (`backyard deploy`, hub drag & drop), people and CI can push sites with plain

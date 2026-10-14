@@ -30,7 +30,7 @@ Durable Objects, secrets and variables. Terraform manages what sits around the W
 | `cloudflare_workers_route` for `base_domain/*` and `*.base_domain/*` | `url_mode = "host"` |
 | `cloudflare_certificate_pack` (advanced) for `*.base_domain` | host mode below the apex with `advanced_certificate` (paid ACM) |
 | Access application over the hub (and `*.base_domain` in host mode) with an allow policy | `enable_access` (default) |
-| Access application with a bypass policy for `/__backyard/api/deploy`, `/__backyard/api/deploy/*`, `/__backyard/api/tokens`, `/__backyard/healthz` and `/__backyard/readyz` | `enable_access` |
+| Access application with a bypass policy for `/__backyard/api/deploy`, `/__backyard/api/deploy/*`, `/__backyard/api/tokens`, `/__backyard/healthz`, `/__backyard/readyz` and the Claude connector's `/__backyard/mcp`, `/__backyard/oauth/*`, `/.well-known/oauth-authorization-server` and `/.well-known/oauth-protected-resource/__backyard/mcp` (on the hub host only) | `enable_access` |
 | Okta identity provider | `okta_account_url` set |
 
 The bypass is needed because the CLI talks to the deploy gateway with bearer tokens
@@ -40,8 +40,13 @@ minted that way never expires later than the one that asked for it, so a token c
 itself: chaining tokens never keeps access past the token that `backyard login` minted through
 Access. The Worker authenticates those requests itself: bearer tokens, or the
 `CF_Authorization` cookie, whose Access JWT it verifies (browser requests on these paths carry
-no `Cf-Access-Jwt-Assertion`). Every other path requires an Access login. The Worker also
-verifies the Access JWT (`AUTH_MODE=access`), so the `workers.dev` URL is protected too.
+no `Cf-Access-Jwt-Assertion`). The [Claude connector](../../../docs/claude-connector.md)'s
+four machine paths check the connector's own tokens and never read cookies or Access headers;
+until `mcp_enabled` they answer `404`. Every other path requires an Access login,
+`/__backyard/auth/authorize` (the connector's sign-in) and the sites' `/.well-known` included.
+The Worker also verifies the Access JWT (`AUTH_MODE=access`), so the `workers.dev` URL is
+protected too. After upgrading the module, `terraform apply` adds the connector's paths to the
+bypass application.
 
 ## Usage
 
@@ -73,6 +78,10 @@ Without a checkout, step 3 uses the module's `setup_args` output, the same argum
 backyard cloudflare setup $(terraform output -raw setup_args)
 npx backyard-cloudflare@latest setup $(terraform output -raw setup_args)   # the same without the backyard CLI (once on npm)
 ```
+
+With `mcp_enabled = true` they include `--var MCP_ENABLED:true`, which turns on the
+[Claude connector](../../../docs/claude-connector.md) (publishing from Claude with the Access
+sign-in).
 
 These variables are then managed by Terraform: `setup` deploys and remembers them, and the
 CLI's `domain add` and `access enable` refuse to take them over (exit 2, with how to drop them
@@ -148,7 +157,8 @@ domains, so they leave the module's alone. Leave `routes` out of `wrangler.jsonc
 | `allowed_emails`, `allowed_email_domains`, `allowed_access_group_ids`, `allowed_okta_groups` | `[]` | Who may sign in (any match). At least one is required with Access. |
 | `identity_provider_ids` | `[]` | Login methods to offer (empty = all of the account's). |
 | `auto_redirect_to_identity` | auto | Skip the Access login page. Defaults to on when exactly one IdP is allowed. |
-| `bypass_paths` | gateway + token minting + health | Paths below `/__backyard/` that skip Access. |
+| `bypass_paths` | gateway + token minting + health + the Claude connector's four machine paths (nine paths) | Paths below `/__backyard/` (or one of the two OAuth discovery documents) that skip Access. |
+| `mcp_enabled` | `false` | Turn on the [Claude connector](../../../docs/claude-connector.md): adds `MCP_ENABLED=true` to `worker_vars` and `setup_args`. |
 | `okta_account_url`, `okta_client_id`, `okta_client_secret`, `okta_authorization_server_id`, `okta_idp_name` | `""` | Create an Okta identity provider. |
 | `okta_identity_provider_id` | `""` | Existing Okta provider for `allowed_okta_groups`. |
 

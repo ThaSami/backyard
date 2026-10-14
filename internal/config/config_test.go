@@ -249,3 +249,186 @@ func TestValidateOIDCHostModeNeedsCookieDomain(t *testing.T) {
 		t.Fatalf("dev load: %v", err)
 	}
 }
+
+// mcpConfig parses yaml (plus a valid server section) and applies defaults.
+func mcpConfig(t *testing.T, yaml string) *Config {
+	t.Helper()
+	cfg, err := Parse([]byte("server:\n  base_domain: backyard.acme.com\n  secret: " + strings.Repeat("s", 40) + "\n" + yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	cfg.ApplyDefaults()
+	return cfg
+}
+
+func TestMCPDefaults(t *testing.T) {
+	cfg := mcpConfig(t, "")
+	m := cfg.MCP
+	if m.Enabled || m.MaxPublishBytes != 4194304 {
+		t.Fatalf("defaults: %+v", m)
+	}
+	if strings.Join(m.Clients, " ") != "https://claude.ai/oauth/mcp-oauth-client-metadata https://claude.ai/oauth/claude-code-client-metadata" {
+		t.Fatalf("clients = %q", m.Clients)
+	}
+	if strings.Join(m.RedirectURIs, " ") != "https://claude.ai/api/mcp/auth_callback https://claude.com/api/mcp/auth_callback" {
+		t.Fatalf("redirect_uris = %q", m.RedirectURIs)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("defaults must validate: %v", err)
+	}
+	// The defaults are copies: changing them does not touch the package lists.
+	m.Clients[0] = "x"
+	if DefaultMCPClients[0] == "x" {
+		t.Fatal("ApplyDefaults shares DefaultMCPClients")
+	}
+
+	// An explicit empty list stays empty (CIMD off / loopback only); a null
+	// value selects the default.
+	cfg = mcpConfig(t, "mcp:\n  enabled: true\n  clients: []\n  redirect_uris: []\n")
+	if cfg.MCP.Clients == nil || len(cfg.MCP.Clients) != 0 || cfg.MCP.RedirectURIs == nil || len(cfg.MCP.RedirectURIs) != 0 {
+		t.Fatalf("explicit []: clients=%#v redirect_uris=%#v", cfg.MCP.Clients, cfg.MCP.RedirectURIs)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("empty lists: %v", err)
+	}
+	cfg = mcpConfig(t, "mcp:\n  clients:\n  redirect_uris:\n")
+	if len(cfg.MCP.Clients) != 2 || len(cfg.MCP.RedirectURIs) != 2 {
+		t.Fatalf("null lists: %q %q", cfg.MCP.Clients, cfg.MCP.RedirectURIs)
+	}
+
+	// Entries are trimmed but their case is kept (comparison is exact).
+	cfg = mcpConfig(t, "mcp:\n  clients: [\" https://Apps.Example.com/Client \"]\n  redirect_uris: [\" https://Apps.Example.com/CB \"]\n  max_publish_bytes: 65536\n")
+	if cfg.MCP.Clients[0] != "https://Apps.Example.com/Client" || cfg.MCP.RedirectURIs[0] != "https://Apps.Example.com/CB" {
+		t.Fatalf("entries: %q %q", cfg.MCP.Clients, cfg.MCP.RedirectURIs)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("trimmed entries: %v", err)
+	}
+}
+
+func TestMCPUnknownKeyRejected(t *testing.T) {
+	if _, err := Parse([]byte("mcp:\n  foo: 1\n")); err == nil || !strings.Contains(err.Error(), "foo") {
+		t.Fatalf("mcp.foo: err = %v", err)
+	}
+}
+
+func TestMCPValidation(t *testing.T) {
+	const (
+		rule1 = "is not a client metadata URL (an https URL with a path, without query, fragment or user info, at most 512 bytes)"
+		rule2 = "is not an https redirect URI without fragment or user info (at most 512 bytes; loopback redirect URIs are always allowed and are not listed)"
+		rule3 = "points at this Backyard or one of its sites"
+		rule4 = "mcp.max_publish_bytes must be between 65536 and 67108864 and at most sites.max_site_bytes"
+		rule5 = "mcp.enabled requires server.public_url to be https (http only on localhost, *.localhost or loopback addresses) without a path, query or fragment"
+		rule6 = "auth.oidc.redirect_url must not be /__backyard/auth/authorize while mcp.enabled is true"
+	)
+	long := "https://apps.example.com/" + strings.Repeat("a", 512-len("https://apps.example.com/")+1)
+	cases := []struct {
+		name, yaml string
+		want       []string // substrings of the joined error ("" = must validate)
+	}{
+		{"client without path", "mcp:\n  clients: [https://claude.ai]\n", []string{`mcp.clients: "https://claude.ai" ` + rule1}},
+		{"client root path", "mcp:\n  clients: [https://claude.ai/]\n", []string{`mcp.clients: "https://claude.ai/" ` + rule1}},
+		{"client http", "mcp:\n  clients: [http://claude.ai/x]\n", []string{`mcp.clients: "http://claude.ai/x" ` + rule1}},
+		{"client ip", "mcp:\n  clients: [https://203.0.113.5/x]\n", []string{`mcp.clients: "https://203.0.113.5/x" ` + rule1}},
+		{"client ipv6", "mcp:\n  clients: [\"https://[2001:db8::1]/x\"]\n", []string{rule1}},
+		{"client query", "mcp:\n  clients: [\"https://claude.ai/x?a=1\"]\n", []string{rule1}},
+		{"client empty query", "mcp:\n  clients: [\"https://claude.ai/x?\"]\n", []string{rule1}},
+		{"client fragment", "mcp:\n  clients: [\"https://claude.ai/x#f\"]\n", []string{rule1}},
+		{"client userinfo", "mcp:\n  clients: [\"https://u@claude.ai/x\"]\n", []string{rule1}},
+		{"client dot segment", "mcp:\n  clients: [https://claude.ai/a/../x]\n", []string{rule1}},
+		{"client too long", "mcp:\n  clients: [" + long + "]\n", []string{rule1}},
+		{"client empty", "mcp:\n  clients: [\"\"]\n", []string{rule1}},
+		{"redirect http loopback", "mcp:\n  redirect_uris: [http://localhost/x]\n", []string{`mcp.redirect_uris: "http://localhost/x" ` + rule2}},
+		{"redirect http", "mcp:\n  redirect_uris: [http://claude.ai/cb]\n", []string{rule2}},
+		{"redirect fragment", "mcp:\n  redirect_uris: [\"https://claude.ai/cb#x\"]\n", []string{rule2}},
+		{"redirect userinfo", "mcp:\n  redirect_uris: [\"https://u:p@claude.ai/cb\"]\n", []string{rule2}},
+		{"redirect too long", "mcp:\n  redirect_uris: [" + long + "]\n", []string{rule2}},
+		{"redirect custom scheme", "mcp:\n  redirect_uris: [\"cursor://cb\"]\n", []string{rule2}},
+		{"redirect hub", "mcp:\n  redirect_uris: [https://backyard.acme.com/cb]\n", []string{`mcp.redirect_uris: "https://backyard.acme.com/cb" ` + rule3}},
+		{"redirect site", "mcp:\n  redirect_uris: [https://evil.backyard.acme.com/cb]\n", []string{`mcp.redirect_uris: "https://evil.backyard.acme.com/cb" ` + rule3}},
+		{"redirect site uppercase", "mcp:\n  redirect_uris: [https://Evil.Backyard.Acme.com/cb]\n", []string{rule3}},
+		{"redirect other domain", "mcp:\n  redirect_uris: [https://notbackyard.acme.com/cb, https://claude.ai/api/mcp/auth_callback/x]\n", nil},
+		{"publish too small", "mcp:\n  max_publish_bytes: 65535\n", []string{rule4}},
+		{"publish too big", "mcp:\n  max_publish_bytes: 67108865\n", []string{rule4}},
+		{"publish over site", "sites:\n  max_site_bytes: 100000\nmcp:\n  enabled: true\n  max_publish_bytes: 100001\n", []string{rule4}},
+		{"default publish over a small site, enabled", "sites:\n  max_site_bytes: 1048576\nmcp:\n  enabled: true\n", []string{rule4}},
+		// Upgrades: a small sites.max_site_bytes stays valid while the connector is off.
+		{"default publish over a small site, disabled", "sites:\n  max_site_bytes: 1048576\n", nil},
+		{"publish bounds", "mcp:\n  max_publish_bytes: 67108864\n", nil},
+		{"enabled https", "mcp:\n  enabled: true\n", nil},
+		{"enabled with path", "  public_url: https://backyard.acme.com/hub\nmcp:\n  enabled: true\n", []string{rule5}},
+		{"enabled with query", "  public_url: \"https://backyard.acme.com?x=1\"\nmcp:\n  enabled: true\n", []string{rule5}},
+		{"enabled http", "  public_url: http://backyard.acme.com\nmcp:\n  enabled: true\n", []string{rule5}},
+		{"enabled http loopback ip", "  public_url: http://127.0.0.1:8080\nmcp:\n  enabled: true\n", nil},
+		{"enabled http localhost", "  public_url: http://localhost:8080\nmcp:\n  enabled: true\n", nil},
+		{"enabled http dot localhost", "  public_url: http://hub.localhost:8080\nmcp:\n  enabled: true\n", nil},
+		{"enabled http ipv6 loopback", "  public_url: \"http://[::1]:8080\"\nmcp:\n  enabled: true\n", nil},
+		{"enabled http lan", "  public_url: http://10.0.0.5:8080\nmcp:\n  enabled: true\n", []string{rule5}},
+		{"disabled http", "  public_url: http://backyard.acme.com/hub\n", nil},
+		{"oidc authorize callback", "auth:\n  mode: oidc\n  oidc: {issuer: https://idp.example.com, client_id: x, redirect_url: https://backyard.acme.com/__backyard/auth/authorize}\nmcp:\n  enabled: true\n", []string{rule6}},
+		{"oidc authorize callback disabled", "auth:\n  mode: oidc\n  oidc: {issuer: https://idp.example.com, client_id: x, redirect_url: https://backyard.acme.com/__backyard/auth/authorize}\n", nil},
+		{"oidc normal callback", "auth:\n  mode: oidc\n  oidc: {issuer: https://idp.example.com, client_id: x}\nmcp:\n  enabled: true\n", nil},
+		{"all problems together", "mcp:\n  enabled: true\n  clients: [https://claude.ai]\n  redirect_uris: [http://localhost/x, https://backyard.acme.com/cb]\n  max_publish_bytes: 1\n",
+			[]string{rule1, rule2, rule3, rule4}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			y := tc.yaml
+			if strings.HasPrefix(y, "  public_url:") {
+				// A server key: splice it into the server section.
+				line, rest, _ := strings.Cut(y, "\n")
+				cfg, err := Parse([]byte("server:\n  base_domain: backyard.acme.com\n  secret: " + strings.Repeat("s", 40) + "\n" + line + "\n" + rest))
+				if err != nil {
+					t.Fatal(err)
+				}
+				cfg.ApplyDefaults()
+				check(t, cfg.Validate(), tc.want)
+				return
+			}
+			check(t, mcpConfig(t, y).Validate(), tc.want)
+		})
+	}
+}
+
+func check(t *testing.T, err error, want []string) {
+	t.Helper()
+	if len(want) == 0 {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		return
+	}
+	if err == nil {
+		t.Fatalf("no error, want %q", want)
+	}
+	for _, w := range want {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("error %q does not contain %q", err, w)
+		}
+	}
+}
+
+func TestExampleMCPSection(t *testing.T) {
+	cfg, err := Parse([]byte(Example))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MCP.Enabled || cfg.MCP.Clients != nil || cfg.MCP.RedirectURIs != nil {
+		t.Fatalf("example mcp section: %+v", cfg.MCP)
+	}
+	if !strings.Contains(Example, "\nmcp:\n") || !strings.Contains(Example, "# max_publish_bytes: 4194304") {
+		t.Fatal("example.yaml lacks the mcp section")
+	}
+}
+
+func TestLoopbackHost(t *testing.T) {
+	for h, want := range map[string]bool{
+		"localhost": true, "LOCALHOST": true, "hub.localhost": true, "127.0.0.1": true, "127.9.8.7": true,
+		"::1": true, "[::1]": true, "localhost.": true,
+		"localhost.example.com": false, "10.0.0.1": false, "backyard.acme.com": false, "": false, "::": false,
+	} {
+		if got := LoopbackHost(h); got != want {
+			t.Errorf("LoopbackHost(%q) = %v, want %v", h, got, want)
+		}
+	}
+}

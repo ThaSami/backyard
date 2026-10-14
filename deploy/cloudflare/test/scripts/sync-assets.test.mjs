@@ -44,6 +44,7 @@ function fillRepo(repo) {
     "skills/backyard/SKILL.md": "---\nname: backyard\n---\n\n# Backyard\n",
     "skills/backyard/references/api.md": "# API\n",
     "internal/docstore/conformance/querycases.json": '{"version":1,"collections":{"c":[]},"cases":[]}\n',
+    "internal/mcpremote/tools.json": JSON.stringify({ instructions: "Use the tools.", tools: [{ name: "t1", inputSchema: { type: "object" } }] }, null, 2) + "\n",
   };
   for (const [rel, content] of Object.entries(files)) {
     mkdirSync(dirname(join(repo, rel)), { recursive: true });
@@ -64,7 +65,7 @@ describe("scripts/sync-assets.mjs", () => {
     for (const d of dirs) rmSync(d, { recursive: true, force: true });
   });
 
-  it("refuses to build or deploy from a checkout without web/ and skills/", () => {
+  it("refuses to build or deploy from a checkout without web/, skills/ and the connector's tool catalog", () => {
     const sb = sandbox();
     const runs = [
       ["--strict", {}],
@@ -77,7 +78,7 @@ describe("scripts/sync-assets.mjs", () => {
       const what = `${arg} ${JSON.stringify(env)}`;
       assert.equal(r.code, 1, what);
       assert.match(r.out, /cannot build the Worker/, what);
-      for (const missing of ["web/sdk/backyard.js", "web/hub", "skills/backyard/SKILL.md", "skills/backyard/references"]) {
+      for (const missing of ["web/sdk/backyard.js", "web/hub", "skills/backyard/SKILL.md", "skills/backyard/references", "internal/mcpremote/tools.json"]) {
         assert.ok(r.out.includes(`  - ${missing}`), `${what}: ${missing} in\n${r.out}`);
       }
       assert.match(r.out, /complete checkout \(git clone https:\/\/github\.com\/thasami\/backyard\.git/, what);
@@ -96,6 +97,8 @@ describe("scripts/sync-assets.mjs", () => {
       assert.match(r.out, /warning: missing web\/sdk\/backyard\.js: using a placeholder/);
     }
     assert.match(readFileSync(join(sb.pkg, "src", "generated", "sdk.ts"), "utf8"), /Backyard SDK placeholder/);
+    // An empty tool catalog: the connector lists no tools.
+    assert.match(readFileSync(join(sb.pkg, "src", "generated", "mcp.ts"), "utf8"), /export const MCP_CATALOG: \{ instructions: string; tools: McpTool\[\] \} = \{\n  "instructions": "The Claude connector's tool catalog was not bundled[^"]*",\n  "tools": \[\]\n\};\n$/);
     // The shared query cases are marked missing, which their test reports.
     const qc = JSON.parse(readFileSync(join(sb.pkg, "test", "generated", "querycases.json"), "utf8"));
     assert.equal(qc.missing, "internal/docstore/conformance/querycases.json");
@@ -110,11 +113,34 @@ describe("scripts/sync-assets.mjs", () => {
     assert.ok(!/warning/.test(r.out), r.out);
     const skills = readFileSync(join(sb.pkg, "src", "generated", "skills.ts"), "utf8");
     assert.match(skills, /"api": "# API\\n"/);
+    // The connector's catalog, parsed and re-emitted as MCP_CATALOG.
+    const mcp = readFileSync(join(sb.pkg, "src", "generated", "mcp.ts"), "utf8");
+    const literal = /export const MCP_CATALOG: [^=]+= (\{[\s\S]*\});\n$/.exec(mcp)?.[1];
+    assert.deepEqual(JSON.parse(literal ?? "null"), JSON.parse(readFileSync(join(sb.repo, "internal/mcpremote/tools.json"), "utf8")));
     assert.equal(
       readFileSync(join(sb.pkg, "test", "generated", "querycases.json"), "utf8"),
       readFileSync(join(sb.repo, "internal/docstore/conformance/querycases.json"), "utf8"),
     );
     r = sync(sb, ["--check"], { WRANGLER_COMMAND: "deploy" });
+    assert.equal(r.code, 0, r.out);
+    // A changed catalog changes ASSETS_HASH and makes --check fail.
+    const index = readFileSync(join(sb.pkg, "src", "generated", "index.ts"), "utf8");
+    const catalog = join(sb.repo, "internal/mcpremote/tools.json");
+    const original = readFileSync(catalog, "utf8");
+    writeFileSync(catalog, JSON.stringify({ instructions: "Changed.", tools: [] }));
+    r = sync(sb, ["--check"]);
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /out of date/);
+    r = sync(sb, ["--strict"]);
+    assert.equal(r.code, 0, r.out);
+    assert.notEqual(readFileSync(join(sb.pkg, "src", "generated", "index.ts"), "utf8"), index, "ASSETS_HASH covers the catalog");
+    // An unparsable catalog is refused by a build.
+    writeFileSync(catalog, "{");
+    r = sync(sb, ["--strict"]);
+    assert.equal(r.code, 1, r.out);
+    assert.ok(r.out.includes("  - invalid internal/mcpremote/tools.json ("), r.out);
+    writeFileSync(catalog, original);
+    r = sync(sb, ["--strict"]);
     assert.equal(r.code, 0, r.out);
     // A changed source (the query cases included) makes --check fail.
     writeFileSync(join(sb.repo, "internal/docstore/conformance/querycases.json"), '{"version":2,"collections":{},"cases":[]}\n');
@@ -122,7 +148,7 @@ describe("scripts/sync-assets.mjs", () => {
     assert.equal(r.code, 1, r.out);
     assert.match(r.out, /out of date/);
     // The query cases are test data: a deploy never needs them.
-    rmSync(join(sb.repo, "internal"), { recursive: true });
+    rmSync(join(sb.repo, "internal", "docstore"), { recursive: true });
     r = sync(sb, ["--strict"]);
     assert.equal(r.code, 0, r.out);
     assert.match(r.out, /warning: cannot read internal\/docstore\/conformance\/querycases\.json/);

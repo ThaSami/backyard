@@ -76,6 +76,11 @@ backyard deploy               # publishes the folder and prints the URL
 - With the MCP server (`backyard mcp`) the same is available as tools: `backyard_docs`,
   `backyard_init`, `backyard_deploy`, `backyard_list_sites`, `backyard_site_files`,
   `backyard_read_site_file`, `backyard_whoami`, `backyard_open_url`.
+- When the Backyard connector is connected in Claude (no CLI needed), publish with
+  `backyard_publish`: give each file inline (binary files as base64 with
+  `"encoding": "base64"`); it merges by default (unlisted files are kept; `delete` and
+  `replace` are explicit), and ask the user before setting `overwrite`. See
+  [references/deploy.md](references/deploy.md#publishing-from-claude-connector).
 - `backyard dev` runs until stopped — agents start it in the background with `--no-open`
   (it opens a browser otherwise). AI and warehouse need
   `backyard dev --config backyard.yaml` with providers configured; otherwise those calls fail

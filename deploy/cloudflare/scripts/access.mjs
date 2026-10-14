@@ -19,8 +19,9 @@
 //        found there.
 //      * --team/--aud: verifies applications made elsewhere.
 //   4. Edge verification BEFORE the Worker changes: the team's signing keys,
-//      the login redirect (team and AUD), and the five bypass paths reaching
-//      the Worker. A failure exits 4 with the Worker unchanged.
+//      the login redirect (team and AUD), and the nine bypass paths reaching
+//      the Worker (the machine endpoints and the Claude connector's four
+//      paths). A failure exits 4 with the Worker unchanged.
 //   5. Deploy with AUTH_MODE=access (the auth guard passes: it strengthens
 //      auth), then post-checks: /info says access, workers.dev answers 401,
 //      the deploy token still works.
@@ -159,10 +160,13 @@ function progress(label) {
  * The edge checks of Cloudflare Access in front of the hub (design §3.4 step
  * 6), without credentials: (a) the team's signing keys, (b) the login redirect
  * at https://<host>/ (team, and AUD when the redirect carries it), (c) in host
- * mode the same at a random https://byd-probe-….<host>/, (d) the five bypass
- * paths reaching the Worker. Returns the failures of each group (empty = ok).
+ * mode the same at a random https://byd-probe-….<host>/, (d) the machine
+ * endpoints of the bypass application reaching the Worker, (e) the Claude
+ * connector's four paths of it reaching the Worker (SPEC §8.4; they pass
+ * whether or not MCP_ENABLED is on, and on a Worker that predates the
+ * connector). Returns the failures of each group (empty = ok).
  * @param {{host: string, mode?: string, team: string, aud: string, worker: string}} o
- * @returns {Promise<{certs: string[], redirect: string[], wildcard: string[], bypass: string[]}>}
+ * @returns {Promise<{certs: string[], redirect: string[], wildcard: string[], bypass: string[], connector: string[]}>}
  */
 export async function accessEdgeFailures(o) {
   const { host, team } = o;
@@ -206,11 +210,22 @@ export async function accessEdgeFailures(o) {
     },
     { path: "/__backyard/api/tokens", rule: "/__backyard/api/tokens", want: "a JSON answer of the Worker", ok: (r) => r.status >= 400 && r.status < 500 && isJSON(r) },
   ];
-  const bypass = async () => {
-    const results = await Promise.all(BYPASS.map((b) => probe(`https://${host}${b.path}`, { accept: "application/json" })));
+  // The Claude connector's paths (SPEC §8.4). The Worker answers them itself:
+  // 401/405/200 with MCP_ENABLED, its JSON 404 without; a Worker older than
+  // the connector answers its hub page (401 in AUTH_MODE=access, else 404) at
+  // the discovery documents.
+  const discovery = (r) => [200, 401, 404].includes(r.status);
+  const CONNECTOR = [
+    { path: "/__backyard/mcp", rule: "/__backyard/mcp", want: "the Worker's JSON 401, 404 or 405", ok: (r) => isJSON(r) && [401, 404, 405].includes(r.status) },
+    { path: "/__backyard/oauth/token", rule: "/__backyard/oauth/*", want: "the Worker's JSON 404 or 405", ok: (r) => isJSON(r) && [404, 405].includes(r.status) },
+    { path: "/.well-known/oauth-authorization-server", rule: "/.well-known/oauth-authorization-server", want: "200, 401 or 404", ok: discovery },
+    { path: "/.well-known/oauth-protected-resource/__backyard/mcp", rule: "/.well-known/oauth-protected-resource/__backyard/mcp", want: "200, 401 or 404", ok: discovery },
+  ];
+  const probeAll = async (list) => {
+    const results = await Promise.all(list.map((b) => probe(`https://${host}${b.path}`, { accept: "application/json" })));
     const out = [];
     for (const [i, r] of results.entries()) {
-      const b = BYPASS[i];
+      const b = list[i];
       let f = "";
       if (!r.ok) f = `https://${host}${b.path} does not answer (${failText(r)})`;
       else if (accessBlocked(r)) f = `the bypass application is missing ${host}${b.rule}`;
@@ -220,13 +235,14 @@ export async function accessEdgeFailures(o) {
     return out;
   };
 
-  const [c, red, wild, by] = await Promise.all([
+  const [c, red, wild, by, conn] = await Promise.all([
     certs(),
     login(host, host),
     o.mode === "host" ? login(`${randomProbeLabel()}.${host}`, `*.${host}`) : Promise.resolve([]),
-    bypass(),
+    probeAll(BYPASS),
+    probeAll(CONNECTOR),
   ]);
-  return { certs: c, redirect: red, wildcard: wild, bypass: by };
+  return { certs: c, redirect: red, wildcard: wild, bypass: by, connector: conn };
 }
 
 /** The origin of a URL, for messages ("" when it is not one). */
@@ -726,7 +742,7 @@ export async function runAccessEnable(opts, ctx) {
   ui.log(`\nChecking Cloudflare Access at the edge (team ${team}, AUD ${aud})…`);
   const verify = async () => {
     const f = await accessEdgeFailures({ host, mode, team, aud, worker: w });
-    const failures = [...f.certs, ...f.redirect, ...f.wildcard, ...f.bypass];
+    const failures = [...f.certs, ...f.redirect, ...f.wildcard, ...f.bypass, ...f.connector];
     return { done: failures.length === 0, failures };
   };
   const v = await waitFor(verify, { timeoutSec: opts.wait ?? VERIFY_WAIT, intervalSec: 5, onPending: progress("waiting for Cloudflare Access") });

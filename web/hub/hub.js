@@ -1,5 +1,6 @@
 /*
- * Backyard hub UI: site directory, drag-and-drop deploys, CLI and agent setup.
+ * Backyard hub UI: site directory, drag-and-drop deploys, CLI and agent setup,
+ * and the "Use Backyard in Claude" card of the Claude connector.
  * No frameworks, no dependencies. Works with the Go server and the Cloudflare
  * Worker edition (same /__backyard/api endpoints, SPEC §2, §7).
  *
@@ -1082,6 +1083,96 @@
     return out;
   }
 
+  // --- Claude connector (remote MCP, SPEC §8.4, §14.1)
+
+  /** The hub API of the signed-in person's connector connections (SPEC §8.4.7). */
+  const GRANTS = API + "/mcp/grants";
+
+  /**
+   * What the "Use Backyard in Claude" card shows, from GET /info: null when
+   * the server has no Claude connector (no mcp_url, SPEC §7.1), else
+   * { url, claudeCode } with the Claude Code command.
+   */
+  function connectorSetup(info) {
+    const url = info && typeof info.mcp_url === "string" ? info.mcp_url.trim() : "";
+    if (!/^https?:\/\/[^\s/?#]+\/[^\s]*$/i.test(url)) return null;
+    return { url, claudeCode: "claude mcp add --transport http backyard " + shellQuote(url) };
+  }
+
+  /** Whether host (no port) is this computer: where a desktop app such as Claude Code receives its sign-in. */
+  function isLoopbackHost(host) {
+    const h = String(host || "")
+      .toLowerCase()
+      .replace(/:\d+$/, "");
+    return h === "localhost" || h.endsWith(".localhost") || /^127(\.\d{1,3}){3}$/.test(h) || h === "[::1]" || h === "::1";
+  }
+
+  /** A date for people ("Oct 14, 2026"); opts: { locale, timeZone } (defaults: the browser's). */
+  function formatDate(value, opts) {
+    const t = typeof value === "number" ? value : Date.parse(value);
+    if (!isFinite(t)) return "";
+    const o = opts || {};
+    try {
+      return new Date(t).toLocaleDateString(o.locale || undefined, { year: "numeric", month: "short", day: "numeric", timeZone: o.timeZone || undefined });
+    } catch (_) {
+      return new Date(t).toISOString().slice(0, 10);
+    }
+  }
+
+  /**
+   * How a connection (a Grant of GET /__backyard/api/mcp/grants) is shown:
+   * { id, app, verified, trust ("verified by <host>" or "unverified"),
+   * returnsTo, created, expires }. Only a client identified by its metadata
+   * document (CIMD) is verified; a self-registered app names itself.
+   */
+  function grantSummary(g, opts) {
+    const str = (v) => (typeof v === "string" ? v.trim() : "");
+    g = g && typeof g === "object" ? g : {};
+    const host = str(g.client_host);
+    const verified = g.client_kind === "metadata_document" && !!host;
+    const back = str(g.redirect_host);
+    return {
+      id: str(g.id),
+      app: str(g.client_name) || "An app",
+      verified,
+      trust: verified ? "verified by " + host : "unverified",
+      returnsTo: !back ? "" : isLoopbackHost(back) ? "an app on this computer" : back,
+      created: formatDate(g.created_at, opts),
+      expires: formatDate(g.expires_at, opts),
+    };
+  }
+
+  /**
+   * The user id of the person an admin names: ids are lowercased emails
+   * (SPEC §4), so an email is lowercased; "sub:…", "anon:…" and other
+   * prefixed ids are kept as typed.
+   */
+  function normalizeUserId(s) {
+    const v = String(s || "").trim();
+    return /^[a-z][a-z0-9+.-]*:/i.test(v) ? v : v.toLowerCase();
+  }
+
+  /** Disconnects one connection: DELETE /__backyard/api/mcp/grants/{id} (204). opts: { id, fetch }. */
+  async function revokeGrant(opts) {
+    const fetchImpl = opts.fetch || ((...a) => globalThis.fetch(...a));
+    const id = String(opts.id || "");
+    if (!id) throw new HubError("Disconnecting failed: no connection given", { code: "bad_request" });
+    await gatewayCall(fetchImpl, GRANTS + "/" + encodeURIComponent(id), { method: "DELETE", headers: gatewayHeaders("", false) }, "Disconnecting");
+  }
+
+  /**
+   * Disconnects every connection of a person (admins; SPEC §8.4.7):
+   * DELETE /__backyard/api/mcp/grants?user=<id>. opts: { user, fetch }.
+   * Resolves with the number of connections ended.
+   */
+  async function revokeUserGrants(opts) {
+    const fetchImpl = opts.fetch || ((...a) => globalThis.fetch(...a));
+    const user = normalizeUserId(opts.user);
+    if (!user) throw new HubError("Enter the person's email or user ID.", { code: "bad_request" });
+    const res = await gatewayCall(fetchImpl, GRANTS + "?user=" + encodeURIComponent(user), { method: "DELETE", headers: gatewayHeaders("", false) }, "Disconnecting " + user);
+    return res && typeof res.revoked === "number" ? res.revoked : 0;
+  }
+
   const helpers = {
     DEFAULT_IGNORE,
     DEFAULT_RESERVED,
@@ -1116,6 +1207,12 @@
     createUploader,
     deleteSite,
     filterSites,
+    connectorSetup,
+    formatDate,
+    grantSummary,
+    normalizeUserId,
+    revokeGrant,
+    revokeUserGrants,
     HubError,
   };
   globalThis.BackyardHub = helpers;
@@ -1141,6 +1238,7 @@
     tokenWanted: false, // a delete was rejected for lack of a (valid) token
     fresh: "",
     deleting: "",
+    grants: null, // the visitor's connector connections (null: not loaded)
   };
 
   function store(key, value) {
@@ -1685,6 +1783,144 @@
     b.hidden = !msg;
   }
 
+  // --- Claude connector card (shown while /info has mcp_url, SPEC §7.1)
+
+  /** Sets a status line (role=status); isError styles it as an error. */
+  function setStatus(node, msg, isError) {
+    node.textContent = msg || "";
+    node.classList.toggle("error", !!msg && !!isError);
+  }
+
+  /** Shows or hides the card; returns whether it is shown. */
+  function renderConnector() {
+    const setup = connectorSetup(state.info);
+    $("connector").hidden = !setup;
+    if (!setup) return false;
+    $("connector-url").textContent = setup.url;
+    $("connector-cmd").textContent = setup.claudeCode;
+    // The API decides (403 otherwise); the form is only offered to admins.
+    $("connector-revoke-user").hidden = !(state.me && state.me.admin && !state.me.anonymous);
+    return true;
+  }
+
+  function grantItem(g) {
+    const v = grantSummary(g);
+    const parts = [v.returnsTo && "Returns to " + v.returnsTo, v.created && "connected " + v.created, v.expires && "expires " + v.expires].filter(Boolean);
+    const details = parts.join(" · ").replace(/^./, (c) => c.toUpperCase());
+    const button = el("button", { type: "button", class: "btn small danger connector-revoke", "data-id": v.id, "aria-label": "Disconnect " + v.app }, "Disconnect");
+    button.addEventListener("click", () => disconnectGrant(v, button));
+    return el(
+      "li",
+      { class: "grant" },
+      el(
+        "div",
+        { class: "grant-main" },
+        el("span", { class: "grant-app", text: v.app }),
+        el("span", { class: "grant-trust" + (v.verified ? " verified" : ""), text: v.trust }),
+        details ? el("span", { class: "grant-meta", text: details }) : null,
+      ),
+      button,
+    );
+  }
+
+  function renderGrants() {
+    const list = $("connector-grants");
+    const grants = state.grants || [];
+    list.textContent = "";
+    for (const g of grants) list.append(grantItem(g));
+    list.removeAttribute("aria-busy");
+    list.hidden = grants.length === 0;
+    $("connector-grants-empty").hidden = state.grants === null || grants.length > 0;
+  }
+
+  let grantsSeq = 0;
+
+  /** Loads the visitor's connections (GET /__backyard/api/mcp/grants). */
+  async function loadGrants() {
+    const seq = ++grantsSeq; // a newer load supersedes one still running
+    let problem = "";
+    let grants = null;
+    try {
+      const res = await getJSON(GRANTS);
+      grants = Array.isArray(res && res.grants) ? res.grants : [];
+    } catch (err) {
+      problem = err.status === 401 ? "Sign in to see your connections." : "Could not load your connections: " + (err.message || err);
+    }
+    if (seq !== grantsSeq) return;
+    state.grants = grants;
+    renderGrants();
+    setStatus($("connector-status"), problem, !!problem);
+  }
+
+  /** The Disconnect button of one connection. */
+  async function disconnectGrant(v, button) {
+    const status = $("connector-status");
+    button.disabled = true;
+    setStatus(status, "");
+    try {
+      await revokeGrant({ id: v.id });
+    } catch (e) {
+      if (e.status === 401 && isSafeRedirect(e.loginUrl)) {
+        location.href = e.loginUrl;
+        return;
+      }
+      if (e.status !== 404) {
+        // 404: it is gone already (it expired, or was disconnected elsewhere).
+        button.disabled = false;
+        setStatus(status, e.message || "Disconnecting failed.", true);
+        return;
+      }
+    }
+    grantsSeq++; // a list still loading would bring it back
+    state.grants = (state.grants || []).filter((g) => g && g.id !== v.id);
+    // The list may have been re-rendered meanwhile: find the item again.
+    const shown = Array.from($("connector-grants").querySelectorAll("button.connector-revoke")).find((b) => b.dataset.id === v.id);
+    const li = shown && shown.closest("li");
+    const next = li && (li.nextElementSibling || li.previousElementSibling);
+    const active = document.activeElement;
+    const focusLost = !active || active === document.body || active === button || (!!li && li.contains(active));
+    if (li) li.remove();
+    if (!state.grants.length) renderGrants();
+    if (focusLost) {
+      // Keep the keyboard focus in the list instead of losing it with the button.
+      const target = next && next.querySelector("button.connector-revoke");
+      (target || $("connector-grants-title")).focus();
+    }
+    setStatus(status, `Disconnected ${v.app}. It needs your approval again to use Backyard.`);
+  }
+
+  /** The admin form: disconnect every connection of one person, after confirming. */
+  async function onRevokeUser(ev) {
+    ev.preventDefault();
+    const input = $("connector-user");
+    const status = $("connector-user-status");
+    const submit = $("connector-user-submit");
+    const user = normalizeUserId(input.value);
+    input.setAttribute("aria-invalid", user ? "false" : "true");
+    if (!user) {
+      setStatus(status, "Enter the person's email or user ID.", true);
+      input.focus();
+      return;
+    }
+    if (!confirm(`Disconnect every Claude connection of ${user}? Their apps lose access to Backyard at once.`)) return;
+    submit.disabled = true;
+    setStatus(status, "");
+    try {
+      const n = await revokeUserGrants({ user });
+      setStatus(status, n ? `Disconnected ${n} connection${n === 1 ? "" : "s"} of ${user}.` : `${user} had no connections.`);
+      input.value = "";
+      if (n) loadGrants(); // the admin's own connections may have been among them
+    } catch (e) {
+      if (e.status === 401 && isSafeRedirect(e.loginUrl)) {
+        location.href = e.loginUrl;
+        return;
+      }
+      setStatus(status, e.message || "Disconnecting failed.", true);
+    } finally {
+      submit.disabled = false;
+    }
+  }
+
   // --- delete dialog
 
   function openDelete(name) {
@@ -1901,6 +2137,10 @@
     });
     $("handoff-ignore").addEventListener("click", () => closeHandoff(false));
     $("handoff-dialog").addEventListener("close", () => closeHandoff(false)); // Escape
+
+    $("connector-copy").addEventListener("click", () => copyText($("connector-url").textContent));
+    $("connector-revoke-user").addEventListener("submit", onRevokeUser);
+    $("connector-user").addEventListener("input", (e) => e.target.removeAttribute("aria-invalid"));
   }
 
   async function boot() {
@@ -1940,6 +2180,7 @@
     renderCLI();
     renderTokenBox();
     renderName();
+    if (renderConnector()) loadGrants();
     const sites = loadSites();
     if (check) offerHandedToken(handed, await check);
     await sites;

@@ -336,6 +336,47 @@ describe("helpers/fake-cloudflare.mjs", () => {
     fake.update((s) => (s.dns = { "*.backyard.example.com": "nxdomain" }));
     assert.equal(await doh("byd-probe-12345678.backyard.example.com"), 3);
   });
+
+  it("answers the Claude connector's paths like the Worker (MCP_ENABLED on, off, and before the connector)", async () => {
+    const WDH = "backyard.acme.workers.dev";
+    const paths = ["/__backyard/mcp", "/__backyard/oauth/token", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource/__backyard/mcp"];
+    const answers = async () => {
+      const out = [];
+      for (const p of paths) {
+        const r = await fetch(`${fake.origin}/__edge/${WDH}${p}`, { headers: { accept: "application/json" } });
+        out.push(`${r.status} ${r.headers.get("content-type")}`);
+      }
+      return out;
+    };
+    const info = async () => JSON.parse((await edge(WDH, "/__backyard/api/deploy/info")).text);
+    fake.update((s) => {
+      s.edge = {};
+      s.dns = {};
+      s.workers.backyard.vars.AUTH_MODE = "access";
+      delete s.workers.backyard.vars.MCP_ENABLED;
+    });
+    // Off: the JSON 404 of every path, before any sign-in (also in AUTH_MODE=access); /info has no mcp_url.
+    assert.deepEqual(await answers(), Array(4).fill("404 application/json"));
+    assert.match((await edge(WDH, "/__backyard/oauth/token")).text, /the Claude connector is not enabled on this server/);
+    assert.equal((await info()).mcp_url, undefined);
+    // On: 401 (with the challenge), 405, 200, 200; /info has mcp_url.
+    fake.update((s) => (s.workers.backyard.vars.MCP_ENABLED = "true"));
+    assert.deepEqual(await answers(), ["401 application/json", "405 application/json", "200 application/json", "200 application/json"]);
+    const r = await fetch(`${fake.origin}/__edge/${WDH}/__backyard/mcp`, { method: "POST" });
+    assert.equal(r.headers.get("www-authenticate"), `Bearer resource_metadata="https://${WDH}/.well-known/oauth-protected-resource/__backyard/mcp", scope="mcp"`);
+    assert.equal((await info()).mcp_url, `https://${WDH}/__backyard/mcp`);
+    // A Worker from before the connector: JSON 404s below /__backyard/, its hub page (401 in AUTH_MODE=access) at the discovery documents.
+    fake.update((s) => (s.edge = { preConnector: true }));
+    const legacy = await answers();
+    assert.deepEqual(legacy.slice(0, 2), ["404 application/json", "404 application/json"]);
+    assert.deepEqual(legacy.slice(2).map((x) => x.split(" ")[0]), ["401", "401"]);
+    assert.equal((await info()).mcp_url, undefined);
+    fake.update((s) => {
+      s.edge = {};
+      s.workers.backyard.vars.AUTH_MODE = "none";
+      delete s.workers.backyard.vars.MCP_ENABLED;
+    });
+  });
 });
 
 function parseAccessRedirectForTest(location) {

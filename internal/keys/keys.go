@@ -23,6 +23,14 @@ const (
 	// (/__backyard/auth/cli). The value never leaves one deployment, so the
 	// Cloudflare edition need not derive it identically.
 	CLIConfirm = "backyard/cli-confirm/v1"
+	// The remote MCP connector's authorization server (SPEC §8.4). These
+	// values reference per-deployment grant state, so they never
+	// interoperate between deployments or editions.
+	MCPClient  = "backyard/mcp-client/v1"  // stateless DCR client_ids
+	MCPConsent = "backyard/mcp-consent/v1" // consent page CSRF tokens
+	MCPCode    = "backyard/mcp-code/v1"    // authorization codes
+	MCPRefresh = "backyard/mcp-refresh/v1" // refresh tokens
+	MCPAccess  = "backyard/mcp-access/v1"  // access tokens
 )
 
 // Derive returns a 32-byte key for label derived from secret with HKDF-SHA256.

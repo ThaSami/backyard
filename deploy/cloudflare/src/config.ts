@@ -55,6 +55,10 @@ export interface Limits {
   ws_message_burst: number;
   ws_max_message_bytes: number;
   ws_max_presence_bytes: number;
+  /** Decoded file bytes of one backyard_publish call of the Claude connector (SPEC §14.1). */
+  mcp_publish_bytes: number;
+  /** Connector tool calls (tools/call) per user per UTC day. 0 = unlimited. */
+  mcp_calls_per_day: number;
 }
 
 export const DEFAULT_LIMITS: Limits = {
@@ -81,7 +85,33 @@ export const DEFAULT_LIMITS: Limits = {
   ws_message_burst: 120,
   ws_max_message_bytes: 64 * 1024,
   ws_max_presence_bytes: 8 * 1024,
+  mcp_publish_bytes: 2 * 1024 * 1024,
+  mcp_calls_per_day: 5000,
 };
+
+/** Claude's client metadata documents (claude.ai, Desktop, mobile and Cowork; Claude Code): the default MCP_CLIENTS. */
+export const DEFAULT_MCP_CLIENTS = ["https://claude.ai/oauth/mcp-oauth-client-metadata", "https://claude.ai/oauth/claude-code-client-metadata"];
+
+/** Claude's OAuth callbacks: the default MCP_REDIRECT_URIS. */
+export const DEFAULT_MCP_REDIRECT_URIS = ["https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback"];
+
+/** The Claude connector (remote MCP, SPEC §8.4, §14.1, §16). */
+export interface MCPConfig {
+  /**
+   * MCP_ENABLED and valid MCP variables. Requests also need an https (or
+   * loopback) hub origin: see mcpEnabled in oauth.ts.
+   */
+  enabled: boolean;
+  /** Effective MCP_CLIENTS: allowlisted Client ID Metadata Document URLs (exact). */
+  clients: string[];
+  /** Effective MCP_REDIRECT_URIS: exact https redirect URIs (loopback ones are always allowed). */
+  redirectURIs: string[];
+  /**
+   * Problems of the MCP variables: each one turns the connector off without
+   * failing the Worker closed; /__backyard/readyz lists them.
+   */
+  problems: string[];
+}
 
 /** An AI model alias (AI_MODELS JSON var). */
 export interface ModelConfig {
@@ -162,6 +192,7 @@ export interface Config {
   deployToken: string;
   warehouseURL: string;
   ai: AIConfig;
+  mcp: MCPConfig;
   /**
    * A misconfiguration that makes the Worker answer every request except the
    * health checks with 503 (fail closed), "" when there is none: an
@@ -221,17 +252,25 @@ const VAR_KEYS = [
   "FILE_INLINE_MAX",
   "TOKEN_TTL_HOURS",
   "WAREHOUSE_URL",
+  "MCP_ENABLED",
+  "MCP_CLIENTS",
+  "MCP_REDIRECT_URIS",
 ] as const satisfies readonly (keyof Env)[];
 
 /** Variables that hold a JSON object: wrangler and the dashboard may deliver them parsed. */
 const JSON_VARS = new Set<string>(["LIMITS", "AI_MODELS"]);
 
+/** List variables that may also be given as a JSON array of strings. */
+const LIST_VARS = new Set<string>(["MCP_CLIENTS", "MCP_REDIRECT_URIS"]);
+
 /**
  * The variables of env as strings. Wrangler turns a variable written as a
  * JSON value in wrangler.jsonc (or a dashboard variable of type JSON) into a
  * parsed value: numbers and booleans are taken as their text, objects in
- * LIMITS and AI_MODELS as their JSON. Any other value is reported and
- * ignored (in AUTH_MODE it makes the configuration fatal).
+ * LIMITS and AI_MODELS as their JSON, arrays of strings in MCP_CLIENTS and
+ * MCP_REDIRECT_URIS as a comma-separated list. Any other value is reported
+ * and ignored (in AUTH_MODE it makes the configuration fatal; in the MCP
+ * lists it turns the Claude connector off).
  */
 function stringVars(env: Env, problems: string[], invalid: Set<string>): Env {
   const out: Record<string, unknown> = { ...env };
@@ -242,8 +281,11 @@ function stringVars(env: Env, problems: string[], invalid: Set<string>): Env {
       out[k] = String(v);
     } else if (JSON_VARS.has(k) && typeof v === "object" && !Array.isArray(v)) {
       out[k] = JSON.stringify(v);
+    } else if (LIST_VARS.has(k) && Array.isArray(v) && v.every((x) => typeof x === "string")) {
+      out[k] = v.join(",");
     } else {
-      problems.push(`${k} must be a string${JSON_VARS.has(k) ? " or a JSON object" : ""} (got ${Array.isArray(v) ? "an array" : `a ${typeof v}`}); ignoring it`);
+      const also = JSON_VARS.has(k) ? " or a JSON object" : LIST_VARS.has(k) ? " or an array of strings" : "";
+      problems.push(`${k} must be a string${also} (got ${Array.isArray(v) ? "an array" : `a ${typeof v}`}); ignoring it`);
       invalid.add(k);
       delete out[k];
     }
@@ -365,6 +407,7 @@ export function parseConfig(rawEnv: Env): Config {
     deployToken: typeof env.DEPLOY_TOKEN === "string" ? env.DEPLOY_TOKEN.trim() : "",
     warehouseURL: str(env.WAREHOUSE_URL).replace(/\/+$/, ""),
     ai: parseAI(env, problems),
+    mcp: parseMCP(env, invalid, baseDomain, publicURL, problems),
     fatal,
     problems,
   };
@@ -436,6 +479,143 @@ function parseAI(env: Env, problems: string[]): AIConfig {
     openaiBaseURL: (str(env.OPENAI_BASE_URL) || "https://api.openai.com/v1").replace(/\/+$/, ""),
     warnings,
   };
+}
+
+// --- Claude connector (SPEC §8.4, §12 entry rules, §16) ----------------------
+
+/** Longest entry of MCP_CLIENTS and MCP_REDIRECT_URIS (bytes). */
+const MAX_MCP_URL_BYTES = 512;
+
+/** A comma or whitespace separated list. */
+function urlList(v: unknown): string[] {
+  return str(v)
+    .split(/[\s,]+/)
+    .filter(Boolean);
+}
+
+/** UTF-8 length of s. */
+function byteLength(s: string): number {
+  return new TextEncoder().encode(s).length;
+}
+
+/**
+ * Splits an absolute "scheme://authority/path…" URL as written (WHATWG URL
+ * would normalize dot segments and case away); null when it is none.
+ */
+function splitURL(e: string): { scheme: string; authority: string; rest: string } | null {
+  const m = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/([^/?#]*)(.*)$/s.exec(e);
+  if (!m) return null;
+  try {
+    new URL(e);
+  } catch {
+    return null;
+  }
+  return { scheme: m[1]!.toLowerCase(), authority: m[2]!, rest: m[3]! };
+}
+
+/** The host of a URL authority (lowercase, no port, no trailing dot; IPv6 in brackets). */
+function authorityHost(authority: string): string {
+  const at = authority.lastIndexOf("@");
+  let h = at >= 0 ? authority.slice(at + 1) : authority;
+  if (h.startsWith("[")) h = h.slice(0, h.indexOf("]") + 1);
+  else if (h.includes(":")) h = h.slice(0, h.indexOf(":"));
+  return h.toLowerCase().replace(/\.$/, "");
+}
+
+/** Whether h is an IP literal (dotted IPv4 or bracketed IPv6). */
+function isIPLiteral(h: string): boolean {
+  return h.startsWith("[") || /^\d{1,3}(\.\d{1,3}){3}$/.test(h);
+}
+
+/**
+ * Whether hostname h (lowercase, without port; IPv6 with or without
+ * brackets) is a loopback host: localhost, *.localhost, 127.0.0.0/8 or ::1.
+ */
+export function isLoopbackHost(h: string): boolean {
+  h = h.toLowerCase().replace(/\.$/, "");
+  if (h === "localhost" || h.endsWith(".localhost")) return true;
+  if (h === "[::1]" || h === "::1") return true;
+  const m = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  return !!m && m.slice(1).every((x) => Number(x) <= 255);
+}
+
+/**
+ * Whether e may be listed in MCP_CLIENTS (rule 1 of SPEC §12): an https URL
+ * whose host is a name (not an IP literal), with a path other than "/" and
+ * without dot segments, query, fragment or user info, at most 512 bytes.
+ */
+export function validMCPClientURL(e: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  if (!e || byteLength(e) > MAX_MCP_URL_BYTES || /[?#\\\s\u0000-\u001f\u007f]/.test(e)) return false;
+  const u = splitURL(e);
+  if (!u || u.scheme !== "https" || u.authority.includes("@")) return false;
+  const host = authorityHost(u.authority);
+  if (!host || isIPLiteral(host)) return false;
+  if (u.rest === "" || u.rest === "/" || !u.rest.startsWith("/")) return false;
+  // Dot segments, also percent-encoded ("%2e%2e", as Go decodes the path).
+  return !u.rest.split("/").some((seg) => {
+    const d = seg.replace(/%2e/gi, ".");
+    return d === "." || d === "..";
+  });
+}
+
+/**
+ * The host of an MCP_REDIRECT_URIS entry when it is valid (rule 2 of SPEC
+ * §12: an https URL with a host and without fragment or user info, at most
+ * 512 bytes), else "".
+ */
+export function mcpRedirectURIHost(e: string): string {
+  // eslint-disable-next-line no-control-regex
+  if (!e || byteLength(e) > MAX_MCP_URL_BYTES || /[#\\\s\u0000-\u001f\u007f]/.test(e)) return "";
+  const u = splitURL(e);
+  if (!u || u.scheme !== "https" || u.authority.includes("@")) return "";
+  return authorityHost(u.authority);
+}
+
+/** Parses MCP_ENABLED, MCP_CLIENTS and MCP_REDIRECT_URIS (SPEC §16). */
+function parseMCP(env: Env, invalid: Set<string>, baseDomain: string, publicURL: string, problems: string[]): MCPConfig {
+  const own: string[] = [];
+  const off = "; the Claude connector is off";
+  const listed = (k: "MCP_CLIENTS" | "MCP_REDIRECT_URIS", def: string[]): string[] => {
+    if (invalid.has(k)) {
+      own.push(`${k} is not a string${off}`);
+      return [];
+    }
+    const v = (env as unknown as Record<string, unknown>)[k];
+    if (v === undefined || v === null) return [...def];
+    return [...new Set(urlList(v))];
+  };
+  const clients = listed("MCP_CLIENTS", DEFAULT_MCP_CLIENTS);
+  const redirectURIs = listed("MCP_REDIRECT_URIS", DEFAULT_MCP_REDIRECT_URIS);
+  for (const e of clients) {
+    if (!validMCPClientURL(e)) {
+      own.push(`MCP_CLIENTS: ${JSON.stringify(e)} is not a client metadata URL (an https URL with a path, without query, fragment or user info, at most 512 bytes)${off}`);
+    }
+  }
+  let hub = "";
+  if (publicURL) {
+    try {
+      hub = new URL(publicURL).hostname.toLowerCase();
+    } catch {
+      /* publicURL is validated above */
+    }
+  }
+  for (const e of redirectURIs) {
+    const h = mcpRedirectURIHost(e);
+    if (!h) {
+      own.push(
+        `MCP_REDIRECT_URIS: ${JSON.stringify(e)} is not an https redirect URI without fragment or user info (at most 512 bytes; loopback redirect URIs are always allowed and are not listed)${off}`,
+      );
+    } else if (h === hub || (baseDomain !== "" && (h === baseDomain || h.endsWith("." + baseDomain)))) {
+      own.push(`MCP_REDIRECT_URIS: ${JSON.stringify(e)} points at this Backyard or one of its sites${off}`);
+    }
+  }
+  const wanted = bool(env.MCP_ENABLED);
+  if (wanted && publicURL && publicURL.startsWith("http://") && !isLoopbackHost(hub)) {
+    own.push(`MCP_ENABLED needs an https hub URL (PUBLIC_URL is ${publicURL}; plain http only on localhost, *.localhost or loopback addresses)${off}`);
+  }
+  problems.push(...own);
+  return { enabled: wanted && own.length === 0, clients, redirectURIs, problems: own };
 }
 
 /** Effective per-file cap for deploys, given whether R2 is bound. */

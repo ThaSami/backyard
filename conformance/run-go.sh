@@ -1,20 +1,26 @@
 #!/bin/sh
-# Run the conformance suite against the Go server (`backyard serve --dev`),
-# each pass against a fresh server with a temporary data directory:
+# Run the conformance suite against the Go server, each pass against a fresh
+# server with a temporary data directory and the Claude connector enabled
+# (mcp.enabled, SPEC §8.4; the suite runs with BACKYARD_CONFORMANCE_MCP=1):
 #
-#   host  host mode (sites at <site>.localhost) as an anonymous guest, with AI
-#         (aliases backed by mock/openai.mjs) and, given a DSN, a warehouse
-#   path  path mode (sites at /s/<site>/) with a static bearer token, without
-#         AI and warehouse (their 501 unsupported answers)
+#   host  `backyard serve --dev`, host mode (sites at <site>.localhost) as an
+#         anonymous guest, with AI (aliases backed by mock/openai.mjs) and,
+#         given a DSN, a warehouse
+#   path  `backyard serve --dev`, path mode (sites at /s/<site>/) with a static
+#         bearer token, without AI and warehouse (their 501 unsupported answers)
+#   oidc  `backyard serve`, auth.mode oidc against the mock OpenID Connect
+#         provider (mock/idp.mjs), path mode on 127.0.0.1; runs only
+#         tests/mcp.test.mjs, signed in as the IdP's alice and bob
 #
-#   conformance/run-go.sh               # both passes
-#   conformance/run-go.sh host          # one pass (host | path)
+#   conformance/run-go.sh               # all three passes
+#   conformance/run-go.sh host          # one pass (host | path | oidc)
 #   conformance/run-go.sh path -- --test-name-pattern=files   # extra node --test args
 #
 # Environment:
 #   BACKYARD_BIN                prebuilt backyard binary (default: go build into a temp dir)
 #   CONFORMANCE_PORT            server port (default 18400)
 #   CONFORMANCE_AI_PORT         port of the mock AI provider (default 18490; "off" disables AI)
+#   CONFORMANCE_IDP_PORT        port of the mock OpenID Connect provider (default 18480)
 #   CONFORMANCE_WAREHOUSE_DSN   PostgreSQL DSN for a warehouse source (default
 #                               $BACKYARD_TEST_POSTGRES_DSN; empty: no warehouse → 501 checks)
 #   CONFORMANCE_TIMEOUT         seconds to wait for the server (default 60)
@@ -24,25 +30,26 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 port="${CONFORMANCE_PORT:-18400}"
 ai_port="${CONFORMANCE_AI_PORT:-18490}"
+idp_port="${CONFORMANCE_IDP_PORT:-18480}"
 timeout="${CONFORMANCE_TIMEOUT:-60}"
 warehouse_dsn="${CONFORMANCE_WAREHOUSE_DSN-${BACKYARD_TEST_POSTGRES_DSN:-}}"
 
 modes=""
 while [ $# -gt 0 ]; do
 	case "$1" in
-	host | path) modes="$modes $1" ;;
+	host | path | oidc) modes="$modes $1" ;;
 	--)
 		shift
 		break
 		;;
 	*)
-		echo "usage: $0 [host|path]... [-- node --test args]" >&2
+		echo "usage: $0 [host|path|oidc]... [-- node --test args]" >&2
 		exit 2
 		;;
 	esac
 	shift
 done
-[ -n "$modes" ] || modes="host path"
+[ -n "$modes" ] || modes="host path oidc"
 
 log() { printf '>> %s\n' "$*" >&2; }
 fail() {
@@ -55,6 +62,7 @@ command -v node >/dev/null 2>&1 || fail "node 22+ is required"
 work="$(mktemp -d 2>/dev/null || mktemp -d -t backyard-conformance)"
 server_pid=""
 mock_pid=""
+idp_pid=""
 
 stop_pid() {
 	[ -n "$1" ] || return 0
@@ -74,6 +82,7 @@ cleanup() {
 	status=$?
 	stop_pid "$server_pid"
 	stop_pid "$mock_pid"
+	stop_pid "$idp_pid"
 	rm -rf "$work"
 	exit "$status"
 }
@@ -150,6 +159,14 @@ auth:
       sha256: "$2"
 deploy:
   allow_anonymous: true
+mcp:
+  enabled: true
+ratelimit:
+  # Every client of the suite comes from 127.0.0.1 and guests are limited per
+  # IP, like the connector's OAuth endpoints: one bucket for all the files
+  # running in parallel. The suite retries HTTP 429s but cannot retry a
+  # websocket handshake.
+  api_per_minute: 6000
 telemetry:
   log_format: text
 EOF
@@ -199,20 +216,75 @@ EOF
 	fi
 }
 
+# write_oidc_config DATA_DIR SECRET IDP_SECRET: prints the configuration of the
+# oidc pass (no --dev: path mode on 127.0.0.1, the mock IdP's issuer).
+write_oidc_config() {
+	cat <<EOF
+server:
+  listen: "127.0.0.1:$port"
+  base_domain: 127.0.0.1
+  public_url: "http://127.0.0.1:$port"
+  url_mode: path
+  secret: "$2"
+storage:
+  type: fs
+  fs:
+    root: "$1/blobs"
+database:
+  type: sqlite
+  sqlite:
+    path: "$1/backyard.db"
+auth:
+  mode: oidc
+  oidc:
+    issuer: "http://localhost:$idp_port"
+    client_id: conformance
+    client_secret: "$3"
+    scopes: [openid, profile, email, groups]
+mcp:
+  enabled: true
+telemetry:
+  log_format: text
+EOF
+}
+
+# start_idp CLIENT_SECRET: starts mock/idp.mjs for the oidc pass. Its issuer is
+# http://localhost:<port>, another cookie host than the server's 127.0.0.1.
+start_idp() {
+	log "starting the mock OpenID Connect provider on 127.0.0.1:$idp_port"
+	node "$here/mock/idp.mjs" "$idp_port" conformance "$1" "http://127.0.0.1:$port/__backyard/auth/callback" >"$work/idp.log" 2>&1 &
+	idp_pid=$!
+	wait_http "http://127.0.0.1:$idp_port/.well-known/openid-configuration" || {
+		cat "$work/idp.log" >&2
+		fail "the mock OpenID Connect provider did not start"
+	}
+}
+
 status=0
 for mode in $modes; do
 	data="$work/$mode"
 	mkdir -p "$data"
 	token="byd_conformance_$(rand_hex 16)"
 	secret="$(rand_hex 32)"
-	features="full"
-	[ "$mode" = "path" ] && features="none"
-	write_config "$mode" "$(sha256_hex "$token")" "$data" "$features" "$secret" >"$data/backyard.yaml"
-	log "starting backyard serve --dev ($mode mode) on 127.0.0.1:$port"
+	dev="--dev"
+	if [ "$mode" = "oidc" ]; then
+		idp_secret="$(rand_hex 16)"
+		stop_pid "$idp_pid"
+		start_idp "$idp_secret"
+		write_oidc_config "$data" "$secret" "$idp_secret" >"$data/backyard.yaml"
+		dev=""
+	else
+		features="full"
+		[ "$mode" = "path" ] && features="none"
+		write_config "$mode" "$(sha256_hex "$token")" "$data" "$features" "$secret" >"$data/backyard.yaml"
+	fi
+	log "starting backyard serve $dev ($mode mode) on 127.0.0.1:$port"
 	(
 		cd "$data"
 		unset BACKYARD_CONFIG BACKYARD_CONFIG_YAML BACKYARD_SECRET BACKYARD_BASE_DOMAIN BACKYARD_PUBLIC_URL DATABASE_URL PORT
-		exec "$bin" serve --dev --config "$data/backyard.yaml"
+		# $dev is empty or "--dev" (word splitting intended).
+		# shellcheck disable=SC2086
+		exec "$bin" serve $dev --config "$data/backyard.yaml"
 	) >"$data/server.log" 2>&1 &
 	server_pid=$!
 	if ! wait_http "http://127.0.0.1:$port/__backyard/healthz"; then
@@ -222,18 +294,29 @@ for mode in $modes; do
 
 	suite_token=""
 	suite_ai="$ai_mode"
+	suite_url="http://localhost:$port"
+	suite_idp=""
+	tests="tests/*.test.mjs"
 	who="an anonymous guest"
 	if [ "$mode" = "path" ]; then
 		suite_token="$token"
 		suite_ai=""
 		who="the static token, without AI and warehouse"
+	elif [ "$mode" = "oidc" ]; then
+		suite_ai=""
+		suite_url="http://127.0.0.1:$port"
+		suite_idp="http://localhost:$idp_port"
+		tests="tests/mcp.test.mjs"
+		who="the mock IdP's alice and bob, only the Claude connector"
 	fi
 	log "running the suite ($mode mode, as $who)"
 	set +e
 	(
 		cd "$here"
-		BACKYARD_URL="http://localhost:$port" BACKYARD_TOKEN="$suite_token" BACKYARD_CONFORMANCE_AI="$suite_ai" \
-			BACKYARD_CONFORMANCE_SECRET="$secret" node --test --test-reporter=spec "$@" "tests/*.test.mjs"
+		BACKYARD_URL="$suite_url" BACKYARD_TOKEN="$suite_token" BACKYARD_CONFORMANCE_AI="$suite_ai" \
+			BACKYARD_CONFORMANCE_SECRET="$secret" BACKYARD_CONFORMANCE_MCP=1 \
+			BACKYARD_CONFORMANCE_IDP="$suite_idp" BACKYARD_CONFORMANCE_IDP_USERS=alice,bob \
+			node --test --test-reporter=spec "$@" "$tests"
 	)
 	rc=$?
 	set -e

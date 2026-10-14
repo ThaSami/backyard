@@ -123,40 +123,65 @@ func (a *authenticator) cliConfirmMAC(u *identity.User, binding string, req cliR
 	if req.display {
 		mode = "display"
 	}
-	// A JSON array encodes the fields unambiguously.
-	msg, _ := json.Marshal([]string{"cli-confirm", strconv.FormatInt(exp, 10), u.ID, binding, req.redirectURI, req.state, mode})
-	m := hmac.New(sha256.New, a.confirmKey)
-	m.Write(msg)
-	return m.Sum(nil)
+	return formMAC(a.confirmKey, []any{"cli-confirm", strconv.FormatInt(exp, 10), u.ID, binding, req.redirectURI, req.state, mode})
 }
 
 // cliCSRFToken returns the CSRF token of a confirmation form:
 // "<unix expiry>.<base64url HMAC>".
 func (a *authenticator) cliCSRFToken(u *identity.User, binding string, req cliRequest) string {
 	exp := a.now().Add(cliConfirmTTL).Unix()
-	return strconv.FormatInt(exp, 10) + "." + base64.RawURLEncoding.EncodeToString(a.cliConfirmMAC(u, binding, req, exp))
+	return formToken(exp, a.cliConfirmMAC(u, binding, req, exp))
 }
 
 // verifyCLIConfirmation checks a posted CSRF token against the current user,
 // browser session and request.
 func (a *authenticator) verifyCLIConfirmation(r *http.Request, u *identity.User, req cliRequest, token string) bool {
-	expStr, macStr, ok := strings.Cut(strings.TrimSpace(token), ".")
-	if !ok || len(token) > 128 {
-		return false
-	}
-	exp, err := strconv.ParseInt(expStr, 10, 64)
-	if err != nil {
+	exp, mac, ok := splitFormToken(token)
+	if !ok {
 		return false
 	}
 	now := a.now().Unix()
 	if exp <= now || exp > now+int64(cliConfirmTTL/time.Second)+60 {
 		return false
 	}
+	return hmac.Equal(mac, a.cliConfirmMAC(u, a.browserSessionBinding(r), req, exp))
+}
+
+// maxFormTokenBytes bounds the CSRF token of a confirmation or consent form.
+const maxFormTokenBytes = 128
+
+// formMAC authenticates the fields of a confirmation or consent form:
+// HMAC-SHA256 under key over their JSON array encoding, which encodes the
+// fields unambiguously. Each form has its own key (keys.CLIConfirm,
+// keys.MCPConsent) and a purpose string as its first field.
+func formMAC(key []byte, fields []any) []byte {
+	msg, _ := json.Marshal(fields)
+	m := hmac.New(sha256.New, key)
+	m.Write(msg)
+	return m.Sum(nil)
+}
+
+// formToken renders a form CSRF token: "<unix expiry>.<base64url MAC>".
+func formToken(exp int64, mac []byte) string {
+	return strconv.FormatInt(exp, 10) + "." + base64.RawURLEncoding.EncodeToString(mac)
+}
+
+// splitFormToken parses a form CSRF token into its expiry and MAC (the
+// caller checks both).
+func splitFormToken(token string) (int64, []byte, bool) {
+	expStr, macStr, ok := strings.Cut(strings.TrimSpace(token), ".")
+	if !ok || len(token) > maxFormTokenBytes {
+		return 0, nil, false
+	}
+	exp, err := strconv.ParseInt(expStr, 10, 64)
+	if err != nil {
+		return 0, nil, false
+	}
 	mac, err := base64.RawURLEncoding.DecodeString(macStr)
 	if err != nil {
-		return false
+		return 0, nil, false
 	}
-	return hmac.Equal(mac, a.cliConfirmMAC(u, a.browserSessionBinding(r), req, exp))
+	return exp, mac, true
 }
 
 // renderCLIConfirmation asks the user whether the CLI may sign in as them.
@@ -195,16 +220,18 @@ func loopbackOrigin(u *url.URL) string {
 	return u.Scheme + "://" + u.Host
 }
 
-// formActionSource is the CSP form-action source that lets the confirmation
-// form's response redirect to the CLI's loopback address (browsers apply
-// form-action to the redirects that follow a form submission). CSP cannot
-// express IPv6 hosts, so [::1] needs the scheme source "http:".
+// formActionSource is the CSP form-action source that lets a confirmation
+// or consent form's response redirect to the origin of u (browsers apply
+// form-action to the redirects that follow a form submission): the CLI's
+// loopback address, an MCP client's callback. CSP cannot express IPv6
+// hosts, so an IPv6 literal needs the scheme source ("http:").
 func formActionSource(u *url.URL) string {
 	if u == nil {
 		return ""
 	}
+	scheme := strings.ToLower(u.Scheme)
 	if strings.Contains(u.Hostname(), ":") {
-		return "http:"
+		return scheme + ":"
 	}
-	return "http://" + strings.ToLower(u.Host)
+	return scheme + "://" + strings.ToLower(u.Host)
 }

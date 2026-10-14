@@ -103,6 +103,8 @@ type authenticator struct {
 	iap    *iapVerifier
 	alb    *albVerifier
 	header *headerAuth
+
+	mcp *MCP // the connector's authorization server (nil unless mcp.enabled)
 }
 
 var _ Authenticator = (*authenticator)(nil)

@@ -765,3 +765,111 @@ test("expired sessions: login responses are recognised and the login URL returns
   assert.equal(hub.isLoginResponse({ type: "basic", status: 401, ok: false, headers: h("application/json") }), false, "JSON 401s carry login_url");
   assert.equal(hub.loginURLFor("https://backyard.acme.com/?q=a b#x"), "/__backyard/auth/login?rd=https%3A%2F%2Fbackyard.acme.com%2F%3Fq%3Da%20b%23x");
 });
+
+// --- the Claude connector card (SPEC §7.1 mcp_url, §8.4.7 grants API) --------
+
+test("connectorSetup: the card exists only while /info has an http(s) mcp_url", () => {
+  for (const info of [
+    null,
+    undefined,
+    {},
+    { mcp_url: "" },
+    { mcp_url: 42 },
+    { mcp_url: "javascript:alert(1)//x/" },
+    { mcp_url: "//evil.example/x" },
+    { mcp_url: "https://hub.example" },
+    { mcp_url: "https://hub.example/a b" },
+  ]) {
+    assert.equal(hub.connectorSetup(info), null, JSON.stringify(info));
+  }
+  assert.deepEqual(plain(hub.connectorSetup({ mcp_url: "https://backyard.acme.com/__backyard/mcp" })), {
+    url: "https://backyard.acme.com/__backyard/mcp",
+    claudeCode: "claude mcp add --transport http backyard https://backyard.acme.com/__backyard/mcp",
+  });
+  assert.equal(
+    hub.connectorSetup({ mcp_url: " http://127.0.0.1:8080/__backyard/mcp " }).claudeCode,
+    "claude mcp add --transport http backyard http://127.0.0.1:8080/__backyard/mcp",
+  );
+});
+
+test("grantSummary: verified only for metadata-document clients; loopback returns; dates", () => {
+  const opts = { locale: "en-US", timeZone: "UTC" };
+  const cimd = {
+    id: "0123456789abcdef0123456789abcdef",
+    user: { id: "alice@acme.com", email: "alice@acme.com", name: "Alice" },
+    client_name: "Claude",
+    client_kind: "metadata_document",
+    client_host: "claude.ai",
+    redirect_host: "claude.ai",
+    scope: "mcp offline_access",
+    created_at: "2026-10-14T09:30:00Z",
+    expires_at: "2026-11-13T09:30:00Z",
+  };
+  assert.deepEqual(plain(hub.grantSummary(cimd, opts)), {
+    id: cimd.id,
+    app: "Claude",
+    verified: true,
+    trust: "verified by claude.ai",
+    returnsTo: "claude.ai",
+    created: "Oct 14, 2026",
+    expires: "Nov 13, 2026",
+  });
+  // A self-registered (DCR) app names itself: never "verified", even with a host.
+  const dcr = { ...cimd, client_name: "  My tool ", client_kind: "registered", client_host: "", redirect_host: "localhost" };
+  const v = hub.grantSummary(dcr, opts);
+  assert.deepEqual([v.app, v.verified, v.trust, v.returnsTo], ["My tool", false, "unverified", "an app on this computer"]);
+  assert.equal(hub.grantSummary({ ...dcr, client_host: "claude.ai" }, opts).trust, "unverified");
+  for (const host of ["127.0.0.1", "[::1]", "localhost:53682", "x.localhost"]) {
+    assert.equal(hub.grantSummary({ ...dcr, redirect_host: host }).returnsTo, "an app on this computer", host);
+  }
+  assert.equal(hub.grantSummary({ ...dcr, redirect_host: "localhost.example" }).returnsTo, "localhost.example");
+  // Missing or malformed fields degrade to neutral text.
+  assert.deepEqual(plain(hub.grantSummary(null)), { id: "", app: "An app", verified: false, trust: "unverified", returnsTo: "", created: "", expires: "" });
+  assert.equal(hub.grantSummary({ client_name: 7, created_at: "soon" }).created, "");
+});
+
+test("normalizeUserId: emails are lowercased, prefixed ids are kept", () => {
+  assert.equal(hub.normalizeUserId("  Alice@ACME.com "), "alice@acme.com");
+  assert.equal(hub.normalizeUserId("sub:AbC123"), "sub:AbC123");
+  assert.equal(hub.normalizeUserId("anon:0123456789abcdef"), "anon:0123456789abcdef");
+  assert.equal(hub.normalizeUserId(""), "");
+  assert.equal(hub.normalizeUserId(undefined), "");
+});
+
+/** A fetch double for the grants API: records the requests, answers with respond(url, init). */
+function fakeGrantsAPI(respond) {
+  const calls = [];
+  const fetch = async (url, init) => {
+    calls.push({ url, ...init });
+    return respond(url, init);
+  };
+  return { fetch, calls };
+}
+
+test("revokeGrant: Disconnect sends DELETE …/mcp/grants/{id} with X-Backyard: 1 (cookies, never the deploy token)", async () => {
+  const api = fakeGrantsAPI(() => new Response(null, { status: 204 }));
+  assert.equal(await hub.revokeGrant({ id: "ab/cd?e", fetch: api.fetch }), undefined);
+  assert.deepEqual(plain(api.calls), [
+    { url: "/__backyard/api/mcp/grants/ab%2Fcd%3Fe", method: "DELETE", headers: { Accept: "application/json", "X-Backyard": "1" }, credentials: "same-origin" },
+  ]);
+  const missing = fakeGrantsAPI(() => Response.json({ error: { code: "not_found", message: "no such connection" } }, { status: 404 }));
+  const err = await hub.revokeGrant({ id: "x", fetch: missing.fetch }).catch((e) => e);
+  assert.deepEqual([err.name, err.status, err.code, err.message], ["HubError", 404, "not_found", "no such connection"]);
+  const none = await hub.revokeGrant({ id: "", fetch: api.fetch }).catch((e) => e);
+  assert.equal(none.code, "bad_request");
+  assert.equal(api.calls.length, 1, "nothing sent without an id");
+});
+
+test("revokeUserGrants: the admin form sends DELETE …/mcp/grants?user=<id> and returns the count", async () => {
+  const api = fakeGrantsAPI(() => Response.json({ revoked: 3 }));
+  assert.equal(await hub.revokeUserGrants({ user: " Bob+x@ACME.com", fetch: api.fetch }), 3);
+  assert.deepEqual(plain(api.calls), [
+    { url: "/__backyard/api/mcp/grants?user=bob%2Bx%40acme.com", method: "DELETE", headers: { Accept: "application/json", "X-Backyard": "1" }, credentials: "same-origin" },
+  ]);
+  const forbidden = fakeGrantsAPI(() => Response.json({ error: { code: "forbidden", message: "admins only" } }, { status: 403 }));
+  const err = await hub.revokeUserGrants({ user: "bob@acme.com", fetch: forbidden.fetch }).catch((e) => e);
+  assert.deepEqual([err.status, err.message], [403, "admins only"]);
+  const empty = await hub.revokeUserGrants({ user: "  ", fetch: api.fetch }).catch((e) => e);
+  assert.equal(empty.code, "bad_request");
+  assert.equal(api.calls.length, 1, "nothing sent without a person");
+});

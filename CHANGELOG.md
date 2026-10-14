@@ -12,11 +12,56 @@ All notable changes to Backyard are documented here. The format follows
   domain is in `auth.allowed_domains` or it is listed here; on its own the list admits only the
   named people — the way to restrict a sign-in anyone can complete, such as Google with personal
   `@gmail.com` accounts. The Terraform modules (AWS, GCP, Azure) take it as `allowed_emails`.
+- **Claude connector** (remote MCP, both editions, off by default): the hub serves an MCP
+  server at `<public_url>/__backyard/mcp` that people add to Claude (web, Desktop, mobile,
+  Cowork, Claude Code) as a custom connector. They sign in with the company login they use for
+  Backyard and approve Backyard's consent page; Claude can then find sites, read their files
+  and publish sites as them, with no CLI or token. Backyard is the OAuth 2.1 authorization
+  server (SPEC §8.4): Claude's published client identity (an allowlisted metadata document) or
+  stateless registration, exact redirect URIs, PKCE `S256`, single-use codes, rotating refresh
+  tokens and tokens valid only at `/__backyard/mcp`; your IdP needs no change. Tools
+  (SPEC §14.1): `backyard_docs`, `backyard_whoami`, `backyard_list_sites`,
+  `backyard_site_files`, `backyard_read_site_file` and `backyard_publish`, which merges by
+  default and carries at most 4 MiB of file content per call on the Go server (2 MiB on
+  Cloudflare; bigger sites go over several calls, big media through the hub or the CLI).
+  Publishing as a person needs a sign-in (Go `oidc`, `iap`, `alb`, `header`; Cloudflare
+  Access); without one the connector is a guest and publishes only with anonymous deploys.
+  Guide: [docs/claude-connector.md](docs/claude-connector.md).
+- Configuration `mcp.enabled`, `mcp.clients`, `mcp.redirect_uris` and `mcp.max_publish_bytes`;
+  on the Cloudflare edition `MCP_ENABLED`, `MCP_CLIENTS`, `MCP_REDIRECT_URIS` and the `LIMITS`
+  keys `mcp_publish_bytes` and `mcp_calls_per_day`.
+- Hub card **Use Backyard in Claude** with the connector URL, setup steps and "Your
+  connections" (Disconnect; admins can disconnect a person), backed by
+  `GET`/`DELETE /__backyard/api/mcp/grants`; `/__backyard/api/info` reports `mcp_url`.
+- Audit events `mcp.authorize`, `mcp.deny`, `mcp.consent_rejected`, `mcp.token`,
+  `mcp.code_replay`, `mcp.refresh_reuse`, `mcp.revoke`; `deploy.commit` with `via=mcp`; HTTP
+  metric areas `mcp` and `oauth` and `backyard_deploys_total{method="mcp"}`.
+- Terraform: the AWS module's ALB rule `mcp` (priority 15, `auth_mode = "alb"`) and the GCP
+  module's four IAP-less routes exempt the connector's machine paths; `config_overrides` (AWS;
+  not passed to the Lambda gateway) and `extra_config_yaml` (GCP, Azure) accept an `mcp`
+  section; the Cloudflare module has
+  `mcp_enabled`, which adds `--var MCP_ENABLED:true` to `setup_args`.
+- `backyard cloudflare status` checks `access-connector`: the connector's paths in the Access
+  bypass application (pending before `MCP_ENABLED`, failed after).
 
 ### Changed
 
 - The OIDC login denial is logged as `auth: login denied by allowed_domains/allowed_emails/allowed_groups`
   (was `…allowed_domains/allowed_groups`).
+- A chat image URL that the SSRF guard blocks now fails with `netguard: address not allowed`
+  (was `imagefetch: address not allowed`): the guard is shared with the Claude connector's
+  client metadata fetches.
+- The Cloudflare Access bypass list (`backyard cloudflare access enable`, the Terraform module's
+  `bypass_paths`) grows from five to nine paths: `/__backyard/mcp`, `/__backyard/oauth/*`,
+  `/.well-known/oauth-authorization-server` and
+  `/.well-known/oauth-protected-resource/__backyard/mcp` reach the Worker without an Access
+  login (it answers `404` there until `MCP_ENABLED`). `access enable` verifies them at the edge
+  too, so applications made in the dashboard from the earlier steps need the four paths added.
+  `bypass_paths` now also accepts the two OAuth discovery documents. **Upgrade:** re-run
+  `backyard cloudflare access enable` (or `terraform apply`) once.
+- The AWS and GCP modules exempt the connector's four machine paths from the ALB login and IAP
+  whether or not the connector is on (Backyard answers `404` there until `mcp.enabled`).
+  **Upgrade:** `terraform apply`.
 
 ## [0.1.0] - 2026-10-14
 

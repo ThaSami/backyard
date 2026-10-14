@@ -505,6 +505,8 @@ run "containerapp_edge_okta_vnet" {
         ownership: owner
       ratelimit:
         ai_per_minute: 10
+      mcp:
+        enabled: true
       warehouse:
         sources:
           default:
@@ -540,6 +542,13 @@ run "containerapp_edge_okta_vnet" {
       startswith(yamldecode(output.backyard_config_yaml).warehouse.queries.signups.sql, "SELECT day")
     )
     error_message = "Okta / path mode / extra config rendering is wrong."
+  }
+
+  assert {
+    # The Claude connector: extra_config_yaml accepts an mcp section (it needs
+    # an https public_url without a path; Okta stays Backyard's sign-in).
+    condition     = yamldecode(output.backyard_config_yaml).mcp.enabled == true && yamldecode(output.backyard_config_yaml).server.public_url == "https://acme-tools.com"
+    error_message = "extra_config_yaml must accept the mcp section."
   }
 
   assert {

@@ -181,6 +181,36 @@ networkPolicy:
           app.kubernetes.io/name: ingress-nginx
 ```
 
+## Claude connector
+
+The [Claude connector](../../../docs/claude-connector.md) lets people publish sites from Claude
+with their company sign-in. Turn it on in `config` (it needs an https `public_url` without a
+path, which the default `https://<base_domain>` is):
+
+```yaml
+config:
+  mcp:
+    enabled: true
+ingress:
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"   # or more; the example above uses 100m
+```
+
+- **Body size.** Publish calls carry up to 9 MiB (`mcp.max_publish_bytes` is 4 MiB of file
+  content, the body limit 2 × that + 1 MiB). ingress-nginx allows only 1 MiB by default, so set
+  `proxy-body-size` to at least `10m`; other controllers have similar limits.
+- **Identity-aware proxies.** With IAP, ALB OIDC, oauth2-proxy, Pomerium or Cloudflare Access in
+  front, exempt the four machine paths from the proxy's login — Claude calls them without a
+  browser session, and they never read identity headers:
+  `/__backyard/mcp`, `/__backyard/oauth/*`, `/.well-known/oauth-authorization-server` and
+  `/.well-known/oauth-protected-resource/__backyard/mcp`. Keep `/__backyard/auth/authorize`
+  behind the proxy: its login is the connector's sign-in. Recipes per proxy:
+  [Claude connector](../../../docs/claude-connector.md#machine-paths-and-identity-proxies).
+- **Reachability.** Hosted Claude calls the hub from `160.79.104.0/21` (IPv4), and Backyard
+  fetches Claude's client metadata from `https://claude.ai` (without egress, add
+  `clients: []` to `config.mcp`). An internal-only ingress works only with connectors added
+  locally in Claude Code.
+
 ## Cloud storage without keys
 
 | Cloud | `config.storage` | Service account annotation |

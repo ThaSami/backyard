@@ -6,6 +6,8 @@
 //   web/sdk/backyard.{js,mjs,d.ts}  → src/generated/sdk.ts
 //   web/hub/**                      → src/generated/hub.ts
 //   skills/backyard/**              → src/generated/skills.ts
+//   internal/mcpremote/tools.json   → src/generated/mcp.ts (the Claude connector's
+//                                     tool catalog, SPEC §14.1: MCP_CATALOG)
 //
 // It also copies the shared query-semantics cases of SPEC §5.2 for the test
 // suite (not bundled into the Worker):
@@ -178,6 +180,35 @@ const skillsTS =
   `/** skills/backyard/SKILL.md (with YAML front matter). */\nexport const SKILL_MD: string = ${lit(skillMD)};\n\n` +
   `/** skills/backyard/references/<name>.md keyed by name. */\nexport const REFERENCES: Record<string, string> = {\n${refEntries.join("\n")}\n};\n`;
 
+// --- Claude connector tool catalog -------------------------------------------
+
+// The normative catalog of the remote MCP endpoint (SPEC §14.1), which the Go
+// server embeds: tools/list returns its tools verbatim, initialize its
+// instructions. A missing or unparsable file becomes an empty catalog with a
+// warning (a build with --strict refuses it).
+const toolsRel = "internal/mcpremote/tools.json";
+const toolsPlaceholder = {
+  instructions: "The Claude connector's tool catalog was not bundled in this build (run npm run sync).",
+  tools: [],
+};
+let mcpCatalog = toolsPlaceholder;
+try {
+  const parsed = JSON.parse(readFileSync(join(repoRoot, toolsRel), "utf8"));
+  const tools = parsed?.tools;
+  if (typeof parsed?.instructions !== "string" || !Array.isArray(tools) || tools.some((t) => typeof t?.name !== "string" || typeof t?.inputSchema !== "object")) {
+    throw new Error("expected {instructions, tools: [{name, inputSchema, …}]}");
+  }
+  mcpCatalog = parsed;
+} catch (e) {
+  warnings.push(e.code === "ENOENT" ? `missing ${toolsRel}: using a placeholder` : `invalid ${toolsRel} (${e.message}): using a placeholder`);
+}
+const mcpTS =
+  banner +
+  "/** A tool of the catalog (MCP Tool: name, title, description, inputSchema, annotations). */\n" +
+  "export interface McpTool {\n  name: string;\n  title?: string;\n  description?: string;\n  inputSchema: Record<string, unknown>;\n  annotations?: Record<string, unknown>;\n}\n\n" +
+  `/** ${toolsRel}: the connector's instructions and tools (SPEC §14.1). */\n` +
+  `export const MCP_CATALOG: { instructions: string; tools: McpTool[] } = ${JSON.stringify(mcpCatalog, null, 2)};\n`;
+
 // --- Test fixtures (not part of the Worker) ---------------------------------
 
 // The shared, language-neutral query cases (SPEC §5.2) that every Backyard
@@ -198,7 +229,7 @@ try {
 
 // --- Write -----------------------------------------------------------------
 
-const outputs = { "sdk.ts": sdkTS, "hub.ts": hubTS, "skills.ts": skillsTS };
+const outputs = { "sdk.ts": sdkTS, "hub.ts": hubTS, "skills.ts": skillsTS, "mcp.ts": mcpTS };
 const digest = createHash("sha256");
 for (const k of Object.keys(outputs).sort()) digest.update(k).update(outputs[k]);
 outputs["index.ts"] =
@@ -216,8 +247,9 @@ if (strict && warnings.length) {
   const missing = warnings.map((w) => w.replace(/: (?:using a placeholder|no reference docs bundled).*$/, ""));
   console.error(
     [
-      `sync-assets: cannot build the Worker: it bundles the browser SDK (web/sdk), the hub UI (web/hub) and the`,
-      `agent docs (skills/backyard) of the Backyard repository, and these are missing under ${repoRoot}:`,
+      `sync-assets: cannot build the Worker: it bundles the browser SDK (web/sdk), the hub UI (web/hub), the`,
+      `agent docs (skills/backyard) and the Claude connector's tool catalog (internal/mcpremote/tools.json)`,
+      `of the Backyard repository, and these are missing under ${repoRoot}:`,
       ...missing.map((m) => `  - ${m.replace(/^missing /, "")}`),
       `Build from a complete checkout (git clone https://github.com/thasami/backyard.git, then`,
       `cd backyard/deploy/cloudflare), or point BACKYARD_REPO_ROOT at one. Placeholders are only`,
@@ -258,6 +290,6 @@ if (check && stale) {
 }
 if (!check) {
   console.log(
-    `sync-assets: ${stale ? "updated" : "up to date"} src/generated (sdk, ${hubFiles.length} hub files, ${refs.length} references, version ${buildVersion()}) and test/generated`,
+    `sync-assets: ${stale ? "updated" : "up to date"} src/generated (sdk, ${hubFiles.length} hub files, ${refs.length} references, ${mcpCatalog.tools.length} connector tools, version ${buildVersion()}) and test/generated`,
   );
 }

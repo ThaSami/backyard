@@ -24,9 +24,9 @@ listener without authentication: `telemetry.metrics_listen: ":9090"` serves `/me
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `backyard_http_requests_total` | counter | `area`, `code` | Requests by area (`static`, `api`, `ws`, `files`, `sdk`, `hub`, `docs`, `auth`, `deploy`, `health`, `metrics`, `unknown_host`, `other`) and status code |
+| `backyard_http_requests_total` | counter | `area`, `code` | Requests by area (`static`, `api`, `ws`, `files`, `sdk`, `hub`, `docs`, `auth`, `deploy`, `health`, `metrics`, `mcp`, `oauth`, `unknown_host`, `other`) and status code. `mcp` is the [Claude connector's](claude-connector.md) endpoint `/__backyard/mcp`, `oauth` its OAuth endpoints and discovery documents (`/__backyard/oauth/*`, `/.well-known/oauth-*`); its sign-in page `/__backyard/auth/authorize` counts as `auth`, its grants API as `api` |
 | `backyard_http_request_duration_seconds` | histogram | `area` | Request latency |
-| `backyard_deploys_total` | counter | `method` (`api`, `sync`), `result` (`ok`, `error`) | Deploy commits through the embedded gateway, and refreshes after direct syncs |
+| `backyard_deploys_total` | counter | `method` (`api`, `sync`, `mcp`), `result` (`ok`, `error`) | Deploy commits through the embedded gateway, refreshes after direct syncs, and publishes by the Claude connector (`mcp`) |
 | `backyard_db_ops_total` | counter | `op`, `result` | Document store operations (`result`: `ok`, `not_found`, `conflict`, `too_large`, …) |
 | `backyard_ai_requests_total` | counter | `model`, `result` | AI requests per alias |
 | `backyard_ai_tokens_total` | counter | `model`, `direction` (`input`, `output`) | AI tokens per alias |
@@ -61,10 +61,18 @@ kept), and every `5xx` failure is logged at error level with its request id — 
 | `token.issue` | `POST /__backyard/api/tokens` (`backyard token create`); `from_api_token` when an API token minted it (its lifetime was capped) |
 | `deploy.create`, `deploy.commit`, `deploy.reject_uploads`, `deploy.clear_conflicts` | deploy gateway (files, bytes, new paths, deletions; `deploy.commit` also counts the files whose digest it `verified` and those `superseded` by another deploy) |
 | `site.refresh`, `site.delete`, `site.owners` | deploy gateway |
+| `mcp.authorize`, `mcp.deny` | [Claude connector](claude-connector.md) consent page: allowed or cancelled (user, `client_name`, `client_kind`, `client_host`, `redirect_host`, `grant` — the first 8 characters of the connection id) |
+| `mcp.consent_rejected` (warn) | a consent form that expired, was not issued to this user or session, or was not sent from Backyard's page |
+| `mcp.token` | a sign-in code exchanged for tokens |
+| `mcp.code_replay`, `mcp.refresh_reuse` (warn) | a code redeemed twice, an old refresh token used again: the connection is deleted |
+| `mcp.revoke` | a connection deleted; `via` = `rfc7009` (the app), `hub` (hub card or grants API; `count` for a person's connections), `policy` (a gate no longer passes) or `replay` |
+| `deploy.commit` with `via=mcp` | a `backyard_publish` call, with `client` (the app's name) and `grant` |
 
-Ship the log stream to your SIEM for retention. In addition, the server stores `token.issue`
-records in the document store (site `_system`, collection `_audit`), which is not reachable
-through the site API.
+Ship the log stream to your SIEM for retention. In addition, the server stores `token.issue`,
+`mcp.authorize`, `mcp.code_replay`, `mcp.refresh_reuse` and `mcp.revoke` records in the
+document store (site `_system`, collection `_audit`), which is not reachable through the site
+API. The Claude connector's connections live in the same site (`_mcp_grants`, `_mcp_rotations`,
+`_mcp_locks`); expired ones are pruned as new ones are created.
 
 ## Backups
 
@@ -136,7 +144,13 @@ Backyard is one binary (or image). To upgrade:
 5. The Cloudflare edition upgrades by re-running setup: `backyard cloudflare setup` with the new
    CLI release (it installs that release's package), `npx backyard-cloudflare@latest setup` (once
    a Backyard release has published it to npm), or `npm run setup` in an updated checkout. Every
-   earlier choice is kept.
+   earlier choice is kept. With Cloudflare Access, run `backyard cloudflare access enable` (or
+   `terraform apply` of the Cloudflare module) again when the bypass list changes — for the
+   [Claude connector](claude-connector.md) it now holds nine paths;
+   `backyard cloudflare status` reports missing ones as `access-connector`.
+6. Terraform kits: `terraform apply` with the new module version, which may change proxy
+   exemptions (as for the Claude connector's machine paths in the AWS, GCP and Cloudflare
+   modules).
 
 Sites never need changes: the SDK is served by the server, so pages pick up the new version on
 the next load.
@@ -145,7 +159,7 @@ the next load.
 
 | Secret | Effect of rotation |
 |---|---|
-| `server.secret` | Everyone is signed out, every API token, deploy id and upload URL becomes invalid. Run `backyard login` again; update CI tokens minted with `backyard token create`. Static tokens are unaffected. |
+| `server.secret` | Everyone is signed out, every API token, deploy id and upload URL becomes invalid, and every Claude connector connection ends (people connect again; connectors added with "Register automatically" must be removed and added again in Claude). Run `backyard login` again; update CI tokens minted with `backyard token create`. Static tokens are unaffected. |
 | A static token | Add the new hash to `auth.tokens`, update the pipeline, remove the old hash. |
 | OIDC client secret | Update `auth.oidc.client_secret`; sessions survive. |
 | Provider and database credentials | Update the environment and restart; nothing else changes. |

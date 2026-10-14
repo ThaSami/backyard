@@ -201,7 +201,7 @@ run "defaults_dynamodb_with_redis" {
   }
 
   assert {
-    condition     = length(aws_route53_record.alb) == 2 && length(aws_lb_listener_rule.deploy) == 0
+    condition     = length(aws_route53_record.alb) == 2 && length(aws_lb_listener_rule.deploy) == 0 && length(aws_lb_listener_rule.mcp) == 0
     error_message = "Apex and wildcard records are created; no ALB auth rules outside alb mode."
   }
 
@@ -509,6 +509,33 @@ run "alb_mode" {
       length(one(aws_lb_listener_rule.deploy[0].condition).path_pattern[0].values) <= 5
     )
     error_message = "The pass-through rule must cover the deploy gateway and POST /__backyard/api/tokens (at most 5 path values per ALB rule)."
+  }
+
+  assert {
+    # The Claude connector's machine paths (SPEC §8.4): Claude calls them
+    # without an ALB session, and they ship whether or not mcp is enabled.
+    condition = (
+      length(aws_lb_listener_rule.mcp) == 1 &&
+      aws_lb_listener_rule.mcp[0].priority == 15 &&
+      toset(one(aws_lb_listener_rule.mcp[0].condition).path_pattern[0].values) == toset(["/__backyard/mcp", "/__backyard/oauth/*", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource/__backyard/mcp"]) &&
+      length(one(aws_lb_listener_rule.mcp[0].condition).path_pattern[0].values) == 4 &&
+      length(aws_lb_listener_rule.mcp[0].condition) == 1 &&
+      length(aws_lb_listener_rule.mcp[0].action) == 1 &&
+      aws_lb_listener_rule.mcp[0].action[0].type == "forward" &&
+      aws_lb_listener_rule.mcp[0].action[0].target_group_arn == aws_lb_target_group.app.arn &&
+      length(aws_lb_listener_rule.mcp[0].action[0].authenticate_oidc) == 0
+    )
+    error_message = "ALB mode forwards exactly the four connector machine paths without authenticate-oidc (rule mcp, priority 15, between public and deploy)."
+  }
+
+  assert {
+    condition     = aws_lb_listener_rule.public[0].priority < aws_lb_listener_rule.mcp[0].priority && aws_lb_listener_rule.mcp[0].priority < aws_lb_listener_rule.deploy[0].priority
+    error_message = "Rule order: public (10), mcp (15), deploy (20)."
+  }
+
+  assert {
+    condition     = !contains(flatten([for r in [aws_lb_listener_rule.public[0], aws_lb_listener_rule.mcp[0], aws_lb_listener_rule.deploy[0]] : one(r.condition).path_pattern[0].values]), "/__backyard/auth/authorize")
+    error_message = "/__backyard/auth/authorize stays behind the ALB login (the connector's sign-in)."
   }
 
   assert {
@@ -888,6 +915,41 @@ run "alb_mode_with_device_flow_and_explicit_endpoints" {
       yamldecode(aws_lambda_function.gateway[0].environment[0].variables.BACKYARD_CONFIG_YAML).auth.alb.signer_arn == aws_lb.this.arn
     )
     error_message = "In ALB mode the server and the Lambda gateway accept device-flow JWTs (issuer + device client id only; the web client id and secret stay with the ALB)."
+  }
+}
+
+run "alb_mode_with_the_claude_connector" {
+  command = apply
+
+  variables {
+    auth_mode          = "alb"
+    oidc_issuer        = "https://acme.okta.com/oauth2/default"
+    oidc_client_id     = "0oa-web"
+    oidc_client_secret = "s3cr3t"
+    config_overrides   = <<-EOT
+      mcp:
+        enabled: true
+      sites:
+        ownership: owner
+    EOT
+  }
+
+  assert {
+    condition     = yamldecode(output.backyard_config_yaml).mcp.enabled == true && yamldecode(output.backyard_config_yaml).server.public_url == "https://backyard.acme.com"
+    error_message = "config_overrides accepts mcp; the server gets it (with an https public_url without a path)."
+  }
+
+  assert {
+    condition = (
+      !can(yamldecode(aws_lambda_function.gateway[0].environment[0].variables.BACKYARD_CONFIG_YAML).mcp) &&
+      yamldecode(aws_lambda_function.gateway[0].environment[0].variables.BACKYARD_CONFIG_YAML).sites.ownership == "owner"
+    )
+    error_message = "The Lambda gateway gets the sites overrides but not mcp (the connector is served by the hub only)."
+  }
+
+  assert {
+    condition     = length(aws_lb_listener_rule.mcp) == 1
+    error_message = "The connector's machine paths bypass the ALB login."
   }
 }
 

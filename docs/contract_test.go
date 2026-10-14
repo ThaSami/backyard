@@ -437,3 +437,175 @@ func TestMCPToolsDocumented(t *testing.T) {
 		}
 	}
 }
+
+// remoteMCPTool is a tool of internal/mcpremote/tools.json, the catalog of
+// the Claude connector (SPEC §14.1), as far as the docs describe it.
+type remoteMCPTool struct {
+	Name        string        `json:"name"`
+	InputSchema mcpToolSchema `json:"inputSchema"`
+}
+
+// TestRemoteMCPToolsDocumented checks the tool table of the "Claude
+// connector (remote MCP)" section of docs/agents.md against the connector's
+// catalog (internal/mcpremote/tools.json) — every tool has a row and every
+// row a tool, and the Input column names each parameter, with "?" exactly
+// for the optional ones — and that SPEC §14 and docs/claude-connector.md
+// name every tool.
+func TestRemoteMCPToolsDocumented(t *testing.T) {
+	var catalog struct {
+		Tools []remoteMCPTool `json:"tools"`
+	}
+	if err := json.Unmarshal([]byte(readRepoFile(t, "internal/mcpremote/tools.json")), &catalog); err != nil {
+		t.Fatalf("internal/mcpremote/tools.json: %v", err)
+	}
+	if len(catalog.Tools) < 6 {
+		t.Fatalf("only %d tools in internal/mcpremote/tools.json (parser broken?)", len(catalog.Tools))
+	}
+
+	section := markdownSection(t, readRepoFile(t, "docs/agents.md"), "Claude connector (remote MCP)")
+	documented := map[string]string{} // tool → Input cell
+	for _, row := range tableRows(t, section, "| Tool | Input | Does |") {
+		names := codeSpans(row[0])
+		if len(names) != 1 || len(row) != 3 {
+			t.Fatalf("docs/agents.md: malformed Claude connector tool row %q", row)
+		}
+		if _, dup := documented[names[0]]; dup {
+			t.Errorf("docs/agents.md: the Claude connector tool %s has two rows", names[0])
+		}
+		documented[names[0]] = row[1]
+	}
+	parenRe := regexp.MustCompile(`\([^()]*\)`)
+	texts := map[string]string{
+		"SPEC §14":                 flatten(specSection(t, "14")),
+		"docs/claude-connector.md": flatten(readRepoFile(t, "docs/claude-connector.md")),
+	}
+	served := map[string]bool{}
+	for _, tool := range catalog.Tools {
+		served[tool.Name] = true
+		for where, text := range texts {
+			if !strings.Contains(text, "`"+tool.Name+"`") {
+				t.Errorf("%s does not name the Claude connector tool %s", where, tool.Name)
+			}
+		}
+		cell, ok := documented[tool.Name]
+		if !ok {
+			t.Errorf("docs/agents.md (Claude connector): the tool %s has no row", tool.Name)
+			continue
+		}
+		var want []string
+		for p := range tool.InputSchema.Properties {
+			if slices.Contains(tool.InputSchema.Required, p) {
+				want = append(want, p)
+			} else {
+				want = append(want, p+"?")
+			}
+		}
+		// The parameters are the code spans outside parentheses, which hold
+		// explanations (a parameter's values, the members of a file).
+		got := codeSpans(parenRe.ReplaceAllString(cell, ""))
+		sort.Strings(want)
+		sort.Strings(got)
+		if !slices.Equal(got, want) {
+			t.Errorf("docs/agents.md (Claude connector): the Input of %s is %q, want the parameters %q (\"?\" = optional)", tool.Name, got, want)
+		}
+	}
+	for name := range documented {
+		if !served[name] {
+			t.Errorf("docs/agents.md (Claude connector) documents the tool %s, which internal/mcpremote/tools.json does not have", name)
+		}
+	}
+}
+
+// mcpMachinePaths are the Claude connector's machine paths, which identity
+// proxies must let through without a login (SPEC §8.4).
+var mcpMachinePaths = []string{
+	"/__backyard/mcp",
+	"/__backyard/oauth/*",
+	"/.well-known/oauth-authorization-server",
+	"/.well-known/oauth-protected-resource/__backyard/mcp",
+}
+
+// TestMCPMachinePathsDocumented checks that every deployment kit exempts
+// exactly the Claude connector's four machine paths from its identity proxy
+// — the last four entries of the Cloudflare Access bypass list
+// (ACCESS_BYPASS_PATHS), the AWS module's alb_mcp_paths and the last four
+// IAP-less routes of the GCP module (a prefix route "/p/" is the path
+// "/p/*") — that none of them exempts the connector's sign-in page, and
+// that SPEC §8.4 and the guides list every path.
+func TestMCPMachinePathsDocumented(t *testing.T) {
+	const authorize = "/__backyard/auth/authorize"
+	m := regexp.MustCompile(`(?s)export const ACCESS_BYPASS_PATHS = \[(.*?)\];`).FindStringSubmatch(readRepoFile(t, "deploy/cloudflare/scripts/lib/access-plan.mjs"))
+	if m == nil {
+		t.Fatal("ACCESS_BYPASS_PATHS not found in deploy/cloudflare/scripts/lib/access-plan.mjs")
+	}
+	access := quotedStrings(m[1])
+	if len(access) < len(mcpMachinePaths) {
+		t.Fatalf("ACCESS_BYPASS_PATHS = %q (parser broken?)", access)
+	}
+
+	m = regexp.MustCompile(`(?s)\balb_mcp_paths\s*=\s*\[(.*?)\]`).FindStringSubmatch(readRepoFile(t, "deploy/terraform/aws/alb.tf"))
+	if m == nil {
+		t.Fatal("alb_mcp_paths not found in deploy/terraform/aws/alb.tf")
+	}
+	alb := quotedStrings(m[1])
+	albDeploy := regexp.MustCompile(`(?s)\balb_(?:public|deploy)_paths\s*=\s*\[(.*?)\]`).FindAllStringSubmatch(readRepoFile(t, "deploy/terraform/aws/alb.tf"), -1)
+	if len(albDeploy) != 2 {
+		t.Fatalf("alb_public_paths and alb_deploy_paths not found in deploy/terraform/aws/alb.tf (found %d)", len(albDeploy))
+	}
+
+	m = regexp.MustCompile(`(?s)\bdeploy_routes\s*=\s*\[(.*?)\n\s*\]`).FindStringSubmatch(readRepoFile(t, "deploy/terraform/gcp/lb.tf"))
+	if m == nil {
+		t.Fatal("deploy_routes not found in deploy/terraform/gcp/lb.tf")
+	}
+	routeRe := regexp.MustCompile(`\{\s*full_path\s*=\s*(null|"[^"]*")\s*,\s*prefix\s*=\s*(null|"[^"]*")\s*,\s*needs_authorization\s*=\s*(true|false)\s*\}`)
+	var gcp []string
+	for _, r := range routeRe.FindAllStringSubmatch(m[1], -1) {
+		full, prefix := strings.Trim(r[1], `"`), strings.Trim(r[2], `"`)
+		switch {
+		case r[1] != "null" && r[2] == "null":
+			gcp = append(gcp, full)
+		case r[1] == "null" && r[2] != "null" && strings.HasSuffix(prefix, "/"):
+			gcp = append(gcp, prefix+"*")
+		default:
+			t.Fatalf("deploy/terraform/gcp/lb.tf: route %s has neither exactly one full_path nor a prefix ending in /", r[0])
+		}
+		if r[3] == "true" && slices.Contains(mcpMachinePaths, gcp[len(gcp)-1]) {
+			t.Errorf("deploy/terraform/gcp/lb.tf: the connector route %s needs an Authorization header, which Claude's first call and the OAuth calls do not send", gcp[len(gcp)-1])
+		}
+	}
+	if len(gcp) < len(mcpMachinePaths) {
+		t.Fatalf("deploy/terraform/gcp/lb.tf: deploy_routes = %q (parser broken?)", gcp)
+	}
+
+	for where, got := range map[string][]string{
+		"ACCESS_BYPASS_PATHS (last four)":                 access[len(access)-len(mcpMachinePaths):],
+		"alb_mcp_paths (deploy/terraform/aws)":            alb,
+		"deploy_routes (deploy/terraform/gcp, last four)": gcp[len(gcp)-len(mcpMachinePaths):],
+	} {
+		if !slices.Equal(got, mcpMachinePaths) {
+			t.Errorf("%s = %q, want the connector's machine paths %q", where, got, mcpMachinePaths)
+		}
+	}
+	exempt := slices.Concat(access, alb, gcp, quotedStrings(albDeploy[0][1]), quotedStrings(albDeploy[1][1]))
+	for _, p := range exempt {
+		if p == authorize || strings.HasPrefix(authorize, strings.TrimSuffix(p, "*")) && strings.HasSuffix(p, "*") {
+			t.Errorf("a deployment kit exempts %s, which covers %s (the connector's sign-in must stay behind the proxy)", p, authorize)
+		}
+	}
+
+	for where, text := range map[string]string{
+		"SPEC §8.4":                      specSection(t, "8.4"),
+		"docs/authentication.md":         readRepoFile(t, "docs/authentication.md"),
+		"docs/claude-connector.md":       readRepoFile(t, "docs/claude-connector.md"),
+		"deploy/helm/backyard/README.md": readRepoFile(t, "deploy/helm/backyard/README.md"),
+	} {
+		for _, p := range mcpMachinePaths {
+			if !strings.Contains(text, "`"+p+"`") {
+				t.Errorf("%s does not list the connector's machine path %s", where, p)
+			}
+		}
+		if !strings.Contains(text, "`"+authorize+"`") {
+			t.Errorf("%s does not say that %s stays behind the proxy", where, authorize)
+		}
+	}
+}

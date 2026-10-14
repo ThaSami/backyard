@@ -122,6 +122,10 @@ Site host (`foo.<base>` or `/s/foo` prefix):
 | `/__backyard/auth/*` | redirects to the hub's auth endpoints (host mode) |
 | anything else | static file from the site folder (§3) |
 
+On site hosts `/.well-known/*` stays site content (the OAuth discovery documents of §8.4 exist
+only on the hub), `/__backyard/mcp` and `/__backyard/oauth/*` answer the JSON `404`, and
+`/__backyard/auth/authorize` is redirected to the hub like the other auth paths.
+
 Hub host:
 
 | Path | Purpose |
@@ -136,14 +140,19 @@ Hub host:
 | `/__backyard/api/sites` | site list (`{sites:[SiteMeta]}`) |
 | `/__backyard/api/tokens` | `POST` mint a personal API token (§8.3) |
 | `/__backyard/api/deploy/...` | embedded deploy gateway (§7) |
-| `/__backyard/auth/{login,callback,logout,cli}` | auth flows (§8) |
+| `/__backyard/api/mcp/grants` | the signed-in user's Claude connector connections; admins: anyone's (§8.4) |
+| `/__backyard/auth/{login,callback,logout,cli,authorize}` | auth flows (§8; `authorize` is the connector's sign-in and consent page, §8.4) |
+| `/__backyard/mcp` | remote MCP endpoint for Claude (§14.1; when enabled) |
+| `/__backyard/oauth/{token,register,revoke}` | the connector's OAuth endpoints (§8.4; when enabled) |
+| `/.well-known/oauth-protected-resource/__backyard/mcp`, `/.well-known/oauth-authorization-server` | OAuth discovery (§8.4; hub only, when enabled) |
 | `/__backyard/healthz` | liveness `200 ok` (no auth) |
 | `/__backyard/readyz` | readiness: pings db + blob; `503 not ready: <checks>` on failure (no auth) |
 | `/__backyard/metrics` | Prometheus, **authenticated** (only if `telemetry.metrics` and no `telemetry.metrics_listen`) |
 
 `/__backyard/healthz` and `/readyz` are served on any host without authentication. Hub pages and
 docs require authentication like sites; the SDK files, `/__backyard/auth/*`,
-`/__backyard/api/info` and the deploy gateway (which authenticates by itself) do not.
+`/__backyard/api/info`, the deploy gateway, and the remote MCP endpoint and the OAuth endpoints
+of §8.4 (which authenticate by themselves) do not.
 
 ### 2.1 SDK context resolution
 
@@ -616,7 +625,10 @@ present in the `oidc`, `iap`, `alb` and `header` modes; `auth.device` whenever
 `auth.oidc.issuer` and `auth.oidc.device_client_id` are set (in any mode);
 `auth.anonymous_deploy` (bool) is true when deploys need no token (`auth.mode: none` +
 `deploy.allow_anonymous`). `gateway_url` is `deploy.gateway_url` when set. `rsync_target` is
-omitted when empty. The Cloudflare edition adds `"edition": "cloudflare"`.
+omitted when empty. The Cloudflare edition adds `"edition": "cloudflare"`. While the Claude
+connector is enabled (§8.4), the hub's embedded gateway adds `"mcp_url": "<R>"`, the remote MCP
+endpoint `<public_url>/__backyard/mcp` (§14.1); it is omitted when the connector is disabled and
+on standalone gateways.
 
 ### 7.2 Sites
 
@@ -704,7 +716,8 @@ gates (admins pass them): `auth.allowed_domains` / `auth.allowed_emails` — whe
 the user's verified email must have a listed domain or be a listed address (case-insensitive) —
 and `auth.allowed_groups` (403 otherwise). A bearer token is tried first; if it is invalid the
 mode's own credentials are tried, and the bearer error is reported only when those are absent
-(in mode `none` an invalid bearer token is always `401`).
+(in mode `none` an invalid bearer token is always `401`). MCP access tokens (§8.4) are accepted
+only at `/__backyard/mcp`, which accepts nothing else.
 
 ### 8.1 `oidc` (Okta, Entra ID, Google, Auth0, Keycloak…)
 
@@ -766,10 +779,15 @@ mode's own credentials are tried, and the bearer error is reported only when tho
 **Key derivation.** Every secret-keyed component uses its own key
 `keys.Derive(server.secret, label)` = HKDF-SHA256(ikm = secret, salt = `"backyard"`,
 info = label, 32 bytes) with the labels `backyard/session/v1`, `backyard/oauth-state/v1`,
-`backyard/api-token/v1`, `backyard/deploy/v1`, `backyard/upload/v1`, `backyard/anon/v1` and
-`backyard/cli-confirm/v1`. Both editions derive keys identically, so tokens interoperate given
-the same secret. (`backyard/cli-confirm/v1` only signs CLI login confirmation forms, which never
-leave the deployment that issued them, so it is not required to interoperate between editions.)
+`backyard/api-token/v1`, `backyard/deploy/v1`, `backyard/upload/v1`, `backyard/anon/v1`,
+`backyard/cli-confirm/v1`, and for the Claude connector (§8.4) `backyard/mcp-client/v1`
+(registered `client_id`s), `backyard/mcp-consent/v1` (consent CSRF tokens),
+`backyard/mcp-code/v1` (authorization codes), `backyard/mcp-refresh/v1` (refresh tokens) and
+`backyard/mcp-access/v1` (access tokens). Both editions derive keys identically, so tokens
+interoperate given the same secret. (`backyard/cli-confirm/v1` only signs CLI login
+confirmation forms, which never leave the deployment that issued them, so it is not required
+to interoperate between editions. Likewise the five `mcp-*` labels sign values that reference
+one deployment's grant records, so they never interoperate between deployments or editions.)
 
 HS256 JWTs signed with `keys.Derive(secret, "backyard/api-token/v1")`:
 `{iss: "backyard", sub: user.id, email, name, groups, admin, scope: "api", jti, iat, exp}`
@@ -839,6 +857,530 @@ alone. In the usual case the next request works again. Cookies the server cannot
 partitioned cookie, a deeper path) keep failing closed. So in mode `none`, too, a browser
 request can be refused with `401`. Several valid cookies of the same user are fine.
 
+### 8.4 Remote MCP connector: OAuth 2.1 authorization server
+
+Claude (claude.ai, Desktop, mobile, Cowork, and Claude Code) can use Backyard as a remote MCP
+server, a "custom connector" (§14.1). The connector signs people in with the company sign-in
+Backyard already uses; Claude never talks to the company IdP.
+
+#### 8.4.1 Roles, URLs and enablement
+
+Backyard is both the protected resource (`/__backyard/mcp`) and the OAuth 2.1 authorization
+server (AS) for it. Okta (through `auth.mode: oidc`), IAP, the ALB, a trusted proxy or Cloudflare
+Access only sign the **browser** in at `/__backyard/auth/authorize`; Backyard then shows its own
+consent page and issues its own tokens.
+
+* **P** (issuer, "hub URL"): the canonical form of the hub's public URL — lowercase scheme and
+  host, no default port, no path, no trailing slash. Go: `server.public_url`, which must then
+  have no path (§12). Worker: `PUBLIC_URL`, else derived from `BASE_DOMAIN`, else the request
+  origin (§16). Example: `https://backyard.acme.com`. **H** is the hostname of P.
+* **R** (resource) = `P + "/__backyard/mcp"`; **M** (protected resource metadata URL) =
+  `P + "/.well-known/oauth-protected-resource/__backyard/mcp"`.
+* **Canonical host:** a request is on the canonical hub host when its hostname (compared
+  case-insensitively, port ignored) equals H. Go takes the host as §2 does (trusted
+  `X-Forwarded-Host` included); the Worker takes the URL's hostname.
+* **Loopback host:** `localhost`, any `*.localhost` name, `127.0.0.0/8` literals and `[::1]`.
+  P may be plain `http` only on a loopback host (development and tests; §8.4.11).
+* **Resource canonicalization** (authorize and token requests): parse the value as an absolute
+  URI and reject it when the scheme is not http/https or when it has a userinfo, query or
+  fragment part; then lowercase the scheme and host, drop `:443` for https and `:80` for http,
+  remove exactly one trailing `/` from a non-empty path, and leave percent-encoding as is. The
+  result must equal R byte for byte.
+
+**Enablement.** Opt-in on both editions: Go `mcp.enabled` (default `false`, §12), Worker
+`MCP_ENABLED` (unset = off, §16). While it is off — on the Worker also while the MCP variables
+are invalid or the hub origin is neither https nor a loopback host — every path of the table
+below answers `404`: the JSON paths with
+`{"error":{"code":"not_found","message":"the Claude connector is not enabled on this server"}}`,
+`/__backyard/auth/authorize` with an HTML page of the same text, and `/__backyard/api/info`
+omits `mcp_url` (§7.1). The standalone gateway and the Lambda function serve none of these
+paths.
+
+| Path | Methods | Canonical hub host only | Behind the identity proxy |
+|---|---|---|---|
+| `/.well-known/oauth-protected-resource/__backyard/mcp` | GET, HEAD | yes | **no** (exempt, §8.4.10) |
+| `/.well-known/oauth-authorization-server` | GET, HEAD | yes | **no** |
+| `/__backyard/oauth/register` | POST | yes | **no** |
+| `/__backyard/oauth/token` | POST | yes | **no** |
+| `/__backyard/oauth/revoke` | POST | yes | **no** |
+| `/__backyard/mcp` | POST | yes | **no** |
+| `/__backyard/auth/authorize` | GET, POST | yes | **yes** |
+| `/__backyard/api/mcp/grants`, `/__backyard/api/mcp/grants/{id}` | GET, DELETE | any hub host | yes (normal hub API) |
+
+* **Site hosts:** `/.well-known/*` stays static site content; `/__backyard/mcp` and
+  `/__backyard/oauth/*` answer the JSON `404`; `/__backyard/auth/authorize` gets the usual `302`
+  to the same path and query on the hub.
+* **A hub host that is not canonical:** the JSON paths answer `404 not_found` (message
+  `not found`); authorize answers a `404` HTML page ("Use <P>/__backyard/mcp").
+* **Wrong method:** the JSON paths answer `405` with `Allow` (`GET, HEAD` or `POST`) and
+  `{"error":{"code":"bad_request","message":"method not allowed"}}`; authorize answers a `405`
+  page with `Allow: GET, POST`. At `/__backyard/mcp` the method is checked after
+  authentication (§14.1).
+* **No CORS** on any of these paths: no `Access-Control-*` headers, and `OPTIONS` → `405`.
+* **No cookies** are read or set on the six machine paths (the first six rows); the Worker never
+  mints a guest cookie there. `/__backyard/oauth/<other>` and any other `/.well-known/oauth-*`
+  path of the hub → `404` JSON, answered before anything authenticates.
+* Metric areas (§15): `oauth` for `/.well-known/oauth-*` and `/__backyard/oauth/*`, `mcp` for
+  `/__backyard/mcp`, `auth` for authorize, `api` for the grants API.
+
+#### 8.4.2 Discovery documents
+
+`GET /.well-known/oauth-protected-resource/__backyard/mcp` (RFC 9728) and
+`GET /.well-known/oauth-authorization-server` (RFC 8414) answer `200`,
+`Content-Type: application/json`, `Cache-Control: public, max-age=300`; `HEAD` gives the same
+headers without a body. The protected resource metadata, with the keys in this order
+(`<server name>` is `server.name` on Go and the `/info` `name` on the Worker, default
+`Backyard`):
+
+```json
+{"resource":"<R>","authorization_servers":["<P>"],"scopes_supported":["mcp"],"bearer_methods_supported":["header"],"resource_name":"<server name>"}
+```
+
+The authorization server metadata, with the keys in this order:
+
+```json
+{"issuer":"<P>",
+ "authorization_endpoint":"<P>/__backyard/auth/authorize",
+ "token_endpoint":"<P>/__backyard/oauth/token",
+ "registration_endpoint":"<P>/__backyard/oauth/register",
+ "revocation_endpoint":"<P>/__backyard/oauth/revoke",
+ "scopes_supported":["mcp","offline_access"],
+ "response_types_supported":["code"],
+ "response_modes_supported":["query"],
+ "grant_types_supported":["authorization_code","refresh_token"],
+ "token_endpoint_auth_methods_supported":["none"],
+ "revocation_endpoint_auth_methods_supported":["none"],
+ "code_challenge_methods_supported":["S256"],
+ "authorization_response_iss_parameter_supported":true,
+ "client_id_metadata_document_supported":true}
+```
+
+`client_id_metadata_document_supported` is present only while the effective client allowlist
+(`mcp.clients` / `MCP_CLIENTS`) is non-empty; without it clients fall back to registration.
+`offline_access` appears only in the AS metadata. The root
+`/.well-known/oauth-protected-resource` and `/.well-known/openid-configuration` are not served
+(every `401` names M, and there are no ID tokens).
+
+#### 8.4.3 Client identification
+
+There are no pre-registered clients and no client secrets. A `client_id` is resolved like this:
+
+* **`https://…` — a Client ID Metadata Document (CIMD).** It must be byte-equal to an entry of
+  the effective `mcp.clients` / `MCP_CLIENTS` (default
+  `https://claude.ai/oauth/mcp-oauth-client-metadata` and
+  `https://claude.ai/oauth/claude-code-client-metadata`); otherwise it is refused ("App not
+  allowed") and nothing is fetched. `client_kind` is `metadata_document`, the display name is
+  the document's sanitized `client_name` (else the URL host), and the verified host is the URL
+  host.
+* **`bydc_…` — a registered client.** Its MAC must verify (`backyard/mcp-client/v1`), else
+  "Unknown app". `client_kind` is `registered`; name and redirect URIs come from the signed
+  payload.
+* **Anything else** → "Unknown app".
+
+**CIMD fetch** (only allowlisted URLs; the token and revoke endpoints never fetch): a `GET` with
+`Accept: application/json`, no cookies or credentials, no redirects (any `3xx` is an error),
+5 s in total, only `200`, a `Content-Type` of `application/json` or ending in `+json`
+(parameters allowed), at most 5120 bytes, UTF-8 JSON that is an object. The Go server dials
+through its SSRF guard (public addresses only, also through an `HTTPS_PROXY`). The document
+must have `client_id` equal to the URL; `redirect_uris` an array of 1–10 strings of which at
+least one passes the redirect policy (§8.4.4; the others are ignored);
+`token_endpoint_auth_method` absent or `"none"`; no `client_secret` or
+`client_secret_expires_at`; `client_name` optional (sanitized as below; not a string → failure;
+empty after sanitizing → the URL host). Other members,
+`grant_types` included, are ignored. Any failure renders "Could not verify the app" with the
+reason. A success is cached for `max-age` clamped to 60–3600 s (300 s without one; `no-store` or
+`no-cache`: this request only); failures are never cached, but the URL is not fetched again for
+10 s and requests in that window get the same failure; concurrent requests for one URL share
+one fetch. The cache is per process (Go) or per isolate (Worker).
+
+**`POST /__backyard/oauth/register`** (RFC 7591, stateless; no authentication, no
+`X-Backyard`). The body is one JSON object (`Content-Type: application/json`, parameters
+allowed, ≤ 16 KiB), else `400 {"error":"invalid_client_metadata","error_description":"…"}`.
+
+* `redirect_uris` is required: 1–4 strings of ≤ 512 bytes, each passing the redirect policy,
+  else `400 {"error":"invalid_redirect_uri","error_description":"redirect URI <uri> is not
+  allowed on this server (allowed: the URIs in mcp.redirect_uris and http loopback URIs)"}`
+  (the Worker names `MCP_REDIRECT_URIS`); a missing or malformed `redirect_uris` (not an array
+  of 1–4 strings, an entry over 512 bytes) is `invalid_redirect_uri` too.
+* `client_name` (optional; JSON `null` counts as absent, any other non-string →
+  `invalid_client_metadata`): control characters (Cc) and the bidi controls U+200E, U+200F,
+  U+202A–U+202E and U+2066–U+2069 are removed, the result trimmed and cut to 64 code points;
+  empty or absent → `MCP client`.
+* Every other member (`token_endpoint_auth_method`, `grant_types`, `response_types`, `scope`,
+  `application_type`, `software_statement`, `logo_uri`, `client_uri`, `contacts`, `jwks`,
+  `jwks_uri`, …) is accepted and ignored; the response states what was registered.
+* `client_id` = `"bydc_" + Sign(backyard/mcp-client/v1, {"v":1,"n":<client_name>,"r":[<redirect_uris as sent>],"t":<unix seconds>})`
+  (compact JSON, keys in this order; Sign as in §8.4.8). A `client_id` longer than 1024 bytes →
+  `400 invalid_client_metadata` "too many or too long redirect_uris". Nothing is stored; a
+  registration stays valid until `server.secret` changes, and the redirect policy is checked
+  again on every use.
+* `201`, `Content-Type: application/json`, `Cache-Control: no-store`:
+  `{"client_id":"bydc_…","client_id_issued_at":<t>,"client_name":"…","redirect_uris":[…],"grant_types":["authorization_code","refresh_token"],"response_types":["code"],"token_endpoint_auth_method":"none"}`.
+* The Go server rate-limits it per client IP (§11):
+  `429 {"error":"invalid_request","error_description":"too many requests"}` with `Retry-After`.
+
+#### 8.4.4 Redirect URIs
+
+A redirect URI is allowed — at registration, authorize, the consent `POST` and the token
+endpoint — if and only if it is (a) byte-equal to an entry of the effective `mcp.redirect_uris` /
+`MCP_REDIRECT_URIS` (https; default `https://claude.ai/api/mcp/auth_callback` and
+`https://claude.com/api/mcp/auth_callback`), or (b) a **loopback URI**: scheme `http`, host
+string exactly `localhost`, `127.0.0.1` or `[::1]`, an optional port, no userinfo, no fragment,
+any path and query. Nothing else, ever.
+
+A requested `redirect_uri` matches a registered one when both are https and byte-equal, or both
+are loopback URIs with equal scheme, host string, path and query, the port being ignored on
+both sides (`localhost`, `127.0.0.1` and `[::1]` are different hosts). A URI with a fragment or
+userinfo never matches.
+
+| Registered | Requested | Match |
+|---|---|---|
+| `https://claude.ai/api/mcp/auth_callback` | same | yes |
+| `https://claude.ai/api/mcp/auth_callback` | `https://claude.ai/api/mcp/auth_callback/` | no |
+| `https://claude.ai/api/mcp/auth_callback` | `https://CLAUDE.ai/api/mcp/auth_callback` | no |
+| `http://localhost/callback` | `http://localhost:53682/callback` | yes |
+| `http://127.0.0.1:9/callback` | `http://127.0.0.1:41000/callback` | yes |
+| `http://localhost/callback` | `http://127.0.0.1:53682/callback` | no |
+| `http://[::1]/cb` | `http://[::1]:1/cb` | yes |
+| `http://localhost/callback` | `http://localhost:1/callback?x=1` | no |
+| `http://localhost/callback?a=1` | `http://localhost:5/callback?a=1` | yes |
+| `http://localhost/callback` | `https://localhost/callback` | no |
+
+Resource canonicalization (§8.4.1) with R = `https://hub.example/__backyard/mcp`:
+
+| Input | Valid |
+|---|---|
+| `https://hub.example/__backyard/mcp` | yes |
+| `HTTPS://HUB.EXAMPLE:443/__backyard/mcp/` | yes |
+| `https://hub.example/__backyard/mcp?x=1` | no |
+| `https://hub.example/__backyard/mcp#f` | no |
+| `http://hub.example/__backyard/mcp` | no |
+| `https://other.example/__backyard/mcp` | no |
+| `https://hub.example/__backyard/MCP` | no |
+| `https://u@hub.example/__backyard/mcp` | no |
+| `""` (present but empty) | no |
+
+#### 8.4.5 Authorization and consent
+
+**`GET /__backyard/auth/authorize`.** The checks run in this order and the first failure
+decides:
+
+1. Go only: the per-IP rate limit (§11) → `429` page "Too many requests".
+2. The raw request URI (path + query) is longer than 2048 bytes, the query cannot be parsed (a
+   `;` separator or a malformed `%`-escape), or one of `response_type`, `client_id`,
+   `redirect_uri`, `code_challenge`, `code_challenge_method`, `resource`, `scope`, `state`,
+   `response_mode` is repeated → `400` page "Invalid authorization request".
+3. `client_id` (§8.4.3): missing or unknown → `400` page "Unknown app"; not allowlisted → `400`
+   page "App not allowed" naming `mcp.clients` (Worker: `MCP_CLIENTS`); CIMD failure → `502`
+   page "Could not verify the app" naming the URL and the reason and suggesting outbound HTTPS
+   or "Register automatically".
+4. `redirect_uri` is required; it must match one of the client's URIs and pass the current
+   redirect policy (§8.4.4), else `400` page "Redirect address not allowed".
+5. Steps 1–4 never redirect. From here on every error is a **`302`** to the redirect URI with
+   `error`, `error_description`, `state` (when one was sent and is ≤ 512 bytes) and `iss=<P>`,
+   URL-encoded, appended with `?` (or `&` when the URI already has a query), with
+   `Cache-Control: no-store` and `Referrer-Policy: no-referrer`:
+   * `response_type` ≠ `code` (absent included) → `unsupported_response_type`;
+   * `request` present → `request_not_supported`; `request_uri` present →
+     `request_uri_not_supported`;
+   * `response_mode` present and ≠ `query` → `invalid_request`;
+   * `code_challenge_method` ≠ `S256`, absent included → `invalid_request` "PKCE with S256 is
+     required";
+   * `code_challenge` not matching `^[A-Za-z0-9_-]{43}$` → `invalid_request`;
+   * `resource` present and not canonicalizing to R → `invalid_target` (absent means R);
+   * `state` longer than 512 bytes → `invalid_request`, sent without `state` (an empty `state`
+     counts as absent);
+   * `scope` is split on spaces: the granted scope is `mcp`, plus ` offline_access` when
+     requested; other values are ignored, never an error. Unknown parameters (`prompt`,
+     `nonce`, `login_hint`, …) are ignored.
+6. The browser identity of the mode (§8.4.9; bearer tokens are never accepted): an
+   infrastructure error → `503` page; refused by `allowed_domains`, `allowed_emails` or
+   `allowed_groups` → `403` page "Access denied" (with a sign-out link where one exists);
+   conflicting cookies → the `401` page of §8.3; Go `oidc` without a session → `302` to the
+   login with `rd` = `P` + the request URI; a proxy mode or Worker `access` without an identity →
+   `401` page; an anonymous user outside mode `none`, or a static-token identity → `403` page
+   "This sign-in cannot connect apps".
+7. `200`: the consent page. Consent is **always** shown — on every authorization, never
+   remembered, whatever `Sec-Fetch-Site` says.
+
+**The consent page** carries `Cache-Control: no-store`, `Referrer-Policy: no-referrer`,
+`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff` and
+
+```
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self' <ORIGIN>
+```
+
+where `<ORIGIN>` is the redirect URI's origin (`https://claude.ai`, `http://localhost:53682`,
+`http://127.0.0.1:9`; `http:` for `[::1]`, which CSP cannot name). The Worker may add its
+`script-src 'nonce-…'`; the page has no scripts. All values are HTML-escaped, and wording may
+differ between editions, but every element is required:
+
+1. the title "Connect an app to Backyard";
+2. the user: "You are signed in as **<email, else name, else id>**", or in mode `none`
+   "**Guest <first 4 hex>**. This Backyard has no sign-in; the app will act as this browser's
+   guest"; a "Not you? Sign out" link to `/__backyard/auth/logout` where a logout exists (Go
+   `oidc`, the Worker);
+3. the app: CIMD "**<client_name>** — verified by **<client_id host>**"; registered
+   "**"<client_name>"** (name provided by the app, not verified)";
+4. where the approval goes: https "Backyard will send the approval to **<redirect origin>**";
+   loopback "Backyard will send the approval to **an app on this computer (<redirect
+   origin>)**. Only continue if you just started the sign-in from an app on this computer.";
+5. what the app can do: "See the sites on <H> and read their files, and publish or change sites
+   as you. Published sites are visible to everyone who can sign in to this Backyard.";
+6. the lifetime: "This connection lasts until <YYYY-MM-DD (UTC) of consent + family lifetime>
+   unless you disconnect it on the Backyard hub.";
+7. the forwarding warning: "Only allow this if you started connecting <client_name> to Backyard
+   yourself just now. Anyone who sent you this link would get this access.";
+8. `<form id="consent" method="post" action="/__backyard/auth/authorize">` with the hidden inputs
+   `response_type` (`code`), `client_id`, `redirect_uri`, `state` (omitted when absent),
+   `code_challenge`, `code_challenge_method` (`S256`), `scope` (the granted scope), `resource`
+   (R) and `csrf`, and the buttons
+   `<button type="submit" name="decision" value="allow" id="allow">Allow</button>` and
+   `<button type="submit" name="decision" value="deny" id="deny">Cancel</button>` (no
+   `autofocus`);
+9. click-delay arming against double-clickjacking: the buttons start `visibility:hidden` and are
+   revealed by `animation: by-arm 0s linear 0.8s forwards` with
+   `@keyframes by-arm { to { visibility: visible } }` in an inline `<style>`.
+
+The CSRF token is `"<unix exp>.<base64url(HMAC-SHA256(backyard/mcp-consent/v1 key, message))>"`
+(≤ 128 characters, `exp` = render time + 600 s) over the UTF-8 compact JSON array
+`["mcp-consent", exp, user.id, binding, client_id, redirect_uri, state, code_challenge, scope, resource]`,
+where `state` is `""` when absent, `scope` is the granted scope, `resource` is R and `binding` is
+the raw `backyard_session` cookie that authenticated the request on the Go server in `oidc`
+mode, `""` everywhere else.
+
+**`POST /__backyard/auth/authorize`** (the consent decision):
+
+1. The body must be `application/x-www-form-urlencoded`, ≤ 16 KiB, UTF-8 → else a `400` page.
+2. Go only: the per-IP rate limit, as for `GET`.
+3. Browser signals → `403` page "This approval was not sent from the Backyard page", no
+   redirect, when `Sec-Fetch-Site` is present and ≠ `same-origin`; or `Origin` is present and
+   neither the hub origin, the request's own origin nor `null`; or `Sec-Fetch-Mode` is present
+   and ≠ `navigate`; or `Sec-Fetch-Dest` is present and ≠ `document`.
+4. GET steps 3–6 run again on the form fields, plus the parsing and repeated-field checks of
+   step 2 (the 2048-byte cap applies only to `GET`); redirect errors use **`303`**.
+   `response_type`, `code_challenge_method` and `resource` are required in the form (a missing
+   one fails as in step 5; a missing `resource` → `invalid_request` "resource is required"). Go
+   `oidc` without a session → `302` to the login with `rd` = the `GET` form of the request.
+5. `csrf` must verify for the current user, binding and fields, with `exp` ≥ now − 60 s → else
+   `403` page "This approval page expired or was not issued to you. Go back to the app and
+   connect again." (audit `mcp.consent_rejected`).
+6. `decision=deny` → `303` to the redirect URI with `error=access_denied`, `state` and `iss`
+   (audit `mcp.deny`). `decision=allow` → a pending grant is created (§8.4.8), the code is
+   `"byac_" + Sign(backyard/mcp-code/v1, {"g":<gid>,"x":<now+300>})`, and the answer is `303`
+   to `redirect_uri` with `code`, `state` and `iss` (same query rules; `Cache-Control:
+   no-store`, `Referrer-Policy: no-referrer`; audit `mcp.authorize`); a storage failure → `503`
+   page. Any other `decision` → `400` page.
+
+#### 8.4.6 Token endpoint
+
+`POST /__backyard/oauth/token` never reads cookies and needs no `X-Backyard`. The body is
+`application/x-www-form-urlencoded`, ≤ 16 KiB; a repeated parameter or a body that cannot be
+parsed (a `;` separator, a malformed `%`-escape) → `invalid_request`. Every
+answer has `Content-Type: application/json`, `Cache-Control: no-store` and `Pragma: no-cache`;
+errors are `{"error":"<code>","error_description":"<text>"}` with status `400`, except
+`invalid_client` (`401`). Storage errors →
+`500 {"error":"server_error","error_description":"request <X-Request-Id>"}`. The Go server
+rate-limits it per client IP (`429` as for registration).
+
+**Client authentication** (public clients only): `client_id` is required, in the body or as
+`Authorization: Basic base64(client_id:)` with an **empty** password; when both are given they
+must be equal (else `invalid_request`). Any other `Authorization` header, a non-empty Basic
+password or a non-empty `client_secret` → `401 invalid_client` with
+`WWW-Authenticate: Basic realm="Backyard"` (so do two `Authorization` headers). A missing
+`client_id`, or one that is not an allowlisted CIMD URL or a `bydc_` id with a valid MAC
+(nothing is fetched here) → `401 invalid_client` without a challenge. A present `resource` is
+checked (`invalid_target`) before `grant_type`; a missing `grant_type` → `invalid_request`.
+
+**`grant_type=authorization_code`.** `code` and `code_verifier` are required. `redirect_uri` is
+optional; when present it must equal the grant's byte for byte. `resource` is optional; when
+present it must canonicalize to R, else `invalid_target`. Then, each failure being
+`invalid_grant`:
+
+1. `code` has the `byac_` prefix, a valid MAC and `x` ≥ now;
+2. the grant exists and its code has not expired (a grant already redeemed is not rejected
+   here: the replay is detected in step 6, after PKCE has verified);
+3. `client_id` equals the grant's;
+4. the `redirect_uri` rule above;
+5. `code_verifier` matches `^[A-Za-z0-9._~-]{43,128}$` and `BASE64URL(SHA-256(ascii(verifier)))`
+   equals the grant's `code_challenge` (constant-time) — a failure here consumes and revokes
+   nothing;
+6. redemption: `rotate(gid, 0, grace=false)` (§8.4.8). `reuse` — a replay of a valid request —
+   has revoked the grant: `invalid_grant`, audit `mcp.code_replay` and `mcp.revoke`
+   (`via=replay`); `missing` → `invalid_grant`;
+7. re-gating (§8.4.8); a failure revokes the grant: `invalid_grant` "access removed by policy";
+8. success (audit `mcp.token`):
+   `{"access_token":"byat_…","token_type":"Bearer","expires_in":<int>,"refresh_token":"byrt_…","scope":"<granted scope>"}`
+   with `expires_in` = min(3600, grant expiry − now) and the refresh token of generation 1. A
+   refresh token is always issued.
+
+**`grant_type=refresh_token`.** `refresh_token` is required. `scope` is optional and must be a
+subset of the granted scope (else `invalid_scope`); it only changes the `scope` of this answer.
+`resource` is optional and must canonicalize to R (else `invalid_target`). Then:
+
+1. `byrt_` prefix, a valid MAC and `n` ≥ 1, else `invalid_grant`;
+2. the grant exists, has been redeemed and has not expired, else `invalid_grant`;
+3. `client_id` equals the grant's, else `invalid_grant` (steps 1–3 revoke nothing);
+4. `rotate(gid, n, grace=true)`: `ok` → the refresh token of generation n+1; `grace` → the same
+   generation n+1 token another request already received (refresh tokens are deterministic per
+   generation); `reuse` → the grant is revoked, `invalid_grant`, audit `mcp.refresh_reuse` and
+   `mcp.revoke` (`via=replay`);
+   `missing` → `invalid_grant`;
+5. re-gating; a failure revokes the grant: `invalid_grant` "access removed by policy".
+
+A narrowed `scope` is answered deduplicated, in the order requested.
+
+A success has the same shape with a new access token and the generation n+1 refresh token.
+Refreshes are not audited. Other grant types → `unsupported_grant_type`.
+
+#### 8.4.7 Revocation and the grants API
+
+**`POST /__backyard/oauth/revoke`** (RFC 7009): a form body ≤ 16 KiB with the required `token`
+(`token_type_hint` is ignored) and the client authentication of §8.4.6. A `byrt_` or `byat_`
+token with a valid MAC whose grant exists and belongs to that `client_id` deletes the grant
+(audit `mcp.revoke`, `via=rfc7009`). The answer is always `200` with an empty body — also for
+unknown, expired or malformed tokens and tokens of other clients, so the endpoint is no oracle.
+A missing `token` → `400 invalid_request`; client authentication failures → `401
+invalid_client`; the form is checked first, then the client, then `token`. A storage error →
+`500 server_error` as for the token endpoint. The Go server rate-limits it per client IP.
+
+**`/__backyard/api/mcp/grants`** is a normal hub API (browser session, proxy identity, API token
+or static token, with `X-Backyard: 1` on `DELETE` and the API rate limit); MCP access tokens are
+not accepted there, and it answers `404` while the connector is disabled.
+
+* `GET /__backyard/api/mcp/grants[?user=<id>]` → `200 {"grants":[Grant…]}`: without `user` the
+  caller's own grants, with `user` any person's (admins only, else `403 forbidden`); live grants
+  only (redeemed, not expired), newest first, at most 200. A `Grant` is
+  `{"id":"<gid>","user":{"id":"…","email":"…","name":"…"},"client_name":"…","client_kind":"metadata_document"|"registered","client_host":"<client_id host or \"\">","redirect_host":"<host of redirect_uri>","scope":"mcp …","created_at":"<RFC3339>","expires_at":"<RFC3339>"}`.
+* `DELETE /__backyard/api/mcp/grants/{id}` → `204`, for the grant's user or an admin; someone
+  else's grant or an unknown id → `404`. Audit `mcp.revoke` (`via=hub`).
+* `DELETE /__backyard/api/mcp/grants[?user=<id>]` → `200 {"revoked":<n>}`: the caller's own
+  grants, or with `user` ≠ the caller any person's (admins only, else `403`). Audit `mcp.revoke`
+  (`via=hub`, `count`).
+* Guests (mode `none`) see and revoke their own grants. A static token acts as `token:<name>`,
+  which owns no grants; an admin static token may use `?user=`.
+
+The hub UI shows a "Use Backyard in Claude" card while `info.mcp_url` exists: the URL with a copy
+button, the setup steps, the caller's connections with a "Disconnect" button each, and for
+admins a form that disconnects one person.
+
+#### 8.4.8 Tokens, grants and rotation
+
+All tokens are opaque. `Sign(L, payload)` is `base64url(payload) "." base64url(HMAC-SHA256(key,
+payload))` with `key = keys.Derive(server.secret, L)` (§8.3), over compact JSON with the keys in
+the order shown; verification checks the prefix, then the MAC, then the JSON field types.
+
+| Item | Format | Payload | Notes |
+|---|---|---|---|
+| registered client id | `bydc_` + Sign(`backyard/mcp-client/v1`) | `{"v":1,"n":name,"r":[uris],"t":iat}` | ≤ 1024 bytes; no expiry; valid until `server.secret` changes |
+| authorization code | `byac_` + Sign(`backyard/mcp-code/v1`) | `{"g":gid,"x":exp}` | 300 s; single use |
+| refresh token | `byrt_` + Sign(`backyard/mcp-refresh/v1`) | `{"g":gid,"n":n}` | n ≥ 1; deterministic for (gid, n) |
+| access token | `byat_` + Sign(`backyard/mcp-access/v1`) | `{"g":gid,"i":iat,"x":exp}` | exp = min(iat + 3600, grant expiry); ≤ 4096 bytes |
+| consent CSRF | `<exp>.<base64url MAC>` (`backyard/mcp-consent/v1`) | the array of §8.4.5 | 600 s |
+
+`gid` is 32 lowercase hex characters (16 random bytes). Logs, audit records, tool results and
+error messages never contain these values.
+
+**The grant record** — one per consent — is the single source of truth: `id` (gid), `user_id`,
+`user` (the snapshot `{id, email, name, groups, anonymous}` taken at consent), `client_id`,
+`client_name`, `client_kind` (`metadata_document` or `registered`), `redirect_uri` (exactly as
+authorized), `code_challenge`, `scope` (`mcp` or `mcp offline_access`), `resource` (R at
+consent), `created_at` (unix s), `code_exp` (`created_at` + 300), `redeemed_at` (set at
+redemption) and `exp` (pending: `code_exp` + 600; after redemption: `created_at` + the family
+lifetime, which is `auth.token_ttl` on Go and `TOKEN_TTL_HOURS` on the Worker, counted from
+consent and never extended). Revocation deletes the record; a missing grant fails every check.
+Storage: §10 (Go) and §16 (Worker). Expired grants and rotation markers are pruned when grants
+are created.
+
+**`rotate(gid, from, grace)`** is the only state transition (codes: `from=0, grace=false`;
+refreshing generation n: `from=n, grace=true`):
+
+```
+rotate(gid, from, grace, now):
+  g := grant(gid); if g missing or g.exp <= now → "missing"
+  (from ≥ 1 additionally requires g.redeemed_at, else "missing")
+  try atomically create marker (gid, from+1) with at=now
+    success → if from == 0: g.redeemed_at = now, g.exp = g.created_at + family lifetime
+              return "ok"
+    conflict →
+      m := marker(gid, from+1)
+      if grace and now - m.at <= 60 s and marker(gid, from+2) does not exist → return "grace"
+      revoke(gid) → return "reuse"
+```
+
+Markers are created in order only, so a conflict at n+1 together with an existing marker n+2
+proves that the presented token is an old generation. Go creates the marker with an atomic
+docstore `Create` (a conflict is the conflict); the Worker runs the whole function in one
+RegistryDO transaction.
+
+**Verifying an access token** (every request to `/__backyard/mcp`; there is no cache, so a
+revocation takes effect at once): the `byat_` prefix, ≤ 4096 bytes, a valid MAC and valid JSON
+(else `malformed token`); `x` > now (else `token expired`); the grant exists, is redeemed and has
+not expired (else `token revoked`); its `resource` equals the current R (else `token not issued
+for this server`); then the user is rebuilt from the snapshot and **re-gated**: an `anon:`
+subject only while the mode is `none`, never a `token:` subject; on Go everything else goes
+through the API-token path (directory enrichment, admin recomputed from the configuration,
+`allowed_domains` / `allowed_emails` / `allowed_groups`); on the Worker admin is recomputed from
+`ADMINS`/`ADMIN_GROUPS`. A gate failure deletes the grant (`access removed by policy`; audit
+`mcp.revoke`, `via=policy`). The same re-gating runs at the code exchange and at every refresh.
+
+#### 8.4.9 Browser identity per mode
+
+The machine endpoints behave the same in every mode; only the browser step at
+`/__backyard/auth/authorize` differs:
+
+| Edition / mode | Identity at `/__backyard/auth/authorize` | Not signed in | Notes |
+|---|---|---|---|
+| Go `oidc` | the `backyard_session` cookie | `302` to the login with `rd` = the authorize URL | consent CSRF bound to the session cookie |
+| Go `iap` / `alb` / `header` | the signed proxy assertion / trusted header | `401` page: "Sign-in required. The identity proxy did not authenticate this request; /__backyard/auth/authorize must stay behind it." | the four machine paths must be exempt (§8.4.10) |
+| Go `none` | the guest cookie `backyard_anon` (minted if absent) | — | grant subject `anon:<16 hex>`; publishing needs `deploy.allow_anonymous`; outside dev mode the server logs `mcp: auth.mode none: every connector connection is an anonymous guest` |
+| Worker `access` | `Cf-Access-Jwt-Assertion` / `CF_Authorization` | `401` page as above | conflicting Access cookies → `401` page |
+| Worker `none` | the guest cookie | — | publishing needs `ALLOW_ANONYMOUS_DEPLOY`; `DEPLOY_TOKEN` plays no part |
+| Worker, any other `AUTH_MODE` | — | — | the whole Worker answers `503` (§16) |
+
+In every mode an anonymous user (outside mode `none`) or a static-token identity gets the `403`
+page "This sign-in cannot connect apps".
+
+#### 8.4.10 Proxy exemptions
+
+An identity proxy in front of Backyard (IAP, an ALB with OIDC, Cloudflare Access, oauth2-proxy,
+Pomerium, Easy Auth) must let exactly these four machine paths through without a login:
+
+* `/__backyard/mcp`
+* `/__backyard/oauth/*`
+* `/.well-known/oauth-authorization-server`
+* `/.well-known/oauth-protected-resource/__backyard/mcp`
+
+`/__backyard/auth/authorize` **must stay** behind the proxy: the proxy's login is the sign-in.
+None of the four paths reads cookies or identity headers, so exempting them — even through a
+"trusted" `header`-mode peer — cannot spoof an identity, and the deployment kits exempt them
+unconditionally; while the connector is off Backyard answers them with `404` itself. The
+Cloudflare edition's Access bypass list is in §16.
+
+#### 8.4.11 Deviations from the standards
+
+1. **http issuer.** Plain-http P (and so http AS endpoints) is allowed only on loopback hosts,
+   for development and tests. RFC 8414 and MCP require https.
+2. **Loopback ports.** The port is ignored for `localhost` as well as for loopback IP literals
+   (RFC 8252 §7.3 names IP literals; Claude Code uses `localhost`).
+3. **Missing `MCP-Protocol-Version`.** Treated as `2025-06-18`, not `2025-03-26`, because
+   2025-03-26 (with its batching) is not supported.
+4. **Refresh grace.** A refresh token that was rotated ≤ 60 s ago, and whose successor has not
+   been used, returns that same successor instead of triggering reuse revocation (OAuth 2.1,
+   section 4.3.1, requires revocation on reuse).
+5. **Revocation answers.** RFC 7009 revocation answers `200` for tokens of other clients instead
+   of an error, so the endpoint is not an oracle.
+6. **CIMD scope.** CIMD is supported only for allowlisted `client_id` URLs (a domain trust
+   policy, which MCP permits); other URL client ids are refused without a fetch.
+7. **Scopes.** Unknown requested scopes are ignored and the granted scope is returned.
+8. **Login before consent.** The upstream login (Okta via Backyard's OIDC client, or a proxy)
+   happens before the consent page. It creates only Backyard's own browser session, never an
+   MCP grant. The consent page is shown on every authorization before any code exists, so the
+   "consent before upstream state" rule of the MCP proxy guidance is met in substance.
+9. **Token-endpoint `redirect_uri`.** Optional, as in OAuth 2.1; when present it must match.
+10. **`code_challenge_method`.** Absent means `plain` per OAuth, and is therefore refused: S256
+    is required.
+
 ## 9. Storage layout (blob keys, after optional `storage.<type>.prefix`)
 
 | Key | Content |
@@ -858,6 +1400,13 @@ System collections live in each site's namespace with names starting with `_` (`
 in the reserved site `_system` (`_users` user cache, `_audit` audit log). They are never listed by
 `GET /db` and cannot be accessed through the site DB API.
 
+The Claude connector (§8.4) keeps its state in `_system` too (quotas do not apply):
+`_system/_mcp_grants/<gid>` (the grant record, `id` = the document id),
+`_system/_mcp_rotations/<gid>.<n>` (`{"gid","n","at":<unix ms>,"exp":<the grant family's
+exp>}`, created with an atomic `Create` so that a code is redeemed and a refresh token rotated
+exactly once) and `_system/_mcp_locks/<site>` (the publish lease `{"exp":<unix s>}`, §14.1). The
+Cloudflare edition keeps the same records in `RegistryDO` tables (§16).
+
 ## 11. Limits & rate limiting
 
 Token buckets per instance (`ratelimit`), keyed by user id (or client IP when anonymous); each
@@ -871,6 +1420,37 @@ the key out) selects the default. With N instances the effective limits are up t
 higher. Per-site storage limits: `database.max_docs_per_site` (default 100,000; negative =
 unlimited; a soft quota, as instances count independently), `database.max_doc_bytes`; per-site
 deploy limits: `sites.max_site_bytes`, `sites.max_files`, `sites.max_file_bytes`.
+
+The Claude connector (§8.4, §14.1) adds no rate-limit keys on the Go server: the OAuth endpoints
+(register, token, revoke and authorize) are charged to `api_per_minute` keyed by client IP, the
+MCP endpoint to `api_per_minute` keyed by the connection's user (`429 rate_limited` with
+`Retry-After`), and `backyard_publish` to `deploys_per_hour` keyed by that user (guests
+included). The Cloudflare edition's daily caps are in §16. Its fixed limits:
+
+| Limit | Value |
+|---|---|
+| authorization code lifetime | 300 s |
+| consent CSRF token lifetime | 600 s (verification accepts up to 60 s of clock skew) |
+| access token lifetime | 3600 s, never past the grant's expiry |
+| refresh family lifetime | `auth.token_ttl` (Go, default 720h) / `TOKEN_TTL_HOURS` (Worker, default 720), counted from consent |
+| refresh grace window | 60 s |
+| retention of an unredeemed grant | code expiry + 600 s |
+| authorize request URI (path + query) | ≤ 2048 bytes |
+| `state` | ≤ 512 bytes |
+| registered `client_id` | ≤ 1024 bytes |
+| registered `redirect_uris` | 1–4 entries of ≤ 512 bytes |
+| displayed `client_name` | ≤ 64 code points after sanitizing |
+| CIMD fetch | 5 s, ≤ 5120 bytes, no redirects, cached 60–3600 s (default 300), failures throttled 10 s |
+| OAuth request bodies (register, token, revoke, consent `POST`) | ≤ 16 KiB |
+| bearer token at `/__backyard/mcp` | ≤ 4096 bytes |
+| MCP request body | ≤ 2 × the publish cap + 1 MiB (Go default 9437184, Worker default 5242880) |
+| decoded file bytes per `backyard_publish` call | Go `mcp.max_publish_bytes` (default 4194304); Worker `LIMITS.mcp_publish_bytes` (default 2097152) |
+| files per publish call | ≤ 1000 in `files`, ≤ 1000 in `delete` |
+| `backyard_read_site_file` | ≤ 131072 bytes, text only |
+| `backyard_list_sites` / `backyard_site_files` | ≤ 200 sites / ≤ 2000 files |
+| Go MCP request deadline | 5 min (read and write, set before the body is read) |
+| Go large-body admission | ≤ 4 concurrent MCP requests with a body > 1 MiB or of unknown length; others wait ≤ 30 s, then `429` |
+| Go publish lease | 300 s |
 
 ## 12. Configuration
 
@@ -895,6 +1475,24 @@ them `auth.mode: oidc` with `url_mode: host` unless `base_domain` can carry a co
 (not `localhost`, `*.localhost`, an IP address or a single-label name) and the host of
 `public_url` is `base_domain` or one of its subdomains (§8.1), and `deploy.allow_anonymous`
 without `auth.mode: none`.
+
+The Claude connector (§8.4) is configured in the `mcp` section: `mcp.enabled` (default
+`false`), `mcp.clients` (the allowlisted client metadata document URLs; default the two Claude
+documents of §8.4.3; an explicit `[]` turns CIMD off, so clients register automatically),
+`mcp.redirect_uris` (the exact https addresses that may receive codes; default the two Claude
+callbacks of §8.4.4; loopback addresses are always allowed and never listed) and
+`mcp.max_publish_bytes` (decoded file bytes per `backyard_publish` call, default 4194304).
+Entries are trimmed but their case is kept, as they are compared byte for byte. Validation
+rejects, whether or not the connector is enabled: a `mcp.clients` entry that is not an https URL
+with a host that is not an IP literal, a path other than `/` and empty, no `.`/`..` segments, no
+query, fragment or userinfo, at most 512 bytes; a `mcp.redirect_uris` entry that is not an https
+URL without fragment or userinfo of at most 512 bytes, or whose host is the `public_url` host,
+`base_domain` or a subdomain of it; and a `mcp.max_publish_bytes` outside 65536–67108864. With
+`mcp.enabled` it also requires a `mcp.max_publish_bytes` of at most `sites.max_site_bytes` (so a
+small `sites.max_site_bytes` stays valid while the connector is off), an http(s) `server.public_url`
+without a path, query or fragment that is https unless its host is a loopback host (§8.4.1), and
+in `auth.mode: oidc` an `auth.oidc.redirect_url` whose path is not `/__backyard/auth/authorize`.
+The standalone gateway validates `mcp` but ignores it.
 
 ## 13. CLI
 
@@ -1004,6 +1602,199 @@ external gateway advertised in `info.gateway_url` is adopted when reachable.
   downloading them and returns at most 256 KiB of text, which is untrusted data. Tool results
   and errors never contain tokens or signed upload URLs.
 * Hub serves `/llms.txt` and `/llms-full.txt`.
+* Remote MCP server for Claude (the "custom connector"): `<public_url>/__backyard/mcp` with
+  Backyard's own OAuth sign-in (§8.4) and the tools `backyard_docs`, `backyard_whoami`,
+  `backyard_list_sites`, `backyard_site_files`, `backyard_read_site_file` and
+  `backyard_publish` (§14.1).
+
+### 14.1 Remote MCP endpoint
+
+`POST /__backyard/mcp` on the canonical hub host (§8.4.1) is an MCP server over Streamable HTTP:
+stateless, JSON responses only — no sessions, no SSE streams, no JSON-RPC batches. It supports
+the protocol versions `2025-11-25` and `2025-06-18`. Both editions implement the JSON-RPC
+handling themselves, so they answer identically.
+
+**Gate.** Every request passes these steps in this order; the HTTP-level errors (steps 3–9) use
+the §5 envelope unless noted:
+
+1. The routing rules of §8.4.1 (canonical host; disabled → `404`).
+2. Go only: the connection's read and write deadlines become now + 5 min, before the body is
+   read.
+3. **Origin.** Absent is fine. Present, it must equal (case-insensitively) the hub origin, the
+   request's own origin, the origin of an https entry of the effective `mcp.redirect_uris` /
+   `MCP_REDIRECT_URIS`, or the origin of an entry of `mcp.clients` / `MCP_CLIENTS` (by default
+   `https://claude.ai` and `https://claude.com`); otherwise
+   `403 {"error":{"code":"forbidden","message":"requests from this origin are not accepted"}}`.
+4. **Credentials.** More than one `Authorization` header — also one value that joins several
+   `<scheme> <credentials>` parts with commas, as proxies and the Workers runtime merge repeated
+   headers — → `400` (`bad_request`) with
+   `WWW-Authenticate: Bearer error="invalid_request", resource_metadata="<M>"`. No
+   `Authorization: Bearer <token>` (the scheme is case-insensitive; other schemes count as
+   absent) → `401` with exactly `WWW-Authenticate: Bearer resource_metadata="<M>", scope="mcp"`
+   and `{"error":{"code":"unauthenticated","message":"connect this app to Backyard to sign in"}}`.
+   An invalid token (§8.4.8) → `401` with exactly
+   `WWW-Authenticate: Bearer error="invalid_token", error_description="<desc>", resource_metadata="<M>", scope="mcp"`
+   and the same body, where `<desc>` is one of `malformed token` (wrong prefix, over 4096
+   bytes, bad MAC), `token expired`, `token revoked` (the grant is missing, unredeemed or
+   expired), `token not issued for this server` (the grant's resource is not the current R) and
+   `access removed by policy` (re-gating failed; the grant is deleted). Only MCP access tokens
+   are accepted: API tokens, static tokens, `DEPLOY_TOKEN`, IdP and Access JWTs are
+   `malformed token`, and cookies and proxy identity headers are never read.
+5. Go only: `api_per_minute` keyed by the user (§11) → `429 rate_limited` with `Retry-After`.
+6. A method other than `POST` (`GET`, `DELETE`, `PUT`, `PATCH`, `OPTIONS`, `HEAD`) → `405` with
+   `Allow: POST`.
+7. A `Content-Type` whose media type is not `application/json` → `415` (`bad_request`). An
+   `Accept` header that admits none of `application/json`, `application/*` and `*/*` → `400`
+   (`bad_request`); no `Accept` is fine.
+8. **`MCP-Protocol-Version`.** Absent means `2025-06-18` (§8.4.11). Any value other than
+   `2025-11-25` and `2025-06-18` → `400`, `Content-Type: application/json`,
+   `{"jsonrpc":"2.0","id":null,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2025-11-25","2025-06-18"],"requested":"<value>"}}}`.
+9. **Body.** A `Content-Length` above the limit (§11) → `413` before reading; a body that
+   exceeds it while reading → `413`; both
+   `{"error":{"code":"too_large","message":"MCP requests are limited to <N> bytes; publish over several calls"}}`.
+   Go only: a body over 1 MiB or of unknown length needs one of 4 admission slots, waited for
+   ≤ 30 s, else `429 rate_limited` with `Retry-After: 5`.
+10. **JSON-RPC parsing** (`400`, `id: null`): invalid JSON →
+    `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}`; a JSON array →
+    `-32600` "Invalid Request: JSON-RPC batches are not supported"; not an object, `jsonrpc` ≠
+    `"2.0"`, a `method` that is not a string, or an `id` that is neither a string nor an integer
+    (`null`, fractional numbers and objects included) → `-32600` "Invalid Request".
+11. **Dispatch.** A notification (`method` without `id`) or a client response (no `method`, a
+    `result` or `error`) → `202` with an empty body. A request → `200`,
+    `Content-Type: application/json`, `Cache-Control: no-store`, one JSON-RPC response echoing
+    `id`. No response carries `Mcp-Session-Id` or sets a cookie; an incoming `Mcp-Session-Id`
+    or `Last-Event-ID` is ignored, and no request needs an earlier `initialize`. Methods:
+    * `initialize`: `params.protocolVersion` must be a string (else `-32602` "Invalid
+      params"); the result is
+      `{"protocolVersion":"<the requested version if supported, else 2025-11-25>","capabilities":{"tools":{}},"serverInfo":{"name":"backyard","title":"Backyard","version":"<build version>"},"instructions":"<the catalog's instructions>"}`;
+    * `ping` → `{}`;
+    * `tools/list` → `{"tools": <the catalog's tools, verbatim>}` (`params.cursor` is ignored;
+      there is no `nextCursor`);
+    * `tools/call` → below;
+    * any other method (`resources/list`, `prompts/list`, `logging/setLevel`,
+      `completion/complete`, `server/discover`, …) → `-32601` "Method not found" (HTTP `200`);
+    * an internal failure → `-32603` "Internal error (request <X-Request-Id>)".
+12. Worker only: `tools/call` charges `LIMITS.mcp_calls_per_day` per user before the tool runs
+    (§16); exhausted → HTTP `429` (§5 envelope, `Retry-After`). Only calls that name a tool of
+    the catalog with valid `params` count (`-32602` answers and other methods are free; a
+    schema violation of the arguments counts).
+
+**The tool catalog** `internal/mcpremote/tools.json` is normative, as `backyard.d.ts` is for the
+SDK: its `instructions` are the `initialize` instructions, and `tools/list` returns its `tools`
+verbatim and in order (the Go server embeds the file; the Worker build generates
+`src/generated/mcp.ts` from it). The tools: `backyard_docs` (Backyard's documentation, topic
+`skill`, `api`, `recipes` or `deploy`), `backyard_whoami` (the account, whether it may publish,
+the hub URL, the site URL pattern and the limits), `backyard_list_sites`, `backyard_site_files`,
+`backyard_read_site_file` (read-only) and `backyard_publish` (destructive).
+
+**`tools/call`.** `params` must be an object with a string `name` and an object `arguments` or
+none (`{}`), else `-32602` "Invalid params"; an unknown tool → `-32602` "Unknown tool: <name>".
+The arguments are validated against the tool's `inputSchema` (the keywords the catalog uses);
+a violation is a tool error `Invalid arguments: <detail>`. A success is
+`{"content":[{"type":"text","text":<T>}]}` where `T` is the Markdown document
+(`backyard_docs`), the file's text (`backyard_read_site_file`, invalid UTF-8 replaced by
+U+FFFD) or the compact JSON of the result object; there is no `structuredContent`. A tool
+failure is `{"content":[{"type":"text","text":<message>}],"isError":true}` with a message of the
+table below. Results and errors never contain tokens, codes, registered `client_id`s, signed
+URLs or the server secret.
+
+* `backyard_whoami` →
+  `{"user":{"id","email"?,"name","admin","anonymous"},"hub_url":"<P>","site_url_template":"<the site URL of §2 with {site} for the name>","can_publish":<bool>,"limits":{"max_publish_bytes","max_files","max_file_bytes","max_site_bytes","max_read_bytes":131072},"connection":{"client":"<client_name>","expires_at":"<RFC3339 grant expiry>"}}`.
+  `can_publish` is true when the user is not anonymous or anonymous deploys are allowed (and,
+  on Go, the embedded gateway is on). On the Worker `max_publish_bytes` is
+  `LIMITS.mcp_publish_bytes`.
+* `backyard_list_sites` (`query`: case-insensitive substring of name, title or description) →
+  `{"sites":[{"name","url","title"?,"description"?,"updated_at"?,"updated_by"?,"file_count","bytes","owners"?}],"total":<matches>,"truncated":<bool>}`,
+  most recently updated first, then by name; `owners` only with ownership `owner`.
+* `backyard_site_files` → `{"site","url","files":[{"path","size"}],"total","truncated"}`, what
+  is served, sorted by path.
+* `backyard_read_site_file` checks, in order: the site exists (E22), the path is valid (E8), the
+  extension is not a binary type (E24), the file exists (E23), its size is ≤ 131072 bytes (E25),
+  and no NUL byte in its first 8 KiB (E24).
+
+**`backyard_publish`** (`site`, `files: [{path, content, encoding?: "utf-8"|"base64",
+content_type?}]`, `delete?: [paths]`, `replace?`, `overwrite?`) merges by default: the listed
+files are written, the site's other files are kept, `delete` removes paths, and `replace: true`
+makes the site exactly the given files. The steps, normative on both editions:
+
+1. Go: `deploy.embedded_gateway: false` → E18. An anonymous user without anonymous deploys →
+   E17.
+2. The site name (E2) and the reserved names (E3): the reserved list of CLI deploys — on Go the
+   effective `sites.reserved` (§9: its defaults unless the key is set), on the Worker the
+   defaults plus `RESERVED_SITES`.
+3. `files` and `delete` both empty → E4; `replace` with a non-empty `delete` → E5; `replace`
+   with empty `files` → E6.
+4. Per file: a valid path (E8, the rules of §7.3), no duplicates (E9), not also in `delete`
+   (E10), the content decoded — `utf-8` (default) is the string's UTF-8 bytes, `base64` takes
+   the standard or URL alphabet with optional padding and no whitespace (else E7) — at most
+   `max_file_bytes` (E12), and a `content_type` of ≤ 255 characters without control characters
+   (else E1; default: by extension). The decoded total must stay within the per-call cap (E11),
+   and the `delete` paths must be valid (E8).
+5. Concurrency: Go takes a publish lease — `Create` of `_system/_mcp_locks/<site>` with
+   `exp` = now + 300 s; on a conflict an expired lease is deleted and the `Create` retried once,
+   otherwise E20; it is deleted when the publish ends. The Worker needs none (step 9 is one
+   transaction). CLI and hub deploys take no lease and keep the semantics of §7.3.
+6. Ownership (`sites.ownership: owner` / `OWNERSHIP=owner`): the caller must be an owner or an
+   admin (E15); guests are never owners; the first publisher of a new site becomes its owner
+   unless anonymous.
+7. **Overwrite guard:** when the site exists and its `updated_by` is non-empty and equals
+   (case-insensitively) neither the user's id, email nor actor name, and `overwrite` is not
+   true → E16; nothing is changed and no quota is charged.
+8. Quotas: Go `deploys_per_hour` keyed `user:<id>` (guests included) → E19; Worker the site cap
+   for a new site (E27) and `deploys_per_day` keyed `user:<id>` → E19.
+9. The result set F: merge F = (current files − `delete` − the paths in `files`) ∪ `files`
+   (deleting a path that does not exist is a warning); replace F = `files`. F empty → E6; more
+   than `max_files` files or more than `max_site_bytes` bytes → E13; a path that is both a file
+   and a folder of another → E14. A file whose content is unchanged is not written again.
+   Kept files keep their manifest entries (Go adopts objects stored out of band, as a refresh
+   does). The manifest and SiteMeta (`updated_by`, `deploy_id`, title and description from
+   `index.html`, owners on first publish) are written before anything is deleted; the Worker
+   switches the file list in one transaction (`deployMerge`, §16).
+10. Audit `deploy.commit` with `via=mcp`, `client` and `grant` (§15); metrics
+    `deploys_total{method="mcp"}`.
+
+The result: `{"site","url","created","files","uploaded","unchanged","deleted","bytes","warnings":[…]}`
+— `files` and `bytes` describe the site afterwards, `uploaded` counts written files,
+`unchanged` listed files that were not rewritten, `deleted` removed paths. Warnings:
+`No index.html at the site root: <url> answers 404 until one is published.` when F has no
+`index.html`; `<path> was sent as text but looks binary; binary files need "encoding":
+"base64".`; `"<path>" in delete does not exist.`.
+
+**Tool errors** (both editions use these templates; sizes formatted like `1.2 MiB`, times in
+UTC; conformance matches only the fragments `reserved` (E3), `base64` (E7), `per call` (E11),
+`overwrite` (E16) and `binary` (E24)):
+
+| Id | Text |
+|---|---|
+| E1 | `Invalid arguments: <detail>` |
+| E2 | `"<site>" is not a valid site name: use lowercase letters, digits and '-' (at most 63 characters), e.g. "lunch-poll".` |
+| E3 | `"<site>" is reserved on this Backyard; choose another name.` |
+| E4 | `Nothing to publish: give files, delete, or both.` |
+| E5 | `Use either "replace" or "delete", not both.` |
+| E6 | `A site needs at least one file.` |
+| E7 | `files[<i>] (<path>): "content" is not valid base64.` |
+| E8 | `"<path>" is not an allowed path: <reason>.` |
+| E9 | `"<path>" appears more than once.` |
+| E10 | `"<path>" is both in files and in delete.` |
+| E11 | `This call carries <X> of file content; the limit is <Y> per call. Send the files over several calls (files you do not list are kept).` |
+| E12 | `<path> is <X>; files may be at most <Y>.` |
+| E13 | `The site would have <n> files; this Backyard allows <max> per site.` or `The site would be <X>; this Backyard allows <Y> per site.` |
+| E14 | `These paths would be both a file and a folder: <list>.` |
+| E15 | `<site> belongs to <owners>; you are not an owner. Ask an owner to add you, or publish under another name.` |
+| E16 | `<site> was last published by <who> on <YYYY-MM-DD HH:MM> UTC. Nothing was changed. Ask the user whether to replace it; if so, call again with "overwrite": true, otherwise choose another name.` |
+| E17 | `This Backyard has no sign-in and does not accept anonymous publishing, so this connection can only read. Ask the Backyard admin to set up sign-in or allow anonymous deploys.` |
+| E18 | `Publishing through this Backyard's hub is turned off (deploy.embedded_gateway: false).` |
+| E19 | `Publishing limit reached (<n> per <hour on Go, day on the Worker>). Try again in <m> minutes.` |
+| E20 | `Another publish to <site> is in progress; call backyard_publish again when it has finished.` |
+| E21 | `Publishing failed: Backyard could not store the files (request <id>). Publishing the same files again completes it.` |
+| E22 | `There is no site named "<site>" on this Backyard.` |
+| E23 | `<site> has no file "<path>".` |
+| E24 | `<path> is a binary file and cannot be read as text; link to it by URL instead.` |
+| E25 | `<path> is <X>; files up to 128 KiB can be read.` |
+| E27 | `This Backyard already has its maximum number of sites (<n>).` |
+
+The ids are stable labels (E26 is unused). Internal failures of `backyard_publish` are E21; those
+of the read tools are `Internal error (request <id>)`. The limits are in §11.
 
 ## 15. Observability
 
@@ -1011,8 +1802,26 @@ external gateway advertised in `info.gateway_url` is adopted when reachable.
 `request_id`, the `X-Request-Id` of every response, §5). Audit events (logins, CLI and API
 token issuance, deploy create/commit, refresh, site deletion, owner changes) are logged with
 `"audit": true`; the server also stores API token issuance records in `_system/_audit` (best
-effort). Prometheus metrics (prefix `backyard_`): `http_requests_total{area,code}`,
-`http_request_duration_seconds{area}`, `deploys_total{method=api|sync,result}`,
+effort). The Claude connector (§8.4) adds these audit events, each with the fields `user`,
+`client_name`, `client_kind`, `client_host`, `redirect_host`, `grant` (the first 8 hex
+characters of the grant id) and `ip` where available, and never a token:
+
+| Event | When | Go | Worker |
+|---|---|---|---|
+| `mcp.authorize` | consent allowed | log + stored | log |
+| `mcp.deny` | consent denied | log | log |
+| `mcp.consent_rejected` | a consent `POST` failed its CSRF or browser-signal checks | log (warn) | log (warn) |
+| `mcp.token` | a code was exchanged | log | log |
+| `mcp.code_replay` | a code was redeemed a second time (after PKCE verified) | log (warn) + stored | log (warn) |
+| `mcp.refresh_reuse` | an old refresh token generation was presented | log (warn) + stored | log (warn) |
+| `mcp.revoke` | any revocation; `via` = `rfc7009`, `hub`, `policy` or `replay`, `count` for bulk | log + stored | log |
+| `deploy.commit` | a `backyard_publish` (§14.1) | the gateway's audit with `via=mcp`, `client`, `grant` | the same fields |
+
+Stored records (`_system/_audit`, shape `{action, user, at, ip?, …fields}`) thus include API
+token issuance, `mcp.authorize`, `mcp.code_replay`, `mcp.refresh_reuse` and `mcp.revoke`.
+Prometheus metrics (prefix `backyard_`): `http_requests_total{area,code}`,
+`http_request_duration_seconds{area}` (areas include `mcp` for `/__backyard/mcp` and `oauth`
+for `/.well-known/oauth-*` and `/__backyard/oauth/*`), `deploys_total{method=api|sync|mcp,result}`,
 `db_ops_total{op,result}`, `ai_requests_total{model,result}`, `ai_tokens_total{model,direction}`,
 `ws_connections`, `ws_messages_total{dir}`, `warehouse_queries_total{source,result}`,
 `rate_limited_total{category}`, `build_info{version}`, plus the Go runtime and process
@@ -1072,16 +1881,39 @@ storage are available on free); R2 and paid features are optional.
   `401`). Unlike the Go server's proxy modes (§8.2), `/__backyard/auth/logout` (`GET`/`POST`)
   exists in both modes: it clears the guest cookie (`none`) or redirects to
   `/cdn-cgi/access/logout` (`access`).
-  Access must bypass the paths the Worker authenticates itself — `/__backyard/api/deploy` and
-  `/__backyard/api/deploy/*` (bearer tokens, signed upload URLs, the public `info`),
-  `/__backyard/api/tokens` (`backyard token create` sends an API token) and the health checks
-  `/__backyard/healthz` and `/__backyard/readyz` — with a Bypass policy (or service tokens);
+  Access must bypass the nine paths the Worker authenticates itself — `/__backyard/api/deploy`
+  and `/__backyard/api/deploy/*` (bearer tokens, signed upload URLs, the public `info`),
+  `/__backyard/api/tokens` (`backyard token create` sends an API token), the health checks
+  `/__backyard/healthz` and `/__backyard/readyz`, and the Claude connector's machine paths
+  (§8.4.10) `/__backyard/mcp`, `/__backyard/oauth/*`, `/.well-known/oauth-authorization-server`
+  and `/.well-known/oauth-protected-resource/__backyard/mcp`, which are bypassed whether or not
+  the connector is enabled — with a Bypass policy (or service tokens);
   `backyard cloudflare access enable` creates or verifies this (or the optional Terraform module
-  in `deploy/terraform/cloudflare`).
+  in `deploy/terraform/cloudflare`). In host mode the bypass names only the hub host, so the
+  sites' own `/.well-known` files stay behind Access. `/__backyard/auth/authorize` stays behind
+  the main Access application.
+* **Claude connector** (§8.4, §14.1), off unless `MCP_ENABLED` is true (`true/1/yes/on`).
+  `MCP_CLIENTS` (default the two Claude client metadata documents; set but empty: no CIMD, so
+  clients register) and `MCP_REDIRECT_URIS` (default the two Claude callbacks; set but empty:
+  loopback redirects only) are comma or whitespace separated and follow the entry rules of §12
+  (using `BASE_DOMAIN` and the `PUBLIC_URL` host). An invalid entry does not make the Worker
+  fail closed: it turns the connector off (every connector path `404`) and adds a problem line
+  to `/__backyard/readyz`; the connector is also off unless the hub origin is https or a
+  loopback host. Grants live in `RegistryDO` tables (`mcp_grants`: `id`, `user_id`, `data`,
+  `created_at`, `code_exp`, `redeemed_at`, `exp`; `mcp_rotations`: `gid`, `n`, `at`, `exp`,
+  primary key (`gid`, `n`)), and `rotate` (§8.4.8) runs in one transaction. `backyard_publish`
+  is atomic per site: `SiteDO.deployMerge` computes the merged file set, checks the limits and
+  switches the manifest in one transaction, so concurrent calls never lose each other's files;
+  a call that the site limits refuse (E6, E13, E14) for the site as it is uploads nothing.
+  It is capped at `LIMITS.mcp_publish_bytes` (default 2097152) decoded bytes per call, and every
+  `tools/call` counts against `LIMITS.mcp_calls_per_day` (default 5000 per user; `429` when
+  exhausted). On the Workers Free plan's CPU limit large publish calls (base64 decoding and
+  hashing) may fail; lower `mcp_publish_bytes` there if they do.
 * **Guardrails (free tier):** per-user/IP daily caps for AI calls, generated images, deploys,
   uploads and document writes, platform-wide daily AI caps, and a platform-wide site cap
   (reserved atomically, so parallel first deploys cannot exceed it), stored in `RegistryDO`;
-  configurable via the `LIMITS` JSON var. The image caps count images: an `/ai/image` request
+  configurable via the `LIMITS` JSON var (which also holds the connector's `mcp_publish_bytes`
+  and `mcp_calls_per_day`). The image caps count images: an `/ai/image` request
   with `n: 4` uses 4, and is refused (`429`) without running the model when fewer are left.
 * **Deploying the platform:** the npm package `backyard-cloudflare` holds a prebuilt Worker and
   its engine (Node.js 22+, wrangler pinned): `npx backyard-cloudflare setup` (wrangler login,
@@ -1100,3 +1932,11 @@ storage are available on free); R2 and paid features are optional.
 dependencies beyond `ws` if needed) run against a base URL (`BACKYARD_URL`, `BACKYARD_TOKEN`). It
 deploys a test site via the gateway protocol and exercises §5–§7. CI runs it against the Go server
 (`backyard serve --dev`) and the Worker (`wrangler dev`).
+
+`tests/mcp.test.mjs` covers the Claude connector (§8.4, §14.1) without a browser: discovery,
+registration, the authorize and consent checks, the token, refresh and revocation endpoints, the
+MCP gate, the tools and the grants API. It is skipped when `/info` has no `mcp_url`, unless
+`BACKYARD_CONFORMANCE_MCP=1` makes that a failure. Both runners enable the connector in every
+pass and set that variable. The Go runner adds an `oidc` pass: the server in `auth.mode: oidc`
+against a mock OpenID Connect provider (`conformance/mock/idp.mjs`), which signs two people in
+without a page, running only `tests/mcp.test.mjs`.

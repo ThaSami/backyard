@@ -3,7 +3,8 @@
 # `wrangler dev --env local` (npm run dev:local in deploy/cloudflare: no
 # Cloudflare login, Durable Objects and R2 simulated, temporary state):
 # once in path mode as an anonymous guest and once in host mode with the
-# DEPLOY_TOKEN, each against a fresh Worker:
+# DEPLOY_TOKEN, each against a fresh Worker with the Claude connector enabled
+# (MCP_ENABLED, SPEC §8.4; the suite runs with BACKYARD_CONFORMANCE_MCP=1):
 #
 #   path  path mode (the default) as an anonymous guest, with AI aliases
 #         backed by mock/openai.mjs through the "openai" provider
@@ -140,7 +141,7 @@ for mode in $modes; do
 		export WRANGLER_SEND_METRICS
 		# The wrangler arguments (this subshell's own positional parameters).
 		set -- --port "$port" --ip 127.0.0.1 --persist-to "$data/state" --show-interactive-dev-session=false \
-			--var AUTH_MODE:none --var ALLOW_ANONYMOUS_DEPLOY:true \
+			--var AUTH_MODE:none --var ALLOW_ANONYMOUS_DEPLOY:true --var MCP_ENABLED:true \
 			--var "BACKYARD_SECRET:$secret" --var "DEPLOY_TOKEN:$token"
 		if [ "$mode" = "host" ]; then
 			set -- "$@" --var URL_MODE:host --var BASE_DOMAIN:localhost
@@ -175,7 +176,8 @@ for mode in $modes; do
 	(
 		cd "$here"
 		BACKYARD_URL="$url" BACKYARD_TOKEN="$suite_token" BACKYARD_CONFORMANCE_AI="$suite_ai" \
-			BACKYARD_CONFORMANCE_SECRET="$secret" node --test --test-reporter=spec "$@" "tests/*.test.mjs"
+			BACKYARD_CONFORMANCE_SECRET="$secret" BACKYARD_CONFORMANCE_MCP=1 \
+			node --test --test-reporter=spec "$@" "tests/*.test.mjs"
 	)
 	rc=$?
 	set -e

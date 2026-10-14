@@ -102,9 +102,13 @@ resource "cloudflare_zero_trust_access_application" "backyard" {
   }]
 }
 
-# More specific paths win in Access: the deploy gateway, token minting and the
-# health checks are authenticated by the Worker (bearer tokens, signed upload
-# URLs, or the CF_Authorization cookie, which it verifies itself).
+# More specific paths win in Access: the deploy gateway, token minting, the
+# health checks and the Claude connector's machine paths are authenticated by
+# the Worker (bearer tokens, signed upload URLs, the CF_Authorization cookie,
+# which it verifies itself, or its own MCP access tokens). On site hosts
+# /.well-known stays behind Access: the destinations name the hub host only.
+# /__backyard/auth/authorize is never bypassed: the Access login there is the
+# connector's sign-in.
 resource "cloudflare_zero_trust_access_application" "bypass" {
   count = var.enable_access && length(var.bypass_paths) > 0 ? 1 : 0
 

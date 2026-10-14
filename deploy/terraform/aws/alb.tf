@@ -21,6 +21,12 @@ locals {
   # with Backyard bearer tokens, which Backyard verifies itself (a token minted
   # with a token never outlives it).
   alb_deploy_paths = ["/__backyard/api/deploy", "/__backyard/api/deploy/*", "/__backyard/api/tokens"]
+  # The Claude connector's machine paths (SPEC §8.4): its MCP endpoint, the
+  # OAuth endpoints and the two discovery documents check their own tokens and
+  # never read the ALB's identity headers. Exempt unconditionally: Backyard
+  # answers 404 there until mcp.enabled. /__backyard/auth/authorize stays
+  # behind the ALB login, which is the connector's sign-in.
+  alb_mcp_paths = ["/__backyard/mcp", "/__backyard/oauth/*", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource/__backyard/mcp"]
 }
 
 data "http" "oidc_discovery" {
@@ -216,6 +222,30 @@ resource "aws_lb_listener_rule" "public" {
   condition {
     path_pattern {
       values = local.alb_public_paths
+    }
+  }
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
+
+  tags = local.tags
+}
+
+# ALB mode: the Claude connector's machine paths are never authenticated by the
+# ALB (Claude calls them without a browser session). No host condition, as in
+# the public rule: on site hosts Backyard answers 404 at the machine paths and
+# demands the ALB's signed header for a site's own /.well-known files.
+resource "aws_lb_listener_rule" "mcp" {
+  count = local.alb_auth ? 1 : 0
+
+  listener_arn = aws_lb_listener.https.arn
+  priority     = 15
+
+  condition {
+    path_pattern {
+      values = local.alb_mcp_paths
     }
   }
 

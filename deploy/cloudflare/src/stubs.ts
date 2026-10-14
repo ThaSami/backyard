@@ -39,6 +39,7 @@ const LABELS: Record<string, string> = {
   ai_image_platform: "daily image budget of this Backyard",
   deploy: "daily deploy limit",
   upload: "daily upload limit",
+  mcp: "daily connector tool-call limit",
 };
 
 /**

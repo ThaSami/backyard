@@ -39,6 +39,7 @@ locals {
       ACCESS_TEAM_DOMAIN = data.cloudflare_zero_trust_organization.this[0].auth_domain
       ACCESS_AUD         = cloudflare_zero_trust_access_application.backyard[0].aud
     } : {},
+    var.mcp_enabled ? { MCP_ENABLED = "true" } : {},
   )
 }
 

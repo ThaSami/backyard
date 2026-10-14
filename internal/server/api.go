@@ -59,6 +59,11 @@ func (s *Server) hubRoutes() *http.ServeMux {
 	mux.HandleFunc("GET /me", s.handleMe)
 	mux.HandleFunc("GET /sites", s.handleSites)
 	mux.HandleFunc("POST /tokens", s.handleTokens)
+
+	// The Claude connector's connections (SPEC §8.4.7).
+	mux.HandleFunc("GET /mcp/grants", s.handleMCPGrants)
+	mux.HandleFunc("DELETE /mcp/grants", s.handleMCPRevokeGrants)
+	mux.HandleFunc("DELETE /mcp/grants/{id}", s.handleMCPRevokeGrant)
 	return mux
 }
 

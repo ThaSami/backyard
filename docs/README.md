@@ -14,6 +14,7 @@ normative reference for every URL, wire format and default.
 | [Deploying sites](deploying-sites.md) | Deploy methods, `.backyardignore`, ownership, CI, the Lambda gateway |
 | [CLI reference](cli.md) | Every `backyard` command and flag |
 | [Agents](agents.md) | Claude skill, Claude Code plugin, MCP server, init templates, `/llms.txt` |
+| [Claude connector](claude-connector.md) | Publish from Claude with the company sign-in: turning on the remote MCP connector, adding it in Claude, proxies, limits, disconnecting |
 
 ## Run Backyard
 

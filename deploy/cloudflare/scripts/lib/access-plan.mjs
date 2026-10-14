@@ -2,8 +2,10 @@
 // dashboard): the names of the applications and policies of a Worker and the
 // paths the Worker authenticates itself, which the bypass application lets
 // through (CLI deploys and tokens use a deploy token, the health checks need
-// none). The same five paths as the Terraform module's bypass_paths default
-// and SPEC §16 (docs/contract_hardening_test.go compares them).
+// none, and the last four are the Claude connector's machine paths: its MCP
+// endpoint and OAuth endpoints check their own tokens, SPEC §8.4). The same
+// nine paths as the Terraform module's bypass_paths default and SPEC §16
+// (docs/contract_hardening_test.go and docs/contract_test.go compare them).
 //
 //   accessNames(w)            names of the four objects ("Backyard (<w>)…")
 //   policyBodies(o)           request bodies of the allow and bypass policies
@@ -12,7 +14,7 @@
 //   describeAllow(e, d)       "Emails ending in @acme.com, Emails a@acme.com"
 //   CONSUMER_MAIL_DOMAINS     mail domains anyone can get an address at
 
-export const ACCESS_BYPASS_PATHS = ["/__backyard/api/deploy", "/__backyard/api/deploy/*", "/__backyard/api/tokens", "/__backyard/healthz", "/__backyard/readyz"];
+export const ACCESS_BYPASS_PATHS = ["/__backyard/api/deploy", "/__backyard/api/deploy/*", "/__backyard/api/tokens", "/__backyard/healthz", "/__backyard/readyz", "/__backyard/mcp", "/__backyard/oauth/*", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource/__backyard/mcp"];
 
 /**
  * Names of the Access objects of a Worker. They intentionally differ from the

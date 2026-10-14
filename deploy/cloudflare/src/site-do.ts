@@ -22,7 +22,7 @@ import { formatMicros, formatMillisFixed, MicroClock, toFixedMillis } from "./db
 import { canonicalDoc } from "./db/values";
 import { newULID } from "./db/ulid";
 import type { Env } from "./env";
-import { HttpError, badRequest, conflict, fail, internal, notFound, ok, tooLarge, rateLimited, type Result, errorResponse } from "./http";
+import { HttpError, badRequest, conflict, fail, internal, notFound, ok, tooLarge, rateLimited, unwrap, type Result, errorResponse } from "./http";
 import { summarize, type User, type UserSummary } from "./identity";
 import { contentTypeFor, detectContentType, isActiveContent, normalizeContentType } from "./mime";
 import { boundaryOf, MultipartError, MultipartReader } from "./multipart";
@@ -95,6 +95,67 @@ export interface CommitResult {
   titleR2Key: string;
   /** R2 objects no longer referenced (the Worker deletes them). */
   r2Garbage: string[];
+}
+
+/** Limits a merge checks on the resulting file set (0 = unlimited). */
+export interface MergeLimits {
+  maxFiles: number;
+  maxSiteBytes: number;
+}
+
+/**
+ * Outcome of deployMerge (SPEC §14.1, the Claude connector's publish): the
+ * site after the switch, or why nothing was changed.
+ */
+export type MergeOutcome =
+  | (CommitResult & {
+      ok: true;
+      /** The site had files before. */
+      existed: boolean;
+      /** Listed files whose content was already the path's content. */
+      unchanged: number;
+      /** Paths of a merge's delete list that did not exist. */
+      missingDeletes: string[];
+      /** index.html is part of the site afterwards. */
+      hasIndex: boolean;
+      /** Unix milliseconds of the switch (the manifest's updated_at). */
+      committedAt: number;
+    })
+  /** Contents of listed files are not stored (any more): the caller stores them again. */
+  | { ok: false; error: "missing"; paths: string[] }
+  | MergeRefusal;
+
+/** Why the result set of a merge breaks the limits; nothing is changed. */
+export type MergeRefusal =
+  /** The site would have no file. */
+  | { ok: false; error: "empty" }
+  /** More files than limits.maxFiles. */
+  | { ok: false; error: "files"; count: number }
+  /** More bytes than limits.maxSiteBytes. */
+  | { ok: false; error: "bytes"; bytes: number }
+  /** Paths that would be both a file and a folder of another file (sorted). */
+  | { ok: false; error: "tree"; paths: string[] };
+
+const enc = new TextEncoder();
+
+/** The paths of a file set that are also a folder of another path in it, sorted. */
+export function fileFolderConflicts(paths: Set<string>): string[] {
+  const both = new Set<string>();
+  for (const p of paths) {
+    for (let i = p.lastIndexOf("/"); i > 0; i = p.lastIndexOf("/", i - 1)) {
+      if (paths.has(p.slice(0, i))) both.add(p.slice(0, i));
+    }
+  }
+  return [...both].sort(byBytes);
+}
+
+/** Orders strings by their UTF-8 bytes (SQLite's BINARY collation, Go's string order). */
+function byBytes(a: string, b: string): number {
+  if (a === b) return 0;
+  const x = enc.encode(a);
+  const y = enc.encode(b);
+  for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i]! - y[i]!;
+  return x.length - y.length;
 }
 
 /** Options of a document write (limits are enforced here, atomically). */
@@ -857,6 +918,133 @@ export class SiteDO extends DurableObject<Env> {
       return ok({ deleted, fileCount: stats.fileCount, bytes: stats.bytes, ...this.titleInfo(), r2Garbage });
     } catch (e) {
       return failure(e, "committing the deploy");
+    }
+  }
+
+  /**
+   * The result set of a connector publish (SPEC §14.1) against the current
+   * manifest: (current files − deletes − changed paths) ∪ changes, or exactly
+   * changes with replace; the paths it drops, the deletes that do not exist,
+   * and the refusal of limits when it breaks one. Reads only.
+   */
+  private mergeSet(changes: DeployFile[], deletes: string[], replace: boolean, limits: MergeLimits) {
+    const base = this.ready ? (this.sql.exec("SELECT path, sha256, size FROM files").toArray() as { path: string; sha256: string; size: number }[]) : [];
+    const current = new Map(base.map((r) => [r.path, r]));
+    const listed = new Set(changes.map((f) => f.path));
+    const result = new Map<string, number>();
+    const removed: string[] = [];
+    const missingDeletes: string[] = [];
+    if (replace) {
+      for (const r of base) if (!listed.has(r.path)) removed.push(r.path);
+    } else {
+      const gone = new Set<string>();
+      for (const p of deletes) {
+        if (gone.has(p)) continue;
+        gone.add(p);
+        if (!current.has(p)) missingDeletes.push(p);
+        else if (!listed.has(p)) removed.push(p);
+      }
+      for (const r of base) if (!listed.has(r.path) && !gone.has(r.path)) result.set(r.path, r.size);
+    }
+    for (const f of changes) result.set(f.path, f.size);
+    let refusal: MergeRefusal | null = null;
+    let total = 0;
+    for (const n of result.values()) total += n;
+    if (result.size === 0) refusal = { ok: false, error: "empty" };
+    else if (limits.maxFiles > 0 && result.size > limits.maxFiles) refusal = { ok: false, error: "files", count: result.size };
+    else if (limits.maxSiteBytes > 0 && total > limits.maxSiteBytes) refusal = { ok: false, error: "bytes", bytes: total };
+    else {
+      const tree = fileFolderConflicts(new Set(result.keys()));
+      if (tree.length) refusal = { ok: false, error: "tree", paths: tree };
+    }
+    return { base, current, result, removed, missingDeletes, refusal };
+  }
+
+  /**
+   * Plans a connector publish without changing anything: the listed paths
+   * whose current content already has the given sha256 and size (they need no
+   * upload), and the refusal of the merge's limits as the site is now, so a
+   * publish that cannot succeed uploads nothing. deployMerge checks again.
+   */
+  async mergePlan(changes: DeployFile[], deletes: string[], replace: boolean, limits: MergeLimits): Promise<Result<{ unchanged: string[]; refusal: MergeRefusal | null }>> {
+    try {
+      const plan = unwrap(await this.deployPlan(changes));
+      return ok({ unchanged: plan.unchanged, refusal: this.mergeSet(changes, deletes, replace, limits).refusal });
+    } catch (e) {
+      return failure(e, "planning the publish");
+    }
+  }
+
+  /**
+   * Merges a publish of the Claude connector into the site (SPEC §14.1) in
+   * one transaction, so concurrent merges never lose each other's files: the
+   * result set is (current files − deletes − changed paths) ∪ changes, or
+   * exactly changes with replace. It verifies that every change's content is
+   * stored, checks the result against limits (nothing changes on a refusal),
+   * switches the manifest (an unchanged file keeps its updated_at) and
+   * garbage-collects content no longer referenced. A path of deletes that
+   * does not exist is reported, not an error; the Worker has already refused
+   * a path that is both in changes and in deletes.
+   */
+  async deployMerge(changes: DeployFile[], deletes: string[], replace: boolean, limits: MergeLimits): Promise<Result<MergeOutcome>> {
+    try {
+      this.ensureSchema();
+      const missing: string[] = [];
+      for (const f of changes) {
+        const b = this.blob("s:" + f.sha256);
+        if (!b || !b.complete || b.size !== f.size) missing.push(f.path);
+      }
+      if (missing.length) return ok({ ok: false, error: "missing", paths: missing });
+      const now = Date.now();
+      // No await from here on: the merge sees the manifest as it is and no
+      // other request of this site runs in between.
+      return ok(
+        this.ctx.storage.transactionSync((): MergeOutcome => {
+          const m = this.mergeSet(changes, deletes, replace, limits);
+          if (m.refusal) return m.refusal;
+          const released = new Set<string>();
+          for (const p of m.removed) {
+            this.sql.exec("DELETE FROM files WHERE path = ?", p);
+            released.add(m.current.get(p)!.sha256);
+          }
+          let unchanged = 0;
+          for (const f of changes) {
+            const prev = m.current.get(f.path);
+            if (prev && prev.sha256 === f.sha256) {
+              this.sql.exec("UPDATE files SET size = ?, content_type = ? WHERE path = ?", f.size, f.content_type, f.path);
+              unchanged++;
+              continue;
+            }
+            if (prev) released.add(prev.sha256);
+            this.sql.exec(
+              "INSERT OR REPLACE INTO files (path, sha256, size, content_type, updated_at) VALUES (?, ?, ?, ?, ?)",
+              f.path,
+              f.sha256,
+              f.size,
+              f.content_type,
+              now,
+            );
+          }
+          this.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('updated_at', ?)", String(now));
+          const r2Garbage = this.collectGarbage(now, released);
+          const stats = this.stats();
+          return {
+            ok: true,
+            existed: m.base.length > 0,
+            deleted: m.removed.length,
+            unchanged,
+            missingDeletes: m.missingDeletes,
+            hasIndex: m.result.has("index.html"),
+            committedAt: now,
+            fileCount: stats.fileCount,
+            bytes: stats.bytes,
+            ...this.titleInfo(),
+            r2Garbage,
+          };
+        }),
+      );
+    } catch (e) {
+      return failure(e, "merging the publish");
     }
   }
 

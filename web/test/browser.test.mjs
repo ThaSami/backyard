@@ -539,17 +539,209 @@ test("hub in playground mode: guests deploy without a token, deleting needs one"
   }
 });
 
+/** A connector connection as GET /__backyard/api/mcp/grants returns it (SPEC §8.4.7). */
+function grant(id, userID, over = {}) {
+  return {
+    id,
+    user: { id: userID, email: userID, name: userID.split("@")[0] },
+    client_name: "Claude",
+    client_kind: "metadata_document",
+    client_host: "claude.ai",
+    redirect_host: "claude.ai",
+    scope: "mcp offline_access",
+    created_at: "2026-10-14T09:30:00Z",
+    expires_at: "2026-11-13T09:30:00Z",
+    ...over,
+  };
+}
+
+test("hub: no Claude connector card while /info has no mcp_url", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  const stub = await startStub();
+  const context = await browser.newContext();
+  try {
+    const { page, problems } = await open(context, stub.url + "/");
+    await page.waitForSelector("#site-list:not([aria-busy])", { state: "attached" });
+    await page.waitForLoadState("networkidle");
+    assert.equal(await page.isHidden("#connector"), true);
+    assert.equal(stub.state.requests.filter((q) => q.path.startsWith("/mcp/")).length, 0, "the grants API is not asked");
+    assert.deepEqual(problems, []);
+  } finally {
+    await context.close();
+    await stub.close();
+  }
+});
+
+test("hub: the Claude connector card shows the URL, the setup steps and the connections; Disconnect sends DELETE with X-Backyard: 1", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  const mine = grant("a0000000000000000000000000000001", "alice@acme.com");
+  const tool = grant("a0000000000000000000000000000002", "alice@acme.com", { client_name: "My tool", client_kind: "registered", client_host: "", redirect_host: "localhost" });
+  const bobs = grant("b0000000000000000000000000000001", "bob@acme.com");
+  const stub = await startStub({ requireToken: "t0k", mcp: { grants: [mine, tool, bobs] } });
+  const context = await browser.newContext({ permissions: ["clipboard-read", "clipboard-write"] });
+  try {
+    // A deploy token in use must not be sent to the grants API (it owns no connections).
+    await context.addInitScript(() => localStorage.setItem("backyard.deployToken", "t0k"));
+    const { page, problems } = await open(context, stub.url + "/");
+    await page.waitForSelector("#connector-grants li");
+    const url = stub.url + "/__backyard/mcp";
+    assert.equal(await page.isVisible("#connector"), true);
+    assert.equal(await page.textContent("#connector h2"), "Use Backyard in Claude");
+    assert.equal(await page.textContent("#connector-url"), url);
+    assert.equal(await page.textContent("#connector-cmd"), "claude mcp add --transport http backyard " + url);
+    assert.match(
+      await page.textContent("#connector .steps"),
+      /Customize → Connectors → Add custom connector[\s\S]*Organization settings[\s\S]*claude mcp add --transport http backyard/,
+    );
+    assert.equal(await page.isHidden("#connector-revoke-user"), true, "the admin form is for admins only");
+
+    await page.click("#connector-copy");
+    await page.waitForFunction(() => document.getElementById("toast").textContent === "Copied to clipboard");
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), url);
+
+    // Only the visitor's own connections, each with its trust and return host.
+    const items = await page.$$eval("#connector-grants li", (lis) => lis.map((li) => li.innerText.replace(/\s+/g, " ").trim()));
+    assert.equal(items.length, 2);
+    assert.match(items[0], /^Claude verified by claude\.ai Returns to claude\.ai · connected .+2026 · expires .+2026 Disconnect$/);
+    assert.match(items[1], /^My tool unverified Returns to an app on this computer · /);
+    assert.deepEqual(
+      await page.$$eval("button.connector-revoke", (bs) => bs.map((b) => [b.dataset.id, b.textContent, b.getAttribute("aria-label")])),
+      [
+        [mine.id, "Disconnect", "Disconnect Claude"],
+        [tool.id, "Disconnect", "Disconnect My tool"],
+      ],
+    );
+    const list = stub.state.requests.find((q) => q.path === "/mcp/grants" && q.method === "GET");
+    assert.equal(list.headers.authorization, undefined);
+
+    // Disconnect: DELETE with the CSRF header and the visitor's cookies only.
+    await page.click(`button.connector-revoke[data-id="${tool.id}"]`);
+    await page.waitForFunction(() => document.querySelectorAll("#connector-grants li").length === 1);
+    const del = stub.state.requests.filter((q) => q.method === "DELETE");
+    assert.equal(del.length, 1);
+    assert.equal(del[0].path, "/mcp/grants/" + tool.id);
+    assert.equal(del[0].headers["x-backyard"], "1");
+    assert.equal(del[0].headers.authorization, undefined);
+    assert.deepEqual(
+      stub.state.grants.map((g) => g.id),
+      [mine.id, bobs.id],
+    );
+    assert.match(await page.textContent("#connector-status"), /^Disconnected My tool\./);
+    assert.equal(await page.evaluate(() => document.activeElement.dataset.id), mine.id, "the focus stays in the list");
+
+    // A connection that is already gone (404) disappears as well; the last one leaves the empty note.
+    stub.state.grants = stub.state.grants.filter((g) => g.id !== mine.id);
+    await page.click(`button.connector-revoke[data-id="${mine.id}"]`);
+    await page.waitForSelector("#connector-grants-empty:not([hidden])");
+    assert.equal(await page.isHidden("#connector-grants"), true);
+    assert.equal(await page.evaluate(() => document.activeElement.id), "connector-grants-title");
+
+    // A failure keeps the connection and says why.
+    stub.state.grants.push(mine);
+    await page.reload();
+    await page.waitForSelector("#connector-grants li");
+    const unavailable = JSON.stringify({ error: { code: "unavailable", message: "storage is down" } });
+    await page.route("**/__backyard/api/mcp/grants/*", (r) => r.fulfill({ status: 503, contentType: "application/json", body: unavailable }));
+    await page.click(`button.connector-revoke[data-id="${mine.id}"]`);
+    await page.waitForFunction(() => document.getElementById("connector-status").textContent === "storage is down");
+    assert.equal(await page.getAttribute("#connector-status", "class"), "hint error");
+    assert.equal(await page.isEnabled(`button.connector-revoke[data-id="${mine.id}"]`), true);
+    assert.deepEqual(problems.filter((p) => !/status of 503/.test(p)), []);
+  } finally {
+    await context.close();
+    await stub.close();
+  }
+});
+
+test("hub: only admins get the form to disconnect a person; it asks first and reports the count", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  const own = grant("c0000000000000000000000000000001", "admin@acme.com");
+  const stub = await startStub({
+    mcp: {
+      grants: [
+        own,
+        grant("b0000000000000000000000000000001", "bob@acme.com"),
+        grant("b0000000000000000000000000000002", "bob@acme.com", { client_kind: "registered", client_host: "" }),
+      ],
+    },
+  });
+  const context = await browser.newContext();
+  try {
+    await context.addCookies([{ name: "user", value: "admin@acme.com", url: stub.url }]);
+    const { page, problems } = await open(context, stub.url + "/");
+    await page.waitForSelector("#connector-grants li");
+    assert.equal(await page.isVisible("#user-admin"), true);
+    assert.equal(await page.isVisible("#connector-revoke-user"), true);
+    const deletes = () => stub.state.requests.filter((q) => q.method === "DELETE");
+
+    // Nothing named: no request.
+    await page.click("#connector-user-submit");
+    assert.equal(await page.textContent("#connector-user-status"), "Enter the person's email or user ID.");
+    assert.equal(await page.getAttribute("#connector-user", "aria-invalid"), "true");
+    assert.equal(deletes().length, 0);
+
+    // Cancelled confirmation: no request.
+    await page.fill("#connector-user", " Bob@ACME.com ");
+    const asked = [];
+    page.once("dialog", (d) => {
+      asked.push(d.type() + ": " + d.message());
+      d.dismiss();
+    });
+    await page.click("#connector-user-submit");
+    assert.deepEqual(asked, ["confirm: Disconnect every Claude connection of bob@acme.com? Their apps lose access to Backyard at once."]);
+    assert.equal(deletes().length, 0);
+
+    page.once("dialog", (d) => d.accept());
+    await page.click("#connector-user-submit");
+    await page.waitForFunction(() => document.getElementById("connector-user-status").textContent === "Disconnected 2 connections of bob@acme.com.");
+    assert.deepEqual(
+      deletes().map((q) => [q.path, q.query, q.headers["x-backyard"]]),
+      [["/mcp/grants", "?user=bob%40acme.com", "1"]],
+    );
+    assert.deepEqual(
+      stub.state.grants.map((g) => g.id),
+      [own.id],
+    );
+    assert.equal(await page.inputValue("#connector-user"), "");
+    assert.equal(await page.$$eval("#connector-grants li", (lis) => lis.length), 1, "the admin's own connection stays");
+
+    page.once("dialog", (d) => d.accept());
+    await page.fill("#connector-user", "bob@acme.com");
+    await page.click("#connector-user-submit");
+    await page.waitForFunction(() => document.getElementById("connector-user-status").textContent === "bob@acme.com had no connections.");
+    assert.deepEqual(problems, []);
+
+    // Someone who is not an admin never sees the form.
+    await context.clearCookies();
+    await context.addCookies([{ name: "user", value: "bob@acme.com", url: stub.url }]);
+    await page.reload();
+    await page.waitForSelector("#connector-grants-empty:not([hidden])");
+    assert.equal(await page.isVisible("#connector"), true);
+    assert.equal(await page.isHidden("#connector-revoke-user"), true);
+  } finally {
+    await context.close();
+    await stub.close();
+  }
+});
+
 test("hub on a phone-sized screen has no horizontal scroll", async (t) => {
   if (!browser) return t.skip(skipReason);
-  const stub = await startStub({ sites: [{ name: "a-very-long-site-name-that-should-wrap-nicely", url: "http://x/", updated_at: new Date().toISOString(), owners: [] }] });
+  const stub = await startStub({
+    sites: [{ name: "a-very-long-site-name-that-should-wrap-nicely", url: "http://x/", updated_at: new Date().toISOString(), owners: [] }],
+    mcp: { grants: [grant("a0000000000000000000000000000001", "admin@acme.com", { client_name: "A-connection-name-without-any-spaces-that-must-wrap" })] },
+  });
   const context = await browser.newContext({ viewport: { width: 360, height: 740 } });
+  await context.addCookies([{ name: "user", value: "admin@acme.com", url: stub.url }]);
   try {
     for (const path of ["/", "/docs"]) {
       const { page, problems } = await open(context, stub.url + path);
       await page.waitForLoadState("networkidle");
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
       assert.ok(overflow <= 0, `${path} overflows horizontally by ${overflow}px`);
-      if (path === "/") assert.equal(await page.isHidden("#banner"), true, "no error banner");
+      if (path === "/") {
+        assert.equal(await page.isHidden("#banner"), true, "no error banner");
+        assert.equal(await page.isVisible("#connector-revoke-user"), true, "the connector card with its admin form");
+      }
       assert.deepEqual(problems, []);
     }
   } finally {

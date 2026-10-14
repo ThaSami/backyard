@@ -3,7 +3,16 @@ import { describe, expect, it } from "vitest";
 import { readSSE } from "../src/ai/sse";
 import { retryHint, safeUpstreamMessage } from "../src/ai/types";
 import { extractText } from "../src/ai/workersai";
-import { DEFAULT_LIMITS, normalizeTeam, parseConfig } from "../src/config";
+import {
+  DEFAULT_LIMITS,
+  DEFAULT_MCP_CLIENTS,
+  DEFAULT_MCP_REDIRECT_URIS,
+  isLoopbackHost,
+  mcpRedirectURIHost,
+  normalizeTeam,
+  parseConfig,
+  validMCPClientURL,
+} from "../src/config";
 import { cookiePathPrefixes, secretMissing } from "../src/auth";
 import { b64urlDecode, base64Decode, base64Encode, base64Head, base64Size, decodeAnyBase64, normalizeBase64 } from "../src/crypto";
 import { buildQuery, normalizeQuery, parseListParams } from "../src/db/query";
@@ -413,6 +422,114 @@ describe("config", () => {
       expect(c.publicURL, bad).toBe("");
       expect(c.problems.join(), bad).toContain("PUBLIC_URL must be an absolute origin");
     }
+  });
+});
+
+describe("Claude connector variables (MCP_*, SPEC §16)", () => {
+  const base = { BACKYARD_SECRET: "x".repeat(32) } as unknown as Env;
+  const cfg = (vars: Record<string, unknown>) => parseConfig({ ...base, ...vars } as unknown as Env);
+
+  it("is off by default, with Claude's clients and callbacks", () => {
+    const c = parseConfig(base);
+    expect(c.mcp).toEqual({ enabled: false, clients: DEFAULT_MCP_CLIENTS, redirectURIs: DEFAULT_MCP_REDIRECT_URIS, problems: [] });
+    expect(DEFAULT_MCP_CLIENTS).toEqual(["https://claude.ai/oauth/mcp-oauth-client-metadata", "https://claude.ai/oauth/claude-code-client-metadata"]);
+    expect(DEFAULT_MCP_REDIRECT_URIS).toEqual(["https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback"]);
+    expect(c.limits.mcp_publish_bytes).toBe(2097152);
+    expect(c.limits.mcp_calls_per_day).toBe(5000);
+    expect(cfg({ LIMITS: '{"mcp_publish_bytes": 1048576, "mcp_calls_per_day": 0}' }).limits).toMatchObject({ mcp_publish_bytes: 1048576, mcp_calls_per_day: 0 });
+  });
+
+  it("parses MCP_ENABLED like the other booleans", () => {
+    for (const v of ["true", "1", "yes", "on", " TRUE ", true, 1]) expect(cfg({ MCP_ENABLED: v }).mcp.enabled, String(v)).toBe(true);
+    for (const v of ["", "false", "0", "no", "off", "ture", false, undefined]) expect(cfg({ MCP_ENABLED: v }).mcp.enabled, String(v)).toBe(false);
+  });
+
+  it("splits the lists on commas and white space; set but empty means none", () => {
+    const c = cfg({
+      MCP_ENABLED: "true",
+      MCP_CLIENTS: " https://a.example/meta,https://b.example/m\nhttps://a.example/meta ",
+      MCP_REDIRECT_URIS: "https://a.example/cb  https://b.example/cb,",
+    });
+    expect(c.mcp.clients).toEqual(["https://a.example/meta", "https://b.example/m"]);
+    expect(c.mcp.redirectURIs).toEqual(["https://a.example/cb", "https://b.example/cb"]);
+    expect(c.mcp.enabled).toBe(true);
+    for (const v of ["", " ", ",", " , "]) {
+      const e = cfg({ MCP_ENABLED: "true", MCP_CLIENTS: v, MCP_REDIRECT_URIS: v });
+      expect(e.mcp, JSON.stringify(v)).toEqual({ enabled: true, clients: [], redirectURIs: [], problems: [] });
+    }
+    // A JSON array of strings (a wrangler.jsonc array) works too; any other value turns the connector off.
+    expect(cfg({ MCP_CLIENTS: ["https://a.example/meta", "https://b.example/m"] }).mcp.clients).toEqual(["https://a.example/meta", "https://b.example/m"]);
+    const bad = cfg({ MCP_ENABLED: "true", MCP_CLIENTS: { a: 1 } });
+    expect(bad.mcp.enabled).toBe(false);
+    expect(bad.mcp.clients).toEqual([]);
+    expect(bad.problems.join("\n")).toContain("MCP_CLIENTS must be a string or an array of strings (got a object)");
+    expect(bad.mcp.problems).toEqual(["MCP_CLIENTS is not a string; the Claude connector is off"]);
+    expect(bad.fatal).toBe("");
+  });
+
+  it("turns the connector off for invalid entries, without failing closed", () => {
+    const off = "; the Claude connector is off";
+    const clientMsg = (e: string) => `MCP_CLIENTS: ${JSON.stringify(e)} is not a client metadata URL (an https URL with a path, without query, fragment or user info, at most 512 bytes)${off}`;
+    for (const e of [
+      "https://claude.ai",
+      "https://claude.ai/",
+      "http://claude.ai/x",
+      "https://1.2.3.4/x",
+      "https://[::1]/x",
+      "https://claude.ai/a/../b",
+      "https://claude.ai/./b",
+      "https://claude.ai/%2E%2e/b",
+      "https://claude.ai/x?y=1",
+      "https://claude.ai/x#f",
+      "https://u@claude.ai/x",
+      "https://claude.ai\\x/y",
+      `https://claude.ai/${"x".repeat(500)}`,
+      "claude.ai/x",
+    ]) {
+      const c = cfg({ MCP_ENABLED: "true", MCP_CLIENTS: e });
+      expect(c.mcp.enabled, e).toBe(false);
+      expect(c.mcp.problems, e).toEqual([clientMsg(e)]);
+      expect(c.problems, e).toContain(clientMsg(e));
+      expect(c.fatal, e).toBe("");
+    }
+    const redirectMsg = (e: string) =>
+      `MCP_REDIRECT_URIS: ${JSON.stringify(e)} is not an https redirect URI without fragment or user info (at most 512 bytes; loopback redirect URIs are always allowed and are not listed)${off}`;
+    for (const e of ["http://localhost/x", "https://claude.ai/cb#f", "https://u@claude.ai/cb", "cursor://cb", `https://claude.ai/${"x".repeat(500)}`, "https://"]) {
+      const c = cfg({ MCP_ENABLED: "true", MCP_REDIRECT_URIS: e });
+      expect(c.mcp.enabled, e).toBe(false);
+      expect(c.mcp.problems, e).toEqual([redirectMsg(e)]);
+    }
+    // Rule 3: not this Backyard or one of its sites.
+    for (const [vars, e] of [
+      [{ BASE_DOMAIN: "backyard.acme.com" }, "https://backyard.acme.com/cb"],
+      [{ BASE_DOMAIN: "backyard.acme.com" }, "https://lunch.backyard.acme.com/cb"],
+      [{ PUBLIC_URL: "https://hub.acme.com" }, "https://HUB.acme.com/cb"],
+    ] as const) {
+      const c = cfg({ MCP_ENABLED: "true", MCP_REDIRECT_URIS: e, ...vars });
+      expect(c.mcp.problems, e).toEqual([`MCP_REDIRECT_URIS: ${JSON.stringify(e)} points at this Backyard or one of its sites${off}`]);
+    }
+    expect(cfg({ MCP_ENABLED: "true", BASE_DOMAIN: "backyard.acme.com", MCP_REDIRECT_URIS: "https://acme.com/cb" }).mcp.enabled).toBe(true);
+    // Problems are reported even while the connector is off.
+    expect(cfg({ MCP_CLIENTS: "https://claude.ai" }).mcp.problems).toHaveLength(1);
+    // Valid entries (the defaults included) are fine.
+    for (const e of [...DEFAULT_MCP_CLIENTS, "https://Example.COM/a/b.json", "https://example.com:8443/m"]) expect(validMCPClientURL(e), e).toBe(true);
+    expect(mcpRedirectURIHost("https://CLAUDE.ai:443/api/mcp/auth_callback")).toBe("claude.ai");
+  });
+
+  it("needs an https public URL (http only on loopback hosts)", () => {
+    const c = cfg({ MCP_ENABLED: "true", PUBLIC_URL: "http://backyard.acme.com" });
+    expect(c.mcp.enabled).toBe(false);
+    expect(c.mcp.problems).toEqual([
+      "MCP_ENABLED needs an https hub URL (PUBLIC_URL is http://backyard.acme.com; plain http only on localhost, *.localhost or loopback addresses); the Claude connector is off",
+    ]);
+    for (const u of ["http://127.0.0.1:8787", "http://localhost:8787", "http://hub.localhost", "http://[::1]:8787", "https://backyard.acme.com"]) {
+      expect(cfg({ MCP_ENABLED: "true", PUBLIC_URL: u }).mcp.enabled, u).toBe(true);
+    }
+  });
+
+  it("knows loopback hosts", () => {
+    for (const h of ["localhost", "LOCALHOST", "a.localhost", "127.0.0.1", "127.1.2.3", "[::1]", "::1", "localhost."]) expect(isLoopbackHost(h), h).toBe(true);
+    for (const h of ["localhost.example", "128.0.0.1", "127.0.0.256", "[::2]", "example.com", "", "0.0.0.0"]) expect(isLoopbackHost(h), h).toBe(false);
   });
 });
 

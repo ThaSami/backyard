@@ -81,6 +81,10 @@ type Info struct {
 	Methods     []string          `json:"methods"`
 	RsyncTarget string            `json:"rsync_target,omitempty"`
 	Limits      Limits            `json:"limits"`
+	// MCPURL is the hub's remote MCP endpoint (SPEC §7.1, §14.1): present
+	// while the Claude connector is enabled, on the hub's embedded gateway
+	// only.
+	MCPURL string `json:"mcp_url,omitempty"`
 }
 
 // AuthInfo tells clients how to obtain a token.

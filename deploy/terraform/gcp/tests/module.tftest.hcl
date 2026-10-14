@@ -89,8 +89,38 @@ run "iap_defaults" {
   }
 
   assert {
-    condition     = length(google_compute_url_map.https.path_matcher[0].route_rules) == 5 && google_compute_url_map.https.path_matcher[0].route_rules[3].match_rules[0].header_matches[0].header_name == "Authorization"
+    condition     = length(google_compute_url_map.https.path_matcher[0].route_rules) == 9 && google_compute_url_map.https.path_matcher[0].route_rules[3].match_rules[0].header_matches[0].header_name == "Authorization"
     error_message = "Deploy routes must send bearer-token gateway calls to the deploy backend."
+  }
+
+  assert {
+    # The Claude connector's machine paths (SPEC §8.4): Claude's first MCP call
+    # and the OAuth calls carry no Authorization header, so no header match.
+    condition = [
+      for r in slice(google_compute_url_map.https.path_matcher[0].route_rules, 5, 9) : {
+        path    = coalesce(r.match_rules[0].full_path_match, r.match_rules[0].prefix_match)
+        deploy  = r.service == google_compute_backend_service.deploy[0].id
+        headers = length(r.match_rules[0].header_matches)
+        strip   = r.header_action[0].request_headers_to_remove
+      }
+      ] == [
+      for p in ["/__backyard/mcp", "/__backyard/oauth/", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource/__backyard/mcp"] : {
+        path    = p
+        deploy  = true
+        headers = 0
+        strip   = tolist(["X-Goog-IAP-JWT-Assertion", "X-Goog-Authenticated-User-Email", "X-Goog-Authenticated-User-Id"])
+      }
+    ]
+    error_message = "The four connector machine paths must reach the IAP-less deploy backend without a header match, with the IAP headers stripped."
+  }
+
+  assert {
+    condition = (
+      google_compute_url_map.https.path_matcher[0].route_rules[6].match_rules[0].prefix_match == "/__backyard/oauth/" &&
+      google_compute_url_map.https.path_matcher[0].route_rules[6].match_rules[0].full_path_match == null &&
+      alltrue([for r in google_compute_url_map.https.path_matcher[0].route_rules : r.match_rules[0].full_path_match != "/__backyard/auth/authorize" && !startswith("/__backyard/auth/authorize", coalesce(r.match_rules[0].prefix_match, "-"))])
+    )
+    error_message = "/__backyard/oauth/ is a prefix route; /__backyard/auth/authorize stays behind IAP (the connector's sign-in)."
   }
 
   assert {
@@ -395,6 +425,22 @@ run "bigquery_and_dns" {
   assert {
     condition     = yamldecode(output.backyard_config_yaml).warehouse.allow_raw_sql == false && yamldecode(output.backyard_config_yaml).warehouse.sources.bigquery.description == "BigQuery (acme-backyard)"
     error_message = "Raw SQL is off by default (as in Backyard); the source is described."
+  }
+}
+
+run "claude_connector" {
+  variables {
+    extra_config_yaml = "mcp:\n  enabled: true\n"
+  }
+
+  assert {
+    condition     = yamldecode(output.backyard_config_yaml).mcp.enabled == true && yamldecode(output.backyard_config_yaml).server.public_url == "https://backyard.example.com"
+    error_message = "extra_config_yaml accepts an mcp section (the connector needs an https public_url without a path)."
+  }
+
+  assert {
+    condition     = length(google_compute_url_map.https.path_matcher[0].route_rules) == 9
+    error_message = "The connector's machine paths bypass IAP whether or not mcp is enabled."
   }
 }
 

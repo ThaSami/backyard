@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/thasami/backyard/internal/auth"
 	"github.com/thasami/backyard/internal/sites"
 )
 
@@ -27,6 +28,20 @@ const (
 	infoPath     = "/__backyard/api/info"
 	deployRoot   = "/__backyard/api/deploy"
 	sitePathPfx  = "/s/"
+)
+
+// Paths of the Claude connector (SPEC §8.4, §14.1). Only authorizePath sits
+// below /__backyard/auth/ and stays behind an identity-aware proxy; the
+// others are the machine paths, which authenticate by themselves.
+const (
+	authorizePath = auth.AuthorizePath   // GET, POST: sign-in and consent
+	mcpPath       = auth.MCPPath         // POST: the remote MCP endpoint
+	oauthPfx      = auth.OAuthPathPrefix // POST register, token, revoke
+	// wellKnownOAuthPfx holds the two discovery documents (GET, HEAD):
+	// auth.ASMetadataPath (RFC 8414) and auth.ResourceMetadataPath (RFC 9728).
+	wellKnownOAuthPfx = "/.well-known/oauth-"
+	// grantsPath is the hub API of connections (GET, DELETE; /{id}).
+	grantsPath = "/__backyard/api/mcp/grants"
 )
 
 type hostKind int
@@ -194,6 +209,14 @@ func (s *Server) serveSite(w http.ResponseWriter, r *http.Request, site string) 
 }
 
 // serveHub dispatches a request for the hub host.
+//
+// The connector's discovery documents come before everything that would
+// authenticate (they are hub-only: on a site host /.well-known/ is site
+// content), and its authorization endpoint before the other auth paths, to
+// add the per-IP rate limit. The machine paths (discovery, /__backyard/mcp,
+// /__backyard/oauth/*) never authenticate here, never check CSRF and get no
+// CORS headers: their handlers apply the rules of SPEC §8.4 themselves,
+// including the canonical host and the disabled 404.
 func (s *Server) serveHub(w http.ResponseWriter, r *http.Request) {
 	ri := info(r)
 	p := r.URL.Path
@@ -201,9 +224,23 @@ func (s *Server) serveHub(w http.ResponseWriter, r *http.Request) {
 	case p == sdkJSPath || p == sdkMJSPath || p == sdkDTSPath:
 		ri.area = "sdk"
 		s.serveSDK(w, r, "")
+	case strings.HasPrefix(p, wellKnownOAuthPfx):
+		// The two discovery documents; other paths below the prefix are JSON
+		// 404s, answered before anything authenticates (as on the Worker).
+		ri.area = "oauth"
+		s.deps.MCP.ServeMetadata(w, r) // nil-safe: the disabled 404
+	case p == authorizePath:
+		ri.area = "auth"
+		s.serveAuthorize(w, r)
 	case p == authRoot || strings.HasPrefix(p, authPfx):
 		ri.area = "auth"
 		s.deps.Auth.Handler().ServeHTTP(w, r)
+	case p == mcpPath:
+		ri.area = "mcp"
+		s.serveMCP(w, r)
+	case strings.HasPrefix(p, oauthPfx):
+		ri.area = "oauth"
+		s.serveOAuth(w, r)
 	case p == infoPath:
 		ri.area = "deploy"
 		s.serveInfo(w, r)
@@ -213,6 +250,10 @@ func (s *Server) serveHub(w http.ResponseWriter, r *http.Request) {
 	case p == metricsPath && s.metricsOnHub:
 		ri.area = "metrics"
 		s.serveHubMetrics(w, r)
+	case s.deps.MCP == nil && (p == grantsPath || strings.HasPrefix(p, grantsPath+"/")):
+		// Off: like every connector path, 404 before anything authenticates.
+		ri.area = "api"
+		s.writeAPIError(w, r, errNotFound(msgConnectorDisabled))
 	case p == apiRoot || strings.HasPrefix(p, apiPfx):
 		ri.area = "api"
 		s.serveHubAPI(w, r)

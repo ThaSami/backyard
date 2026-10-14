@@ -168,6 +168,13 @@ deploy:
   # rsync_target: deploy@backyard.example.com:/var/lib/backyard/sites
   # gateway_url: https://abc123.lambda-url.us-east-1.on.aws
 
+mcp:
+  # Claude connector (remote MCP, SPEC §8.4): <public_url>/__backyard/mcp
+  enabled: false
+  # clients: [https://claude.ai/oauth/mcp-oauth-client-metadata, https://claude.ai/oauth/claude-code-client-metadata]
+  # redirect_uris: [https://claude.ai/api/mcp/auth_callback, https://claude.com/api/mcp/auth_callback]
+  # max_publish_bytes: 4194304
+
 ratelimit:
   # Per user and instance. 0 (or unset) = the default; negative = unlimited.
   ai_per_minute: 20

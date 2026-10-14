@@ -39,7 +39,7 @@ func newMetrics(version string, wsConns func() float64) *metrics {
 			Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60},
 		}, []string{"area"}),
 		deploys: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: ns, Name: "deploys_total", Help: "Deploy commits (api) and refreshes after direct syncs (sync) by result.",
+			Namespace: ns, Name: "deploys_total", Help: "Deploy commits (api), refreshes after direct syncs (sync) and Claude connector publishes (mcp) by result.",
 		}, []string{"method", "result"}),
 		dbOps: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "db_ops_total", Help: "Document store operations by operation and result.",

@@ -652,6 +652,70 @@ label.check input {
   margin: 12px 0;
 }
 
+/* ---------------------------------------------------------------- Claude connector */
+
+.connector h3 {
+  margin: 18px 0 8px;
+  font-size: 15px;
+}
+.connector h3:focus-visible {
+  outline-offset: 4px;
+}
+.step-text {
+  margin: 2px 0 14px;
+  font-size: 13px;
+  color: var(--fg-muted);
+  overflow-wrap: anywhere;
+}
+.step-text code {
+  color: var(--fg);
+}
+.grant-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.grant {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.grant-main {
+  display: grid;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.grant-app {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.grant-trust,
+.grant-meta {
+  font-size: 13px;
+  color: var(--fg-muted);
+  overflow-wrap: anywhere;
+}
+.grant-trust.verified {
+  color: var(--accent-strong);
+}
+.grant .btn {
+  flex: none;
+}
+.connector-admin {
+  margin-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.connector-admin label {
+  margin-top: 10px;
+}
+
 /* ---------------------------------------------------------------- sites */
 
 .sites {

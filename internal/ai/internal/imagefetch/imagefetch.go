@@ -4,10 +4,10 @@
 // servers). Because the URL comes from an end user, fetching is guarded
 // against server-side request forgery: only http(s) URLs are allowed and every
 // connection to a loopback, private, link-local, multicast or otherwise
-// non-public address is refused (checked on the dialled IP, so DNS rebinding
-// cannot bypass it). Each image is capped at MaxBytes, a per-request total can
-// be set with WithBudget, timeouts are bounded, and error messages never
-// contain the URL's query string or credentials.
+// non-public address is refused (internal/netguard: checked on the dialled
+// IP, so DNS rebinding cannot bypass it). Each image is capped at MaxBytes,
+// a per-request total can be set with WithBudget, timeouts are bounded, and
+// error messages never contain the URL's query string or credentials.
 package imagefetch
 
 import (
@@ -16,14 +16,14 @@ import (
 	"fmt"
 	"io"
 	"mime"
-	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
+
+	"github.com/thasami/backyard/internal/netguard"
 )
 
 // MaxBytes is the largest image Fetch downloads (matches the router's limit).
@@ -52,8 +52,9 @@ func budget(ctx context.Context) *atomic.Int64 {
 	return b
 }
 
-// ErrForbiddenAddress is returned when a URL resolves to a non-public address.
-var ErrForbiddenAddress = errors.New("imagefetch: address not allowed")
+// ErrForbiddenAddress is returned when a URL resolves to a non-public
+// address (it is netguard.ErrForbiddenAddress).
+var ErrForbiddenAddress = netguard.ErrForbiddenAddress
 
 // Func fetches an image and returns its bytes and media type. Providers take
 // a Func so tests can substitute a fake.
@@ -87,61 +88,10 @@ func New() *Fetcher {
 	}}
 }
 
-// newTransport builds the guarded transport; proxy selects the proxy for a
-// request (http.ProxyFromEnvironment in production).
-func newTransport(proxy func(*http.Request) (*url.URL, error)) guardedTransport {
-	base := func() *http.Transport {
-		return &http.Transport{
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          16,
-			IdleConnTimeout:       60 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 20 * time.Second,
-		}
-	}
-	direct := base()
-	direct.Proxy = nil
-	direct.DialContext = (&net.Dialer{
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-		Control: func(_, address string, _ syscall.RawConn) error {
-			host, _, err := net.SplitHostPort(address)
-			if err != nil {
-				return fmt.Errorf("%w: %s", ErrForbiddenAddress, address)
-			}
-			ip, err := netip.ParseAddr(host)
-			if err != nil || !Public(ip) {
-				return fmt.Errorf("%w: %s", ErrForbiddenAddress, address)
-			}
-			return nil
-		},
-	}).DialContext
-	proxied := base()
-	proxied.Proxy = proxy
-	proxied.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
-	return guardedTransport{proxy: proxy, direct: direct, proxied: proxied}
-}
-
-// guardedTransport routes each request either directly (dial-time IP
-// check) or through the environment's proxy (pre-request DNS check).
-type guardedTransport struct {
-	proxy           func(*http.Request) (*url.URL, error)
-	direct, proxied *http.Transport
-}
-
-// RoundTrip implements http.RoundTripper.
-func (g guardedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	p, err := g.proxy(req)
-	if err != nil {
-		return nil, fmt.Errorf("imagefetch: proxy: %w", err)
-	}
-	if p == nil {
-		return g.direct.RoundTrip(req)
-	}
-	if err := checkHost(req.Context(), req.URL.Hostname()); err != nil {
-		return nil, err
-	}
-	return g.proxied.RoundTrip(req)
+// newTransport builds the guarded transport (internal/netguard); proxy
+// selects the proxy for a request (http.ProxyFromEnvironment in production).
+func newTransport(proxy func(*http.Request) (*url.URL, error)) http.RoundTripper {
+	return netguard.NewTransport(proxy)
 }
 
 // Fetch downloads rawURL. It implements Func.
@@ -243,64 +193,8 @@ func stripURL(err error) error {
 	return err
 }
 
-// checkHost resolves host and rejects it unless every address is public.
-func checkHost(ctx context.Context, host string) error {
-	if ip, err := netip.ParseAddr(host); err == nil {
-		if !Public(ip) {
-			return fmt.Errorf("%w: %s", ErrForbiddenAddress, host)
-		}
-		return nil
-	}
-	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-	if err != nil {
-		return fmt.Errorf("imagefetch: resolve %s: %w", host, err)
-	}
-	if len(addrs) == 0 {
-		return fmt.Errorf("imagefetch: resolve %s: no addresses", host)
-	}
-	for _, a := range addrs {
-		if !Public(a) {
-			return fmt.Errorf("%w: %s", ErrForbiddenAddress, host)
-		}
-	}
-	return nil
-}
-
-// nonPublic lists special-purpose ranges not covered by the netip helpers.
-var nonPublic = []netip.Prefix{
-	netip.MustParsePrefix("0.0.0.0/8"),
-	netip.MustParsePrefix("100.64.0.0/10"), // carrier-grade NAT
-	netip.MustParsePrefix("192.0.0.0/24"),
-	netip.MustParsePrefix("192.0.2.0/24"),
-	netip.MustParsePrefix("198.18.0.0/15"),
-	netip.MustParsePrefix("198.51.100.0/24"),
-	netip.MustParsePrefix("203.0.113.0/24"),
-	netip.MustParsePrefix("240.0.0.0/4"),
-	netip.MustParsePrefix("::/96"),        // deprecated IPv4-compatible IPv6
-	netip.MustParsePrefix("64:ff9b::/96"), // NAT64 can map to private IPv4
-	netip.MustParsePrefix("64:ff9b:1::/48"),
-	netip.MustParsePrefix("100::/64"),  // discard-only
-	netip.MustParsePrefix("2001::/32"), // Teredo (embeds an IPv4 address)
-	netip.MustParsePrefix("2001:db8::/32"),
-	netip.MustParsePrefix("2002::/16"), // 6to4 (embeds an IPv4 address)
-	netip.MustParsePrefix("fc00::/7"),
-}
-
 // Public reports whether ip is a globally routable unicast address.
-func Public(ip netip.Addr) bool {
-	ip = ip.Unmap()
-	if !ip.IsValid() || ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
-		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() ||
-		ip.IsMulticast() || !ip.IsGlobalUnicast() {
-		return false
-	}
-	for _, p := range nonPublic {
-		if p.Contains(ip) {
-			return false
-		}
-	}
-	return true
-}
+func Public(ip netip.Addr) bool { return netguard.Public(ip) }
 
 // redact drops credentials and the query string from u for error messages.
 func redact(u *url.URL) string {

@@ -113,9 +113,10 @@ locals {
 
   # Sections from config_overrides. The Lambda gateway gets them too (sites,
   # identity and rate limits affect deploys) except warehouse, whose sources
-  # may reference secrets that only the ECS tasks receive.
+  # may reference secrets that only the ECS tasks receive, and mcp: the Claude
+  # connector is served by the hub only (a standalone gateway ignores it).
   config_overrides         = try(yamldecode(var.config_overrides), {})
-  gateway_config_overrides = { for k, v in local.config_overrides : k => v if k != "warehouse" }
+  gateway_config_overrides = { for k, v in local.config_overrides : k => v if !contains(["warehouse", "mcp"], k) }
 
   # ---------------------------------------------------------------------------
   # Rendered backyard.yaml (server) and the Lambda gateway variant

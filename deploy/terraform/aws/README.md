@@ -22,8 +22,8 @@ deploy gateway.
                                          │
  browsers ──HTTPS──▶ Application Load Balancer (ACM cert, HTTP→HTTPS, optional WAF)
                        │  auth_mode = alb: authenticate-oidc (Okta) on every request,
-                       │  except /__backyard/healthz|readyz, /__backyard/api/deploy/*
-                       │  and /__backyard/api/tokens
+                       │  except /__backyard/healthz|readyz, /__backyard/api/deploy/*,
+                       │  /__backyard/api/tokens and the Claude connector's machine paths
                        ▼
                ECS Fargate service "backyard serve" (private subnets, autoscaling)
                  │          │              │                 │
@@ -171,6 +171,15 @@ needs a NAT route from its subnets. The authorization, token and userinfo endpoi
 `<oidc_issuer>/.well-known/openid-configuration` at plan time; set
 `oidc_endpoints` to skip discovery (e.g. when Terraform runs without internet access).
 
+In ALB mode the listener rules exempt these paths from `authenticate-oidc`:
+
+| Rule | Priority | Paths | ALB login |
+|---|---|---|---|
+| `public` | 10 | `/__backyard/healthz`, `/__backyard/readyz` | never |
+| `mcp` | 15 | `/__backyard/mcp`, `/__backyard/oauth/*`, `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/__backyard/mcp` | never (the [Claude connector](#claude-connector)'s machine paths) |
+| `deploy` | 20 | `/__backyard/api/deploy`, `/__backyard/api/deploy/*`, `/__backyard/api/tokens` | only when the browser already has an ALB session |
+| default | — | everything else, `/__backyard/auth/authorize` included | always |
+
 ## Okta application setup
 
 Run `terraform output oidc_redirect_uris` to get the exact URIs for your settings.
@@ -289,7 +298,7 @@ EOT
 ## More configuration
 
 `config_overrides` adds the Backyard config sections the module does not generate
-(`identity`, `warehouse`, `sites`, `files`, `ratelimit`, `realtime`). Secrets they
+(`identity`, `warehouse`, `sites`, `files`, `ratelimit`, `realtime`, `mcp`). Secrets they
 need come from `extra_secrets` (Secrets Manager or SSM parameter ARNs, the
 execution role is granted access) and extra AWS permissions from
 `task_role_policy_arns`:
@@ -326,6 +335,42 @@ Secrets Manager and the Lambda environment), `cpu_architecture = "ARM64"`,
 [`variables.tf`](variables.tf) for every input and [`outputs.tf`](outputs.tf) for
 the outputs (`hub_url`, `gateway_url`, `bucket`, `cli_login_command`,
 `alb_dns_name`, `certificate_validation_records`, `dns_records`, …).
+
+## Claude connector
+
+The [Claude connector](../../../docs/claude-connector.md) lets people publish sites from Claude
+with their Okta sign-in. Turn it on in the ECS service's configuration:
+
+```hcl
+config_overrides = <<-EOT
+  mcp:
+    enabled: true
+EOT
+```
+
+The connector URL is `https://<domain>/__backyard/mcp` (output `hub_url` +
+`/__backyard/mcp`). The Lambda gateway never gets the `mcp` section: only the hub serves the
+connector.
+
+- **`auth_mode = "oidc"`**: nothing else to do. Backyard keeps using the Okta application and
+  its redirect URI `/__backyard/auth/callback`.
+- **`auth_mode = "alb"`**: the listener rule `mcp` (priority 15, between `public` and
+  `deploy`) forwards the four machine paths — `/__backyard/mcp`, `/__backyard/oauth/*`,
+  `/.well-known/oauth-authorization-server` and
+  `/.well-known/oauth-protected-resource/__backyard/mcp` — without `authenticate-oidc`, because
+  Claude calls them without a browser session. The rule exists whether or not the connector is
+  on (Backyard answers `404` there until it is); after upgrading the module, run
+  `terraform apply`. `/__backyard/auth/authorize` stays behind the ALB login, which is the
+  connector's sign-in. On site hosts Backyard answers the machine paths with `404` and still
+  demands the ALB's signed header for a site's own `/.well-known` files.
+- **Network**: hosted Claude reaches the hub from `160.79.104.0/21` (IPv4), so an internet-facing
+  ALB whose `allowed_cidrs` restrict sources must include that range (an `internal = true` ALB
+  works only with connectors added locally in Claude Code). By default Backyard fetches Claude's
+  client metadata from `https://claude.ai` at the first connect; the tasks reach it through the
+  NAT gateway. Without egress, add `clients: []` to the `mcp` section.
+- **AWS WAF** (`waf_web_acl_arn`): the managed rule `SizeRestrictions_BODY` (Core rule set)
+  blocks large request bodies; exclude `/__backyard/mcp` from it (publish calls carry up to
+  9 MiB), and allow `160.79.104.0/21` if the web ACL restricts sources.
 
 ## Scaling and pub/sub
 

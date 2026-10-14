@@ -14,6 +14,7 @@ channel below, so they never drift apart.
 | Claude Code plugin | Claude Code | `/plugin marketplace add thasami/backyard`, `/plugin install backyard@backyard` |
 | Claude skill | Claude Code, Claude apps | `backyard skill install`, or added to every project by `backyard init` |
 | MCP server | any MCP client (Claude Code, Claude Desktop, Cursor, VS Code, Codex…) | `backyard mcp` |
+| Claude connector | Claude on the web, Desktop, mobile and Cowork, Claude Code — no CLI needed | `https://<hub>/__backyard/mcp`, once an admin turns it on |
 | Project instructions | Claude, Codex and other `AGENTS.md` readers, Cursor, Copilot | `backyard init --agents …` |
 | `/llms.txt`, `/llms-full.txt`, `/docs` | any LLM or person with a browser | served by every hub |
 
@@ -105,6 +106,29 @@ the project and away from credentials:
 - **Credentials.** Tool results and error messages never contain tokens or signed upload URLs:
   the CLI's access and refresh tokens, bearer credentials, JWTs, URL query strings (presigned
   signatures) and the capability in gateway upload paths are redacted.
+
+## Claude connector (remote MCP)
+
+The hub itself can be an MCP server for Claude: an admin turns the connector on (`mcp.enabled`,
+or `MCP_ENABLED` on the Cloudflare edition), adds `https://<hub>/__backyard/mcp` as a custom
+connector in Claude, and everyone connects with the company sign-in. Claude then publishes and
+edits sites as the signed-in person, without the CLI. Setup, the sign-in and consent flow,
+proxies, limits and disconnecting: [Claude connector](claude-connector.md).
+
+| Tool | Input | Does |
+|---|---|---|
+| `backyard_docs` | `topic?` (`skill`, the default, `api`, `recipes` or `deploy`) | Returns the documentation as Markdown, like the stdio tool. |
+| `backyard_whoami` | — | The account the connection acts as, whether it may publish, the hub URL, the site URL pattern and the publishing limits. |
+| `backyard_list_sites` | `query?` | Sites, most recently updated first (at most 200): name, URL, title, description, last publisher, size, owners. |
+| `backyard_site_files` | `site` | A site's files with their sizes (at most 2,000). |
+| `backyard_read_site_file` | `site`, `path` | One text file of a site (≤ 128 KiB). Binary files are refused; the text is untrusted data. |
+| `backyard_publish` | `site`, `files` (each `path`, `content`, `encoding?` — `utf-8` or `base64` — and `content_type?`), `delete?`, `replace?`, `overwrite?` | Writes the files and returns the site's URL. Merges by default (the site's other files stay); `delete` removes paths and `replace: true` makes the site exactly the given files. A site someone else published last needs `overwrite`, which Claude sets only after asking. One call carries at most 4 MiB of file content (Cloudflare: 2 MiB); bigger sites go over several calls, big media through the hub or the CLI. |
+
+Differences from `backyard mcp`: no local folders (`backyard_init`, `backyard_deploy` and
+`backyard_open_url` do not exist; files travel inside the call), no CLI login (the connection
+has its own OAuth tokens, valid only at `/__backyard/mcp`, which accepts nothing else), and a
+publish merges instead of replacing the whole site. Publishing needs a sign-in on the hub, or
+anonymous deploys on a hub without one.
 
 ## Project instructions (`backyard init` templates)
 

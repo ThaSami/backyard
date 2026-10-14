@@ -36,7 +36,9 @@ async function readyz(env: Env): Promise<Response> {
   } catch {
     return text("not ready: registry unavailable\n", 503);
   }
-  return text("ok\n");
+  // Ready, but name what is switched off (an invalid MCP variable turns the
+  // Claude connector off instead of failing closed).
+  return text("ok\n" + cfg.mcp.problems.map((p) => `problem: ${p}\n`).join(""));
 }
 
 /** Renders an error as JSON (API clients) or as an HTML page (browsers). */

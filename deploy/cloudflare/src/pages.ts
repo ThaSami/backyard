@@ -1,4 +1,7 @@
-/** Built-in HTML pages: errors, "site not found", the CLI token page. */
+/**
+ * Built-in HTML pages: errors, "site not found", the CLI token page and the
+ * consent page of the Claude connector (SPEC §8.4.5).
+ */
 import { HttpError, escapeHTML } from "./http";
 
 const STYLE = `:root{color-scheme:light dark;--bg:#f7f7f5;--fg:#1d1d1b;--muted:#6b6b66;--card:#fff;--line:#e4e4df;--accent:#2f6f4f}
@@ -107,10 +110,13 @@ export function pageNotFound(): HttpError {
 }
 
 /**
- * Security headers of the self-contained auth pages (no framing, no scripts
- * but ours, no forms unless formAction names where one may go).
+ * Security headers of the self-contained auth pages: no framing, no scripts
+ * but ours (none at all without a nonce), no forms unless formAction names
+ * where one may go (its sources: "'self'" and the origin a form's answer
+ * redirects to, see formActionSource).
  */
-function authPageHeaders(nonce: string, formAction = "'none'"): Headers {
+export function authPageHeaders(nonce: string, formAction = "'none'"): Headers {
+  const script = nonce ? ` script-src 'nonce-${nonce}';` : "";
   return new Headers({
     "Content-Type": "text/html; charset=utf-8",
     "Cache-Control": "no-store, max-age=0",
@@ -118,8 +124,20 @@ function authPageHeaders(nonce: string, formAction = "'none'"): Headers {
     Expires: "0",
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "DENY",
-    "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action ${formAction}`,
+    "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline';${script} img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action ${formAction}`,
   });
+}
+
+/**
+ * The CSP form-action source of the origin a form's answer redirects to
+ * (browsers apply form-action to those redirects too): "https://claude.ai",
+ * "http://127.0.0.1:9"; "http:" for an IPv6 host such as [::1], which CSP
+ * cannot name; "" for none.
+ */
+export function formActionSource(u: URL | null): string {
+  if (!u) return "";
+  const scheme = u.protocol.slice(0, -1).toLowerCase();
+  return u.hostname.includes(":") ? scheme + ":" : `${scheme}://${u.host.toLowerCase()}`;
 }
 
 /** The confirmation form of a cross-site CLI login (/__backyard/auth/cli). */
@@ -172,10 +190,116 @@ ${hidden("redirect_uri", f.redirectURI)}${hidden("state", f.state)}${hidden("mod
   return new Response(html, { status: 200, headers: authPageHeaders(nonce, formAction) });
 }
 
+/** Extras of an auth-flow error page. */
+export interface AuthErrorExtras {
+  /** A second sentence (what to do about it). */
+  detail?: string;
+  /** A link, e.g. "Sign out". */
+  linkURL?: string;
+  linkText?: string;
+  /** Allow header of a 405. */
+  allow?: string;
+  /** Retry-After seconds. */
+  retryAfter?: number;
+}
+
 /** Auth-flow error page (/__backyard/auth/*). */
-export function authErrorPage(status: number, title: string, message: string): Response {
+export function authErrorPage(status: number, title: string, message: string, extras: AuthErrorExtras = {}): Response {
   const nonce = crypto.randomUUID().replace(/-/g, "");
-  return new Response(renderPage({ status, title, message }), { status, headers: authPageHeaders(nonce) });
+  const d: PageData = { status, title, message: extras.detail ? `${message} ${extras.detail}` : message };
+  if (extras.linkURL) {
+    d.actionURL = extras.linkURL;
+    d.actionText = extras.linkText ?? "Continue";
+  }
+  const h = authPageHeaders(nonce);
+  if (extras.allow) h.set("Allow", extras.allow);
+  if (extras.retryAfter) h.set("Retry-After", String(Math.ceil(extras.retryAfter)));
+  return new Response(renderPage(d), { status, headers: h });
+}
+
+/** What the consent page of the Claude connector shows (SPEC §8.4.5). */
+export interface ConsentForm {
+  /** The signed-in user: email, else name, else id ("Guest 1a2b" in mode none). */
+  who: string;
+  /** Mode none: the app acts as this browser's guest. */
+  guest: boolean;
+  /** "Not you? Sign out" target ("" where there is no logout). */
+  signOutURL: string;
+  clientName: string;
+  /** A client metadata document vouches for the name (CIMD); else the app named itself. */
+  verified: boolean;
+  /** Host of the client metadata URL (verified clients). */
+  clientHost: string;
+  /** Origin the approval is sent to (the redirect URI's). */
+  origin: string;
+  /** The redirect URI is an app on this computer (loopback). */
+  loopback: boolean;
+  /** H, the hub host. */
+  hubHost: string;
+  /** YYYY-MM-DD (UTC) the connection lasts until. */
+  until: string;
+  /** Hidden fields, in order (csrf last). */
+  fields: [string, string][];
+  /** Extra CSP form-action source: the redirect URI's origin (formActionSource). */
+  formAction: string;
+}
+
+/** Arming of the consent buttons: they appear after 0.8 s (double-clickjacking). */
+const CONSENT_STYLE = `#consent{display:flex;flex-wrap:wrap;gap:12px;margin-top:8px}
+#consent button{visibility:hidden;animation: by-arm 0s linear 0.8s forwards;padding:8px 16px;border-radius:8px;border:1px solid var(--line);font:inherit;cursor:pointer;background:none;color:var(--fg)}
+#consent #allow{background:var(--accent);border-color:var(--accent);color:#fff}
+@keyframes by-arm { to { visibility: visible } }
+.warn{border-left:3px solid var(--accent);padding-left:10px}
+strong{color:var(--fg)}`;
+
+/**
+ * The consent page of /__backyard/auth/authorize: shown on every
+ * authorization, before any code exists. It has no script; its form posts
+ * back to the authorize endpoint with a CSRF token.
+ */
+export function consentPage(f: ConsentForm): Response {
+  const e = escapeHTML;
+  const user = f.guest
+    ? `<strong>${e(f.who)}</strong>. This Backyard has no sign-in; the app will act as this browser's guest.`
+    : `You are signed in as <strong>${e(f.who)}</strong>.`;
+  const signOut = f.signOutURL ? ` <a href="${e(f.signOutURL)}">Not you? Sign out</a>` : "";
+  const app = f.verified
+    ? `<strong>${e(f.clientName)}</strong> — verified by <strong>${e(f.clientHost)}</strong> wants to use Backyard as you.`
+    : `<strong>"${e(f.clientName)}"</strong> (name provided by the app, not verified) wants to use Backyard as you.`;
+  const back = f.loopback
+    ? `Backyard will send the approval to <strong>an app on this computer (${e(f.origin)})</strong>. Only continue if you just started the sign-in from an app on this computer.`
+    : `Backyard will send the approval to <strong>${e(f.origin)}</strong>.`;
+  const hidden = f.fields.map(([name, value]) => `<input type="hidden" name="${e(name)}" value="${e(value)}">\n`).join("");
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="referrer" content="no-referrer">
+<title>Connect an app to Backyard · Backyard</title>
+<style>${STYLE}
+${CONSENT_STYLE}</style>
+</head>
+<body>
+<main>
+<h1>Connect an app to Backyard</h1>
+<p id="consent-user">${user}${signOut}</p>
+<p id="consent-app">${app}</p>
+<p id="consent-return">${back}</p>
+<p>The app can see the sites on ${e(f.hubHost)} and read their files, and publish or change sites as you. Published sites are visible to everyone who can sign in to this Backyard.</p>
+<p>This connection lasts until ${e(f.until)} unless you disconnect it on the Backyard hub.</p>
+<p class="warn">Only allow this if you started connecting ${e(f.clientName)} to Backyard yourself just now. Anyone who sent you this link would get this access.</p>
+<form id="consent" method="post" action="/__backyard/auth/authorize">
+${hidden}<button type="submit" name="decision" value="allow" id="allow">Allow</button>
+<button type="submit" name="decision" value="deny" id="deny">Cancel</button>
+</form>
+</main>
+</body>
+</html>
+`;
+  // No script at all: no nonce, so no script-src.
+  return new Response(html, { status: 200, headers: authPageHeaders("", ("'self' " + f.formAction).trim()) });
 }
 
 /** The page showing a freshly minted CLI token (/__backyard/auth/cli?mode=display). */

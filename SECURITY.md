@@ -21,6 +21,10 @@ Include:
 - steps to reproduce (configuration, auth mode, storage/database backends),
 - affected version(s) and, if possible, a suggested fix.
 
+In scope: the Go server and the Cloudflare edition, including the Claude connector's OAuth
+authorization server and MCP endpoint (`/__backyard/auth/authorize`, `/__backyard/oauth/*`,
+`/__backyard/mcp`), the CLI, the deployment kits and the browser SDK.
+
 We aim to acknowledge reports within 3 business days and to ship a fix or mitigation within
 30 days for confirmed high-severity issues. We will credit reporters in the release notes unless
 you prefer to remain anonymous.
@@ -36,3 +40,7 @@ you prefer to remain anonymous.
 - Keep AI provider keys, database credentials and warehouse credentials server-side only.
 - Use read-only credentials for warehouse sources.
 - Enable `sites.ownership: owner` if teams must not overwrite each other's sites.
+- Turn on the Claude connector (`mcp.enabled`, off by default) only with a sign-in, keep
+  `/__backyard/auth/authorize` behind your identity proxy, and keep `mcp.clients` and
+  `mcp.redirect_uris` at their exact defaults unless you add a client you trust
+  (see [docs/claude-connector.md](docs/claude-connector.md)).

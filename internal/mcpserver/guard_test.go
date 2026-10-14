@@ -469,6 +469,8 @@ func TestRedactError(t *testing.T) {
 		{"see https://u:p@host.example/a?sig=1.", "see https://host.example/a?" + redacted + "."},
 		{"site at https://backyard.example.com/s/lunch/, ok", "site at https://backyard.example.com/s/lunch/, ok"},
 		{"known my-known-secret-1 here", "known " + redacted + " here"},
+		{"connector byat_eyJnIjoiMDEyMzQ1Njc4OSJ9.c2ln and byrt_abcdefghijklmnop0123, byac_x",
+			"connector " + redacted + " and " + redacted + ", byac_x"},
 	}
 	for _, tt := range tests {
 		if got := redactError(tt.in, []string{"my-known-secret-1"}); got != tt.want {

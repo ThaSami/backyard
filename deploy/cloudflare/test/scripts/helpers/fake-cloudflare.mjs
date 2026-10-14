@@ -30,7 +30,8 @@
 //   edge          {omitKid, redirectTeam, certsEmpty, readyz (status), readyzBody (its text when not 200),
 //                  tlsFail: [host suffixes;
 //                  "*.<host>" = its subdomains only],
-//                  down: [hosts → ECONNREFUSED], workerVersion}
+//                  down: [hosts → ECONNREFUSED], workerVersion,
+//                  preConnector: true → the Worker predates the Claude connector (see EDGE)}
 //
 // PERMISSIONS: a credential needs, per endpoint (edit implies read):
 //   workers subdomain GET → scriptsRead, PUT → scriptsEdit; script settings/subdomain → scriptsRead;
@@ -77,8 +78,14 @@
 //     /__backyard/api/deploy/info → {edition: "cloudflare", version, auth: {mode}, …},
 //     /__backyard/api/deploy/me → 200 with "Authorization: Bearer <DEPLOY_TOKEN>", the guest
 //     ({anonymous: true}) without a token in AUTH_MODE=none, else 401 JSON,
-//     /__backyard/api/tokens → 401 JSON; with AUTH_MODE=access every other path → 401
-//     (unless a Cf-Access-Jwt-Assertion header is sent), else the hub page (200 HTML).
+//     /__backyard/api/tokens → 401 JSON; the Claude connector's paths (SPEC §8.4) with
+//     MCP_ENABLED on: /__backyard/mcp → 401 JSON (+ WWW-Authenticate), GET
+//     /__backyard/oauth/{token,register,revoke} → 405 JSON, the two discovery documents
+//     → 200 JSON, and /info carries mcp_url; with it off all four → 404 JSON (a
+//     Worker with edge.preConnector answers /__backyard/mcp and /__backyard/oauth/* with
+//     404 JSON and the discovery documents like any hub page); with AUTH_MODE=access
+//     every other path → 401 (unless a Cf-Access-Jwt-Assertion header is sent), else
+//     the hub page (200 HTML).
 // DNS (DoH and edge): a name resolves when dns[name] says so, it is a custom domain, it has
 // a DNS record (or a "*.<parent>" record covers it), it is a deployed <w>.<sub>.workers.dev,
 // or an Access team; dns[name] = "nxdomain" overrides. DoH answers {Status: 0, Answer: [...]},
@@ -821,18 +828,38 @@ export async function startFakeCloudflare(o) {
       const reason = secrets.BACKYARD_SECRET ? (ed.readyzBody ?? "not ready\n") : "not ready: BACKYARD_SECRET is not set\n";
       return answer(status, { "content-type": "text/plain" }, status === 200 ? "ok\n" : reason);
     }
+    const base = String(vars.BASE_DOMAIN ?? "") || host;
+    const publicUrl = vars.PUBLIC_URL || `https://${base}`;
+    const mcp = !ed.preConnector && /^(true|1|yes|on)$/i.test(String(vars.MCP_ENABLED ?? "").trim());
     if (path === "/__backyard/api/deploy/info") {
-      const base = String(vars.BASE_DOMAIN ?? "") || host;
       return json(200, {
         name: vars.SERVER_NAME || "Backyard",
         version: ed.workerVersion ?? w.version ?? "0.1.0-dev",
-        public_url: vars.PUBLIC_URL || `https://${base}`,
+        public_url: publicUrl,
         base_domain: base,
         url_mode: String(vars.URL_MODE ?? "path") === "host" ? "host" : "path",
         auth: { mode, anonymous_deploy: false },
         methods: ["api"],
         edition: "cloudflare",
+        ...(mcp ? { mcp_url: `${publicUrl}/__backyard/mcp` } : {}),
       });
+    }
+    // The Claude connector's machine paths: answered before any sign-in, like the real Worker.
+    const wellKnown = path === "/.well-known/oauth-authorization-server" || path === "/.well-known/oauth-protected-resource/__backyard/mcp";
+    if (path === "/__backyard/mcp" || path.startsWith("/__backyard/oauth/") || (wellKnown && !ed.preConnector)) {
+      const off = () => json(404, { error: { code: "not_found", message: ed.preConnector ? `no such endpoint: ${path}` : "the Claude connector is not enabled on this server" } });
+      if (!mcp) return off();
+      if (path === "/__backyard/mcp") {
+        const challenge = `Bearer resource_metadata="${publicUrl}/.well-known/oauth-protected-resource/__backyard/mcp", scope="mcp"`;
+        return answer(401, { "content-type": "application/json", "www-authenticate": challenge }, JSON.stringify({ error: { code: "unauthenticated", message: "connect this app to Backyard to sign in" } }));
+      }
+      if (["/__backyard/oauth/token", "/__backyard/oauth/register", "/__backyard/oauth/revoke"].includes(path)) {
+        if (req.method === "POST") return json(400, { error: "invalid_request", error_description: "the fake Worker does not run OAuth" });
+        return answer(405, { "content-type": "application/json", allow: "POST" }, JSON.stringify({ error: { code: "bad_request", message: "method not allowed" } }));
+      }
+      if (path === "/.well-known/oauth-authorization-server") return json(200, { issuer: publicUrl, authorization_endpoint: `${publicUrl}/__backyard/auth/authorize`, token_endpoint: `${publicUrl}/__backyard/oauth/token` });
+      if (path === "/.well-known/oauth-protected-resource/__backyard/mcp") return json(200, { resource: `${publicUrl}/__backyard/mcp`, authorization_servers: [publicUrl], scopes_supported: ["mcp"] });
+      return json(404, { error: { code: "not_found", message: `no such endpoint: ${path}` } });
     }
     if (path === "/__backyard/api/deploy/me") {
       const bearer = /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1];

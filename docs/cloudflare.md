@@ -97,11 +97,25 @@ tail` shows it — rather than silently running without sign-in.
 Access must let through the paths the Worker authenticates itself: `/__backyard/api/deploy`
 and `/__backyard/api/deploy/*` (deploys with `DEPLOY_TOKEN` or API tokens, signed upload URLs),
 `/__backyard/api/tokens` (`backyard token create`; a minted token never outlives the token that
-asked for it) and the health checks `/__backyard/healthz` and `/__backyard/readyz`.
-`backyard cloudflare access enable` creates this Bypass application (with an API token in
-`BACKYARD_CF_API_TOKEN`) or prints the dashboard steps, and verifies at the edge that all five
-paths reach the Worker before it switches the Worker to Access. The optional
+asked for it), the health checks `/__backyard/healthz` and `/__backyard/readyz`, and the
+[Claude connector's](claude-connector.md) machine paths `/__backyard/mcp`, `/__backyard/oauth/*`,
+`/.well-known/oauth-authorization-server` and
+`/.well-known/oauth-protected-resource/__backyard/mcp` (the Worker answers them with `404`
+until `MCP_ENABLED` is set). `backyard cloudflare access enable` creates this Bypass application
+(with an API token in `BACKYARD_CF_API_TOKEN`) or prints the dashboard steps, and verifies at
+the edge that all nine paths reach the Worker before it switches the Worker to Access; after an
+upgrade, run it once more so the bypass application gains the connector's paths
+(`backyard cloudflare status` reports them as `access-connector`). The optional
 [Terraform module](../deploy/terraform/cloudflare/README.md) creates the same (`bypass_paths`).
+
+**Use Backyard in Claude.** `backyard cloudflare setup --var MCP_ENABLED:true` (Terraform:
+`mcp_enabled = true`) turns on the [Claude connector](claude-connector.md) at
+`https://<hub>/__backyard/mcp`: people add it to Claude and Claude publishes sites as them. It
+signs people in with Cloudflare Access, so publishing from Claude needs `AUTH_MODE=access` (or
+`ALLOW_ANONYMOUS_DEPLOY`, which lets anyone publish); `DEPLOY_TOKEN` plays no part. One publish
+carries at most 2 MiB of file content (`LIMITS.mcp_publish_bytes`) and tool calls count against
+`LIMITS.mcp_calls_per_day`; `MCP_CLIENTS` and `MCP_REDIRECT_URIS` change which apps may connect.
+Invalid values turn only the connector off and are listed by `/__backyard/readyz`.
 
 Within the shared contract, a few edition differences are visible to pages and CLIs (all
 listed in the [specification](spec/SPEC.md#16-cloudflare-edition-free-tier)):

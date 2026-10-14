@@ -32,7 +32,7 @@ npx playwright show-trace test-results/<test>/trace.zip   # after a failure
 | Variable | Effect |
 |---|---|
 | `BACKYARD_BIN` | Use this `backyard` binary instead of running `go build` (CI passes `bin/backyard`). |
-| `BACKYARD_E2E_PORT` | First of the seven ports the servers use (default `18500`, see below). |
+| `BACKYARD_E2E_PORT` | First of the nine ports the servers use (default `18500`, see below). |
 | `BACKYARD_E2E_WORKERS` | Parallel workers (default 4, 2 on CI). |
 | `BACKYARD_E2E_CHROMIUM` | Launch this Chromium binary instead of Playwright's own build. |
 | `BACKYARD_TEST_POSTGRES_DSN` | Also run the KPI dashboard against a real Postgres warehouse (skipped otherwise). |
@@ -51,7 +51,9 @@ npx playwright show-trace test-results/<test>/trace.zip   # after a failure
 
 Spec files that would disturb the others start servers of their own: `18502` (the reconnect test
 kills and restarts it), `18504` (phone layouts), `18505` (Postgres warehouse), `18506`
-(accessibility checks with data). The fake AI listens on a random port.
+(accessibility checks with data), `18507` and `18508` (an `auth.mode: oidc` server with the
+Claude connector enabled, `mcp.enabled`, and a mock IdP of its own). The fake AI, and the
+connector test's client callback (its loopback redirect URI), listen on random ports.
 
 Path mode for the OIDC server is deliberate: browsers refuse `Domain=localhost` cookies, so in host
 mode on `localhost` the hub's session cookie never reaches `<site>.localhost` (see SPEC §8.3).
@@ -72,6 +74,7 @@ mode on `localhost` the hub's session cookie never reaches `<site>.localhost` (s
 | auth | `oidc.spec.mjs` | site visit → IdP → back with the mapped identity (`backyard.me()`), cookies, 401s, allowed domains, sign-out |
 | auth | `sessions.spec.mjs` | hub deploys with the browser session, the CLI's browser sign-in (and its confirmation page when another site links to it), re-sign-in from the hub, docs and SDK |
 | auth | `examples.spec.mjs` | the examples in path mode with real names and avatars, AI/warehouse not configured |
+| auth | `mcp-connector.spec.mjs` | the Claude connector with a real MCP client (`@modelcontextprotocol/sdk`): registration, sign-in at the IdP, the consent page (axe-core), publishing a site, consent shown again on a second connection, Cancel (`access_denied`), a person outside the allowed domains, the hub card and Disconnect cutting the client off |
 
 ## Conventions for tests
 

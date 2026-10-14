@@ -188,17 +188,50 @@ func (g *Gateway) clearTreeConflicts(r *http.Request, u *identity.User, site str
 	}
 	unlock := g.lockSite(site)
 	defer unlock()
-	err := parallel(r.Context(), len(stale), deleteParallelism, func(ctx context.Context, i int) error {
-		if err := g.store.Delete(ctx, sites.SiteKey(site, stale[i])); err != nil {
-			return fmt.Errorf("delete %q (file/directory conflict): %w", stale[i], err)
-		}
-		return nil
-	})
-	if err != nil {
+	if err := g.deleteObjects(r.Context(), site, stale, "file/directory conflict"); err != nil {
 		return internalErr(err)
 	}
 	g.audit(r, u, "deploy.clear_conflicts", site, "deleted", len(stale))
 	return nil
+}
+
+// deleteObjects deletes files of site in parallel; why says in errors why
+// they are deleted.
+func (g *Gateway) deleteObjects(ctx context.Context, site string, paths []string, why string) error {
+	return parallel(ctx, len(paths), deleteParallelism, func(ctx context.Context, i int) error {
+		if err := g.store.Delete(ctx, sites.SiteKey(site, paths[i])); err != nil {
+			return fmt.Errorf("delete %q (%s): %w", paths[i], why, err)
+		}
+		return nil
+	})
+}
+
+// nextMeta returns the meta document of site after a write by u at now: the
+// creation fields and owners of prev (the stored document, nil when none)
+// are kept and, with sites.ownership: owner, a first writer that is not
+// anonymous becomes the owner. The caller fills in the content fields.
+func (g *Gateway) nextMeta(prev *sites.Meta, site string, u *identity.User, now time.Time) *sites.Meta {
+	meta := &sites.Meta{Name: site, CreatedAt: now, CreatedBy: u.Actor()}
+	if prev != nil {
+		meta.CreatedAt, meta.CreatedBy, meta.Owners = prev.CreatedAt, prev.CreatedBy, prev.Owners
+		if meta.CreatedAt.IsZero() {
+			meta.CreatedAt = now
+		}
+	}
+	if g.ownershipOn() && len(meta.Owners) == 0 && !u.Anonymous {
+		meta.Owners = []string{ownerID(u)}
+	}
+	meta.UpdatedAt, meta.UpdatedBy = now, u.Actor()
+	return meta
+}
+
+// commitSite switches a site to a new version: the manifest first, then the
+// meta document (the site list shows a version once its manifest exists).
+func (g *Gateway) commitSite(ctx context.Context, man *sites.Manifest, meta *sites.Meta) error {
+	if err := g.reg.PutManifest(ctx, man); err != nil {
+		return err
+	}
+	return g.reg.PutMeta(ctx, meta)
 }
 
 // presignParallelism bounds concurrent PresignPut calls (signing may be a
@@ -404,28 +437,13 @@ func (g *Gateway) handleCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := g.now().UTC()
-	meta := &sites.Meta{Name: site, CreatedAt: now, CreatedBy: u.Actor()}
-	if prev != nil {
-		meta.CreatedAt, meta.CreatedBy, meta.Owners = prev.CreatedAt, prev.CreatedBy, prev.Owners
-		if meta.CreatedAt.IsZero() {
-			meta.CreatedAt = now
-		}
-	}
-	if g.ownershipOn() && len(meta.Owners) == 0 && !u.Anonymous {
-		meta.Owners = []string{ownerID(u)}
-	}
-	meta.UpdatedAt, meta.UpdatedBy = now, u.Actor()
+	meta := g.nextMeta(prev, site, u, g.now().UTC())
 	meta.DeployID = shortDeployID(claims.Nonce)
 	meta.FileCount, meta.Bytes = len(req.Files), total
 	if listed[sites.IndexFile] {
 		meta.Title, meta.Description = g.readTitle(ctx, site)
 	}
-	if err := g.reg.PutManifest(ctx, man); err != nil {
-		writeError(w, r, g.log, internalErr(err))
-		return
-	}
-	if err := g.reg.PutMeta(ctx, meta); err != nil {
+	if err := g.commitSite(ctx, man, meta); err != nil {
 		writeError(w, r, g.log, internalErr(err))
 		return
 	}
@@ -437,13 +455,7 @@ func (g *Gateway) handleCommit(w http.ResponseWriter, r *http.Request) {
 			stale = append(stale, o.Key)
 		}
 	}
-	err = parallel(ctx, len(stale), deleteParallelism, func(ctx context.Context, i int) error {
-		if err := g.store.Delete(ctx, sites.SiteKey(site, stale[i])); err != nil {
-			return fmt.Errorf("delete stale %q: %w", stale[i], err)
-		}
-		return nil
-	})
-	if err != nil {
+	if err := g.deleteObjects(ctx, site, stale, "stale"); err != nil {
 		writeError(w, r, g.log, internalErr(err))
 		return
 	}

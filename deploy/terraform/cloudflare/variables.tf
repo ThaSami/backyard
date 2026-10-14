@@ -123,7 +123,7 @@ variable "auto_redirect_to_identity" {
 }
 
 variable "bypass_paths" {
-  description = "Hub paths that skip Access because the Worker authenticates them itself: the deploy gateway (DEPLOY_TOKEN / API tokens, signed upload URLs, the public /info), token minting for the CLI (backyard token create sends an API token; a minted token never outlives the one that asked) and health checks. Change only if you know why."
+  description = "Hub paths that skip Access because the Worker authenticates them itself: the deploy gateway (DEPLOY_TOKEN / API tokens, signed upload URLs, the public /info), token minting for the CLI (backyard token create sends an API token; a minted token never outlives the one that asked), health checks, and the Claude connector's MCP endpoint, OAuth endpoints and discovery documents (SPEC §8.4; the Worker answers 404 there until mcp_enabled). Change only if you know why."
   type        = list(string)
   default = [
     "/__backyard/api/deploy",
@@ -131,12 +131,24 @@ variable "bypass_paths" {
     "/__backyard/api/tokens",
     "/__backyard/healthz",
     "/__backyard/readyz",
+    "/__backyard/mcp",
+    "/__backyard/oauth/*",
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/oauth-protected-resource/__backyard/mcp",
   ]
 
   validation {
-    condition     = alltrue([for p in var.bypass_paths : startswith(p, "/__backyard/")])
-    error_message = "bypass_paths must stay below /__backyard/ (never bypass sites or the hub UI)."
+    condition     = alltrue([for p in var.bypass_paths : startswith(p, "/__backyard/") || contains(["/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource/__backyard/mcp"], p)])
+    error_message = "bypass_paths must stay below /__backyard/ or be one of the two OAuth discovery documents (never bypass sites or the hub UI)."
   }
+}
+
+# --- Claude connector (remote MCP) ----------------------------------------------
+
+variable "mcp_enabled" {
+  description = "Serve the Claude connector (remote MCP, SPEC §8.4): adds MCP_ENABLED=true to worker_vars and setup_args, so Claude can publish sites with the user's sign-in. The bypass application already lets its machine paths through."
+  type        = bool
+  default     = false
 }
 
 # --- Optional: create an Okta identity provider --------------------------------

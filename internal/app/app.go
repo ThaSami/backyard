@@ -7,8 +7,13 @@
 // the handler (and an optional metrics listener) until its context is
 // cancelled, then shuts down gracefully.
 //
+// With mcp.enabled the authenticator also is the Claude connector's
+// authorization server (auth.MCPOf), and the remote MCP endpoint
+// (internal/mcpremote) is built on the same registry, storage, document store
+// and gateway as the hub.
+//
 // With Options.GatewayOnly only storage, a bearer-only authenticator and the
-// deploy gateway are built (`backyard gateway`).
+// deploy gateway are built (`backyard gateway`); mcp.* is then ignored.
 package app
 
 import (
@@ -33,6 +38,8 @@ import (
 	"github.com/thasami/backyard/internal/docstore"
 	docbackends "github.com/thasami/backyard/internal/docstore/backends"
 	"github.com/thasami/backyard/internal/identity"
+	"github.com/thasami/backyard/internal/mcpremote"
+	"github.com/thasami/backyard/internal/mcpserver"
 	"github.com/thasami/backyard/internal/pubsub"
 	pubsubbackends "github.com/thasami/backyard/internal/pubsub/backends"
 	"github.com/thasami/backyard/internal/realtime"
@@ -57,6 +64,10 @@ type Options struct {
 	// OnListen, if set, is called by Run with the bound address once the
 	// server accepts connections.
 	OnListen func(addr net.Addr)
+
+	// authOptions, if set, adjusts the authenticator's options before it is
+	// built (tests: the clock, the client metadata document fetcher).
+	authOptions func(*auth.Options)
 }
 
 // App is a running Backyard instance.
@@ -74,6 +85,8 @@ type App struct {
 	server    *server.Server
 	handler   http.Handler
 	metrics   http.Handler
+	mcpURL    string    // the Claude connector's endpoint ("" while it is off)
+	mcpAS     *auth.MCP // its authorization server (nil while it is off)
 
 	closeOnce sync.Once
 	closeErr  error
@@ -115,9 +128,19 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (_ *App, err err
 	if err != nil {
 		return nil, fmt.Errorf("identity directory: %w", err)
 	}
-	authn, err := auth.New(ctx, cfg, auth.Options{Directory: dir, Logger: log})
+	// The connector's grants live in the same document store as the audit
+	// records (_system), unwrapped like the server's own system writes.
+	authOpts := auth.Options{Directory: dir, Logger: log, Docs: a.docs}
+	if opts.authOptions != nil {
+		opts.authOptions(&authOpts)
+	}
+	authn, err := auth.New(ctx, cfg, authOpts)
 	if err != nil {
 		return nil, fmt.Errorf("auth: %w", err)
+	}
+	mcpAS := auth.MCPOf(authn)
+	if mcpAS != nil && authn.Mode() == auth.ModeNone && !cfg.Server.Dev {
+		log.Warn("mcp: auth.mode none: every connector connection is an anonymous guest")
 	}
 
 	// The hub is built before the server, so frame metrics reach the server
@@ -154,6 +177,7 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (_ *App, err err
 		OnDeleteSite: func(ctx context.Context, site string) error {
 			return docs.DeleteSite(ctx, site)
 		},
+		MCPURL:  mcpAS.Resource(), // "" (no mcp_url in /info) while the connector is off
 		Logger:  log,
 		Version: version.Version,
 	})
@@ -161,21 +185,30 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (_ *App, err err
 		return nil, fmt.Errorf("deploy gateway: %w", err)
 	}
 
+	var mcpEndpoint http.Handler
+	if mcpAS != nil {
+		mcpEndpoint = a.newMCPEndpoint(mcpAS, registry, gw, &srvRef)
+		a.mcpURL = mcpAS.Resource()
+		a.mcpAS = mcpAS
+	}
+
 	a.server, err = server.New(server.Deps{
-		Config:    cfg,
-		Logger:    log,
-		Blob:      a.blob,
-		Docs:      a.docs,
-		Sites:     registry,
-		Auth:      authn,
-		Tokens:    auth.NewTokens(cfg.Server.Secret, cfg.Auth.TokenTTL.D()),
-		Users:     identity.NewUserCache(a.docs, dir),
-		Realtime:  a.hub,
-		AI:        a.ai,
-		Warehouse: a.warehouse,
-		Gateway:   gw,
-		DevSites:  opts.DevSites,
-		Version:   version.Version,
+		Config:      cfg,
+		Logger:      log,
+		Blob:        a.blob,
+		Docs:        a.docs,
+		Sites:       registry,
+		Auth:        authn,
+		Tokens:      auth.NewTokens(cfg.Server.Secret, cfg.Auth.TokenTTL.D()),
+		Users:       identity.NewUserCache(a.docs, dir),
+		Realtime:    a.hub,
+		AI:          a.ai,
+		Warehouse:   a.warehouse,
+		Gateway:     gw,
+		MCP:         mcpAS,
+		MCPEndpoint: mcpEndpoint,
+		DevSites:    opts.DevSites,
+		Version:     version.Version,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("server: %w", err)
@@ -184,6 +217,44 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (_ *App, err err
 	a.handler = a.server.Handler()
 	a.metrics = a.server.MetricsHandler()
 	return a, nil
+}
+
+// newMCPEndpoint builds the remote MCP endpoint (POST /__backyard/mcp). It
+// reaches the server, which is built afterwards, through srv: the per-user
+// rate limit and, after every publish that reached the gateway, the static
+// cache purge and deploys_total{method="mcp"}.
+func (a *App) newMCPEndpoint(m *auth.MCP, registry *sites.Registry, gw *deploy.Gateway, srv *atomic.Pointer[server.Server]) http.Handler {
+	cfg := a.cfg
+	var publisher *deploy.Gateway
+	if cfg.Deploy.EmbeddedGateway == nil || *cfg.Deploy.EmbeddedGateway {
+		publisher = gw // nil: backyard_publish answers that the hub's gateway is off
+	}
+	return mcpremote.New(mcpremote.Options{
+		Config:  cfg,
+		Auth:    m,
+		Sites:   registry,
+		Blob:    a.blob,
+		Docs:    a.docs,
+		Gateway: publisher,
+		DocsFor: mcpserver.DefaultDocs,
+		Allow: func(key string) (bool, time.Duration) {
+			return srv.Load().AllowAPI(key) // nil-safe until the server exists
+		},
+		OnPublish: func(site string, ok bool) {
+			s := srv.Load()
+			// Always purge: a failed publish may have written files.
+			s.PurgeSite(site)
+			result := "ok"
+			if !ok {
+				result = "error"
+			}
+			s.ObserveDeploy("mcp", result)
+		},
+		RequestOrigin: server.RequestOrigin,
+		ClientIP:      server.ClientIP,
+		Version:       version.Version,
+		Logger:        a.log,
+	})
 }
 
 // buildGateway assembles the standalone deploy gateway (backyard gateway).
@@ -274,10 +345,15 @@ func (a *App) Run(ctx context.Context) error {
 	if a.opts.GatewayOnly {
 		mode = "gateway"
 	}
-	a.log.Info("backyard listening",
+	attrs := []any{
 		"mode", mode, "addr", ln.Addr().String(), "public_url", cfg.Server.PublicURL,
 		"url_mode", cfg.Server.URLMode, "auth", cfg.Auth.Mode, "storage", cfg.Storage.Type,
-		"database", cfg.Database.Type, "pubsub", cfg.PubSub.Type, "version", version.Version)
+		"database", cfg.Database.Type, "pubsub", cfg.PubSub.Type, "version", version.Version,
+	}
+	if a.mcpURL != "" {
+		attrs = append(attrs, "mcp_url", a.mcpURL)
+	}
+	a.log.Info("backyard listening", attrs...)
 	if a.opts.OnListen != nil {
 		a.opts.OnListen(ln.Addr())
 	}
@@ -322,6 +398,11 @@ func (a *App) Close() error {
 		if a.server != nil {
 			if err := a.server.Close(ctx); err != nil {
 				errs = append(errs, fmt.Errorf("server: %w", err))
+			}
+		}
+		if a.mcpAS != nil { // background grant pruning still uses the document store
+			if err := a.mcpAS.Close(ctx); err != nil {
+				errs = append(errs, fmt.Errorf("mcp: %w", err))
 			}
 		}
 		if a.hub != nil {

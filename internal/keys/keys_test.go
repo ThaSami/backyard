@@ -22,14 +22,17 @@ func TestSignVerify(t *testing.T) {
 func TestLabelsAreDistinct(t *testing.T) {
 	const secret = "s3cret-s3cret-s3cret-s3cret-s3cret"
 	seen := map[string]string{}
-	for _, label := range []string{Session, OAuthState, APIToken, Deploy, Upload, Anon, CLIConfirm} {
+	for _, label := range []string{
+		Session, OAuthState, APIToken, Deploy, Upload, Anon, CLIConfirm,
+		MCPClient, MCPConsent, MCPCode, MCPRefresh, MCPAccess,
+	} {
 		k := string(Derive(secret, label))
 		if prev, dup := seen[k]; dup {
 			t.Fatalf("labels %q and %q derive the same key", prev, label)
 		}
 		seen[k] = label
 	}
-	if len(seen) != 7 {
+	if len(seen) != 12 {
 		t.Fatalf("labels = %d", len(seen))
 	}
 }

@@ -10,7 +10,9 @@
 //
 // Each check is ok, pending or failed, with a detail. Check names: worker,
 // workers-dev, hub, custom-domain, route, dns, tls, access-redirect,
-// access-bypass, workers-dev-closed, deploy-token. --json prints
+// access-bypass, access-connector (the Claude connector's four bypass paths:
+// failed once /info has mcp_url, pending before), workers-dev-closed,
+// deploy-token. --json prints
 //
 //   {"schema": 1, "worker", "accountId", "statePath",
 //    "versions": {"package", "wrangler", "deployed"},
@@ -28,7 +30,7 @@ import { dohResolves, parseAccessRedirect, probe, randomProbeLabel } from "./lib
 import { CliError, EXIT, bold, dim, green, maskSecret, red, ui, yellow } from "./lib/ui.mjs";
 
 /** The order of the checks in the output. */
-export const CHECK_NAMES = ["worker", "workers-dev", "hub", "custom-domain", "route", "dns", "tls", "access-redirect", "access-bypass", "workers-dev-closed", "deploy-token"];
+export const CHECK_NAMES = ["worker", "workers-dev", "hub", "custom-domain", "route", "dns", "tls", "access-redirect", "access-bypass", "access-connector", "workers-dev-closed", "deploy-token"];
 
 const lower = (s) => String(s ?? "").trim().toLowerCase();
 const trimUrl = (u) => String(u ?? "").trim().replace(/\/+$/, "");
@@ -218,6 +220,16 @@ export async function runStatus(opts, ctx) {
       if (!access || !domain) return null;
       const f = await accessP;
       return f.bypass.length ? check("access-bypass", "failed", f.bypass.join("; ")) : check("access-bypass", "ok", "the machine paths reach the Worker");
+    },
+    async "access-connector"() {
+      if (!access || !domain) return null;
+      const f = await accessP;
+      if (!f.connector.length) return check("access-connector", "ok", "the Claude connector's paths reach the Worker");
+      // Not a failure until the connector is on (an installation from before it, SPEC §8.4).
+      const info = await infoP;
+      const on = Boolean(info?.ok && info.status === 200 && info.json?.mcp_url);
+      if (on) return check("access-connector", "failed", f.connector.join("; "));
+      return check("access-connector", "pending", `the Claude connector paths are not bypassed yet: run ${inv} access enable before setting MCP_ENABLED (${f.connector.join("; ")})`);
     },
     async "workers-dev-closed"() {
       if (!access || !workersDevOn || !workersDevUrl) return null;

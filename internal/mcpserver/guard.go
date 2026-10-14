@@ -248,7 +248,7 @@ func within(root, p string) bool {
 // Remote files
 
 // binaryExts are file types backyard_read_site_file refuses without
-// downloading them.
+// downloading them (here and in the remote connector, internal/mcpremote).
 var binaryExts = []string{
 	".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".bmp", ".tif", ".tiff", ".heic", ".psd",
 	".pdf", ".zip", ".gz", ".tgz", ".bz2", ".xz", ".zst", ".br", ".7z", ".rar", ".tar", ".jar",
@@ -258,14 +258,16 @@ var binaryExts = []string{
 	".xls", ".xlsx", ".doc", ".docx", ".ppt", ".pptx",
 }
 
-// binaryExt reports whether p has the extension of a binary format.
-func binaryExt(p string) bool {
+// BinaryExt reports whether p has the extension of a binary format.
+func BinaryExt(p string) bool {
 	return slices.Contains(binaryExts, strings.ToLower(path.Ext(p)))
 }
 
-// looksBinary reports whether b is not readable text: invalid UTF-8, any
+// LooksBinary reports whether b is not readable text: invalid UTF-8, any
 // NUL byte, or more than 1% control characters other than tab, newlines,
 // form feed and escape.
+func LooksBinary(b []byte) bool { return looksBinary(b) }
+
 func looksBinary(b []byte) bool {
 	if !utf8.Valid(b) {
 		return true
@@ -358,12 +360,14 @@ func (s *server) configPath() string {
 	return p
 }
 
-// redactSecrets replaces every occurrence of a known credential in text.
+// redactSecrets replaces every occurrence of a known credential in text,
+// and the Claude connector's tokens, codes and registered client ids (SPEC
+// §8.4.8), which a site file or an error may quote.
 func redactSecrets(text string, secrets []string) string {
 	for _, v := range secrets {
 		text = strings.ReplaceAll(text, v, redacted)
 	}
-	return text
+	return connectorTokenRe.ReplaceAllString(text, redacted)
 }
 
 var (
@@ -375,6 +379,9 @@ var (
 	tokenJSONRe  = regexp.MustCompile(`(?i)"((?:access_|refresh_|id_)?token)"\s*:\s*"[^"]{8,}"`)
 	jwtRe        = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*`)
 	urlRe        = regexp.MustCompile("https?://[^\\s\"'<>`]+")
+	// connectorTokenRe matches the connector's credentials (the prefixes
+	// byat_, byrt_, byac_ and bydc_; internal/mcpremote scrubs the same).
+	connectorTokenRe = regexp.MustCompile(`by(?:at|rt|ac|dc)_[A-Za-z0-9_.-]{16,}`)
 )
 
 // redactError removes credentials from an error message: known tokens,

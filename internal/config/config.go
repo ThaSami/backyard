@@ -12,6 +12,7 @@ import (
 	"net/mail"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -34,6 +35,7 @@ type Config struct {
 	Sites     SitesConfig     `yaml:"sites"`
 	Files     FilesConfig     `yaml:"files"`
 	Deploy    DeployConfig    `yaml:"deploy"`
+	MCP       MCPConfig       `yaml:"mcp"`
 	RateLimit RateLimitConfig `yaml:"ratelimit"`
 	Realtime  RealtimeConfig  `yaml:"realtime"`
 	Telemetry TelemetryConfig `yaml:"telemetry"`
@@ -460,6 +462,44 @@ type DeployConfig struct {
 	// EmbeddedGateway mounts the gateway at /__backyard/api/deploy (default true).
 	EmbeddedGateway *bool `yaml:"embedded_gateway"`
 }
+
+// MCPConfig configures the remote MCP connector (SPEC §8.4, §14.1): Claude
+// and other MCP clients reach <public_url>/__backyard/mcp with OAuth tokens
+// Backyard issues itself after the browser signed in through auth.mode.
+type MCPConfig struct {
+	// Enabled serves the connector endpoint and Backyard's OAuth endpoints
+	// (default false: every connector path answers 404).
+	Enabled bool `yaml:"enabled"`
+	// Clients are the Client ID Metadata Document URLs that may connect
+	// (only these are fetched). Unset: DefaultMCPClients; [] turns CIMD off,
+	// so clients register automatically (stateless DCR).
+	Clients []string `yaml:"clients"`
+	// RedirectURIs are the exact https addresses that may receive sign-in
+	// codes (unset: DefaultMCPRedirectURIs). http loopback addresses are
+	// always allowed and are not listed.
+	RedirectURIs []string `yaml:"redirect_uris"`
+	// MaxPublishBytes caps the decoded file bytes of one backyard_publish
+	// call (default 4194304). The MCP request body limit is 2× this + 1 MiB.
+	MaxPublishBytes int64 `yaml:"max_publish_bytes"`
+}
+
+// Defaults of the mcp section.
+var (
+	// DefaultMCPClients are Claude's client metadata documents (claude.ai,
+	// Desktop, mobile and Cowork; Claude Code).
+	DefaultMCPClients = []string{
+		"https://claude.ai/oauth/mcp-oauth-client-metadata",
+		"https://claude.ai/oauth/claude-code-client-metadata",
+	}
+	// DefaultMCPRedirectURIs are Claude's OAuth callbacks.
+	DefaultMCPRedirectURIs = []string{
+		"https://claude.ai/api/mcp/auth_callback",
+		"https://claude.com/api/mcp/auth_callback",
+	}
+)
+
+// DefaultMCPMaxPublishBytes is the default of mcp.max_publish_bytes.
+const DefaultMCPMaxPublishBytes = 4 << 20
 
 // RateLimitConfig sets per-user limits (per instance). For every limit, 0
 // selects the default and a negative value = unlimited (that limit is
@@ -926,6 +966,25 @@ func (c *Config) ApplyDefaults() {
 		dp.EmbeddedGateway = &t
 	}
 
+	mc := &c.MCP
+	// nil (unset) selects the defaults; an explicit [] stays empty. Entries
+	// are compared byte for byte, so only surrounding space is removed.
+	if mc.Clients == nil {
+		mc.Clients = append([]string(nil), DefaultMCPClients...)
+	}
+	if mc.RedirectURIs == nil {
+		mc.RedirectURIs = append([]string(nil), DefaultMCPRedirectURIs...)
+	}
+	for i := range mc.Clients {
+		mc.Clients[i] = strings.TrimSpace(mc.Clients[i])
+	}
+	for i := range mc.RedirectURIs {
+		mc.RedirectURIs[i] = strings.TrimSpace(mc.RedirectURIs[i])
+	}
+	if mc.MaxPublishBytes == 0 {
+		mc.MaxPublishBytes = DefaultMCPMaxPublishBytes
+	}
+
 	r := &c.RateLimit
 	setDefaultInt(&r.APIPerMinute, 600)
 	setDefaultInt(&r.DBWritesPerMinute, 300)
@@ -1177,12 +1236,133 @@ func (c *Config) Validate() error {
 	if c.Deploy.AllowAnonymous && c.Auth.Mode != "none" {
 		add("deploy.allow_anonymous is only allowed with auth.mode=none")
 	}
+	errs = append(errs, c.validateMCP()...)
 	switch c.Telemetry.LogFormat {
 	case "json", "text":
 	default:
 		add("telemetry.log_format must be json or text")
 	}
 	return errors.Join(errs...)
+}
+
+// validateMCP checks the mcp section (SPEC §12; rules 1–6 of the connector
+// design). The entry rules apply whether or not the connector is enabled.
+func (c *Config) validateMCP() []error {
+	var errs []error
+	add := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
+	m := c.MCP
+	for _, e := range m.Clients {
+		if !validMCPClientURL(e) {
+			add("mcp.clients: %q is not a client metadata URL (an https URL with a path, without query, fragment or user info, at most 512 bytes)", e)
+		}
+	}
+	hub := ""
+	if u, err := url.Parse(c.Server.PublicURL); err == nil {
+		hub = bareHost(u.Hostname())
+	}
+	base := bareHost(c.Server.BaseDomain)
+	for _, e := range m.RedirectURIs {
+		u, ok := parseMCPRedirectURI(e)
+		if !ok {
+			add("mcp.redirect_uris: %q is not an https redirect URI without fragment or user info (at most 512 bytes; loopback redirect URIs are always allowed and are not listed)", e)
+		}
+		if u == nil {
+			continue
+		}
+		if h := bareHost(u.Hostname()); h != "" && (h == hub || (base != "" && (h == base || strings.HasSuffix(h, "."+base)))) {
+			add("mcp.redirect_uris: %q points at this Backyard or one of its sites", e)
+		}
+	}
+	// The comparison with sites.max_site_bytes applies only while the
+	// connector is on, so an existing small sites.max_site_bytes keeps
+	// validating after an upgrade.
+	if v := m.MaxPublishBytes; v < 64<<10 || v > 64<<20 || (m.Enabled && v > c.Sites.MaxSiteBytes) {
+		add("mcp.max_publish_bytes must be between 65536 and 67108864 and at most sites.max_site_bytes")
+	}
+	if !m.Enabled {
+		return errs
+	}
+	if !mcpPublicURLOK(c.Server.PublicURL) {
+		add("mcp.enabled requires server.public_url to be https (http only on localhost, *.localhost or loopback addresses) without a path, query or fragment")
+	}
+	if c.Auth.Mode == "oidc" {
+		if u, err := url.Parse(strings.TrimSpace(c.Auth.OIDC.RedirectURL)); err == nil && path.Clean("/"+u.Path) == "/__backyard/auth/authorize" {
+			add("auth.oidc.redirect_url must not be /__backyard/auth/authorize while mcp.enabled is true")
+		}
+	}
+	return errs
+}
+
+// maxMCPURLBytes bounds the entries of mcp.clients and mcp.redirect_uris.
+const maxMCPURLBytes = 512
+
+// validMCPClientURL reports whether e may be listed in mcp.clients: an https
+// URL whose host is a name (not an IP literal), with a path other than "/"
+// and without dot segments, query, fragment or user info.
+func validMCPClientURL(e string) bool {
+	if e == "" || len(e) > maxMCPURLBytes || strings.ContainsAny(e, "?#\\ ") {
+		return false
+	}
+	u, err := url.Parse(e)
+	if err != nil || u.Scheme != "https" || u.Opaque != "" || u.User != nil || u.Host == "" || u.Hostname() == "" {
+		return false
+	}
+	if net.ParseIP(strings.Trim(u.Hostname(), "[]")) != nil {
+		return false
+	}
+	if u.Path == "" || u.Path == "/" || !strings.HasPrefix(u.Path, "/") {
+		return false
+	}
+	for _, seg := range strings.Split(u.Path, "/") {
+		if seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// parseMCPRedirectURI parses an mcp.redirect_uris entry. ok reports whether it
+// is an https URL with a host and without fragment or user info, at most 512
+// bytes; u is the parsed URL whenever it has a host (for further checks).
+func parseMCPRedirectURI(e string) (u *url.URL, ok bool) {
+	u, err := url.Parse(e)
+	if err != nil || u.Host == "" {
+		return nil, false
+	}
+	ok = e != "" && len(e) <= maxMCPURLBytes && u.Scheme == "https" && u.Opaque == "" && u.User == nil &&
+		u.Hostname() != "" && !strings.Contains(e, "#") && !strings.ContainsAny(e, "\\ ")
+	return u, ok
+}
+
+// mcpPublicURLOK reports whether public_url can be the connector's issuer:
+// http(s) without a path, query or fragment, and https unless its host is a
+// loopback host (localhost, *.localhost, 127.0.0.0/8, [::1]).
+func mcpPublicURLOK(pu string) bool {
+	u, err := url.Parse(strings.TrimSpace(pu))
+	if err != nil || u.Host == "" || u.Hostname() == "" || u.Opaque != "" || u.User != nil {
+		return false
+	}
+	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(pu, "#") {
+		return false
+	}
+	switch u.Scheme {
+	case "https":
+		return true
+	case "http":
+		return LoopbackHost(u.Hostname())
+	}
+	return false
+}
+
+// LoopbackHost reports whether h (a hostname without port) is localhost, a
+// *.localhost name, a 127.0.0.0/8 literal or ::1.
+func LoopbackHost(h string) bool {
+	h = bareHost(h)
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }
 
 // ---------------------------------------------------------------------------

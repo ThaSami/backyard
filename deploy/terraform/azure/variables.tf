@@ -588,7 +588,7 @@ variable "log_retention_days" {
 }
 
 variable "extra_config_yaml" {
-  description = "Additional backyard.yaml sections appended to the rendered config, limited to top-level keys the module does not render: identity, warehouse, sites, files, ratelimit, realtime. $${VAR} references are expanded from the container environment (see extra_env / extra_secret_env)."
+  description = "Additional backyard.yaml sections appended to the rendered config, limited to top-level keys the module does not render: identity, warehouse, sites, files, ratelimit, realtime, mcp (mcp.enabled turns on the Claude connector). $${VAR} references are expanded from the container environment (see extra_env / extra_secret_env)."
   type        = string
   default     = ""
 
@@ -598,8 +598,8 @@ variable "extra_config_yaml" {
   }
 
   validation {
-    condition     = trimspace(var.extra_config_yaml) == "" || alltrue([for k in try(keys(yamldecode(var.extra_config_yaml)), []) : contains(["identity", "warehouse", "sites", "files", "ratelimit", "realtime"], k)])
-    error_message = "extra_config_yaml may only contain the top-level keys identity, warehouse, sites, files, ratelimit and realtime; the other sections are rendered from module variables."
+    condition     = trimspace(var.extra_config_yaml) == "" || alltrue([for k in try(keys(yamldecode(var.extra_config_yaml)), []) : contains(["identity", "warehouse", "sites", "files", "ratelimit", "realtime", "mcp"], k)])
+    error_message = "extra_config_yaml may only contain the top-level keys identity, warehouse, sites, files, ratelimit, realtime and mcp; the other sections are rendered from module variables."
   }
 }
 

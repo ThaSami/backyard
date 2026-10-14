@@ -208,10 +208,15 @@ export function gatewayURL(ctx: RequestContext): string {
   return ctx.origin + "/__backyard/api/deploy";
 }
 
-/** Whether the client prefers JSON errors (API paths or Accept: application/json). */
+/**
+ * Whether the client prefers JSON errors: API paths, the OAuth discovery
+ * documents of the hub (/.well-known/oauth-*, SPEC §8.4.2) or Accept:
+ * application/json.
+ */
 export function wantsJSON(ctx: RequestContext): boolean {
   const p = ctx.path;
   if (p.startsWith("/__backyard/") && !p.startsWith("/__backyard/files/") && !p.startsWith("/__backyard/auth/")) return true;
+  if (ctx.kind === "hub" && p.startsWith("/.well-known/oauth-")) return true;
   const accept = ctx.req.headers.get("Accept") ?? "";
   return accept.includes("application/json") && !accept.includes("text/html");
 }

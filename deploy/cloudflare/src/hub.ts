@@ -1,7 +1,9 @@
 /**
  * Hub host requests (SPEC §2): the hub UI, /docs, /llms.txt, the hub API
- * (/me, /sites, /tokens, /info), the deploy gateway and the auth endpoints
- * (/__backyard/auth/cli browser → CLI token handoff, login, logout).
+ * (/me, /sites, /tokens, /info, /mcp/grants), the deploy gateway, the auth
+ * endpoints (/__backyard/auth/cli browser → CLI token handoff, login, logout,
+ * authorize) and the Claude connector's machine paths (/__backyard/mcp,
+ * /__backyard/oauth/*, the OAuth discovery documents; SPEC §8.4, §14.1).
  */
 import { hubDirExists, serveHubFile, serveSDK, serveText } from "./assets";
 import { ANON_COOKIE, authenticate, cookieString, isCookieConflict } from "./auth";
@@ -12,7 +14,23 @@ import { HttpError, badRequest, forbidden, isPlainObject, json, methodNotAllowed
 import { cleanUser, type User } from "./identity";
 import { issueAPIToken } from "./jwt";
 import { docMarkdown, llmsFullTxt, llmsTxt } from "./llms";
-import { authErrorPage, cliConfirmPage, tokenPage } from "./pages";
+import { serveMcp } from "./mcp";
+import {
+  AUTHORIZE_PATH,
+  MCP_NOT_ENABLED,
+  MCP_PATH,
+  OAUTH_PREFIX,
+  isGrantsPath,
+  listMcpGrants,
+  mcpEnabled,
+  mcpPathGate,
+  revokeMcpGrant,
+  revokeMcpGrants,
+  serveAuthorize,
+  serveOAuth,
+  serveOAuthMetadata,
+} from "./oauth";
+import { authErrorPage, cliConfirmPage, formActionSource, tokenPage } from "./pages";
 import { redirect, siteURL, type RequestContext } from "./router";
 import { apiGate, dispatch } from "./site-api";
 import { siteMetaJSON } from "./sitemeta";
@@ -25,7 +43,12 @@ export async function serveHub(ctx: RequestContext): Promise<Response> {
     if (ctx.req.method !== "GET" && ctx.req.method !== "HEAD") throw methodNotAllowed(["GET", "HEAD"]);
     return serveSDK(ctx);
   }
+  // The connector's machine paths never read or set cookies (SPEC §8.4.1):
+  // they are served before anything authenticates.
+  if (p.startsWith("/.well-known/oauth-")) return serveOAuthMetadata(ctx);
   if (p === "/__backyard/auth" || p.startsWith("/__backyard/auth/")) return serveAuth(ctx);
+  if (p === MCP_PATH) return mcpPathGate(ctx) ?? serveMcp(ctx);
+  if (p.startsWith(OAUTH_PREFIX)) return serveOAuth(ctx);
   if (p === "/__backyard/api/info") {
     if (ctx.req.method !== "GET" && ctx.req.method !== "HEAD") throw methodNotAllowed(["GET", "HEAD"]);
     return json(infoDocument(ctx), 200, { "Cache-Control": "no-cache" });
@@ -33,6 +56,7 @@ export async function serveHub(ctx: RequestContext): Promise<Response> {
   if (p === "/__backyard/api/deploy" || p.startsWith("/__backyard/api/deploy/")) {
     return serveGateway(ctx, p.slice("/__backyard/api/deploy".length) || "/");
   }
+  if (isGrantsPath(p) && !mcpEnabled(ctx)) throw notFound(MCP_NOT_ENABLED);
   if (p === "/__backyard/api" || p.startsWith("/__backyard/api/")) {
     const user = await apiGate(ctx);
     return dispatch(ctx, user, p.slice("/__backyard/api".length) || "/", HUB_ROUTES);
@@ -45,6 +69,10 @@ const HUB_ROUTES = [
   { method: "GET", re: /^\/me$/, h: async (_c: RequestContext, u: User) => json(cleanUser(u)) },
   { method: "GET", re: /^\/sites$/, h: listSites },
   { method: "POST", re: /^\/tokens$/, h: mintToken },
+  // The Claude connector's connections (SPEC §8.4.7).
+  { method: "GET", re: /^\/mcp\/grants$/, h: listMcpGrants },
+  { method: "DELETE", re: /^\/mcp\/grants$/, h: revokeMcpGrants },
+  { method: "DELETE", re: /^\/mcp\/grants\/([^/]+)$/, h: revokeMcpGrant },
 ];
 
 async function listSites(ctx: RequestContext): Promise<Response> {
@@ -305,6 +333,7 @@ export function safeReturnTo(ctx: RequestContext, raw: string): string {
 
 async function serveAuth(ctx: RequestContext): Promise<Response> {
   const p = ctx.path;
+  if (p === AUTHORIZE_PATH) return serveAuthorize(ctx);
   if (p === "/__backyard/auth/cli") {
     // GET, or POST from the confirmation page. Not HEAD: minting a token on
     // HEAD would be a pointless side effect.
@@ -450,12 +479,6 @@ async function verifyCLIConfirmation(ctx: RequestContext, u: User, req: CLIReque
   if (!mac) return false;
   const { key, msg } = await cliConfirmMAC(ctx, u, req, exp);
   return crypto.subtle.verify("HMAC", key, mac, msg);
-}
-
-/** The CSP form-action source of a loopback redirect (CSP cannot name IPv6 hosts: [::1] needs "http:"). */
-function formActionSource(u: URL | null): string {
-  if (!u) return "";
-  return u.hostname.includes(":") ? "http:" : `http://${u.host.toLowerCase()}`;
 }
 
 /** Asks the user whether the CLI may sign in as them (a request another site may have started). */

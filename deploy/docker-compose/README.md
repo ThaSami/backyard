@@ -121,6 +121,25 @@ in through the browser. The static `deploy` token keeps working for CI.
 Behind an identity-aware proxy instead (Cloudflare Access, Pomerium, oauth2-proxy, …) use
 `auth.mode: header` — see `backyard config example`.
 
+### Claude connector (optional)
+
+To let people publish sites from Claude with their sign-in, add to `backyard.yaml`:
+
+```yaml
+mcp:
+  enabled: true
+```
+
+and add `https://backyard.acme.com/__backyard/mcp` to Claude as a custom connector (see the
+[Claude connector guide](../../docs/claude-connector.md)). Caddy needs nothing else: it has no
+request body limit. It needs a sign-in (step 4) to publish as a person; with `auth.mode: none`
+the connector is a guest and can publish only with `deploy.allow_anonymous`. Hosted Claude
+reaches the server from `160.79.104.0/21`, so the four machine paths (`/__backyard/mcp`,
+`/__backyard/oauth/*`, `/.well-known/oauth-authorization-server`,
+`/.well-known/oauth-protected-resource/__backyard/mcp`) must be reachable from there; behind an
+identity-aware proxy, exempt exactly those from its login and keep
+`/__backyard/auth/authorize` behind it.
+
 ### 5. Start and upgrade
 
 ```sh

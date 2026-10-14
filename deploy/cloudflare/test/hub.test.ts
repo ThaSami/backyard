@@ -134,7 +134,8 @@ describe("hub", () => {
     const site = uniqueSite("failclosed");
     await deploy(site, { "index.html": "secret page" });
     for (const mode of ["oidc", "okta", "cf-access", "cloudflare-access", "acess", "true"]) {
-      const env = { AUTH_MODE: mode, ACCESS_TEAM_DOMAIN: "acme", ACCESS_AUD: "aud" };
+      // The Claude connector's paths fail closed too, also while it is enabled.
+      const env = { AUTH_MODE: mode, ACCESS_TEAM_DOMAIN: "acme", ACCESS_AUD: "aud", MCP_ENABLED: "true" };
       for (const [path, init] of [
         [`/s/${site}/`, {}],
         ["/", {}],
@@ -143,6 +144,14 @@ describe("hub", () => {
         ["/__backyard/api/deploy/sites", { headers: tokenHeaders() }],
         ["/__backyard/api/info", {}],
         ["/__backyard/auth/cli?mode=display", {}],
+        ["/__backyard/mcp", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer byat_x.y" }, body: '{"jsonrpc":"2.0","id":1,"method":"ping"}' }],
+        ["/__backyard/oauth/register", { method: "POST", headers: { "Content-Type": "application/json" }, body: '{"redirect_uris":["http://127.0.0.1:9/cb"]}' }],
+        ["/__backyard/oauth/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "grant_type=refresh_token" }],
+        ["/__backyard/oauth/revoke", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "token=x" }],
+        ["/.well-known/oauth-authorization-server", {}],
+        ["/.well-known/oauth-protected-resource/__backyard/mcp", {}],
+        ["/__backyard/auth/authorize?client_id=x", {}],
+        ["/__backyard/api/mcp/grants", {}],
       ] as const) {
         const res = await call(path, init as RequestInit, env);
         expect(res.status, `${mode} ${path}`).toBe(503);

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/thasami/backyard/internal/config"
+	"github.com/thasami/backyard/internal/docstore"
 	"github.com/thasami/backyard/internal/identity"
 )
 
@@ -23,6 +24,13 @@ type Options struct {
 	Logger *slog.Logger
 	// Now overrides the clock (tests).
 	Now func() time.Time
+	// Docs stores the grants of the MCP connector's authorization server;
+	// required by New when mcp.enabled is true (nil for NewBearer).
+	Docs docstore.Store
+	// MCPHTTPClient replaces the SSRF-guarded client that fetches client
+	// metadata documents (tests only). Redirects are never followed and the
+	// 5 s timeout applies either way.
+	MCPHTTPClient *http.Client
 }
 
 // New builds the authenticator for cfg.Auth.Mode. For mode "oidc" it performs
@@ -75,6 +83,11 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (Authenticator, 
 	}
 	if a.mode != ModeOIDC {
 		a.initIDPBearer(ctx)
+	}
+	if cfg.MCP.Enabled {
+		if a.mcp, err = newMCP(a, opts); err != nil {
+			return nil, err
+		}
 	}
 	return a, nil
 }

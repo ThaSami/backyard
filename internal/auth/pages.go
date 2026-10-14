@@ -22,10 +22,30 @@ type pageData struct {
 	Nonce     string
 	// Confirm renders the CLI login confirmation form.
 	Confirm *cliConfirmForm
-	// formAction is an extra CSP form-action source for Confirm (the
-	// target of the redirect that answers the form).
+	// Consent renders the consent page of the MCP connector.
+	Consent *consentForm
+	// formAction is an extra CSP form-action source for Confirm and Consent
+	// (the target of the redirect that answers the form).
 	formAction string
 }
+
+// consentForm feeds the consent page (SPEC §8.4.5).
+type consentForm struct {
+	Who        string // email, name or id of the signed-in user ("Guest 1a2b")
+	Guest      bool   // mode none: the app acts as this browser's guest
+	SignOutURL string // "" where Backyard has no logout
+	ClientName string
+	Verified   bool   // CIMD: the name comes from an allowlisted document
+	ClientHost string // CIMD: host of the client_id URL
+	Origin     string // origin of the redirect URI
+	Loopback   bool   // the redirect URI is an app on this computer
+	Host       string // H, the hub host
+	Until      string // YYYY-MM-DD (UTC) the connection lasts until
+	Fields     []formField
+}
+
+// formField is a hidden input of the consent form.
+type formField struct{ Name, Value string }
 
 var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
 <html lang="en">
@@ -54,6 +74,10 @@ button { margin-top:8px; font:inherit; padding:6px 14px; border-radius:8px; bord
   background:var(--accent); color:var(--card); cursor:pointer; }
 form { margin-top:16px; display:flex; flex-wrap:wrap; align-items:center; gap:16px; }
 form button { margin-top:0; }
+#deny { background:transparent; color:var(--fg); }
+#consent button { visibility:hidden; animation: by-arm 0s linear 0.8s forwards; }
+@keyframes by-arm { to { visibility: visible } }
+.warn { border-left:3px solid var(--accent); padding-left:10px; }
 </style>
 </head>
 <body>
@@ -84,6 +108,19 @@ document.getElementById("copy").addEventListener("click", function () {
 <input type="hidden" name="csrf" value="{{.CSRF}}">
 <button id="allow" type="submit">Allow</button>
 <a id="cancel" href="{{.CancelURL}}">Cancel</a>
+</form>
+{{end}}
+{{with .Consent}}
+<p id="consent-user">{{if .Guest}}<strong>{{.Who}}</strong>. This Backyard has no sign-in; the app will act as this browser's guest.{{else}}You are signed in as <strong>{{.Who}}</strong>.{{end}}{{if .SignOutURL}} <a href="{{.SignOutURL}}">Not you? Sign out</a>{{end}}</p>
+<p id="consent-app">{{if .Verified}}<strong>{{.ClientName}}</strong> — verified by <strong>{{.ClientHost}}</strong>{{else}}<strong>"{{.ClientName}}"</strong> (name provided by the app, not verified){{end}} wants to use Backyard as you.</p>
+<p id="consent-return">{{if .Loopback}}Backyard will send the approval to <strong>an app on this computer ({{.Origin}})</strong>. Only continue if you just started the sign-in from an app on this computer.{{else}}Backyard will send the approval to <strong>{{.Origin}}</strong>.{{end}}</p>
+<p>The app can see the sites on {{.Host}} and read their files, and publish or change sites as you. Published sites are visible to everyone who can sign in to this Backyard.</p>
+<p class="muted">This connection lasts until {{.Until}} unless you disconnect it on the Backyard hub.</p>
+<p class="warn">Only allow this if you started connecting {{.ClientName}} to Backyard yourself just now. Anyone who sent you this link would get this access.</p>
+<form id="consent" method="post" action="/__backyard/auth/authorize">
+{{range .Fields}}<input type="hidden" name="{{.Name}}" value="{{.Value}}">
+{{end}}<button type="submit" name="decision" value="allow" id="allow">Allow</button>
+<button type="submit" name="decision" value="deny" id="deny">Cancel</button>
 </form>
 {{end}}
 {{if .LinkURL}}<p><a href="{{.LinkURL}}">{{.LinkText}}</a></p>{{end}}
@@ -118,11 +155,17 @@ func renderPage(w http.ResponseWriter, status int, d pageData) {
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("X-Frame-Options", "DENY")
 	formAction := "'none'"
-	if d.Confirm != nil {
+	if d.Confirm != nil || d.Consent != nil {
 		formAction = strings.TrimSpace("'self' " + d.formAction)
 	}
-	h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-"+d.Nonce+
-		"'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action "+formAction)
+	if d.Consent != nil {
+		// The consent page has no script at all.
+		h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; "+
+			"frame-ancestors 'none'; base-uri 'none'; form-action "+formAction)
+	} else {
+		h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-"+d.Nonce+
+			"'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action "+formAction)
+	}
 	w.WriteHeader(status)
 	_, _ = w.Write(buf.Bytes())
 }

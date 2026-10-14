@@ -831,16 +831,16 @@ variable "ai_api_keys" {
 # -----------------------------------------------------------------------------
 
 variable "config_overrides" {
-  description = "YAML with additional top-level Backyard config sections that the module does not manage: identity, warehouse, sites, files, ratelimit, realtime. Use $$${VAR} for environment references (see extra_environment / extra_secrets)."
+  description = "YAML with additional top-level Backyard config sections that the module does not manage: identity, warehouse, sites, files, ratelimit, realtime, mcp (mcp.enabled turns on the Claude connector). Use $$${VAR} for environment references (see extra_environment / extra_secrets)."
   type        = string
   default     = null
 
   validation {
     condition = var.config_overrides == null ? true : (
       can(keys(yamldecode(var.config_overrides))) &&
-      alltrue([for k in try(keys(yamldecode(var.config_overrides)), []) : contains(["identity", "warehouse", "sites", "files", "ratelimit", "realtime"], k)])
+      alltrue([for k in try(keys(yamldecode(var.config_overrides)), []) : contains(["identity", "warehouse", "sites", "files", "ratelimit", "realtime", "mcp"], k)])
     )
-    error_message = "config_overrides must be a YAML mapping whose keys are among identity, warehouse, sites, files, ratelimit, realtime (the other sections are generated from module variables)."
+    error_message = "config_overrides must be a YAML mapping whose keys are among identity, warehouse, sites, files, ratelimit, realtime, mcp (the other sections are generated from module variables)."
   }
 }
 

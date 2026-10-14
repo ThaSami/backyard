@@ -103,7 +103,7 @@ describe("backyard-cloudflare status", () => {
     assert.match(r.out, /Domain: {7}backyard\.example\.com \(path mode, active, cli\)/);
     assert.match(r.out, /Access: {7}team acme\.cloudflareaccess\.com · AUD [0-9a-f]{64} \(api\)/);
     assert.match(r.out, /Deploy token: byd_…cdef/);
-    for (const name of ["worker", "workers-dev", "hub", "custom-domain", "tls", "access-redirect", "access-bypass", "workers-dev-closed", "deploy-token"]) {
+    for (const name of ["worker", "workers-dev", "hub", "custom-domain", "tls", "access-redirect", "access-bypass", "access-connector", "workers-dev-closed", "deploy-token"]) {
       assert.match(r.out, new RegExp(`^  ok {7}${name} `, "m"), name);
     }
     assert.match(r.out, /All checks passed\./);
@@ -124,7 +124,7 @@ describe("backyard-cloudflare status", () => {
     assert.deepEqual(j.access, { team: TEAM, aud: JSON.parse(before).access.aud, source: "api" });
     assert.deepEqual(
       j.checks.map((c) => c.name),
-      ["worker", "workers-dev", "hub", "custom-domain", "tls", "access-redirect", "access-bypass", "workers-dev-closed", "deploy-token"],
+      ["worker", "workers-dev", "hub", "custom-domain", "tls", "access-redirect", "access-bypass", "access-connector", "workers-dev-closed", "deploy-token"],
     );
     for (const c of j.checks) {
       assert.deepEqual(Object.keys(c), ["name", "status", "detail"]);
@@ -157,6 +157,40 @@ describe("backyard-cloudflare status", () => {
     assert.equal(human.code, 4);
     assert.match(human.out, /^ {2}failed {3}access-bypass {7}the bypass application is missing/m);
     assert.match(human.out, /1 check needs attention\./);
+  });
+
+  it("reports the Claude connector's bypass paths: pending before MCP_ENABLED, failed after", async () => {
+    const sb = await accessSandbox();
+    // A bypass application from before the connector: the five machine paths only.
+    const connector = ["/__backyard/mcp", "/__backyard/oauth/*", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource/__backyard/mcp"];
+    sb.updateCf((s) => {
+      const app = s.access.acc1.apps.find((a) => a.name === "Backyard (backyard) machine endpoints");
+      app.destinations = app.destinations.filter((d) => !connector.some((p) => d.uri.endsWith(p)));
+    });
+    const missing = connector.map((p) => `the bypass application is missing ${HOST}${p}`).join("; ");
+    let r = await sb.run(["status", "--json"]);
+    assert.equal(r.code, 4, r.out);
+    let c = checksOf(JSON.parse(r.stdout));
+    assert.equal(c["access-connector"].status, "pending");
+    assert.equal(c["access-connector"].detail, `the Claude connector paths are not bypassed yet: run npm run cf -- access enable before setting MCP_ENABLED (${missing})`);
+    assert.equal(c["access-bypass"].status, "ok", "the machine endpoints are fine");
+    const human = await sb.run(["status"]);
+    assert.match(human.out, /^ {2}pending {2}access-connector {4}the Claude connector paths are not bypassed yet/m);
+    assert.match(human.out, /1 check needs attention\./);
+    // MCP_ENABLED is on (/info has mcp_url): now a failure.
+    sb.updateCf((s) => (s.workers.backyard.vars.MCP_ENABLED = "true"));
+    r = await sb.run(["status", "--json"]);
+    assert.equal(r.code, 4, r.out);
+    c = checksOf(JSON.parse(r.stdout));
+    assert.equal(c["access-connector"].status, "failed");
+    assert.equal(c["access-connector"].detail, missing);
+    // access enable puts them back: ok, with the connector on.
+    r = await sb.run(["access", "enable", "--wait", "0"], { BACKYARD_CF_API_TOKEN: ADMIN });
+    assert.equal(r.code, 0, r.out);
+    r = await sb.run(["status", "--json"]);
+    c = checksOf(JSON.parse(r.stdout));
+    assert.equal(c["access-connector"].status, "ok", c["access-connector"].detail);
+    assert.equal(c["access-connector"].detail, "the Claude connector's paths reach the Worker");
   });
 
   it("skips the Cloudflare checks when not logged in, without opening the browser (exit 4)", async () => {

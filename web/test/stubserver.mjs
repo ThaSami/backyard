@@ -117,6 +117,10 @@ function wsAccept(req, socket, handlers) {
  * tokens: {"<bearer token>": User} — the accounts of API tokens, as the deploy
  * gateway's GET /me reports them (requireToken is "token:deploy", an admin).
  * maxEventDocBytes: db events of larger documents are sent with "doc": null.
+ * mcp: the Claude connector is enabled: /info has mcp_url and the grants API
+ * answers (SPEC §8.4.7); mcp.grants seeds the connections (Grant objects,
+ * user.id is the owner). Without it the grants API answers 404, as the
+ * servers do with the connector off.
  * Returns { url, state, close() }.
  */
 export async function startStub(opts = {}) {
@@ -133,6 +137,7 @@ export async function startStub(opts = {}) {
     logins: [], // rd parameters of /__backyard/auth/login visits
     bucket: [], // requests the presigned "bucket" received: { method, path, headers }
     requireToken: opts.requireToken || "",
+    grants: opts.mcp && Array.isArray(opts.mcp.grants) ? opts.mcp.grants.map((g) => ({ ...g })) : [],
     seq: 0,
   };
   let base = "";
@@ -265,7 +270,7 @@ export async function startStub(opts = {}) {
     const method = req.method;
     const user = userFor(req);
     const body = method === "GET" ? Buffer.alloc(0) : await readBody(req);
-    const entry = { method, path, site, headers: req.headers, body };
+    const entry = { method, path, query: new URL(req.url, base).search, site, headers: req.headers, body };
     state.requests.push(entry);
     if (method !== "GET" && method !== "HEAD" && !path.startsWith("/deploy/uploads/") && req.headers["x-backyard"] !== "1") {
       return apiError(res, 403, "forbidden", 'missing "X-Backyard: 1" header');
@@ -283,8 +288,31 @@ export async function startStub(opts = {}) {
         auth: { mode: "none", anonymous_deploy: !state.requireToken },
         methods: ["api"],
         limits: { max_site_bytes: 524288000, max_files: 10000, max_file_bytes: 104857600 },
+        ...(opts.mcp ? { mcp_url: base + "/__backyard/mcp" } : {}),
         ...(opts.info || {}),
       });
+    }
+    // Connector connections (SPEC §8.4.7): the caller's own; other people's for admins.
+    if (path === "/mcp/grants" || path.startsWith("/mcp/grants/")) {
+      if (!opts.mcp) return apiError(res, 404, "not_found", "the Claude connector is not enabled on this server");
+      const who = new URL(req.url, base).searchParams.get("user");
+      if (who !== null && who !== user.id && !user.admin) return apiError(res, 403, "forbidden", "only admins can manage other people's connections");
+      const owner = who === null ? user.id : who;
+      if (path === "/mcp/grants" && method === "GET") return json(res, 200, { grants: state.grants.filter((g) => g.user.id === owner) });
+      if (path === "/mcp/grants" && method === "DELETE") {
+        const before = state.grants.length;
+        state.grants = state.grants.filter((g) => g.user.id !== owner);
+        return json(res, 200, { revoked: before - state.grants.length });
+      }
+      if ((m = /^\/mcp\/grants\/([^/]+)$/.exec(path)) && method === "DELETE") {
+        const id = decodeURIComponent(m[1]);
+        const g = state.grants.find((x) => x.id === id && (x.user.id === user.id || user.admin));
+        if (!g) return apiError(res, 404, "not_found", "no such connection");
+        state.grants = state.grants.filter((x) => x !== g);
+        res.writeHead(204);
+        return res.end();
+      }
+      return apiError(res, 405, "bad_request", "method not allowed");
     }
     if (path === "/me") return json(res, 200, user);
     if (path === "/sites") return json(res, 200, { sites: state.sites });

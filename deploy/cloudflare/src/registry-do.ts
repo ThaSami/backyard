@@ -1,12 +1,42 @@
 /**
  * RegistryDO: the single platform-wide Durable Object (idFromName("registry"))
- * holding the site list with SiteMeta, the user cache behind GET /users/{email}
- * and the daily guardrail counters of the free-tier edition (SPEC §16).
+ * holding the site list with SiteMeta, the user cache behind GET /users/{email},
+ * the daily guardrail counters of the free-tier edition and the grants of the
+ * Claude connector (SPEC §8.4.8, §16).
  */
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import { fail, internal, ok, type Result } from "./http";
 import type { User } from "./identity";
+import type { McpGrantRecord } from "./oauth";
+
+/** Outcome of rotating a grant (SPEC §8.4.8). */
+export type RotateOutcome = "ok" | "grace" | "reuse" | "missing";
+
+/** Seconds within which a rotated refresh token still gets its successor (SPEC §8.4.11). */
+const MCP_REFRESH_GRACE = 60;
+
+/** Most grants listed at once. */
+const MCP_MAX_GRANTS = 200;
+
+/** A row of mcp_grants. */
+interface GrantRow {
+  id: string;
+  user_id: string;
+  data: string;
+  created_at: number;
+  code_exp: number;
+  redeemed_at: number | null;
+  exp: number;
+}
+
+const GRANT_COLUMNS = "id, user_id, data, created_at, code_exp, redeemed_at, exp";
+
+/** A stored grant: the columns plus the JSON of the other fields. */
+function grantOf(r: GrantRow): McpGrantRecord {
+  const d = JSON.parse(r.data) as Omit<McpGrantRecord, "id" | "user_id" | "created_at" | "code_exp" | "redeemed_at" | "exp">;
+  return { ...d, id: r.id, user_id: r.user_id, created_at: r.created_at, code_exp: r.code_exp, redeemed_at: r.redeemed_at ?? null, exp: r.exp };
+}
 
 /** SiteMeta as stored (the Worker adds the URL per request). */
 export interface SiteRecord {
@@ -67,6 +97,15 @@ export class RegistryDO extends DurableObject<Env> {
     this.sql.exec(`CREATE INDEX IF NOT EXISTS users_email ON users (email)`);
     // Slots of max_sites held by first deploys between their commit and putSite.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS site_reservations (name TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)`);
+    // Claude connector (SPEC §8.4.8): one grant per consent (times in unix
+    // seconds; data holds the other fields as JSON) and one marker per issued
+    // refresh-token generation.
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS mcp_grants (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL, code_exp INTEGER NOT NULL, redeemed_at INTEGER, exp INTEGER NOT NULL)`,
+    );
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS mcp_grants_user ON mcp_grants (user_id)`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS mcp_grants_exp ON mcp_grants (exp)`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS mcp_rotations (gid TEXT NOT NULL, n INTEGER NOT NULL, at INTEGER NOT NULL, exp INTEGER NOT NULL, PRIMARY KEY (gid, n))`);
   }
 
   /** Sites plus live reservations of names that are not sites yet. */
@@ -255,5 +294,131 @@ export class RegistryDO extends DurableObject<Env> {
   /** Liveness check for /readyz. */
   async ping(): Promise<Result<string>> {
     return ok("ok");
+  }
+
+  // --- Claude connector grants (SPEC §8.4.8) ---------------------------------
+
+  private grantRow(id: string): GrantRow | undefined {
+    return this.sql.exec(`SELECT ${GRANT_COLUMNS} FROM mcp_grants WHERE id = ?`, id).toArray()[0] as GrantRow | undefined;
+  }
+
+  private dropGrant(id: string): void {
+    this.sql.exec("DELETE FROM mcp_rotations WHERE gid = ?", id);
+    this.sql.exec("DELETE FROM mcp_grants WHERE id = ?", id);
+  }
+
+  /** Stores a new (pending) grant, after pruning expired grants and rotation markers. */
+  async mcpGrantCreate(g: McpGrantRecord): Promise<Result<null>> {
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      const { id, user_id, created_at, code_exp, redeemed_at, exp, ...rest } = g;
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec("DELETE FROM mcp_grants WHERE exp < ?", now);
+        this.sql.exec("DELETE FROM mcp_rotations WHERE exp < ?", now);
+        this.sql.exec(
+          `INSERT INTO mcp_grants (${GRANT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          id,
+          user_id,
+          JSON.stringify(rest),
+          created_at,
+          code_exp,
+          redeemed_at ?? null,
+          exp,
+        );
+      });
+      return ok(null);
+    } catch (e) {
+      return failure(e, "saving the connection");
+    }
+  }
+
+  /** One grant (pending, redeemed or expired), or null. */
+  async mcpGrantGet(id: string): Promise<Result<McpGrantRecord | null>> {
+    try {
+      const r = this.grantRow(id);
+      return ok(r ? grantOf(r) : null);
+    } catch (e) {
+      return failure(e, "reading the connection");
+    }
+  }
+
+  /**
+   * rotate (SPEC §8.4.8), the only state transition of a grant, in one
+   * transaction: code redemption calls it with from=0, grace=false (and the
+   * grant's family expiry, which becomes its expiry); refreshing generation n
+   * with from=n, grace=true. now is unix seconds.
+   */
+  async mcpRotate(gid: string, from: number, now: number, grace: boolean, familyExp: number): Promise<Result<RotateOutcome>> {
+    try {
+      const outcome = this.ctx.storage.transactionSync((): RotateOutcome => {
+        const g = this.grantRow(gid);
+        if (!g || g.exp <= now) return "missing";
+        if (from >= 1 && g.redeemed_at === null) return "missing";
+        const created = this.sql.exec("INSERT OR IGNORE INTO mcp_rotations (gid, n, at, exp) VALUES (?, ?, ?, ?)", gid, from + 1, now, familyExp);
+        if (created.rowsWritten > 0) {
+          if (from === 0) this.sql.exec("UPDATE mcp_grants SET redeemed_at = ?, exp = ? WHERE id = ?", now, familyExp, gid);
+          return "ok";
+        }
+        if (grace) {
+          const m = this.sql.exec("SELECT at FROM mcp_rotations WHERE gid = ? AND n = ?", gid, from + 1).toArray()[0] as { at: number } | undefined;
+          const next = this.sql.exec("SELECT 1 FROM mcp_rotations WHERE gid = ? AND n = ?", gid, from + 2).toArray().length > 0;
+          if (m && now - m.at <= MCP_REFRESH_GRACE && !next) return "grace";
+        }
+        // A replay of a code, or an old refresh generation: revoke the grant.
+        this.dropGrant(gid);
+        return "reuse";
+      });
+      return ok(outcome);
+    } catch (e) {
+      return failure(e, "updating the connection");
+    }
+  }
+
+  /** Deletes a grant and its rotation markers; returns the deleted grant, or null. */
+  async mcpGrantRevoke(id: string): Promise<Result<McpGrantRecord | null>> {
+    try {
+      const g = this.ctx.storage.transactionSync(() => {
+        const r = this.grantRow(id);
+        if (r) this.dropGrant(id);
+        return r;
+      });
+      return ok(g ? grantOf(g) : null);
+    } catch (e) {
+      return failure(e, "revoking the connection");
+    }
+  }
+
+  /** The live (redeemed, unexpired) grants of a user, newest first (at most limit, ≤ 200). */
+  async mcpGrantsByUser(userId: string, limit: number): Promise<Result<McpGrantRecord[]>> {
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      const n = Math.max(1, Math.min(MCP_MAX_GRANTS, Math.floor(limit) || MCP_MAX_GRANTS));
+      const rows = this.sql
+        .exec(
+          `SELECT ${GRANT_COLUMNS} FROM mcp_grants WHERE user_id = ? AND redeemed_at IS NOT NULL AND exp > ? ORDER BY created_at DESC, id DESC LIMIT ?`,
+          userId,
+          now,
+          n,
+        )
+        .toArray() as unknown as GrantRow[];
+      return ok(rows.map(grantOf));
+    } catch (e) {
+      return failure(e, "listing connections");
+    }
+  }
+
+  /** Deletes every grant of a user (pending ones included); returns how many there were. */
+  async mcpRevokeUser(userId: string): Promise<Result<number>> {
+    try {
+      const n = this.ctx.storage.transactionSync(() => {
+        const count = (this.sql.exec("SELECT COUNT(*) AS n FROM mcp_grants WHERE user_id = ?", userId).one() as { n: number }).n;
+        this.sql.exec("DELETE FROM mcp_rotations WHERE gid IN (SELECT id FROM mcp_grants WHERE user_id = ?)", userId);
+        this.sql.exec("DELETE FROM mcp_grants WHERE user_id = ?", userId);
+        return count;
+      });
+      return ok(n);
+    } catch (e) {
+      return failure(e, "revoking connections");
+    }
   }
 }

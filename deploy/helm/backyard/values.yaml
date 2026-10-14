@@ -73,6 +73,12 @@ config:
     log_format: json
     metrics: true
     metrics_listen: ":9090"
+  # The Claude connector (remote MCP; README: "Claude connector"): Claude
+  # publishes sites as the signed-in user. Needs an https public_url without a
+  # path, an ingress body limit of at least 10m, and, behind an identity
+  # proxy, its four machine paths exempted from the proxy's login.
+  # mcp:
+  #   enabled: true
 
 # Container ports; they must match config.server.listen and
 # config.telemetry.metrics_listen.
@@ -147,7 +153,8 @@ ingress:
   className: ""
   annotations: {}
     # ingress-nginx: websockets and streaming AI responses need long timeouts
-    # and no buffering; deploy uploads need a large body size.
+    # and no buffering; deploy uploads (and Claude connector publishes, at
+    # least 10m) need a large body size.
     # nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     # nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
     # nginx.ingress.kubernetes.io/proxy-buffering: "off"

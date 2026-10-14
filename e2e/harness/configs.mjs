@@ -53,10 +53,11 @@ export function devServerConfig({ dir, port, name, adminToken, fakeAI, secret = 
 /**
  * The config of a server in auth.mode oidc (path mode on 127.0.0.1:port)
  * against the mock IdP: admins by group, only example.com addresses, claims
- * enriched from userinfo, and a static deploy token.
+ * enriched from userinfo, and a static deploy token. mcp: true also serves the
+ * Claude connector (mcp.enabled, SPEC §8.4).
  */
-export function oidcServerConfig({ dir, port, publicURL, issuer, clientId, clientSecret, deployToken }) {
-  return {
+export function oidcServerConfig({ dir, port, publicURL, issuer, clientId, clientSecret, deployToken, mcp = false }) {
+  const config = {
     server: {
       listen: `127.0.0.1:${port}`,
       base_domain: "127.0.0.1",
@@ -84,4 +85,6 @@ export function oidcServerConfig({ dir, port, publicURL, issuer, clientId, clien
     ratelimit: RELAXED_LIMITS,
     telemetry: { log_level: "warn", log_format: "text" },
   };
+  if (mcp) config.mcp = { enabled: true };
+  return config;
 }

@@ -122,7 +122,7 @@ See [authentication](authentication.md) for step-by-step setups.
 | `auth.allowed_domains` | list of strings | `[]` (anyone) | Only these email domains may use Backyard (`403` otherwise). |
 | `auth.allowed_emails` | list of strings | `[]` | These exact (verified) email addresses may use Backyard too: an address passes when its domain is in `allowed_domains` or it is listed here. With only this list set, only the listed people get in. |
 | `auth.allowed_groups` | list of strings | `[]` (anyone) | Only members of these groups may use Backyard. |
-| `auth.token_ttl` | duration | `720h` | Lifetime — and maximum lifetime — of API tokens minted by the server (CLI login, `backyard token create`). A token minted with an API token as the credential expires no later than that token. |
+| `auth.token_ttl` | duration | `720h` | Lifetime — and maximum lifetime — of API tokens minted by the server (CLI login, `backyard token create`). A token minted with an API token as the credential expires no later than that token. Also how long a [Claude connector](#mcp) connection lasts after its consent. |
 | `auth.tokens` | list | `[]` | Static bearer tokens, e.g. for CI: `[{name, sha256, admin}]`. |
 | `auth.tokens[].name` | string | — | Shown in audit logs; the token acts as user `token:<name>`. |
 | `auth.tokens[].sha256` | string | — | Hex SHA-256 of the token (64 characters). `backyard token hash` prints it. The token itself is never stored. |
@@ -388,6 +388,43 @@ See [warehouse](warehouse.md).
 | `deploy.expose_storage` | bool | `true` | Include bucket/container details in `/info` (needed for direct-sync methods). |
 | `deploy.embedded_gateway` | bool | `true` | Mount the gateway at `/__backyard/api/deploy`. Disable when only a standalone gateway may deploy. |
 
+## `mcp`
+
+The [Claude connector](claude-connector.md): a remote MCP endpoint at
+`<public_url>/__backyard/mcp` with Backyard's own OAuth sign-in
+([SPEC §8.4](spec/SPEC.md#84-remote-mcp-connector-oauth-21-authorization-server)). Off by
+default; while it is off every connector path answers `404`.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `mcp.enabled` | bool | `false` | Serve the Claude connector: `<public_url>/__backyard/mcp` plus Backyard's OAuth endpoints (SPEC §8.4). Needs an https `server.public_url` without a path. |
+| `mcp.clients` | list of URLs | the two Claude client metadata URLs | Client ID Metadata Document URLs that may connect. Only these are fetched. `[]` turns CIMD off, so apps register automatically. |
+| `mcp.redirect_uris` | list of URLs | `[https://claude.ai/api/mcp/auth_callback, https://claude.com/api/mcp/auth_callback]` | Exact https addresses that may receive sign-in codes. http loopback addresses are always allowed. |
+| `mcp.max_publish_bytes` | int | `4194304` | Decoded file bytes per `backyard_publish` call. The MCP request body limit is 2× this + 1 MiB. |
+
+The two Claude client metadata URLs are `https://claude.ai/oauth/mcp-oauth-client-metadata`
+and `https://claude.ai/oauth/claude-code-client-metadata`. Leaving a list out keeps its
+default; an explicit `[]` stays empty. Entries are compared byte for byte, so write them exactly
+(their case is kept). The connector also uses `auth.token_ttl` (how long a connection lasts),
+`ratelimit.api_per_minute` (OAuth requests per client IP, MCP requests per user),
+`ratelimit.deploys_per_hour` (publishes per user), `server.name` (the name in the discovery
+document), `deploy.allow_anonymous` and `deploy.embedded_gateway`. A standalone gateway
+validates the section but ignores it.
+
+Validation reports every problem at once, with these messages (the entry rules apply even
+while the connector is off):
+
+- `mcp.clients: "…" is not a client metadata URL (an https URL with a path, without query, fragment or user info, at most 512 bytes)`
+  — also for an IP-literal host, a path of `/` or with `.`/`..` segments (`https://claude.ai`
+  alone fails: it has no path).
+- `mcp.redirect_uris: "…" is not an https redirect URI without fragment or user info (at most 512 bytes; loopback redirect URIs are always allowed and are not listed)`
+- `mcp.redirect_uris: "…" points at this Backyard or one of its sites` — its host is the
+  `public_url` host, `server.base_domain` or a subdomain of it.
+- `mcp.max_publish_bytes must be between 65536 and 67108864 and at most sites.max_site_bytes`
+  — the comparison with `sites.max_site_bytes` applies only with `mcp.enabled: true`.
+- `mcp.enabled requires server.public_url to be https (http only on localhost, *.localhost or loopback addresses) without a path, query or fragment`
+- `auth.oidc.redirect_url must not be /__backyard/auth/authorize while mcp.enabled is true`
+
 ## `ratelimit`
 
 Per-user token buckets, **per instance** (anonymous users are keyed by client IP). Limited
@@ -397,11 +434,11 @@ default; a negative value means unlimited (that one limit is off).
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `ratelimit.disabled` | bool | `false` | Turn every limit off. |
-| `ratelimit.api_per_minute` | int | `600` | All site and hub API calls; negative = unlimited. |
+| `ratelimit.api_per_minute` | int | `600` | All site and hub API calls, and the Claude connector's requests (OAuth per client IP, MCP per user); negative = unlimited. |
 | `ratelimit.db_writes_per_minute` | int | `300` | Document writes and file deletes; negative = unlimited. |
 | `ratelimit.ai_per_minute` | int | `20` | AI calls; negative = unlimited. |
 | `ratelimit.ai_tokens_per_day` | int | `2000000` | Input + output AI tokens per user per day (resets 00:00 UTC); negative = unlimited. |
-| `ratelimit.deploys_per_hour` | int | `60` | Deploy creates and refreshes (enforced by the gateway); negative = unlimited. |
+| `ratelimit.deploys_per_hour` | int | `60` | Deploy creates and refreshes (enforced by the gateway), and Claude connector publishes; negative = unlimited. |
 | `ratelimit.uploads_per_minute` | int | `60` | `backyard.files.upload` calls; negative = unlimited. |
 | `ratelimit.warehouse_per_minute` | int | `30` | Warehouse queries; negative = unlimited. |
 

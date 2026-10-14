@@ -17,7 +17,8 @@
 #   Access     one self-hosted application over the hub (and every site host in
 #              host mode) with an allow policy (emails, email domains, Access
 #              groups, Okta groups), plus a bypass application for the paths the
-#              Worker authenticates itself (deploy gateway, health checks).
+#              Worker authenticates itself (deploy gateway, health checks, the
+#              Claude connector's machine paths).
 #
 # Backyard's deploys (setup, scripts/cloudflare-ci.mjs) never change routes or
 # custom domains, so they leave what this module creates alone. Keep "routes"
