@@ -27,7 +27,7 @@ var (
 //
 // Authenticate returns (user, nil) on success, (nil, ErrUnauthenticated) when
 // the request carries no usable credentials, (nil, ErrForbidden) when the user
-// is authenticated but rejected by allowed_domains/allowed_groups, or another
+// is authenticated but rejected by allowed_domains/allowed_emails/allowed_groups, or another
 // error for infrastructure failures. Bearer tokens (API, static, IdP JWT) are
 // accepted in every mode. In mode "none" Authenticate only fails when an
 // invalid bearer token is presented, or when the browser sends valid guest

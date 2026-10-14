@@ -31,7 +31,8 @@ you prefer to remain anonymous.
 - Set a strong `server.secret` (`openssl rand -hex 32`) and keep it in a secret manager.
   Rotating it invalidates all sessions and API tokens.
 - Restrict `server.trusted_proxies` to your load balancer ranges.
-- Use `auth.allowed_domains` / `auth.allowed_groups` to limit who can sign in.
+- Use `auth.allowed_domains` / `auth.allowed_emails` / `auth.allowed_groups` to limit who can
+  sign in.
 - Keep AI provider keys, database credentials and warehouse credentials server-side only.
 - Use read-only credentials for warehouse sources.
 - Enable `sites.ownership: owner` if teams must not overwrite each other's sites.

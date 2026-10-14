@@ -373,6 +373,12 @@ variable "allowed_domains" {
   default     = []
 }
 
+variable "allowed_emails" {
+  description = "These exact email addresses may sign in too (auth.allowed_emails): with allowed_domains either admits; alone, only the listed addresses get in."
+  type        = list(string)
+  default     = []
+}
+
 variable "allowed_groups" {
   description = "Only members of these groups may sign in (auth.allowed_groups). Empty allows any group."
   type        = list(string)

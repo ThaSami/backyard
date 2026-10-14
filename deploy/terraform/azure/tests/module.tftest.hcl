@@ -224,11 +224,12 @@ run "frontdoor_host_mode_entra" {
   command = apply
 
   variables {
-    domain        = "backyard.acme.com"
-    dns_zone_name = "acme.com"
-    admins        = ["alice@acme.com"]
-    admin_groups  = ["7c9e6679-7425-40de-944b-e07fc1f90ae7", "team-$${HOME}"]
-    static_tokens = [{ name = "ci", sha256 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", admin = true }]
+    domain         = "backyard.acme.com"
+    dns_zone_name  = "acme.com"
+    admins         = ["alice@acme.com"]
+    admin_groups   = ["7c9e6679-7425-40de-944b-e07fc1f90ae7", "team-$${HOME}"]
+    allowed_emails = ["pat@contractor.example"]
+    static_tokens  = [{ name = "ci", sha256 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", admin = true }]
     # The module's default (the file-level variables turn it off).
     postgres_allow_azure_services = true
   }
@@ -261,6 +262,7 @@ run "frontdoor_host_mode_entra" {
       yamldecode(output.backyard_config_yaml).auth.oidc.client_secret == "$${OIDC_CLIENT_SECRET}" &&
       yamldecode(output.backyard_config_yaml).auth.oidc.scopes == ["openid", "profile", "email"] &&
       yamldecode(output.backyard_config_yaml).auth.admins == ["alice@acme.com"] &&
+      yamldecode(output.backyard_config_yaml).auth.allowed_emails == ["pat@contractor.example"] &&
       yamldecode(output.backyard_config_yaml).auth.tokens[0].admin == true
     )
     error_message = "auth section is wrong."

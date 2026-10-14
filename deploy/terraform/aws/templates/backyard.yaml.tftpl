@@ -28,6 +28,9 @@ auth:
 %{ if length(allowed_domains) > 0 ~}
   allowed_domains: ${jsonencode(allowed_domains)}
 %{ endif ~}
+%{ if length(allowed_emails) > 0 ~}
+  allowed_emails: ${jsonencode(allowed_emails)}
+%{ endif ~}
 %{ if length(allowed_groups) > 0 ~}
   allowed_groups: ${jsonencode(allowed_groups)}
 %{ endif ~}

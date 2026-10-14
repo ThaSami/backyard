@@ -139,8 +139,8 @@ Cloud Run revision.
 `roles/iap.httpsResourceAccessor` on the app backend service. Use
 `domain:example.com`, `group:…` or `user:…`. Leave it empty to manage that
 role outside this module (Terraform then warns that nobody has access yet).
-You can also limit users inside Backyard with `allowed_domains`, and grant
-admin rights with `admins`.
+You can also limit users inside Backyard with `allowed_domains` and
+`allowed_emails`, and grant admin rights with `admins`.
 
 **Google-managed vs. custom OAuth client.** By default IAP uses a Google-managed
 OAuth client, so no consent screen or client setup is needed, but only users in

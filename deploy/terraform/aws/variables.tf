@@ -324,6 +324,12 @@ variable "allowed_domains" {
   default     = []
 }
 
+variable "allowed_emails" {
+  description = "Also admit these exact email addresses (auth.allowed_emails): with allowed_domains either admits; alone, only the listed addresses get in."
+  type        = list(string)
+  default     = []
+}
+
 variable "allowed_groups" {
   description = "Restrict access to members of these IdP groups (auth.allowed_groups; empty = any authenticated user)."
   type        = list(string)

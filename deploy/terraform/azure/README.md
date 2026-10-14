@@ -372,7 +372,7 @@ All inputs, with validation, are in [variables.tf](variables.tf).
 | `dns_zone_name` | `null` | Azure DNS zone to manage records in |
 | `auth_mode` | `oidc` | `oidc` or `none` |
 | `oidc_issuer` / `oidc_client_id` / `oidc_client_secret` | `null` | existing IdP app (Okta, …); `null` = generated Entra ID app |
-| `admins`, `admin_groups`, `allowed_domains`, `allowed_groups` | `[]` | access control |
+| `admins`, `admin_groups`, `allowed_domains`, `allowed_emails`, `allowed_groups` | `[]` | access control |
 | `static_tokens` | `[]` | CI tokens (`name`, `sha256`, `admin`) |
 | `image` | `ghcr.io/thasami/backyard:latest` | container image |
 | `cpu` / `memory` | `0.5` / `1Gi` | per replica |

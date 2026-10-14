@@ -192,6 +192,40 @@ func TestAPITokensViaAuthenticate(t *testing.T) {
 	if _, err = auth(issue(&identity.User{ID: "h@acme.com", Email: "h@acme.com", Groups: []string{"sales"}})); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("non-member err = %v", err)
 	}
+
+	// Allowed emails: alone they admit only the listed addresses.
+	cfg.Auth.AllowedGroups = nil
+	cfg.Auth.AllowedEmails = []string{" Ana@Gmail.com "}
+	if _, err = auth(issue(&identity.User{ID: "ana@gmail.com", Email: "ana@gmail.com"})); err != nil {
+		t.Fatalf("listed email: %v", err)
+	}
+	for _, u := range []*identity.User{
+		{ID: "bob@gmail.com", Email: "bob@gmail.com"},
+		{ID: "ana@gmail.com.evil.example", Email: "ana@gmail.com.evil.example"},
+		{ID: "g@acme.com", Email: "g@acme.com"},
+		{ID: "sub:ana"},
+	} {
+		if _, err = auth(issue(u)); !errors.Is(err, ErrForbidden) {
+			t.Fatalf("%s with an email list err = %v", u.ID, err)
+		}
+	}
+	// With allowed domains, either list admits; allowed groups still apply on top.
+	cfg.Auth.AllowedDomains = []string{"acme.com"}
+	for _, id := range []string{"ana@gmail.com", "g@acme.com"} {
+		if _, err = auth(issue(&identity.User{ID: id, Email: id})); err != nil {
+			t.Fatalf("%s with domains and emails: %v", id, err)
+		}
+	}
+	if _, err = auth(issue(&identity.User{ID: "bob@gmail.com", Email: "bob@gmail.com"})); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("unlisted with domains and emails err = %v", err)
+	}
+	cfg.Auth.AllowedGroups = []string{"Eng"}
+	if _, err = auth(issue(&identity.User{ID: "ana@gmail.com", Email: "ana@gmail.com"})); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("listed email outside the allowed groups err = %v", err)
+	}
+	if _, err = auth(issue(&identity.User{ID: "ana@gmail.com", Email: "ana@gmail.com", Groups: []string{"eng"}})); err != nil {
+		t.Fatalf("listed email in an allowed group: %v", err)
+	}
 }
 
 func TestDomainAllowed(t *testing.T) {

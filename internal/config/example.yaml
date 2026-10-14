@@ -23,6 +23,7 @@ auth:
   admins: ["platform-team@example.com"]
   admin_groups: ["backyard-admins"]
   allowed_domains: ["example.com"]
+  # allowed_emails: ["contractor@gmail.com"]   # exact addresses admitted too
   # allowed_groups: ["employees"]
   # token_ttl: 720h                 # lifetime of CLI/API tokens minted by the server
   # Static bearer tokens for CI (store only the sha256; see `backyard token hash`).

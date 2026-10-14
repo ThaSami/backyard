@@ -137,6 +137,7 @@ locals {
     admins             = [for s in var.admins : replace(s, "$${", "$$${")]
     admin_groups       = [for s in var.admin_groups : replace(s, "$${", "$$${")]
     allowed_domains    = [for s in var.allowed_domains : replace(s, "$${", "$$${")]
+    allowed_emails     = [for s in var.allowed_emails : replace(s, "$${", "$$${")]
     allowed_groups     = [for s in var.allowed_groups : replace(s, "$${", "$$${")]
     token_ttl          = var.token_ttl != null ? var.token_ttl : ""
     static_tokens      = var.static_tokens

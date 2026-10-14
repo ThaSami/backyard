@@ -93,6 +93,29 @@ func TestValidateErrors(t *testing.T) {
 	}
 }
 
+func TestValidateAllowedEmails(t *testing.T) {
+	cfg, err := Parse([]byte("auth:\n  allowed_emails: [ana@gmail.com, \" Sam@Example.com \", gmail.com, \"Ana <ana@gmail.com>\"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ApplyDefaults()
+	err = cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation errors")
+	}
+	msg := err.Error()
+	for _, want := range []string{`auth.allowed_emails[2]: "gmail.com"`, `auth.allowed_emails[3]: "Ana <ana@gmail.com>"`} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("missing %q in %v", want, err)
+		}
+	}
+	for _, unwanted := range []string{"auth.allowed_emails[0]", "auth.allowed_emails[1]"} {
+		if strings.Contains(msg, unwanted) {
+			t.Errorf("valid address rejected (%s): %v", unwanted, err)
+		}
+	}
+}
+
 func TestAliasesAndAdmin(t *testing.T) {
 	cfg, _ := Parse([]byte("auth:\n  mode: okta\n  admins: [Root@Example.com]\n  admin_groups: [ops]\n"))
 	cfg.ApplyDefaults()

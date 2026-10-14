@@ -31,7 +31,8 @@ Whatever the mode, the result is a user profile that pages read with `backyard.m
   `groups`) and an optional people directory (`identity.directory`, a CSV or JSON file). See
   [configuration](configuration.md#identity).
 - An `email` claim the IdP marks `email_verified: false` is ignored (the user is then
-  identified by `sub`), so unverified addresses can never match `allowed_domains` or `admins`.
+  identified by `sub`), so unverified addresses can never match `allowed_domains`,
+  `allowed_emails` or `admins`.
 
 Access rules:
 
@@ -40,13 +41,18 @@ auth:
   admins: [platform-team@acme.com]        # user ids / emails
   admin_groups: [backyard-admins]         # IdP groups
   allowed_domains: [acme.com]             # optional: only these email domains
+  allowed_emails: [pat.contractor@gmail.com]  # optional: and these exact addresses
   allowed_groups: [employees]             # optional: only these groups
 ```
 
-People outside `allowed_domains` / `allowed_groups` get `403`. Admins can delete and (in
-ownership mode) overwrite any site. Everything else — reading and writing a site's data — is
-open to everyone who passes the gates: Backyard deliberately has no per-site ACLs (see
-[security](security.md)).
+An address passes when its domain is in `allowed_domains` or the address itself is in
+`allowed_emails`; with only `allowed_emails`, only the listed people get in. That is how you
+restrict a sign-in everyone can complete — Google with personal `@gmail.com` accounts, say —
+to named people. `allowed_groups` applies on top. People outside these gates get `403`.
+
+Admins pass every gate, and can delete and (in ownership mode) overwrite any site. Everything
+else — reading and writing a site's data — is open to everyone who passes the gates: Backyard
+deliberately has no per-site ACLs (see [security](security.md)).
 
 ## `oidc`: built-in OpenID Connect login
 
@@ -155,6 +161,10 @@ Create an OAuth client (**APIs & Services → Credentials → OAuth client ID �
 application**) with the redirect URI above, then `issuer: https://accounts.google.com`. Google
 ID tokens carry no groups: restrict access with `allowed_domains: [acme.com]` and grant admin
 rights with `admins`. Or use [IAP](#iap-google-cloud-identity-aware-proxy).
+
+Without a Workspace domain — personal `@gmail.com` accounts — anyone with a Google account can
+complete the sign-in, so name the people who may use Backyard:
+`allowed_emails: [ana@gmail.com, sam@gmail.com]` (Google verifies the addresses it issues).
 
 ### Auth0, Keycloak and others
 

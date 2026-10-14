@@ -12,8 +12,8 @@ colleague**.
 
 - **Outsiders** — anyone your identity provider has not authenticated — must not be able to
   read a page, call an API or deploy. This is enforced on every request by the configured
-  [auth mode](authentication.md); `auth.allowed_domains` and `auth.allowed_groups` narrow it
-  further.
+  [auth mode](authentication.md); `auth.allowed_domains`, `auth.allowed_emails` and
+  `auth.allowed_groups` narrow it further.
 - **Insiders** can read and write the data of **every** site: there are no per-site or
   per-document permissions, and `_meta.created_by` is a UX hint, not an access control. Any
   employee can open any site, query its collections, read its uploads and redeploy it (unless
@@ -254,7 +254,9 @@ and the acting user and client IP; see [operations](operations.md#logs-and-audit
 - [ ] `server.secret` from a secret manager, 32+ random characters (`openssl rand -hex 32`).
 - [ ] Host mode with a wildcard certificate (path mode only if every site author is trusted).
 - [ ] `server.trusted_proxies` set to exactly your load balancers / proxies.
-- [ ] `auth.allowed_domains` / `allowed_groups`, and `admins` / `admin_groups` for a small group.
+- [ ] `auth.allowed_domains` / `allowed_emails` / `allowed_groups` (always, when anyone outside
+      your organisation can complete the sign-in, e.g. Google with personal accounts), and
+      `admins` / `admin_groups` for a small group.
 - [ ] Behind IAP/ALB: `auth.iap.audience` / `auth.alb.signer_arn` set, and Backyard reachable
       only through the proxy (plus the proxy-exempt routes for the deploy gateway and
       bearer-token `POST /__backyard/api/tokens`).

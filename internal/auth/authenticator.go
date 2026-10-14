@@ -404,7 +404,7 @@ func (a *authenticator) mapClaims(claims map[string]any) *identity.User {
 }
 
 // finalize enriches u from the directory, computes Admin and applies the
-// allowed_domains / allowed_groups gates.
+// allowed_domains / allowed_emails / allowed_groups gates.
 func (a *authenticator) finalize(ctx context.Context, u *identity.User, src source) (*identity.User, error) {
 	if u == nil || strings.TrimSpace(u.ID) == "" {
 		return nil, fmt.Errorf("%w: identity has neither an email nor a subject", ErrUnauthenticated)
@@ -433,14 +433,16 @@ func (a *authenticator) finalize(ctx context.Context, u *identity.User, src sour
 	return u, nil
 }
 
-// gate enforces auth.allowed_domains and auth.allowed_groups. Admins pass.
+// gate enforces auth.allowed_domains / auth.allowed_emails (either may admit
+// the address) and auth.allowed_groups. Admins pass.
 func (a *authenticator) gate(u *identity.User) error {
 	if u.Admin {
 		return nil
 	}
-	if doms := a.cfg.Auth.AllowedDomains; len(doms) > 0 {
-		if !domainAllowed(identity.EmailDomain(u.Email), doms) {
-			return fmt.Errorf("%w: %s is not in an allowed domain", ErrForbidden, displayID(u))
+	doms, emails := a.cfg.Auth.AllowedDomains, a.cfg.Auth.AllowedEmails
+	if len(doms) > 0 || len(emails) > 0 {
+		if !domainAllowed(identity.EmailDomain(u.Email), doms) && !emailAllowed(u.Email, emails) {
+			return fmt.Errorf("%w: %s is not an allowed email address or domain", ErrForbidden, displayID(u))
 		}
 	}
 	if groups := a.cfg.Auth.AllowedGroups; len(groups) > 0 {
@@ -478,6 +480,19 @@ func domainAllowed(domain string, allowed []string) bool {
 				return true
 			}
 		case domain == d:
+			return true
+		}
+	}
+	return false
+}
+
+// emailAllowed reports whether the (normalized, verified) email is listed.
+func emailAllowed(email string, allowed []string) bool {
+	if email == "" {
+		return false
+	}
+	for _, e := range allowed {
+		if identity.NormalizeEmail(e) == email {
 			return true
 		}
 	}

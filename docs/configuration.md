@@ -120,6 +120,7 @@ See [authentication](authentication.md) for step-by-step setups.
 | `auth.admins` | list of strings | `[]` | User ids / emails with admin rights (delete any site, overwrite in ownership mode). |
 | `auth.admin_groups` | list of strings | `[]` | Groups whose members are admins. |
 | `auth.allowed_domains` | list of strings | `[]` (anyone) | Only these email domains may use Backyard (`403` otherwise). |
+| `auth.allowed_emails` | list of strings | `[]` | These exact (verified) email addresses may use Backyard too: an address passes when its domain is in `allowed_domains` or it is listed here. With only this list set, only the listed people get in. |
 | `auth.allowed_groups` | list of strings | `[]` (anyone) | Only members of these groups may use Backyard. |
 | `auth.token_ttl` | duration | `720h` | Lifetime — and maximum lifetime — of API tokens minted by the server (CLI login, `backyard token create`). A token minted with an API token as the credential expires no later than that token. |
 | `auth.tokens` | list | `[]` | Static bearer tokens, e.g. for CI: `[{name, sha256, admin}]`. |

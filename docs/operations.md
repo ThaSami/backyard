@@ -54,7 +54,7 @@ kept), and every `5xx` failure is logged at error level with its request id — 
 
 | Event | Source |
 |---|---|
-| `auth: login`, `auth: login denied by allowed_domains/allowed_groups` | OIDC login |
+| `auth: login`, `auth: login denied by allowed_domains/allowed_emails/allowed_groups` | OIDC login |
 | `auth: issued CLI token` | browser → CLI token hand-off (`confirmed` when the user confirmed a cross-site request) |
 | `auth: CLI login confirmation rejected …` | a confirmation form that expired or was not issued for this user and session |
 | `auth: request carries session cookies of different users …`, `… guest cookies of different guests …` | conflicting (possibly planted) cookies; the request was refused and foreign cookie variants expired |

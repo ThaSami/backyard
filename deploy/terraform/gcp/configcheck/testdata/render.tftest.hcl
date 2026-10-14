@@ -106,6 +106,7 @@ run "oidc_full" {
     admins           = ["alice@example.com"]
     admin_groups     = ["backyard-admins"]
     allowed_domains  = ["example.com"]
+    allowed_emails   = ["pat@contractor.example"]
     allowed_groups   = ["eng"]
     static_tokens = [
       { name = "ci", sha256 = "0000000000000000000000000000000000000000000000000000000000000000", admin = true },

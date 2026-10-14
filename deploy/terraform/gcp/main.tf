@@ -173,6 +173,7 @@ locals {
     admins          = var.admins
     admin_groups    = var.admin_groups
     allowed_domains = var.allowed_domains
+    allowed_emails  = var.allowed_emails
     allowed_groups  = var.allowed_groups
     static_tokens   = var.static_tokens
     oidc = var.auth_mode == "oidc" && var.oidc != null ? {

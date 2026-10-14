@@ -434,6 +434,7 @@ run "oidc_mode" {
     oidc_scopes           = ["openid", "profile", "email", "groups"]
     admin_groups          = ["backyard-admins"]
     allowed_domains       = ["acme.com"]
+    allowed_emails        = ["pat@contractor.example"]
     static_tokens         = [{ name = "ci", sha256 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", admin = true }]
   }
 
@@ -452,6 +453,7 @@ run "oidc_mode" {
       yamldecode(output.backyard_config_yaml).auth.oidc.scopes == ["openid", "profile", "email", "groups"] &&
       yamldecode(output.backyard_config_yaml).auth.admin_groups == ["backyard-admins"] &&
       yamldecode(output.backyard_config_yaml).auth.allowed_domains == ["acme.com"] &&
+      yamldecode(output.backyard_config_yaml).auth.allowed_emails == ["pat@contractor.example"] &&
       yamldecode(output.backyard_config_yaml).auth.tokens[0].name == "ci" &&
       yamldecode(output.backyard_config_yaml).auth.tokens[0].admin == true
     )

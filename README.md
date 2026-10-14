@@ -214,8 +214,8 @@ See [docs/agents.md](docs/agents.md).
 
 Backyard trusts **everyone your IdP signs in** — that is the point — and nobody else:
 
-- every request is authenticated; outsiders see nothing, and `allowed_domains` /
-  `allowed_groups` narrow access further;
+- every request is authenticated; outsiders see nothing, and `allowed_domains`,
+  `allowed_emails` and `allowed_groups` narrow access further;
 - inside the bubble there are no per-site permissions: anyone may read and write any site's
   data, so sites must not hold data not every employee may see;
 - in host mode each site is its own browser origin, separated from other sites and the hub by

@@ -4,6 +4,20 @@ All notable changes to Backyard are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `auth.allowed_emails`: admit exact (verified) email addresses. An address passes when its
+  domain is in `auth.allowed_domains` or it is listed here; on its own the list admits only the
+  named people — the way to restrict a sign-in anyone can complete, such as Google with personal
+  `@gmail.com` accounts. The Terraform modules (AWS, GCP, Azure) take it as `allowed_emails`.
+
+### Changed
+
+- The OIDC login denial is logged as `auth: login denied by allowed_domains/allowed_emails/allowed_groups`
+  (was `…allowed_domains/allowed_groups`).
+
 ## [0.1.0] - 2026-10-14
 
 The first public version of Backyard: drop a folder of HTML, get an internal URL with a
@@ -313,4 +327,5 @@ zero-config backend for every site.
 - Further hardening from an adversarial review of both editions: stricter input validation,
   safer defaults and narrower error messages.
 
+[Unreleased]: https://github.com/thasami/backyard/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/thasami/backyard/releases/tag/v0.1.0

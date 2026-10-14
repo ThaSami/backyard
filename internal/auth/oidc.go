@@ -262,12 +262,12 @@ func (l *oidcLogin) callback(w http.ResponseWriter, r *http.Request) {
 				// (email_verified=false), so domain/admin rules could not
 				// match it. Tell both the user and the operator why.
 				a.log.Warn("auth: the identity provider marked the user's email as unverified (email_verified=false); "+
-					"it is ignored for allowed_domains and admins — verify emails at the IdP (Keycloak: \"Trust Email\") "+
+					"it is ignored for allowed_domains, allowed_emails and admins — verify emails at the IdP (Keycloak: \"Trust Email\") "+
 					"or map identity.claims.email to another claim", "subject", base.ID)
 				detail = "Your identity provider has not verified the email address " + unverified +
 					", so Backyard cannot use it. Ask your administrator to verify it."
 			}
-			a.log.Info("auth: login denied by allowed_domains/allowed_groups", "user", displayID(base), "audit", true)
+			a.log.Info("auth: login denied by allowed_domains/allowed_emails/allowed_groups", "user", displayID(base), "audit", true)
 			renderPage(w, http.StatusForbidden, pageData{
 				Title:   "Access denied",
 				Message: "You signed in as " + displayID(base) + ", but this account is not allowed to use Backyard.",

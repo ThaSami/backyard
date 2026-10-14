@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/mail"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -79,6 +80,10 @@ type AuthConfig struct {
 	AdminGroups []string `yaml:"admin_groups"`
 	// AllowedDomains restricts access to these email domains (empty = any).
 	AllowedDomains []string `yaml:"allowed_domains"`
+	// AllowedEmails admits these exact addresses too. With AllowedDomains a
+	// person passes when either matches; alone, only the listed addresses
+	// pass (empty = no per-address list).
+	AllowedEmails []string `yaml:"allowed_emails"`
 	// AllowedGroups restricts access to members of these groups (empty = any).
 	AllowedGroups []string `yaml:"allowed_groups"`
 	// TokenTTL is the lifetime of minted Backyard API tokens (default 720h).
@@ -1004,6 +1009,12 @@ func (c *Config) Validate() error {
 		}
 	default:
 		add("auth.mode must be one of none, oidc, iap, alb, header; got %q", a.Mode)
+	}
+	for i, e := range a.AllowedEmails {
+		e = strings.TrimSpace(e)
+		if addr, err := mail.ParseAddress(e); err != nil || !strings.EqualFold(addr.Address, e) {
+			add("auth.allowed_emails[%d]: %q is not an email address (domains go in auth.allowed_domains)", i, e)
+		}
 	}
 	for i, t := range a.Tokens {
 		if t.Name == "" || len(t.SHA256) != 64 {

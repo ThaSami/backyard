@@ -700,9 +700,11 @@ actor (anonymous: per client IP).
 `google`, `auth0`, `keycloak`, `openid` are aliases of `oidc`; `off`/`disabled`/empty mean
 `none`). In all modes, `Authorization: Bearer` Backyard API tokens and static tokens are also
 accepted (API + deploy), and admins are `auth.admins` ∪ members of `auth.admin_groups`. Optional
-gates: `auth.allowed_domains`, `auth.allowed_groups` (403 otherwise). A bearer token is tried
-first; if it is invalid the mode's own credentials are tried, and the bearer error is reported
-only when those are absent (in mode `none` an invalid bearer token is always `401`).
+gates (admins pass them): `auth.allowed_domains` / `auth.allowed_emails` — when either is set,
+the user's verified email must have a listed domain or be a listed address (case-insensitive) —
+and `auth.allowed_groups` (403 otherwise). A bearer token is tried first; if it is invalid the
+mode's own credentials are tried, and the bearer error is reported only when those are absent
+(in mode `none` an invalid bearer token is always `401`).
 
 ### 8.1 `oidc` (Okta, Entra ID, Google, Auth0, Keycloak…)
 

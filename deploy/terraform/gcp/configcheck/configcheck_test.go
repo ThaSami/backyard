@@ -207,6 +207,7 @@ func checkOIDCFull(t *testing.T, c *config.Config) {
 	eq(t, "auth.admins", strings.Join(c.Auth.Admins, ","), "alice@example.com")
 	eq(t, "auth.admin_groups", strings.Join(c.Auth.AdminGroups, ","), "backyard-admins")
 	eq(t, "auth.allowed_domains", strings.Join(c.Auth.AllowedDomains, ","), "example.com")
+	eq(t, "auth.allowed_emails", strings.Join(c.Auth.AllowedEmails, ","), "pat@contractor.example")
 	eq(t, "auth.allowed_groups", strings.Join(c.Auth.AllowedGroups, ","), "eng")
 	if len(c.Auth.Tokens) != 1 || c.Auth.Tokens[0].Name != "ci" || !c.Auth.Tokens[0].Admin {
 		t.Errorf("auth.tokens = %+v, want one admin token named ci", c.Auth.Tokens)
