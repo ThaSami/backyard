@@ -1,5 +1,6 @@
-// Tests for the Makefile's conformance, e2e, tf-configcheck and helm-lint
-// targets and for scripts/conformance.sh: node --test scripts/*.test.mjs
+// Tests for the Makefile's conformance, e2e, tf-configcheck, helm-lint,
+// cloudflare-setup, cloudflare-pack and release-snapshot targets and for
+// scripts/conformance.sh: node --test scripts/*.test.mjs
 //
 // The Makefile is checked with `make -n` (nothing runs: make prints the
 // recipe it would run, with the target selection already resolved), and
@@ -7,9 +8,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
@@ -20,7 +21,22 @@ const hasSh = process.platform !== "win32" && spawnSync("sh", ["-c", "true"]).st
 // the target selection.
 function cleanEnv() {
   const env = { ...process.env };
-  for (const k of ["MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEOVERRIDES", "CONFORMANCE_TARGET", "CONFORMANCE_ARGS", "E2E_TARGET"]) delete env[k];
+  for (const k of [
+    "MAKEFLAGS",
+    "MFLAGS",
+    "MAKELEVEL",
+    "MAKEOVERRIDES",
+    "CONFORMANCE_TARGET",
+    "CONFORMANCE_ARGS",
+    "E2E_TARGET",
+    "CF_PACK_VERSION",
+    "CF_PACK_OUT",
+    "CF_SETUP_ARGS",
+    "BACKYARD_CF_INVOKED_AS",
+    "GORELEASER",
+  ]) {
+    delete env[k];
+  }
   return env;
 }
 
@@ -137,4 +153,99 @@ test("make helm-lint runs the chart's guard tests with helm required", { skip: !
   const r = dryRun("helm-lint", "GO=go", "HELM=helm");
   assert.equal(r.status, 0, r.err);
   assert.match(r.out, /^BACKYARD_TEST_HELM=1 go test -count=1 \.\/deploy\/helm\/\.\.\.$/m);
+});
+
+test("make cloudflare-setup names the engine the way it is reached from the repository root", { skip: (!hasMake || !hasSh) && "make or sh not found" }, () => {
+  const r = dryRun("cloudflare-setup", "CF_SETUP_ARGS=--r2");
+  assert.equal(r.status, 0, r.err);
+  assert.match(r.out, /^cd deploy\/cloudflare && npm ci && BACKYARD_CF_INVOKED_AS="npm --prefix deploy\/cloudflare run cf --" npm run setup -- --r2$/m);
+
+  // The recipe cds into deploy/cloudflare, but the user's shell stays at the
+  // root: the next steps setup prints ("<invoked as> domain add <host>") must
+  // work from there. Without BACKYARD_CF_INVOKED_AS the engine says
+  // "npm run cf --", which fails at the root (no package.json).
+  const dir = mkdtempSync(join(tmpdir(), "backyard-cf-setup-"));
+  try {
+    const log = join(dir, "calls.log");
+    const npm = join(dir, "npm");
+    writeFileSync(npm, `#!/bin/sh\nprintf '%s\\t%s\\t%s\\n' "$PWD" "$*" "\${BACKYARD_CF_INVOKED_AS-(unset)}" >> '${log}'\n`);
+    chmodSync(npm, 0o755);
+    const run = spawnSync("make", ["--no-print-directory", "-C", root, "cloudflare-setup", `NPM=${npm}`, "CF_SETUP_ARGS=--worker-name team"], {
+      encoding: "utf8",
+      env: cleanEnv(),
+    });
+    assert.equal(run.status, 0, run.stderr);
+    const calls = readFileSync(log, "utf8").trim().split("\n").map((l) => l.split("\t"));
+    assert.deepEqual(calls.map(([, args]) => args), ["ci", "run setup -- --worker-name team"]);
+    const [cwd, , invokedAs] = calls[1];
+    const cfDir = realpathSync(join(root, "deploy", "cloudflare"));
+    assert.equal(realpathSync(cwd), cfDir);
+    const m = /^npm --prefix (\S+) run cf --$/.exec(invokedAs);
+    assert.ok(m, `BACKYARD_CF_INVOKED_AS=${invokedAs}`);
+    assert.equal(resolve(realpathSync(root), m[1]), cfDir, "--prefix is relative to the repository root");
+    const pkg = JSON.parse(readFileSync(join(cfDir, "package.json"), "utf8"));
+    assert.ok(pkg.scripts?.cf, "deploy/cloudflare/package.json has the cf script the hint runs");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("make cloudflare-pack builds the npm package into dist-npm/", { skip: !hasMake && "make not found" }, () => {
+  const r = dryRun("cloudflare-pack", "CF_PACK_VERSION=1.2.3");
+  assert.equal(r.status, 0, r.err);
+  assert.match(r.out, /^cd deploy\/cloudflare && npm ci --no-audit --no-fund && node scripts\/pack\.mjs --version 1\.2\.3 --out \.\.\/\.\.\/dist-npm$/m);
+
+  const def = dryRun("cloudflare-pack");
+  assert.equal(def.status, 0, def.err);
+  assert.match(def.out, /node scripts\/pack\.mjs --out \.\.\/\.\.\/dist-npm$/m, "the version defaults to package.json's (pack.mjs)");
+
+  const rel = dryRun("cloudflare-pack", "CF_PACK_OUT=build/npm");
+  assert.match(rel.out, / --out \.\.\/\.\.\/build\/npm$/m, "CF_PACK_OUT is relative to the repository root");
+  const abs = dryRun("cloudflare-pack", "CF_PACK_OUT=/srv/npm");
+  assert.match(abs.out, / --out \/srv\/npm$/m, "an absolute CF_PACK_OUT is kept");
+});
+
+test("make cloudflare-pack runs pack.mjs in deploy/cloudflare with --out pointing at the repository's dist-npm/", { skip: (!hasMake || !hasSh) && "make or sh not found" }, () => {
+  // Stand-in npm and node record their working directory and arguments.
+  const dir = mkdtempSync(join(tmpdir(), "backyard-cf-pack-"));
+  try {
+    const log = join(dir, "calls.log");
+    for (const name of ["npm", "node"]) {
+      const p = join(dir, name);
+      writeFileSync(p, `#!/bin/sh\nprintf '%s\\t%s\\t%s\\n' ${name} "$PWD" "$*" >> '${log}'\n`);
+      chmodSync(p, 0o755);
+    }
+    const r = spawnSync("make", ["--no-print-directory", "-C", root, "cloudflare-pack", `NODE=${join(dir, "node")}`, `NPM=${join(dir, "npm")}`, "CF_PACK_VERSION=1.2.3"], {
+      encoding: "utf8",
+      env: cleanEnv(),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    const calls = readFileSync(log, "utf8").trim().split("\n").map((l) => l.split("\t"));
+    const cfDir = join(root, "deploy", "cloudflare");
+    assert.deepEqual(
+      calls.map(([tool, , args]) => [tool, args]),
+      [
+        ["npm", "ci --no-audit --no-fund"],
+        ["node", "scripts/pack.mjs --version 1.2.3 --out ../../dist-npm"],
+      ],
+    );
+    for (const [, cwd] of calls) assert.equal(realpathSync(cwd), realpathSync(cfDir));
+    assert.equal(resolve(realpathSync(calls[1][1]), "../../dist-npm"), join(realpathSync(root), "dist-npm"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("make release-snapshot builds the Cloudflare package before GoReleaser", { skip: !hasMake && "make not found" }, () => {
+  // GoReleaser's extra_files glob (dist-npm/backyard-cloudflare-*.tgz) fails when it matches nothing.
+  const r = dryRun("release-snapshot", "GORELEASER=goreleaser");
+  assert.equal(r.status, 0, r.err);
+  const lines = r.out.split("\n");
+  const pack = lines.findIndex((l) => /node scripts\/pack\.mjs --out \.\.\/\.\.\/dist-npm$/.test(l));
+  const snapshot = lines.findIndex((l) => /^goreleaser release --snapshot --clean --skip=publish$/.test(l));
+  assert.ok(pack >= 0, `no cloudflare-pack in:\n${r.out}`);
+  assert.ok(snapshot > pack, `GoReleaser must run after cloudflare-pack:\n${r.out}`);
+
+  const db = spawnSync("make", ["--no-print-directory", "-C", root, "-p", "-n", "-q", "release-snapshot"], { encoding: "utf8", env: cleanEnv() });
+  assert.match(db.stdout, /^release-snapshot: cloudflare-pack$/m, "release-snapshot depends on cloudflare-pack");
 });

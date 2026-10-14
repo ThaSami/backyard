@@ -1,207 +1,152 @@
-// Offline tests of scripts/setup.mjs (node --test): the script runs against a
-// fake wrangler that records every call, so the account choice, the automatic
-// R2 bucket, secrets, remembered state and the generated config are checked
-// without a Cloudflare account.
+// Offline tests of `backyard-cloudflare setup` (node --test): the engine runs
+// in a sandbox against the fake wrangler and the fake Cloudflare API/edge
+// (test/scripts/helpers), so the account choice, the workers.dev subdomain,
+// adoption, the auth guard, the automatic R2 bucket, secrets, remembered state
+// and the generated config are checked without a Cloudflare account.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { createServer } from "node:http";
-import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { after, before, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
+import { join } from "node:path";
+import { after, afterEach, describe, it } from "node:test";
 
-import { isCI, isMissingWorker, maskSecret, parseSecretList, revealSecrets } from "../../scripts/setup.mjs";
+import { isCI, isMissingWorker, maskSecret, parseJSONC, parseSecretList, revealSecrets, suggestSubdomain } from "../../scripts/setup.mjs";
+import { OAUTH_TOKEN, TOKEN_PRESETS, deployedWorker } from "./helpers/fake-cloudflare.mjs";
+import { assertNoLeaks, createSandbox, makeReadOnly, makeWritable, ttyAvailable } from "./helpers/sandbox.mjs";
 
-const pkgDir = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-
-// The fake wrangler: answers from FAKE_* variables, logs each call as a JSON line.
-const FAKE_WRANGLER = String.raw`
-import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
-const args = process.argv.slice(2);
-const log = process.env.FAKE_LOG;
-const secretsFile = process.env.FAKE_SECRETS;
-const readStdin = () => { try { return readFileSync(0, "utf8"); } catch { return ""; } };
-const entry = { args, account: process.env.CLOUDFLARE_ACCOUNT_ID ?? null };
-const secrets = existsSync(secretsFile) ? JSON.parse(readFileSync(secretsFile, "utf8")) : {};
-let code = 0;
-switch (args[0]) {
-  case "whoami":
-    if (process.env.FAKE_LOGGED_OUT) { console.log('{"loggedIn":false}'); code = 1; break; }
-    console.log("noise before json");
-    console.log(JSON.stringify({ loggedIn: true, email: "me@example.com", accounts: JSON.parse(process.env.FAKE_ACCOUNTS || "[]") }));
-    break;
-  case "r2":
-    if (process.env.FAKE_R2 === "disabled") { console.error("✘ [ERROR] A request to the Cloudflare API failed. Please enable R2 through the Cloudflare Dashboard. [code: 10042]"); code = 1; }
-    else console.log("Created bucket " + args[3]);
-    break;
-  case "deploy": {
-    const i = args.indexOf("--config");
-    if (i >= 0) entry.config = readFileSync(args[i + 1], "utf8");
-    const j = args.indexOf("--secrets-file");
-    if (j >= 0) {
-      const file = JSON.parse(readFileSync(args[j + 1], "utf8"));
-      entry.secretsFile = Object.keys(file).sort();
-      entry.secretsMode = (statSync(args[j + 1]).mode & 0o777).toString(8);
-      Object.assign(secrets, file);
-      writeFileSync(secretsFile, JSON.stringify(secrets));
-    }
-    writeFileSync(secretsFile + ".deployed", "1");
-    console.log("Uploaded backyard\nDeployed backyard triggers\n  https://" + args[args.indexOf("--name") + 1] + ".me.workers.dev");
-    break;
-  }
-  case "secret": {
-    // FAKE_LIST_MODE plays the ways "secret list" can go wrong.
-    const mode = process.env.FAKE_LIST_MODE || (process.env.FAKE_LIST_ERROR ? "auth" : "");
-    if (args[1] === "list" && mode === "auth") { console.error("✘ [ERROR] Authentication error [code: 10000]"); code = 1; break; }
-    if (args[1] === "list" && mode === "network") { console.error("✘ [ERROR] fetch failed: getaddrinfo ENOTFOUND api.cloudflare.com (route not found)"); code = 1; break; }
-    if (args[1] === "list" && !existsSync(secretsFile + ".deployed")) { console.error('✘ [ERROR] Worker "' + args[args.indexOf("--name") + 1] + '" not found. [code: 10007]'); code = 1; break; }
-    // Exit 0 without the list on stdout (an empty "[]" only on stderr).
-    if (args[1] === "list" && mode === "stderr-json") { console.log("Listing secrets…"); console.error("[]"); break; }
-    if (args[1] === "list" && mode === "garbage") { console.log("Something unexpected happened"); break; }
-    // A warning on stderr that starts with "[" (what a proxy warning can look like without colors).
-    if (args[1] === "list" && mode === "stderr-warning") console.error("[WARNING] Proxy environment variables detected. We'll use your proxy for fetch requests.");
-    if (args[1] === "list") console.log("▲ [WARNING] noise [x]\n" + JSON.stringify(Object.keys(secrets).map((name) => ({ name, type: "secret_text" }))));
-    if (args[1] === "put") { secrets[args[2]] = readStdin().replace(/\n$/, ""); writeFileSync(secretsFile, JSON.stringify(secrets)); entry.secret = args[2]; }
-    break;
-  }
-  default:
-    code = 2;
-}
-appendFileSync(log, JSON.stringify(entry) + "\n");
-process.exit(code);
-`;
-
-function sandbox() {
-  const dir = mkdtempSync(join(tmpdir(), "backyard-setup-"));
-  mkdirSync(join(dir, "scripts"));
-  cpSync(join(pkgDir, "scripts", "setup.mjs"), join(dir, "scripts", "setup.mjs"));
-  writeFileSync(join(dir, "scripts", "sync-assets.mjs"), "");
-  cpSync(join(pkgDir, "wrangler.jsonc"), join(dir, "wrangler.jsonc"));
-  mkdirSync(join(dir, "node_modules", "wrangler", "bin"), { recursive: true });
-  writeFileSync(join(dir, "node_modules", "wrangler", "bin", "wrangler.js"), FAKE_WRANGLER);
-  writeFileSync(join(dir, "node_modules", "wrangler", "package.json"), '{"type":"module"}');
-  return dir;
-}
-
-function run(dir, args, env = {}) {
-  return new Promise((resolveRun) => {
-    const child = spawn(process.execPath, [join(dir, "scripts", "setup.mjs"), ...args], {
-      cwd: dir,
-      env: {
-        PATH: process.env.PATH,
-        HOME: dir,
-        XDG_CONFIG_HOME: join(dir, "config"),
-        FAKE_LOG: join(dir, "calls.log"),
-        FAKE_SECRETS: join(dir, "secrets.json"),
-        NO_COLOR: "1",
-        ...env,
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let out = "";
-    child.stdout.on("data", (c) => (out += c));
-    child.stderr.on("data", (c) => (out += c));
-    child.on("close", (code) => resolveRun({ code, out }));
-  });
-}
-
-function calls(dir) {
-  const p = join(dir, "calls.log");
-  if (!existsSync(p)) return [];
-  const all = readFileSync(p, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
-  rmSync(p);
-  return all;
-}
-
-const statePath = (dir, worker = "backyard") => join(dir, "config", "backyard", "cloudflare", `${worker}.json`);
-const state = (dir, worker = "backyard") => JSON.parse(readFileSync(statePath(dir, worker), "utf8"));
-const fileMode = (p) => (statSync(p).mode & 0o777).toString(8);
-
-describe("scripts/setup.mjs", () => {
-  let server;
-  let hub;
-  const dirs = [];
-  before(async () => {
-    server = createServer((req, res) => {
-      res.writeHead(req.url === "/__backyard/readyz" ? 200 : 404);
-      res.end("ok\n");
-    });
-    await new Promise((r) => server.listen(0, "127.0.0.1", r));
-    hub = `http://127.0.0.1:${server.address().port}`;
-  });
-  after(() => {
-    server.close();
-    for (const d of dirs) rmSync(d, { recursive: true, force: true });
-  });
-  const newSandbox = () => {
-    const d = sandbox();
-    dirs.push(d);
-    return d;
+const sandboxes = [];
+let fresh = [];
+/** A sandbox whose every run's output is kept for the secret checks after each test. */
+async function newSandbox(o) {
+  const sb = await createSandbox(o);
+  const run = sb.run.bind(sb);
+  sb.outputs = [];
+  sb.allowInEnv = [];
+  sb.extraSecrets = [];
+  sb.run = async (...a) => {
+    const r = await run(...a);
+    sb.outputs.push(r.out);
+    return r;
   };
+  sandboxes.push(sb);
+  fresh.push(sb);
+  return sb;
+}
+// Every test: no secret in a wrangler argv or env, the state, the result file or the output.
+afterEach(() => {
+  const check = fresh;
+  fresh = [];
+  for (const sb of check) assertNoLeaks(sb, { outputs: sb.outputs, allowInEnv: sb.allowInEnv, extra: sb.extraSecrets });
+});
+after(async () => {
+  for (const sb of sandboxes) await sb.close();
+});
 
+const deployOf = (calls) => calls.find((c) => c.args[0] === "deploy");
+const names = (calls) => calls.map((c) => c.args.slice(0, 2).join(" "));
+const secretsOf = (sb, w = "backyard") => sb.cf().workers?.[w]?.secrets ?? {};
+const AUD = "a".repeat(64);
+const fileMode = (p) => (statSync(p).mode & 0o777).toString(8);
+/** "Another machine" or a fresh $XDG_CONFIG_HOME: no state at all. */
+const forgetState = (sb) => rmSync(join(sb.root, "config"), { recursive: true, force: true });
+
+/** A Worker another machine deployed (vars merged over the defaults of wrangler.jsonc). */
+function seedWorker(sb, o = {}) {
+  const base = parseJSONC(readFileSync(join(sb.pkg, "wrangler.jsonc"), "utf8")).vars;
+  sb.updateCf((s) => {
+    s.workers[o.name ?? "backyard"] = deployedWorker({
+      vars: { ...base, ...(o.vars ?? {}) },
+      secrets: o.secrets ?? { BACKYARD_SECRET: "s".repeat(64), DEPLOY_TOKEN: "byd_existing-token-0123456789abcdef" },
+      r2Bucket: o.r2Bucket,
+      workersDev: o.workersDev,
+    });
+    for (const host of o.customDomains ?? []) {
+      s.zones = [...(s.zones ?? []), { id: "zone-example", name: "example.com", status: "active", account: "acc1" }];
+      s.customDomains.push({ id: `cd-${host}`, hostname: host, zone_id: "zone-example", zone_name: "example.com", service: o.name ?? "backyard", environment: "production" });
+    }
+  });
+}
+
+describe("backyard-cloudflare setup", () => {
   it("deploys with an automatic R2 bucket, sets secrets once and remembers its choices", async () => {
-    const dir = newSandbox();
-    const accounts = JSON.stringify([{ id: "acc1", name: "Only" }]);
-    let r = await run(dir, ["--var", `PUBLIC_URL:${hub}`, "--var", 'LIMITS:{"ai_per_day":5}'], { FAKE_ACCOUNTS: accounts });
+    const sb = await newSandbox();
+    let r = await sb.run(["setup", "--var", 'LIMITS:{"ai_per_day":5}']);
     assert.equal(r.code, 0, r.out);
-    let c = calls(dir);
-    assert.deepEqual(c.map((x) => x.args.slice(0, 2).join(" ")), ["whoami --json", "r2 bucket", "secret list", "deploy --name"]);
+    let c = sb.calls();
+    assert.deepEqual(names(c), ["whoami --json", "auth token", "r2 bucket", "secret list", "deploy --name"]);
     // Every call after the account choice runs for that account.
     assert.ok(c.slice(1).every((x) => x.account === "acc1"));
-    const deployCall = c.find((x) => x.args[0] === "deploy");
+    assert.equal(sb.syncRuns(), 1, "the checkout's assets are synced once");
+    const d = deployOf(c);
     // The secrets travel with the first version, through a private file.
-    assert.deepEqual(deployCall.secretsFile, ["BACKYARD_SECRET", "DEPLOY_TOKEN"]);
-    assert.equal(deployCall.secretsMode, "600");
-    assert.ok(deployCall.args.includes("--env="));
-    const generated = JSON.parse(deployCall.config.slice(deployCall.config.indexOf("\n") + 1));
-    assert.deepEqual(generated.r2_buckets, [{ binding: "R2", bucket_name: "backyard-files" }]);
-    assert.equal(generated.vars.LIMITS, '{"ai_per_day":5}');
-    assert.equal(generated.vars.URL_MODE, "path");
-    assert.ok(!existsSync(join(dir, "wrangler.setup.jsonc")), "the generated config is removed");
-    const secrets = JSON.parse(readFileSync(join(dir, "secrets.json"), "utf8"));
+    assert.deepEqual(d.secretsFile, ["BACKYARD_SECRET", "DEPLOY_TOKEN"]);
+    assert.equal(d.secretsMode, "600");
+    assert.ok(d.args.includes("--env="));
+    assert.deepEqual(d.config.r2_buckets, [{ binding: "R2", bucket_name: "backyard-files" }]);
+    assert.equal(d.config.vars.LIMITS, '{"ai_per_day":5}');
+    assert.equal(d.config.vars.URL_MODE, "path");
+    assert.equal(d.config.workers_dev, true);
+    assert.equal(d.config.routes, undefined, "a deploy never carries routes");
+    assert.equal(d.config.main, "src/index.ts");
+    assert.ok(!existsSync(join(sb.pkg, "wrangler.setup.jsonc")), "the generated config is removed");
+    const secrets = secretsOf(sb);
     assert.match(secrets.BACKYARD_SECRET, /^[0-9a-f]{64}$/);
     assert.match(secrets.DEPLOY_TOKEN, /^byd_/);
-    const st = state(dir);
-    assert.equal(st.url, hub);
+    // The REST calls: the live settings (none yet), then the account's workers.dev subdomain.
+    assert.deepEqual(
+      sb.requests().map((x) => `${x.method} ${x.path} ${x.status} ${x.token}`),
+      ["GET /accounts/acc1/workers/scripts/backyard/settings 404 oauth", "GET /accounts/acc1/workers/subdomain 200 oauth"],
+    );
+    const st = sb.state();
+    assert.equal(st.version, 2);
+    assert.equal(st.url, "https://backyard.acme.workers.dev");
+    assert.equal(st.workersDevUrl, "https://backyard.acme.workers.dev");
+    assert.equal(st.workersDev, true);
     assert.equal(st.deployToken, secrets.DEPLOY_TOKEN);
     assert.equal(st.accountId, "acc1");
     assert.equal(st.r2Bucket, "backyard-files");
-    if (process.platform !== "win32") assert.equal(fileMode(statePath(dir)), "600");
+    assert.deepEqual(st.vars, { LIMITS: '{"ai_per_day":5}' });
+    if (process.platform !== "win32") assert.equal(sb.stateMode(), "600");
     // Not a terminal: the generated secrets are never printed, the token is
     // masked and lives in the state file.
-    assert.ok(!r.out.includes(secrets.DEPLOY_TOKEN), "the deploy token is not printed");
-    assert.ok(!r.out.includes(secrets.BACKYARD_SECRET), "BACKYARD_SECRET is not printed");
-    assert.ok(r.out.includes(`backyard login --server ${hub} --token <"deployToken" in ${statePath(dir)}>`), r.out);
+    assert.ok(r.out.includes(`backyard login --server https://backyard.acme.workers.dev --token <"deployToken" in ${sb.statePath()}>`), r.out);
     assert.ok(r.out.includes(maskSecret(secrets.DEPLOY_TOKEN)), r.out);
+    assert.match(r.out, /Waiting for https:\/\/backyard\.acme\.workers\.dev to answer… ready/);
+    assert.match(r.out, /Your own domain: npm run cf -- domain add <host>/);
+    assert.doesNotMatch(r.out, /Terraform/);
 
     // A re-run keeps secrets, bucket and overrides.
-    r = await run(dir, [], { FAKE_ACCOUNTS: accounts });
+    r = await sb.run(["setup"]);
     assert.equal(r.code, 0, r.out);
-    c = calls(dir);
+    c = sb.calls();
     assert.equal(c.filter((x) => x.secret || x.secretsFile).length, 0, "no secret is rewritten");
-    assert.equal(JSON.parse(c.find((x) => x.args[0] === "deploy").config.split("\n").slice(1).join("\n")).vars.PUBLIC_URL, hub);
-    assert.equal(state(dir).deployToken, secrets.DEPLOY_TOKEN);
+    assert.equal(deployOf(c).config.vars.LIMITS, '{"ai_per_day":5}');
+    assert.equal(sb.state().deployToken, secrets.DEPLOY_TOKEN);
+    assert.deepEqual(secretsOf(sb), secrets);
 
     // --no-r2 is remembered; --rotate-token replaces the token.
-    r = await run(dir, ["--no-r2", "--rotate-token"], { FAKE_ACCOUNTS: accounts });
+    r = await sb.run(["setup", "--no-r2", "--rotate-token"]);
     assert.equal(r.code, 0, r.out);
-    c = calls(dir);
+    c = sb.calls();
     assert.ok(!c.some((x) => x.args[0] === "r2"));
-    assert.deepEqual(c.find((x) => x.args[0] === "deploy").secretsFile, ["DEPLOY_TOKEN"]);
-    assert.equal(state(dir).r2, false);
-    assert.equal(state(dir).r2Bucket, undefined);
-    r = await run(dir, [], { FAKE_ACCOUNTS: accounts });
-    assert.ok(!calls(dir).some((x) => x.args[0] === "r2"), "--no-r2 sticks");
+    assert.deepEqual(deployOf(c).secretsFile, ["DEPLOY_TOKEN"]);
+    assert.equal(deployOf(c).config.r2_buckets, undefined);
+    assert.equal(sb.state().r2, false);
+    assert.equal(sb.state().r2Bucket, undefined);
+    assert.notEqual(secretsOf(sb).DEPLOY_TOKEN, secrets.DEPLOY_TOKEN);
+    assert.equal(sb.state().deployToken, secretsOf(sb).DEPLOY_TOKEN);
+    r = await sb.run(["setup"]);
+    assert.equal(r.code, 0, r.out);
+    assert.ok(!sb.calls().some((x) => x.args[0] === "r2"), "--no-r2 sticks");
+    assertNoLeaks(sb, { outputs: [r.out] });
   });
 
   it("never replaces secrets when they cannot be listed, and sets them directly with --skip-deploy", async () => {
-    const dir = newSandbox();
-    const accounts = '[{"id":"a","name":"A"}]';
-    let r = await run(dir, ["--var", `PUBLIC_URL:${hub}`], { FAKE_ACCOUNTS: accounts });
+    const sb = await newSandbox();
+    let r = await sb.run(["setup"]);
     assert.equal(r.code, 0, r.out);
-    const before = readFileSync(join(dir, "secrets.json"), "utf8");
-    calls(dir);
+    const before = secretsOf(sb);
+    sb.calls();
     // Authentication or network errors, exit 0 without the list on stdout (an
     // empty list only on stderr), or garbage: stop, change nothing.
     for (const [mode, msg] of [
@@ -210,150 +155,745 @@ describe("scripts/setup.mjs", () => {
       ["stderr-json", /unexpected output of wrangler secret list/],
       ["garbage", /unexpected output of wrangler secret list/],
     ]) {
-      r = await run(dir, [], { FAKE_ACCOUNTS: accounts, FAKE_LIST_MODE: mode });
-      assert.notEqual(r.code, 0, mode);
+      r = await sb.run(["setup"], { FAKE_LIST_MODE: mode });
+      assert.equal(r.code, 1, `${mode}: ${r.out}`);
       assert.match(r.out, msg, mode);
-      assert.ok(!calls(dir).some((x) => x.args[0] === "deploy" || x.secret), mode);
-      assert.equal(readFileSync(join(dir, "secrets.json"), "utf8"), before, mode);
+      assert.ok(!sb.calls().some((x) => x.args[0] === "deploy" || x.secret), mode);
+      assert.deepEqual(secretsOf(sb), before, mode);
     }
     // A "[…]" warning on stderr is not the list: the secrets are kept.
-    r = await run(dir, [], { FAKE_ACCOUNTS: accounts, FAKE_LIST_MODE: "stderr-warning", CI: "true" });
+    r = await sb.run(["setup"], { FAKE_LIST_MODE: "stderr-warning", CI: "true" });
     assert.equal(r.code, 0, r.out);
-    let c = calls(dir);
+    let c = sb.calls();
     assert.ok(c.some((x) => x.args[0] === "deploy"));
     assert.equal(c.filter((x) => x.secret || x.secretsFile).length, 0, "no secret is rewritten");
-    assert.equal(readFileSync(join(dir, "secrets.json"), "utf8"), before);
+    assert.deepEqual(secretsOf(sb), before);
     assert.match(r.out, /not printed: CI/);
-    assert.ok(!r.out.includes(JSON.parse(before).DEPLOY_TOKEN));
-    r = await run(dir, ["--skip-deploy", "--rotate-token"], { FAKE_ACCOUNTS: accounts });
+    assert.ok(!r.out.includes(before.DEPLOY_TOKEN));
+    r = await sb.run(["setup", "--skip-deploy", "--rotate-token"]);
     assert.equal(r.code, 0, r.out);
-    c = calls(dir);
+    c = sb.calls();
     assert.ok(!c.some((x) => x.args[0] === "deploy"));
     assert.deepEqual(c.filter((x) => x.secret).map((x) => x.secret), ["DEPLOY_TOKEN"]);
-    assert.equal(state(dir).deployToken, JSON.parse(readFileSync(join(dir, "secrets.json"), "utf8")).DEPLOY_TOKEN);
+    assert.equal(sb.state().deployToken, secretsOf(sb).DEPLOY_TOKEN);
+    assertNoLeaks(sb, { outputs: [r.out] });
   });
 
   it("continues without R2 when the account has not enabled it", async () => {
-    const dir = newSandbox();
-    const r = await run(dir, ["--var", `PUBLIC_URL:${hub}`], { FAKE_ACCOUNTS: '[{"id":"a","name":"A"}]', FAKE_R2: "disabled" });
+    const sb = await newSandbox();
+    const r = await sb.run(["setup"], { FAKE_R2: "disabled" });
     assert.equal(r.code, 0, r.out);
     assert.match(r.out, /R2 is not enabled on this account/);
-    const deployCall = calls(dir).find((x) => x.args[0] === "deploy");
-    assert.ok(!JSON.parse(deployCall.config.split("\n").slice(1).join("\n")).r2_buckets);
-    assert.equal(state(dir).r2Bucket, undefined);
-    assert.equal(state(dir).r2, undefined, "a failed attempt is retried next time");
+    assert.match(r.out, /re-run npm run cf -- setup/);
+    assert.equal(deployOf(sb.calls()).config.r2_buckets, undefined);
+    assert.equal(sb.state().r2Bucket, undefined);
+    assert.equal(sb.state().r2, undefined, "a failed attempt is retried next time");
+  });
+
+  it("never unbinds or forgets the R2 bucket in use when creating it fails", async () => {
+    const sb = await newSandbox();
+    let r = await sb.run(["setup", "--r2-bucket", "team-files"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(sb.cf().workers.backyard.r2Bucket, "team-files");
+    // The create fails (a transient error, a token without R2 permission): the bound bucket stays bound.
+    r = await sb.run(["setup"], { FAKE_R2: "disabled" });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /could not confirm the R2 bucket team-files: keeping it bound \(the Worker already uses it\)/);
+    assert.doesNotMatch(r.out, /Continuing without R2/);
+    assert.deepEqual(deployOf(sb.calls()).config.r2_buckets, [{ binding: "R2", bucket_name: "team-files" }]);
+    assert.equal(sb.state().r2Bucket, "team-files");
+    assert.equal(sb.cf().workers.backyard.r2Bucket, "team-files");
+    // A machine without state adopts the live bucket and keeps it bound too.
+    forgetState(sb);
+    r = await sb.run(["setup"], { FAKE_R2: "disabled" });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /R2 bucket team-files/);
+    assert.deepEqual(deployOf(sb.calls()).config.r2_buckets, [{ binding: "R2", bucket_name: "team-files" }]);
+    assert.equal(sb.state().r2Bucket, "team-files");
+  });
+
+  it("remembers a bucket name it could not create yet, and uses it on the next run", async () => {
+    const sb = await newSandbox();
+    sb.writeState("backyard", { version: 2, accountId: "acc1", r2Bucket: "team-files", updatedAt: "2026-01-01T00:00:00Z" });
+    let r = await sb.run(["setup"], { FAKE_R2: "disabled" });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /R2 is not enabled on this account/);
+    assert.match(r.out, /Continuing without R2/);
+    assert.equal(deployOf(sb.calls()).config.r2_buckets, undefined);
+    assert.equal(sb.state().r2Bucket, "team-files", "the name is kept");
+    r = await sb.run(["setup"]);
+    assert.equal(r.code, 0, r.out);
+    assert.deepEqual(deployOf(sb.calls()).config.r2_buckets, [{ binding: "R2", bucket_name: "team-files" }]);
+  });
+
+  it("exits 4 with the reason when the hub does not become ready, instead of saying it is live", async () => {
+    const sb = await newSandbox();
+    const fast = { FAKE_FAST_SLEEP: "1", BACKYARD_CF_RESULT_FILE: sb.resultPath };
+    // The Worker fails closed (e.g. AUTH_MODE=oidc from the Go server): its own reason is shown.
+    sb.updateCf((s) => (s.edge = { readyz: 503, readyzBody: 'not ready: AUTH_MODE must be "none" or "access" (got "oidc")\n' }));
+    let r = await sb.run(["setup", "--no-r2"], fast);
+    assert.equal(r.code, 4, r.out);
+    assert.match(r.out, /Waiting for https:\/\/backyard\.acme\.workers\.dev to answer… not yet/);
+    assert.ok(
+      r.out.includes('Deployed to https://backyard.acme.workers.dev, but it is not ready: /__backyard/readyz answers HTTP 503: not ready: AUTH_MODE must be "none" or "access" (got "oidc").'),
+      r.out,
+    );
+    assert.match(r.out, /Check with npm run cf -- status; re-run npm run cf -- setup once it is fixed/);
+    assert.doesNotMatch(r.out, /Backyard is live|workers\.dev can take a minute/);
+    assert.match(r.out, /backyard login --server https:\/\/backyard\.acme\.workers\.dev --token/, "the login line is still there");
+    assert.equal(sb.fake.edgeRequests.filter((x) => x.path === "/__backyard/readyz").length, 15);
+    assert.equal(sb.result().command, "setup", "the result file is written");
+    // A name that does not resolve yet: the DNS hint.
+    sb.updateCf((s) => {
+      s.edge = {};
+      s.dns = { "backyard.acme.workers.dev": "nxdomain" };
+    });
+    r = await sb.run(["setup", "--no-r2"], fast);
+    assert.equal(r.code, 4, r.out);
+    assert.match(r.out, /but it is not ready: DNS or the certificate is still provisioning/);
+    // Ready: exit 0.
+    sb.updateCf((s) => (s.dns = {}));
+    r = await sb.run(["setup", "--no-r2"], fast);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /Backyard is live at https:\/\/backyard\.acme\.workers\.dev/);
+  });
+
+  it("leaves the login and the next step to the Go CLI when it logs in itself, and says where the CLI comes from otherwise", async () => {
+    const sb = await newSandbox();
+    let r = await sb.run(["setup", "--no-r2"]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /Connect the CLI with the deploy token/);
+    assert.ok(r.out.includes("No backyard CLI yet? curl -fsSL https://raw.githubusercontent.com/thasami/backyard/main/scripts/install.sh | sh"), r.out);
+    assert.match(r.out, /Then: backyard init my-site && cd my-site && backyard deploy/);
+    // Run by `backyard cloudflare`, which logs in with the deploy token and prints the next step.
+    r = await sb.run(["setup", "--no-r2"], { BACKYARD_CF_INVOKED_AS: "backyard cloudflare", BACKYARD_CF_CLI_LOGIN: "1" });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /Backyard is live at/);
+    assert.doesNotMatch(r.out, /Connect the CLI|backyard login --server|Then: |No backyard CLI yet/);
+    assert.match(r.out, /The deploy token is saved in/);
+    // `backyard cloudflare --no-login`: the CLI is installed, the login line stays.
+    r = await sb.run(["setup", "--no-r2"], { BACKYARD_CF_INVOKED_AS: "backyard cloudflare" });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /backyard login --server https:\/\/backyard\.acme\.workers\.dev --token/);
+    assert.match(r.out, /Then: backyard init my-site/);
+    assert.doesNotMatch(r.out, /No backyard CLI yet/);
   });
 
   it("asks for an account only when it must", async () => {
-    const two = JSON.stringify([
-      { id: "a1", name: "Personal" },
-      { id: "a2", name: "Work" },
-    ]);
-    const dir = newSandbox();
+    const sb = await newSandbox({ cf: { accounts: { a1: { name: "Personal", subdomain: "personal" }, a2: { name: "Work", subdomain: "work" } } } });
     // Non-interactive with several accounts: a clear error, nothing deployed.
-    let r = await run(dir, [], { FAKE_ACCOUNTS: two });
-    assert.notEqual(r.code, 0);
-    assert.match(r.out, /CLOUDFLARE_ACCOUNT_ID/);
-    assert.ok(!calls(dir).some((x) => x.args[0] === "deploy"));
+    let r = await sb.run(["setup"]);
+    assert.equal(r.code, 2, r.out);
+    // The names tell the accounts apart (real ids are 32 hex characters).
+    assert.match(r.out, /this login can deploy to 2 Cloudflare accounts: set CLOUDFLARE_ACCOUNT_ID to one of: Personal \(a1\), Work \(a2\)/);
+    assert.ok(!sb.calls().some((x) => x.args[0] === "deploy"));
+    // status reports the same answer (its live checks are pending).
+    r = await sb.run(["status"]);
+    assert.equal(r.code, 4, r.out);
+    assert.match(r.out, /set CLOUDFLARE_ACCOUNT_ID to one of: Personal \(a1\), Work \(a2\)/);
     // CLOUDFLARE_ACCOUNT_ID decides (and is remembered).
-    r = await run(dir, ["--var", `PUBLIC_URL:${hub}`], { FAKE_ACCOUNTS: two, CLOUDFLARE_ACCOUNT_ID: "a2" });
+    r = await sb.run(["setup"], { CLOUDFLARE_ACCOUNT_ID: "a2" });
     assert.equal(r.code, 0, r.out);
-    assert.ok(calls(dir).filter((x) => x.args[0] !== "whoami").every((x) => x.account === "a2"));
-    r = await run(dir, [], { FAKE_ACCOUNTS: two });
+    assert.ok(sb.calls().filter((x) => x.args[0] !== "whoami").every((x) => x.account === "a2"));
+    assert.equal(sb.state().url, "https://backyard.work.workers.dev");
+    r = await sb.run(["setup"]);
     assert.equal(r.code, 0, r.out);
-    assert.ok(calls(dir).slice(1).every((x) => x.account === "a2"));
+    assert.ok(sb.calls().slice(1).every((x) => x.account === "a2"));
+    assert.ok(sb.requests().every((x) => x.path.startsWith("/accounts/a2/")));
   });
 
   it("uses API tokens non-interactively and fails clearly when logged out", async () => {
-    const dir = newSandbox();
-    let r = await run(dir, ["--worker-name", "team-yard", "--var", `PUBLIC_URL:${hub}`], { CLOUDFLARE_API_TOKEN: "t", CLOUDFLARE_ACCOUNT_ID: "acc", DEPLOY_TOKEN: "my-token" });
+    const apiToken = "ci-api-token-0123456789abcdef";
+    const sb = await newSandbox({ cf: { tokens: { [apiToken]: { label: "ci", permissions: [...TOKEN_PRESETS.workers] } } } });
+    // The admin token is for Backyard's own REST calls only: never given to wrangler, never stored.
+    const adminToken = "admin-token-for-dns-and-access-0123456789";
+    const env = { CLOUDFLARE_API_TOKEN: apiToken, CLOUDFLARE_ACCOUNT_ID: "acc1", DEPLOY_TOKEN: "byd_my-token-0123456789", BACKYARD_CF_API_TOKEN: adminToken };
+    let r = await sb.run(["setup", "--worker-name", "team-yard"], env);
     assert.equal(r.code, 0, r.out);
-    const c = calls(dir);
+    const c = sb.calls();
     assert.ok(!c.some((x) => x.args[0] === "whoami"), "no whoami with token and account");
     assert.ok(c.some((x) => x.args.join(" ").startsWith("deploy --name team-yard")));
-    assert.equal(JSON.parse(readFileSync(join(dir, "secrets.json"), "utf8")).DEPLOY_TOKEN, "my-token");
-    assert.ok(c.find((x) => x.args[0] === "deploy").secretsFile.includes("DEPLOY_TOKEN"));
-    assert.equal(state(dir, "team-yard").deployToken, "my-token");
+    assert.equal(secretsOf(sb, "team-yard").DEPLOY_TOKEN, "byd_my-token-0123456789");
+    assert.ok(deployOf(c).secretsFile.includes("DEPLOY_TOKEN"));
+    assert.equal(sb.state("team-yard").deployToken, "byd_my-token-0123456789");
+    assert.ok(sb.requests().every((x) => x.token === "ci"), "the REST calls use wrangler's credential");
     // A token from the environment is referred to, never echoed.
-    assert.ok(!r.out.includes("my-token"), r.out);
+    assert.ok(!r.out.includes("byd_my-token-0123456789"), r.out);
     assert.match(r.out, /--token \$DEPLOY_TOKEN/);
+    sb.allowInEnv = [apiToken, "byd_my-token-0123456789"];
+    sb.extraSecrets = [adminToken];
+    assertNoLeaks(sb, { outputs: [r.out], allowInEnv: sb.allowInEnv, extra: [adminToken] });
+    assert.ok(sb.allCalls().every((x) => !("BACKYARD_CF_API_TOKEN" in x.env)));
 
-    r = await run(newSandbox(), [], { FAKE_LOGGED_OUT: "1" });
-    assert.notEqual(r.code, 0);
+    r = await sb.run(["setup"], { FAKE_LOGGED_OUT: "1" });
+    assert.equal(r.code, 2, r.out);
     assert.match(r.out, /not logged in to Cloudflare/);
-    r = await run(dir, ["--bogus"]);
-    assert.notEqual(r.code, 0);
+    r = await sb.run(["setup", "--bogus"]);
+    assert.equal(r.code, 2);
     assert.match(r.out, /unknown option --bogus/);
+    assert.match(r.out, /Usage: npm run cf -- setup/);
   });
+
   it("keeps a DEPLOY_TOKEN the Worker has when this machine does not know it (second machine, CI)", async () => {
-    const dir = newSandbox();
-    const accounts = '[{"id":"a","name":"A"}]';
+    const sb = await newSandbox();
     // Set up from "laptop A".
-    let r = await run(dir, ["--var", `PUBLIC_URL:${hub}`], { FAKE_ACCOUNTS: accounts });
+    let r = await sb.run(["setup"]);
     assert.equal(r.code, 0, r.out);
-    calls(dir);
-    const before = readFileSync(join(dir, "secrets.json"), "utf8");
-    const token = JSON.parse(before).DEPLOY_TOKEN;
+    sb.calls();
+    const before = secretsOf(sb);
+    const token = before.DEPLOY_TOKEN;
     // "Laptop B" or a CI runner: no state file.
-    rmSync(join(dir, "config"), { recursive: true, force: true });
-    r = await run(dir, ["--var", `PUBLIC_URL:${hub}`], { FAKE_ACCOUNTS: accounts, CI: "true" });
+    forgetState(sb);
+    r = await sb.run(["setup"], { CI: "true" });
     assert.equal(r.code, 0, r.out);
-    const c = calls(dir);
-    const deployCall = c.find((x) => x.args[0] === "deploy");
-    assert.ok(deployCall, "it still deploys");
-    assert.ok(!(deployCall.secretsFile ?? []).includes("DEPLOY_TOKEN"), "DEPLOY_TOKEN is not uploaded");
+    const c = sb.calls();
+    const d = deployOf(c);
+    assert.ok(d, "it still deploys");
+    assert.ok(!(d.secretsFile ?? []).includes("DEPLOY_TOKEN"), "DEPLOY_TOKEN is not uploaded");
     assert.ok(!c.some((x) => x.secret), "no secret is put");
-    assert.equal(readFileSync(join(dir, "secrets.json"), "utf8"), before, "the Worker's secrets are unchanged");
+    assert.deepEqual(secretsOf(sb), before, "the Worker's secrets are unchanged");
     assert.match(r.out, /already has a DEPLOY_TOKEN that this machine does not know: keeping it/);
     assert.match(r.out, /--token <DEPLOY_TOKEN>/);
-    assert.match(r.out, /No saved setup for backyard on this machine/);
-    assert.equal(state(dir).deployToken, undefined, "no token is remembered that is not the Worker's");
+    assert.match(r.out, /Adopted the deployed configuration of backyard \(no setup state on this machine\): R2 bucket backyard-files/);
+    assert.equal(sb.state().deployToken, undefined, "no token is remembered that is not the Worker's");
     assert.ok(!r.out.includes(token));
     // Telling it the token remembers it again, without rotating anything.
-    r = await run(dir, [], { FAKE_ACCOUNTS: accounts, DEPLOY_TOKEN: token });
+    sb.allowInEnv = [token];
+    r = await sb.run(["setup"], { DEPLOY_TOKEN: token });
     assert.equal(r.code, 0, r.out);
-    calls(dir);
-    assert.equal(JSON.parse(readFileSync(join(dir, "secrets.json"), "utf8")).DEPLOY_TOKEN, token);
-    assert.equal(state(dir).deployToken, token);
+    sb.calls();
+    assert.equal(secretsOf(sb).DEPLOY_TOKEN, token);
+    assert.equal(sb.state().deployToken, token);
     // --rotate-token still issues a new one on purpose.
-    rmSync(join(dir, "config"), { recursive: true, force: true });
-    r = await run(dir, ["--rotate-token"], { FAKE_ACCOUNTS: accounts });
+    forgetState(sb);
+    r = await sb.run(["setup", "--rotate-token"]);
     assert.equal(r.code, 0, r.out);
-    assert.deepEqual(calls(dir).find((x) => x.args[0] === "deploy").secretsFile, ["DEPLOY_TOKEN"]);
-    assert.notEqual(JSON.parse(readFileSync(join(dir, "secrets.json"), "utf8")).DEPLOY_TOKEN, token);
+    assert.deepEqual(deployOf(sb.calls()).secretsFile, ["DEPLOY_TOKEN"]);
+    assert.notEqual(secretsOf(sb).DEPLOY_TOKEN, token);
+    assertNoLeaks(sb, { outputs: [r.out] });
   });
 
   it("keeps a broken state file and an unknown Worker from rotating anything", async () => {
-    const dir = newSandbox();
-    const accounts = '[{"id":"a","name":"A"}]';
+    const sb = await newSandbox();
     // --skip-deploy cannot set secrets on a Worker that does not exist yet.
-    let r = await run(dir, ["--skip-deploy"], { FAKE_ACCOUNTS: accounts });
-    assert.notEqual(r.code, 0);
+    let r = await sb.run(["setup", "--skip-deploy"]);
+    assert.equal(r.code, 1, r.out);
     assert.match(r.out, /does not exist yet/);
-    assert.ok(!calls(dir).some((x) => x.secret || x.args[0] === "deploy"));
+    assert.ok(!sb.calls().some((x) => x.secret || x.args[0] === "deploy"));
 
-    r = await run(dir, ["--var", `PUBLIC_URL:${hub}`], { FAKE_ACCOUNTS: accounts });
+    r = await sb.run(["setup"]);
     assert.equal(r.code, 0, r.out);
-    calls(dir);
-    const token = state(dir).deployToken;
+    sb.calls();
+    const token = sb.state().deployToken;
     // An older version may have left the state readable by others: fixed on save.
-    chmodSync(statePath(dir), 0o644);
-    r = await run(dir, [], { FAKE_ACCOUNTS: accounts });
+    chmodSync(sb.statePath(), 0o644);
+    r = await sb.run(["setup"]);
     assert.equal(r.code, 0, r.out);
-    calls(dir);
-    if (process.platform !== "win32") assert.equal(fileMode(statePath(dir)), "600");
-    assert.equal(state(dir).deployToken, token);
+    sb.calls();
+    if (process.platform !== "win32") assert.equal(sb.stateMode(), "600");
+    assert.equal(sb.state().deployToken, token);
 
     // A corrupt state file stops the setup instead of issuing a new token.
-    writeFileSync(statePath(dir), "{ not json");
-    r = await run(dir, [], { FAKE_ACCOUNTS: accounts });
-    assert.notEqual(r.code, 0);
-    assert.match(r.out, /is not a valid state file/);
-    writeFileSync(statePath(dir), "[]");
-    r = await run(dir, [], { FAKE_ACCOUNTS: accounts });
-    assert.notEqual(r.code, 0);
-    assert.match(r.out, /is not a valid state file/);
-    assert.ok(!calls(dir).some((x) => x.args[0] === "deploy" || x.secret));
+    for (const bad of ["{ not json", "[]"]) {
+      sb.writeState("backyard", bad);
+      r = await sb.run(["setup"]);
+      assert.equal(r.code, 1, r.out);
+      assert.match(r.out, /is not a valid state file/);
+      assert.ok(!sb.calls().some((x) => x.args[0] === "deploy" || x.secret));
+    }
+  });
+
+  it("leaves no secrets file behind on Ctrl-C during the deploy, and remembers a new deploy token first", async () => {
+    for (const layout of ["packaged", "source"]) {
+      const sb = await newSandbox({ layout });
+      const tmp = join(sb.root, "tmp");
+      mkdirSync(tmp);
+      // Ctrl-C while wrangler uploads (the secrets file with BACKYARD_SECRET exists then).
+      let r = await sb.run(["setup", "--no-r2"], { TMPDIR: tmp, FAKE_DEPLOY_DELAY_MS: "20000" }, { interrupt: /Uploading \(fake: slow\)/ });
+      assert.equal(r.code, 130, `${layout}: ${r.out}`);
+      assert.match(r.out, /Interrupted\./);
+      assert.deepEqual(readdirSync(tmp), [], `${layout}: nothing is left in TMPDIR`);
+      assert.ok(!existsSync(join(sb.pkg, "wrangler.setup.jsonc")), `${layout}: the generated config is gone`);
+      // The token was saved before the upload, so the next run uploads that one.
+      const token = sb.state().deployToken;
+      assert.match(token, /^byd_/, layout);
+      r = await sb.run(["setup", "--no-r2"], { TMPDIR: tmp });
+      assert.equal(r.code, 0, `${layout}: ${r.out}`);
+      assert.equal(secretsOf(sb).DEPLOY_TOKEN, token, layout);
+      assert.equal(sb.state().deployToken, token, layout);
+      assert.deepEqual(readdirSync(tmp), [], layout);
+    }
+  });
+
+  it("saves a rotated deploy token only once the deploy worked", async () => {
+    const sb = await newSandbox();
+    let r = await sb.run(["setup", "--no-r2"]);
+    assert.equal(r.code, 0, r.out);
+    const token = sb.state().deployToken;
+    r = await sb.run(["setup", "--no-r2", "--rotate-token"], { FAKE_DEPLOY_FAIL: "1" });
+    assert.equal(r.code, 1, r.out);
+    assert.equal(sb.state().deployToken, token, "the state still names the token the Worker has");
+    assert.equal(secretsOf(sb).DEPLOY_TOKEN, token);
+  });
+
+  it("deploys the prebuilt Worker of the packaged layout from a private run directory", async () => {
+    for (const wrangler of ["nested", "hoisted"]) {
+      const sb = await newSandbox({ layout: "packaged", wrangler });
+      const before = sb.snapshot();
+      makeReadOnly(sb.pkg);
+      try {
+        const r = await sb.run(["setup"]);
+        assert.equal(r.code, 0, `${wrangler}: ${r.out}`);
+        assert.equal(sb.syncRuns(), 0, "no build step in the package");
+        const c = sb.calls();
+        assert.deepEqual(names(c), ["whoami --json", "auth token", "r2 bucket", "secret list", "deploy --name"]);
+        const d = deployOf(c);
+        assert.equal(d.config.main, join(sb.pkg, "dist", "worker.js"));
+        assert.equal(d.config.no_bundle, true);
+        assert.equal(d.config.find_additional_modules, false);
+        for (const k of ["build", "env", "$schema", "routes"]) assert.equal(d.config[k], undefined, k);
+        assert.equal(d.config.name, "backyard");
+        assert.deepEqual(
+          d.config.durable_objects.bindings.map((b) => b.name),
+          ["SITE", "REGISTRY"],
+        );
+        // Every wrangler call ran in a private temporary directory, gone afterwards.
+        const cwds = new Set(c.map((x) => x.cwd));
+        assert.equal(cwds.size, 1);
+        for (const cwd of cwds) {
+          assert.ok(!cwd.startsWith(sb.pkg), cwd);
+          assert.match(cwd, /backyard-cf-/);
+          assert.ok(!existsSync(cwd), `${cwd} is removed`);
+        }
+        assert.equal(d.configPath, join([...cwds][0], "wrangler.json"));
+        assert.ok(r.out.includes("Your own domain: backyard-cloudflare domain add <host>"), r.out);
+        assertNoLeaks(sb, { outputs: [r.out] });
+      } finally {
+        makeWritable(sb.pkg);
+      }
+      assert.deepEqual(sb.snapshot(), before, "nothing is written into the package");
+      // npx sets npm_command=exec: the hints name npx.
+      const r = await sb.run(["setup", "--dry-run"], { npm_command: "exec" });
+      assert.equal(r.code, 0, r.out);
+    }
+  });
+
+  it("registers the account's workers.dev subdomain from the terminal, and never renames one", async () => {
+    // No subdomain, non-interactive, no flag: exit 2 with the onboarding link, nothing deployed.
+    const sb = await newSandbox({ cf: { accounts: { acc1: { name: "Acme Inc.", subdomain: null } }, takenSubdomains: ["taken"] } });
+    let r = await sb.run(["setup"]);
+    assert.equal(r.code, 2, r.out);
+    assert.match(r.out, /this account has no workers\.dev subdomain: pass --workers-subdomain <name>, or register one at https:\/\/dash\.cloudflare\.com\/acc1\/workers\/onboarding/);
+    assert.ok(!sb.calls().some((x) => x.args[0] === "deploy" || x.args[0] === "r2"));
+    assert.equal(sb.fake.writes().length, 0);
+    // A taken name: exit 1, nothing registered.
+    r = await sb.run(["setup", "--workers-subdomain", "taken"]);
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /the workers\.dev subdomain taken is taken/);
+    assert.equal(sb.fake.writes().length, 0);
+    assert.ok(!sb.calls().some((x) => x.args[0] === "deploy"));
+    // An invalid name: exit 2.
+    r = await sb.run(["setup", "--workers-subdomain", "-bad-"]);
+    assert.equal(r.code, 2, r.out);
+    // --workers-subdomain acme: availability check, then the PUT.
+    sb.requests();
+    r = await sb.run(["setup", "--workers-subdomain", "acme"]);
+    assert.equal(r.code, 0, r.out);
+    // (After the live settings: the subdomain is resolved once the adopted workers.dev setting is known.)
+    const reqs = sb.requests().filter((x) => /\/workers\/subdomains?(\/|$)/.test(x.path));
+    assert.deepEqual(
+      reqs.slice(0, 3).map((x) => `${x.method} ${x.path} ${x.status}`),
+      ["GET /accounts/acc1/workers/subdomain 404", "GET /accounts/acc1/workers/subdomains/acme 404", "PUT /accounts/acc1/workers/subdomain 200"],
+    );
+    assert.deepEqual(reqs[2].body, { subdomain: "acme" });
+    assert.match(r.out, /workers\.dev subdomain acme registered \(DNS can take a few minutes\)/);
+    assert.equal(sb.state().workersDevUrl, "https://backyard.acme.workers.dev");
+    assert.equal(sb.state().url, "https://backyard.acme.workers.dev");
+    // An existing (different) subdomain is never renamed.
+    r = await sb.run(["setup", "--workers-subdomain", "other"]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /account already uses acme; --workers-subdomain ignored/);
+    assert.ok(!sb.requests().some((x) => x.method === "PUT"));
+    assert.equal(suggestSubdomain("Acme Inc."), "acme-inc");
+    assert.equal(suggestSubdomain("--Ünïcode__Corp--"), "n-code-corp");
+    assert.equal(suggestSubdomain("x".repeat(80)).length, 63);
+  });
+
+  it("asks on a terminal: the account, the workers.dev subdomain (again when taken), and shows the hub link", { skip: !ttyAvailable() && "needs util-linux script" }, async () => {
+    const sb = await newSandbox({ cf: { accounts: { acc1: { name: "Acme Inc.", subdomain: null }, acc2: { name: "Other", subdomain: "other" } }, takenSubdomains: ["taken"] } });
+    const r = await sb.runTTY(["setup"], {}, {
+      answers: [
+        [/Deploy Backyard to which account\? \[1-2\]/, "1\r"],
+        [/workers\.dev subdomain for this account \[acme-inc\]/, "taken\r"],
+        [/taken\.workers\.dev is taken; please choose another\s+workers\.dev subdomain for this account \[acme-inc\]/, "\r"],
+      ],
+    });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /workers\.dev subdomain acme-inc registered/);
+    const token = sb.state().deployToken;
+    assert.equal(sb.state().url, "https://backyard.acme-inc.workers.dev");
+    // On a terminal (outside CI) the token is shown once: the hub link and the login line.
+    assert.ok(r.out.includes(`https://backyard.acme-inc.workers.dev/#token=${token}`), r.out);
+    assert.ok(r.out.includes(`backyard login --server https://backyard.acme-inc.workers.dev --token ${token}`), r.out);
+    assert.deepEqual(sb.requests().filter((x) => x.method === "PUT").map((x) => x.body), [{ subdomain: "acme-inc" }]);
+    // CI=true is never interactive, even on a terminal.
+    const ci = await sb.runTTY(["setup"], { CI: "true" });
+    assert.equal(ci.code, 0, ci.out);
+    assert.ok(!ci.out.includes(token), "masked in CI");
+    sb.outputs = [ci.out];
+  });
+
+  it("falls back to the deploy output when the credential cannot read the subdomain (code 10000)", async () => {
+    const sb = await newSandbox();
+    sb.fake.addFault({ method: "GET", path: "/accounts/acc1/workers/subdomain", status: 403, code: 10000, message: "Authentication error", times: 2 });
+    const r = await sb.run(["setup"]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /cannot read the account's workers\.dev subdomain/);
+    assert.equal(sb.state().url, "https://backyard.acme.workers.dev");
+    assert.equal(sb.state().workersDevUrl, "https://backyard.acme.workers.dev");
+    // The credential was re-read once after the 10000 (an expired OAuth token gets refreshed).
+    assert.equal(sb.calls().filter((x) => x.args[0] === "auth").length, 2);
+  });
+
+  it("adopts the deployed configuration on a machine without state", async () => {
+    const sb = await newSandbox();
+    seedWorker(sb, {
+      vars: { AUTH_MODE: "access", ACCESS_TEAM_DOMAIN: "acme", ACCESS_AUD: AUD, BASE_DOMAIN: "backyard.example.com", LIMITS: '{"ai_per_day":5}' },
+      r2Bucket: "custom",
+      customDomains: ["backyard.example.com"],
+    });
+    const r = await sb.run(["setup"]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(
+      r.out,
+      /Adopted the deployed configuration of backyard \(no setup state on this machine\): R2 bucket custom; variables LIMITS; domain backyard\.example\.com \(path mode\); Access team acme\.cloudflareaccess\.com/,
+    );
+    const d = deployOf(sb.calls());
+    assert.equal(d.config.vars.AUTH_MODE, "access");
+    assert.equal(d.config.vars.ACCESS_TEAM_DOMAIN, "acme.cloudflareaccess.com");
+    assert.equal(d.config.vars.ACCESS_AUD, AUD);
+    assert.equal(d.config.vars.BASE_DOMAIN, "backyard.example.com");
+    assert.equal(d.config.vars.URL_MODE, "path");
+    assert.equal(d.config.vars.LIMITS, '{"ai_per_day":5}');
+    assert.deepEqual(d.config.r2_buckets, [{ binding: "R2", bucket_name: "custom" }]);
+    assert.equal(d.secretsFile, undefined, "no secret changes");
+    const st = sb.state();
+    assert.deepEqual(st.domain, { host: "backyard.example.com", mode: "path", status: "active", source: "adopted" });
+    assert.deepEqual(st.access, { team: "acme.cloudflareaccess.com", aud: AUD, source: "adopted" });
+    assert.deepEqual(st.vars, { LIMITS: '{"ai_per_day":5}' });
+    assert.equal(st.r2Bucket, "custom");
+    assert.equal(st.url, "https://backyard.example.com");
+    assert.match(r.out, /--token <DEPLOY_TOKEN>/);
+    // Managed now: --var for them is refused.
+    for (const [v, by] of [
+      ["BASE_DOMAIN:x.example.com", /BASE_DOMAIN is managed by `npm run cf -- domain add` \(use `npm run cf -- domain remove`\)/],
+      ["AUTH_MODE:none", /AUTH_MODE is managed by `npm run cf -- access enable` \(use `npm run cf -- access disable`\)/],
+    ]) {
+      const rr = await sb.run(["setup", "--var", v]);
+      assert.equal(rr.code, 2, rr.out);
+      assert.match(rr.out, by);
+    }
+    assert.ok(!sb.calls().some((x) => x.args[0] === "deploy"));
+    assertNoLeaks(sb, { outputs: [r.out] });
+  });
+
+  it("keeps --var for managed keys working when nothing manages them (the Terraform hand-off)", async () => {
+    const sb = await newSandbox();
+    seedWorker(sb, { customDomains: ["backyard.example.com"] });
+    sb.writeState("backyard", { accountId: "acc1", updatedAt: "2026-01-01T00:00:00Z", deployToken: "byd_existing-token-0123456789abcdef" });
+    let r = await sb.run(["setup", "--var", "BASE_DOMAIN:backyard.example.com", "--var", "URL_MODE:path"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(deployOf(sb.calls()).config.vars.BASE_DOMAIN, "backyard.example.com");
+    assert.deepEqual(sb.state().vars, { BASE_DOMAIN: "backyard.example.com", URL_MODE: "path" });
+    assert.equal(sb.state().domain, undefined);
+    assert.equal(sb.state().url, "https://backyard.example.com");
+    // A second machine running the module's setup_args: the adopted domain stays external.
+    forgetState(sb);
+    r = await sb.run(["setup", "--var", "BASE_DOMAIN:backyard.example.com", "--var", "URL_MODE:path"]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /Adopted the deployed configuration/);
+    assert.equal(sb.state().domain, undefined);
+    assert.deepEqual(sb.state().vars, { BASE_DOMAIN: "backyard.example.com", URL_MODE: "path" });
+    sb.calls();
+    // --var KEY: drops it again.
+    r = await sb.run(["setup", "--var", "BASE_DOMAIN:", "--var", "URL_MODE:"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(sb.state().vars, undefined);
+    assert.equal(deployOf(sb.calls()).config.vars.BASE_DOMAIN, "");
+  });
+
+  it("refuses a secret as --var before anything happens (not a plain-text variable)", async () => {
+    const sb = await newSandbox();
+    for (const [name, hint] of [
+      ["DEPLOY_TOKEN", /DEPLOY_TOKEN=<token>/],
+      ["BACKYARD_SECRET", /--rotate-secret/],
+      ["ANTHROPIC_API_KEY", /npx wrangler secret put ANTHROPIC_API_KEY --name backyard/],
+    ]) {
+      const r = await sb.run(["setup", "--var", `${name}:not-a-variable-value`]);
+      assert.equal(r.code, 2, r.out);
+      assert.match(r.out, new RegExp(`${name} is a secret, not a variable: never pass it with --var`));
+      assert.match(r.out, hint);
+      assert.doesNotMatch(r.out, /not-a-variable-value/, "the value is not echoed");
+    }
+    // Written with "=" (the habit of other tools): refused the same way, the value never echoed.
+    for (const v of ["DEPLOY_TOKEN=not-a-variable-value", "deploy_token=not-a-variable-value"]) {
+      const r = await sb.run(["setup", "--var", v]);
+      assert.equal(r.code, 2, r.out);
+      assert.match(r.out, /DEPLOY_TOKEN is a secret, not a variable: never pass it with --var/);
+      assert.doesNotMatch(r.out, /not-a-variable-value/, "the value is not echoed");
+    }
+    // Any other malformed --var names only its key.
+    let r = await sb.run(["setup", "--var", "SERVER_NAME=not-a-variable-value"]);
+    assert.equal(r.code, 2, r.out);
+    assert.match(r.out, /--var expects KEY:VALUE \(with ":"\), got "SERVER_NAME" followed by a value/);
+    assert.doesNotMatch(r.out, /not-a-variable-value/);
+    // Also with --dry-run, which prints the variables it would deploy.
+    r = await sb.run(["setup", "--dry-run", "--var", "WAREHOUSE_TOKEN:not-a-variable-value"]);
+    assert.equal(r.code, 2, r.out);
+    assert.deepEqual(sb.calls(), [], "no wrangler call");
+    assert.equal(sb.hasState("backyard"), false);
+  });
+
+  it("refuses to turn a live Cloudflare Access off, or to change its team, unless confirmed", async () => {
+    const sb = await newSandbox();
+    seedWorker(sb, { vars: { AUTH_MODE: "access", ACCESS_TEAM_DOMAIN: "acme.cloudflareaccess.com", ACCESS_AUD: AUD, BASE_DOMAIN: "backyard.example.com" }, customDomains: ["backyard.example.com"] });
+    // This machine set it up before another machine turned Access on.
+    const old = { accountId: "acc1", updatedAt: "2026-01-01T00:00:00Z", deployToken: "byd_existing-token-0123456789abcdef", url: "https://backyard.acme.workers.dev" };
+    sb.writeState("backyard", old);
+    let r = await sb.run(["setup"]);
+    assert.equal(r.code, 3, r.out);
+    assert.match(r.out, /Worker backyard is live with Cloudflare Access \(team acme\.cloudflareaccess\.com\), and this deploy would turn it off \(AUTH_MODE=none\)\. Nothing was changed\./);
+    assert.ok(r.out.includes(`delete ${sb.statePath()} to adopt the live configuration`), r.out);
+    assert.match(r.out, /npm run cf -- setup --confirm-auth-change/);
+    assert.ok(!sb.calls().some((x) => x.args[0] === "deploy" || x.secret));
+    assert.equal(sb.cf().workers.backyard.deployments, 1);
+    // A team change is refused too.
+    sb.writeState("backyard", { ...old, domain: { host: "backyard.example.com", mode: "path", status: "active", source: "cli" }, access: { team: "other", aud: AUD, source: "manual" } });
+    r = await sb.run(["setup"]);
+    assert.equal(r.code, 3, r.out);
+    assert.match(r.out, /live with Cloudflare Access team acme\.cloudflareaccess\.com, and this deploy would switch it to other\.cloudflareaccess\.com/);
+    assert.ok(!sb.calls().some((x) => x.args[0] === "deploy"));
+    // --confirm-auth-change deploys anyway.
+    sb.writeState("backyard", old);
+    r = await sb.run(["setup", "--confirm-auth-change"]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /deploying anyway \(confirmed\)/);
+    assert.equal(deployOf(sb.calls()).config.vars.AUTH_MODE, "none");
+  });
+
+  it("refuses to deploy over a Worker whose live auth mode cannot be read", async () => {
+    const sb = await newSandbox();
+    seedWorker(sb);
+    sb.writeState("backyard", { accountId: "acc1", updatedAt: "2026-01-01T00:00:00Z", deployToken: "byd_existing-token-0123456789abcdef", url: "https://backyard.acme.workers.dev", workersDevUrl: "https://backyard.acme.workers.dev" });
+    sb.fake.addFault({ method: "GET", path: "*/workers/scripts/backyard/settings", status: 500, code: 10013, times: Infinity, retryAfter: 0 });
+    // The Worker's own /info answers: AUTH_MODE=none, nothing to protect.
+    let r = await sb.run(["setup"]);
+    assert.equal(r.code, 0, r.out);
+    assert.ok(sb.fake.edgeRequests.some((x) => x.path === "/__backyard/api/deploy/info"));
+    // Settings 500 and /info unreachable on an existing Worker: refused.
+    sb.updateCf((s) => (s.edge = { down: ["backyard.acme.workers.dev"] }));
+    sb.calls();
+    r = await sb.run(["setup"]);
+    assert.equal(r.code, 3, r.out);
+    assert.match(r.out, /could not read the live configuration of Worker backyard .*Nothing was changed\./s);
+    assert.ok(!sb.calls().some((x) => x.args[0] === "deploy"));
+    // A first deploy (wrangler: Worker not found) needs no guard even then.
+    sb.updateCf((s) => {
+      delete s.workers.backyard;
+      s.edge = {};
+    });
+    r = await sb.run(["setup"]);
+    assert.equal(r.code, 0, r.out);
+    sb.fake.clearFaults();
+  });
+
+  it("turns workers.dev off only with a working custom domain, and remembers it", async () => {
+    const sb = await newSandbox();
+    let r = await sb.run(["setup", "--no-workers-dev"]);
+    assert.equal(r.code, 2, r.out);
+    assert.match(r.out, /turning workers\.dev off needs a working custom domain \(npm run cf -- domain add <host>\)/);
+    assert.ok(!sb.calls().some((x) => x.args[0] === "deploy"));
+    seedWorker(sb, { customDomains: ["backyard.example.com"] });
+    sb.writeState("backyard", {
+      accountId: "acc1",
+      updatedAt: "2026-01-01T00:00:00Z",
+      deployToken: "byd_existing-token-0123456789abcdef",
+      domain: { host: "backyard.example.com", mode: "path", zoneId: "zone-example", zoneName: "example.com", status: "active", source: "cli" },
+    });
+    r = await sb.run(["setup", "--no-workers-dev"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(deployOf(sb.calls()).config.workers_dev, false);
+    assert.equal(sb.state().workersDev, false);
+    assert.equal(sb.state().url, "https://backyard.example.com");
+    assert.equal(sb.state().workersDevUrl, "https://backyard.acme.workers.dev", "kept for later");
+    sb.requests();
+    r = await sb.run(["setup"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(deployOf(sb.calls()).config.workers_dev, false, "remembered");
+    assert.ok(!sb.requests().some((x) => x.path.endsWith("/workers/subdomain")), "no subdomain lookup while off");
+    r = await sb.run(["setup", "--workers-dev"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(deployOf(sb.calls()).config.workers_dev, true);
+    assert.equal(sb.state().workersDev, true);
+    r = await sb.run(["setup", "--workers-dev", "--no-workers-dev"]);
+    assert.equal(r.code, 2, r.out);
+  });
+
+  it("never registers a workers.dev subdomain for a Worker that does not serve workers.dev", async () => {
+    // The account has no workers.dev subdomain (deleted after moving to the custom domain).
+    const sb = await newSandbox({ cf: { accounts: { acc1: { name: "Acme", subdomain: null } } } });
+    seedWorker(sb, { customDomains: ["backyard.example.com"], vars: { BASE_DOMAIN: "backyard.example.com" } });
+    sb.writeState("backyard", {
+      accountId: "acc1",
+      updatedAt: "2026-01-01T00:00:00Z",
+      deployToken: "byd_existing-token-0123456789abcdef",
+      domain: { host: "backyard.example.com", mode: "path", zoneId: "zone-example", zoneName: "example.com", status: "active", source: "cli" },
+    });
+    let r = await sb.run(["setup", "--no-workers-dev"]);
+    assert.equal(r.code, 0, r.out);
+    assert.doesNotMatch(r.out, /no workers\.dev subdomain/);
+    assert.equal(deployOf(sb.calls()).config.workers_dev, false);
+    assert.ok(!sb.requests().some((x) => x.method === "PUT" && x.path.endsWith("/workers/subdomain")), "nothing registered");
+    assert.equal(sb.cf().accounts.acc1.subdomain, null);
+    // A second machine adopts a Worker that is off workers.dev: a plain setup works too.
+    forgetState(sb);
+    r = await sb.run(["setup"]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /workers\.dev off/);
+    assert.equal(deployOf(sb.calls()).config.workers_dev, false);
+    assert.ok(!sb.requests().some((x) => x.method === "PUT" && x.path.endsWith("/workers/subdomain")));
+    // --workers-dev on that machine is applied after the adoption (and needs the subdomain again).
+    r = await sb.run(["setup", "--workers-dev", "--non-interactive"]);
+    assert.equal(r.code, 2, r.out);
+    assert.match(r.out, /this account has no workers\.dev subdomain: pass --workers-subdomain <name>/);
+  });
+
+  it("validates offline with --dry-run: no lock, no login, no API call, no state write", async () => {
+    const sb = await newSandbox();
+    let r = await sb.run(["setup", "--dry-run", "--non-interactive", "--var", "SERVER_NAME:Team"]);
+    assert.equal(r.code, 0, r.out);
+    const c = sb.calls();
+    assert.deepEqual(names(c), ["deploy --dry-run"]);
+    assert.ok(c[0].args.includes("--outdir"));
+    assert.equal(c[0].config.vars.SERVER_NAME, "Team");
+    assert.equal(c[0].config.routes, undefined);
+    assert.equal(sb.fake.requests.length, 0);
+    assert.ok(!sb.hasState());
+    assert.ok(!existsSync(join(sb.root, "config", "backyard", "cloudflare", "backyard.lock")));
+    assert.match(r.out, /Effective variables:/);
+    assert.match(r.out, /SERVER_NAME=Team/);
+    // It reads the state when there is one, and returns wrangler's exit code.
+    sb.writeState("backyard", { vars: { LIMITS: '{"max_sites":3}' }, r2Bucket: "kept", updatedAt: "2026-01-01T00:00:00Z" });
+    r = await sb.run(["setup", "--dry-run"]);
+    assert.equal(r.code, 0, r.out);
+    const d = sb.calls()[0];
+    assert.equal(d.config.vars.LIMITS, '{"max_sites":3}');
+    assert.deepEqual(d.config.r2_buckets, [{ binding: "R2", bucket_name: "kept" }]);
+    assert.deepEqual(sb.state(), { vars: { LIMITS: '{"max_sites":3}' }, r2Bucket: "kept", updatedAt: "2026-01-01T00:00:00Z" }, "unchanged");
+    r = await sb.run(["setup", "--dry-run", "--rotate-token"]);
+    assert.equal(r.code, 2, r.out);
+    // Routes in a checkout's wrangler.jsonc are ignored (the fake wrangler fails on any).
+    const cfg = join(sb.pkg, "wrangler.jsonc");
+    writeFileSync(cfg, readFileSync(cfg, "utf8").replace(/\n}\s*$/, ',\n  "routes": [{ "pattern": "backyard.example.com", "custom_domain": true }]\n}\n'));
+    assert.ok(parseJSONC(readFileSync(cfg, "utf8")).routes);
+    r = await sb.run(["setup", "--dry-run"]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /routes in wrangler\.jsonc are ignored; use domain add/);
+    assert.equal(sb.calls()[0].config.routes, undefined);
+  });
+
+  it("upgrades a version-1 state without losing the token or unknown fields", async () => {
+    const sb = await newSandbox();
+    seedWorker(sb, { r2Bucket: "backyard-files" });
+    sb.writeState("backyard", {
+      accountId: "acc1",
+      deployToken: "byd_existing-token-0123456789abcdef",
+      url: "https://backyard.acme.workers.dev",
+      r2Bucket: "backyard-files",
+      updatedAt: "2026-01-01T00:00:00Z",
+      futureField: { keep: true },
+    });
+    const r = await sb.run(["setup"]);
+    assert.equal(r.code, 0, r.out);
+    const st = sb.state();
+    assert.equal(st.version, 2);
+    assert.equal(st.deployToken, "byd_existing-token-0123456789abcdef");
+    assert.deepEqual(st.futureField, { keep: true });
+    assert.equal(deployOf(sb.calls()).secretsFile, undefined);
+    assert.doesNotMatch(r.out, /Adopted/);
+  });
+
+  it("takes the Worker's lock, and takes over a stale one", async () => {
+    const sb = await newSandbox();
+    const lockPath = join(sb.root, "config", "backyard", "cloudflare", "backyard.lock");
+    const write = (o) => {
+      mkdirSync(join(sb.root, "config", "backyard", "cloudflare"), { recursive: true });
+      writeFileSync(lockPath, JSON.stringify(o));
+    };
+    // Held by a live process on this host (the test runner itself).
+    write({ pid: process.pid, host: hostname(), startedAt: new Date().toISOString() });
+    let r = await sb.run(["setup"]);
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /another backyard-cloudflare run for backyard is in progress \(pid \d+ on .* since .*\); if not, delete .*backyard\.lock/);
+    assert.ok(!sb.calls().some((x) => x.args[0] === "deploy"));
+    // A dead process: stale, taken over, and released afterwards.
+    const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+    write({ pid: dead, host: hostname(), startedAt: new Date().toISOString() });
+    r = await sb.run(["setup"]);
+    assert.equal(r.code, 0, r.out);
+    assert.ok(!existsSync(lockPath), "the lock is released");
+    // Another host's lock counts until it is 2 hours old.
+    write({ pid: 1, host: "elsewhere.example", startedAt: new Date().toISOString() });
+    r = await sb.run(["setup"]);
+    assert.equal(r.code, 1, r.out);
+    write({ pid: 1, host: "elsewhere.example", startedAt: new Date(Date.now() - 3 * 3600_000).toISOString() });
+    r = await sb.run(["setup"]);
+    assert.equal(r.code, 0, r.out);
+  });
+
+  it("writes the result file for wrappers, without secrets", async () => {
+    const sb = await newSandbox();
+    const env = { BACKYARD_CF_RESULT_FILE: sb.resultPath, BACKYARD_CF_INVOKED_AS: "backyard cloudflare" };
+    let r = await sb.run(["setup"], env);
+    assert.equal(r.code, 0, r.out);
+    assert.deepEqual(sb.result(), {
+      schema: 1,
+      command: "setup",
+      worker: "backyard",
+      statePath: sb.statePath(),
+      url: "https://backyard.acme.workers.dev",
+      previousUrl: "",
+      workersDevUrl: "https://backyard.acme.workers.dev",
+      authMode: "none",
+      deployToken: "state",
+    });
+    if (process.platform !== "win32") assert.equal(fileMode(sb.resultPath), "600");
+    // BACKYARD_CF_INVOKED_AS names the right command form in the hints.
+    assert.match(r.out, /Your own domain: backyard cloudflare domain add <host>/);
+    sb.allowInEnv = [secretsOf(sb).DEPLOY_TOKEN];
+    r = await sb.run(["setup"], { ...env, DEPLOY_TOKEN: secretsOf(sb).DEPLOY_TOKEN });
+    assert.equal(r.code, 0, r.out);
+    assert.equal(sb.result().previousUrl, "https://backyard.acme.workers.dev");
+    assert.equal(sb.result().deployToken, "env");
+    assertNoLeaks(sb, { outputs: [r.out], allowInEnv: [secretsOf(sb).DEPLOY_TOKEN] });
+    // No result file without a state save (--help, --dry-run).
+    rmSync(sb.resultPath, { force: true });
+    r = await sb.run(["setup", "--dry-run"], env);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(sb.result(), null);
+  });
+
+  it("runs the same through `node scripts/setup.mjs` (setup's old entry point)", async () => {
+    const sb = await newSandbox();
+    let r = await sb.run(["--help"], {}, { script: "scripts/setup.mjs" });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /Usage: npm run cf -- setup \[options\]/);
+    assert.match(r.out, /domain add <host>/);
+    assert.match(r.out, /access enable --allow-email-domain/);
+    r = await sb.run(["--var", "SERVER_NAME:Direct"], {}, { script: "scripts/setup.mjs" });
+    assert.equal(r.code, 0, r.out);
+    assert.equal(deployOf(sb.calls()).config.vars.SERVER_NAME, "Direct");
+    assert.ok(!r.out.includes(OAUTH_TOKEN));
   });
 });
 
@@ -408,5 +948,11 @@ describe("scripts/setup.mjs helpers", () => {
     assert.ok(!maskSecret(tok).includes("abcdefgh"));
     assert.equal(maskSecret("short"), "…");
     assert.equal(maskSecret("0123456789abcdef0123456789abcdef"), "…cdef");
+  });
+
+  it("reads wrangler.jsonc (comments, trailing commas, strings with //)", () => {
+    assert.deepEqual(parseJSONC('// c\n{ "a": "x // y", /* z */ "b": [1, 2,], }\n'), { a: "x // y", b: [1, 2] });
+    // A trailing-comma lookalike inside a string is a value, not syntax.
+    assert.deepEqual(parseJSONC('{ "a": "x,}", "b": "y, ]", "c": "\\",}", "d": [1, /* e */ ], }'), { a: "x,}", b: "y, ]", c: '",}', d: [1] });
   });
 });

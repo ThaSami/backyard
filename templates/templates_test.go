@@ -253,6 +253,17 @@ func TestRenderServer(t *testing.T) {
 	if !strings.Contains(string(none["AGENTS.md"]), "backyard login --server <hub URL>") {
 		t.Error("AGENTS.md lacks the generic login hint")
 	}
+	// The free Cloudflare option says what a CLI from `go install` needs (only
+	// release builds pin the engine) and never sends anyone to the npm name.
+	for _, p := range []string{"CLAUDE.md", "AGENTS.md"} {
+		doc := string(none[p])
+		if !strings.Contains(doc, "`backyard cloudflare setup`") || !strings.Contains(doc, "`go install`") || !strings.Contains(doc, "`--package`") {
+			t.Errorf("%s: the Cloudflare hint lacks what a CLI from go install needs:\n%s", p, doc)
+		}
+		if strings.Contains(doc, "npx backyard-cloudflare") {
+			t.Errorf("%s sends people to npx backyard-cloudflare", p)
+		}
+	}
 }
 
 func TestProjectFile(t *testing.T) {

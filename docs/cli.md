@@ -20,7 +20,7 @@ Every command accepts:
 | `--gateway <url>` | `BACKYARD_GATEWAY` | Deploy gateway URL, if not `<server>/__backyard/api/deploy`. |
 | `--token <token>` | `BACKYARD_TOKEN` | API token (overrides the stored login). |
 | `--profile <name>` | `BACKYARD_PROFILE` | CLI profile to use (default `default`). |
-| `--json` | | Machine-readable JSON output (for scripts and agents). |
+| `--json` | | Machine-readable JSON output (for scripts and agents; of the `backyard cloudflare` commands, only `status` takes it). |
 | `-v`, `--verbose` | | Verbose logging. |
 | `-h`, `--help` | | Help for any command. |
 | `--version` | | Print the version (root command). |
@@ -33,6 +33,7 @@ Every command accepts:
 | `BACKYARD_DEPLOY_METHOD` | Default for `deploy --method`. |
 | `XDG_CONFIG_HOME` | Location of the CLI config (`$XDG_CONFIG_HOME/backyard/config.json`). |
 | `BROWSER` | Command used to open URLs. |
+| `BACKYARD_GITHUB_URL` | GitHub base URL of the release download of `backyard cloudflare` (default `https://github.com`). |
 | `BACKYARD_CONFIG`, `BACKYARD_CONFIG_YAML`, `BACKYARD_SECRET`, `PORT`, … | Server configuration, see [configuration](configuration.md#loading). |
 
 ### Files
@@ -271,30 +272,151 @@ pass. Flag: `-c`, `--config <file>`.
 | `backyard config example` | Print a fully commented example `backyard.yaml`. |
 | `backyard config validate [file]` | Load a config (file argument, else `$BACKYARD_CONFIG_YAML`, `$BACKYARD_CONFIG` or `./backyard.yaml`) with defaults and environment expansion applied, and report every problem. `--dev` applies dev defaults first. |
 
-### `backyard cloudflare setup [-- setup-args…]`
+### `backyard cloudflare`
 
-Provision (or upgrade — re-running is safe) the Backyard Workers edition on your own Cloudflare
-account, on the free plan: one Worker plus SQLite-backed Durable Objects, Workers AI, and an
-optional R2 bucket. It runs `npm ci` and `npm run setup` in `deploy/cloudflare`, which logs in
-with wrangler (browser) if needed, creates secrets and deploys. Afterwards this CLI is logged in
-to the new server with its deploy token. Requires Node.js 20+ and npm. See
-[Cloudflare](cloudflare.md).
+Run Backyard on your own Cloudflare account, on the free plan: one Worker with SQLite-backed
+Durable Objects, Workers AI and an optional R2 bucket. No checkout, build or Terraform needed.
+See [Cloudflare](cloudflare.md).
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--dir <path>` | found from the current directory | Path to `deploy/cloudflare`. |
-| `--download` | `false` | Download the Backyard source from GitHub when no checkout is found. |
-| `--ref <ref>` | this CLI's version (`main` for dev builds) | Git tag or branch to download. |
-| `--no-login` | `false` | Do not log this CLI in to the new server afterwards. |
-| `--skip-install` | `false` | Skip `npm ci`. |
+| Command | Meaning |
+|---|---|
+| `backyard cloudflare setup` | Deploy or upgrade Backyard on your Cloudflare account (Workers free plan); re-running keeps every choice: secrets, the deploy token, R2, the domain, Access and the `--var` overrides. It logs in with wrangler (in the browser) when needed, asks which account to use when the login reaches several, registers the account's workers.dev subdomain when it has none, creates the R2 bucket when R2 is enabled, sets the secrets and deploys. A machine without saved setup state adopts the deployed configuration first, and a deploy that would turn a live Cloudflare Access off is refused. |
+| `backyard cloudflare domain add <host>` | Serve Backyard on your own domain: `<host>` becomes a Workers custom domain (Cloudflare creates its DNS record and certificate) and the hub moves there, with sites at `https://<host>/s/<site>/`. With `--host-mode` sites get their own hosts, `https://<site>.<host>/`: it also adds the route `*.<host>/*` and a proxied wildcard DNS record, created with `BACKYARD_CF_API_TOKEN` (a token with Zone · DNS · Edit) or added by you in the dashboard from the printed values (Backyard detects it). Existing DNS records and other Workers' domains are never replaced without `--replace-dns-record` or `--take-over`. |
+| `backyard cloudflare domain remove` | Remove the custom domain this tool added: back to workers.dev. |
+| `backyard cloudflare access enable` | Turn on company login with Cloudflare Access (needs a custom domain): two self-hosted Access applications, one for people (who may sign in: `--allow-email`, `--allow-email-domain`) and one that lets the machine endpoints the Worker authenticates itself (deploys, token minting, health checks) through. With `BACKYARD_CF_API_TOKEN` (Access: Apps and Policies · Edit and Access: Organizations, Identity Providers, and Groups · Read) Backyard creates them; otherwise it prints the dashboard steps and detects the result (`--team` and `--aud` name applications you already have). Access is verified at the edge before the Worker switches to it. |
+| `backyard cloudflare access disable` | Turn company login (Cloudflare Access) off; `--delete-apps` also deletes the applications this tool created. |
+| `backyard cloudflare status` | Read-only live check of the Worker, its domain and Cloudflare Access: versions, URLs, the R2 bucket, workers.dev, the custom domain (and its route, DNS record and certificate in host mode), Access and the deploy token. Each check prints ok, pending or failed. It never logs in: without a wrangler login the live Cloudflare checks are skipped. |
 
-Arguments after `--` go to the setup script, e.g. `-- --worker-name team`, `-- --r2`,
-`-- --var AUTH_MODE:access`, `-- --rotate-token`.
+These commands run **backyard-cloudflare**, the engine of the Workers edition (Node.js):
+
+- With `--dir`, the engine is that checkout's `deploy/cloudflare`. A `backyard` built from source
+  also uses the checkout it runs in (found from the current directory, never outside its
+  repository); a release build uses a checkout only with `--dir`. Before the engine runs,
+  `npm ci` installs its dependencies (`npm install` when there is no lockfile), unless
+  `node_modules` is newer than `package-lock.json` or `--skip-install` is given.
+- Otherwise it is the package of this CLI release,
+  `<BACKYARD_GITHUB_URL>/thasami/backyard/releases/download/v<version>/backyard-cloudflare-<version>.tgz`
+  (`BACKYARD_GITHUB_URL` defaults to `https://github.com`). It is installed once with npm into
+  your user cache (`backyard/cloudflare-engine/<sha256>`) after its SHA-256 has been checked
+  against the digest built into this CLI; later runs reuse it without network access. A new
+  install removes the older engines there, keeping the previous one and this release's.
+- `--package` installs another package, a local `.tgz` or an https URL, which is not verified
+  against the release. Development builds (`go install`, `make build`) have no package pinned:
+  they need a checkout, `--dir` or `--package` (`make cloudflare-pack` builds one), or install a
+  release build (`install.sh`). Once a Backyard release has published it to npm,
+  `npx backyard-cloudflare@latest setup` followed by the `backyard login --server <hub> --token <token>`
+  it prints works too; until then npm has nothing, or something that is not Backyard, under
+  that name.
+
+Requires Node.js 22 or later and npm. Afterwards `setup` and `domain add`/`remove` log this CLI
+in to the Worker with its deploy token (unless `--no-login`), and the profiles on the Worker's
+previous URL or its workers.dev URL move to its new URL, keeping their credentials. `setup`
+then prints the next step (`backyard init`, `backyard deploy`) when the current profile is one
+for the Worker; when this CLI cannot log in (the deploy token is not saved on this machine, or
+the Worker rejects it), it prints the `backyard login --server <hub> --token …` command to run
+instead. With `--no-login` the engine prints that command itself. The Worker's profile becomes
+the current one, except when the current profile is for another server and the Worker already
+has a profile of its own: a domain change or a setup re-run then updates that profile and keeps
+the current one (`--profile` picks the profile explicitly).
+`access enable`/`disable` refresh the cached server info of the profiles on the Worker. While
+Cloudflare Access is on, a personal login (`backyard login --server <hub>`, with or without
+`--token`) is never replaced by the deploy token; a profile named with `--profile` is still
+logged in, unless it is that personal login.
+
+Flags of this CLI, for every subcommand (not passed to the engine). Everything else, and
+everything after a literal `--`, goes to the engine unchanged:
+`backyard cloudflare setup -- --help` shows the engine's own help. `--server`, `--gateway` and
+`--token` are not used here, and `--json` is an engine option of `backyard cloudflare status`
+only (`setup`, `domain` and `access` reject it with exit code 2).
+
+| Flag | Meaning |
+|---|---|
+| `--dir <path>` | Path to `deploy/cloudflare` of a Backyard checkout (default: found from the current directory in builds from source). |
+| `--package <path\|url>` | A backyard-cloudflare `.tgz` (local file or https URL) to use instead of this release's package. |
+| `--skip-install` | Checkout only: skip `npm ci` (skipped anyway when `node_modules` is newer than `package-lock.json`). |
+| `--no-login` | Do not log this CLI in or update its profiles afterwards. |
+| `--profile <name>` | CLI profile to log in (env `BACKYARD_PROFILE`). |
+| `-v`, `--verbose` | Verbose logging. |
+
+Global options of the engine, for every subcommand:
+
+| Option | Meaning |
+|---|---|
+| `--worker-name <name>` (alias `--name`) | Worker name (default `backyard`). |
+| `-y`, `--yes` | Answer yes to confirmations (never implies `--take-over`, `--replace-dns-record` or `--confirm-auth-change`). |
+| `--non-interactive` | Never prompt (also when `CI` is set or there is no terminal). |
+| `-h`, `--help` | Show help. |
+
+`backyard cloudflare setup [options]`:
+
+| Option | Meaning |
+|---|---|
+| `--r2` | Use an R2 bucket for big files (default when R2 is enabled). |
+| `--no-r2` | Never use R2 (remembered). |
+| `--r2-bucket <name>` | Bucket name (default `<worker>-files`). |
+| `--var <KEY:VALUE>` | Override a Worker variable (remembered; `KEY:` drops it). Repeatable. |
+| `--rotate-token` | Issue a new `DEPLOY_TOKEN`. |
+| `--rotate-secret` | Replace `BACKYARD_SECRET` (revokes every API token). |
+| `--skip-deploy` | Only (re)set secrets. |
+| `--workers-subdomain <name>` | workers.dev subdomain to register when the account has none. |
+| `--workers-dev` | Serve on workers.dev (default). |
+| `--no-workers-dev` | Stop serving on workers.dev (needs a custom domain). |
+| `--confirm-auth-change` | Allow a deploy that turns Cloudflare Access off or changes its team. |
+| `--dry-run` | Build and validate only (no login, no changes). |
+
+`backyard cloudflare domain add <host> [options]` (`domain remove` takes only the global options):
+
+| Option | Meaning |
+|---|---|
+| `--host-mode` | Sites at `https://<site>.<host>/` (wildcard route and DNS record). |
+| `--zone <zone>` | Cloudflare zone of `<host>` (default: found automatically). |
+| `--take-over` | Move `<host>` or the `*.<host>/*` route from another Worker to this one. |
+| `--replace-dns-record` | Replace existing DNS records at `<host>`. |
+| `--wait <seconds>` | How long to wait for DNS, certificate and readiness (default 300). |
+
+`backyard cloudflare access enable [options]`:
+
+| Option | Meaning |
+|---|---|
+| `--allow-email <email>` | Allow this email. Repeatable. |
+| `--allow-email-domain <domain>` | Allow every email at this domain. Repeatable. |
+| `--team <team>` | Zero Trust team of existing Access applications. |
+| `--aud <tag>` | AUD tag of the existing hub application. |
+| `--wait <seconds>` | How long to wait for Access (default 120; 900 while waiting for dashboard steps). |
+
+`backyard cloudflare access disable [options]`:
+
+| Option | Meaning |
+|---|---|
+| `--delete-apps` | Also delete the Access applications and policies this tool created (needs `BACKYARD_CF_API_TOKEN`). |
+
+`backyard cloudflare status [options]`:
+
+| Option | Meaning |
+|---|---|
+| `--json` | Machine-readable output. |
+
+Exit codes (the engine's, kept by this CLI, also after it logged in):
+
+| Code | Meaning |
+|---|---|
+| `0` | Done, or nothing to do (`status`: every check is ok). |
+| `1` | A Cloudflare, wrangler, network or file operation failed (a re-run resumes); `status`: the Worker does not exist. |
+| `2` | Usage error, or input or confirmation needed in non-interactive mode. |
+| `3` | Refused for safety (conflict, foreign object, auth downgrade…): nothing was changed. |
+| `4` | Applied, but verification (DNS, certificate, readiness, Access) is pending or failed: re-running the same command resumes. `status`: a check is pending or failed. |
+| `130` | Interrupted. |
 
 ```sh
 backyard cloudflare setup
-backyard cloudflare setup --download
-backyard cloudflare setup --dir ~/src/backyard/deploy/cloudflare -- --worker-name backyard
+backyard cloudflare setup --worker-name team --no-r2
+backyard cloudflare setup --non-interactive --workers-subdomain acme   # CI
+backyard cloudflare setup --package ./dist-npm/backyard-cloudflare-0.1.0.tgz
+backyard cloudflare domain add backyard.acme.com
+backyard cloudflare domain add acme-sites.dev --host-mode
+backyard cloudflare access enable --allow-email-domain acme.com
+backyard cloudflare access disable --delete-apps
+backyard cloudflare status --json
 ```
 
 ### `backyard version`

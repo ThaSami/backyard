@@ -29,7 +29,9 @@ Follow the **backyard** skill (`references/deploy.md` covers the CLI in detail):
    publishes the folder `.backyard.json` names.
    - "not logged in" / `401`: ask the user to run `backyard login --server <their Backyard URL>`
      in a terminal, then retry. No Backyard server yet? The user can create one for free on
-     Cloudflare with `backyard cloudflare setup` (it logs the CLI in), then retry.
+     Cloudflare with `backyard cloudflare setup` (it logs the CLI in; it needs a release build of
+     the CLI, since one from `go install` needs a checkout of the Backyard repository or
+     `--package`), then retry.
    - `forbidden`: the site belongs to someone else; suggest a different name.
    - `too_large`: exclude big or unneeded files with `.backyardignore`, or deploy the build
      output folder.

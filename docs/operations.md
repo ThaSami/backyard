@@ -133,7 +133,10 @@ Backyard is one binary (or image). To upgrade:
 3. PostgreSQL migrations run on start (`database.postgres.auto_migrate: true`), serialized
    across instances by an advisory lock; SQLite and DynamoDB need no migration step.
 4. Redeploy a standalone or Lambda gateway with the same version.
-5. The Cloudflare edition upgrades with `backyard cloudflare setup` (or `npm run setup`) again.
+5. The Cloudflare edition upgrades by re-running setup: `backyard cloudflare setup` with the new
+   CLI release (it installs that release's package), `npx backyard-cloudflare@latest setup` (once
+   a Backyard release has published it to npm), or `npm run setup` in an updated checkout. Every
+   earlier choice is kept.
 
 Sites never need changes: the SDK is served by the server, so pages pick up the new version on
 the next load.

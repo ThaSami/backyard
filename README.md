@@ -146,7 +146,7 @@ More in [docs/architecture.md](docs/architecture.md); the normative contract is
 | **Kubernetes** | Helm chart: one replica on a volume with SQLite by default; production values with buckets, Postgres/DynamoDB, Redis, OIDC, HPA, PDB, ServiceMonitor | [deploy/helm/backyard](deploy/helm/backyard/README.md) |
 | **One VM, no bucket — Docker Compose** | Backyard + PostgreSQL + Caddy (automatic TLS for the wildcard domain), files on a volume, rsync deploys | [deploy/docker-compose](deploy/docker-compose/README.md) |
 | **One VM, no bucket — systemd** | One hardened binary, SQLite, files on disk, Caddy or nginx, rsync deploys | [deploy/systemd](deploy/systemd/README.md) |
-| **Cloudflare free tier** | One Worker + Durable Objects + Workers AI, optional R2 and Cloudflare Access; no server, no credit card (`backyard cloudflare setup --download`) | [deploy/cloudflare](deploy/cloudflare/README.md), [Terraform](deploy/terraform/cloudflare/README.md) |
+| **Cloudflare free tier** | One Worker + Durable Objects + Workers AI, optional R2 and Cloudflare Access; no server, no credit card, no Terraform: `backyard cloudflare setup` (Node.js 22+; a release build of the CLI installs its engine, one from `go install` needs a checkout or `--package`), then `domain add` and `access enable` | [deploy/cloudflare](deploy/cloudflare/README.md), [Terraform](deploy/terraform/cloudflare/README.md) (optional) |
 
 The container image is `ghcr.io/thasami/backyard`. Configuration is one `backyard.yaml`
 ([reference](docs/configuration.md); `backyard config example` prints an annotated one).

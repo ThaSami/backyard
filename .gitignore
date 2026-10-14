@@ -1,6 +1,8 @@
 # Build output
 /bin/
 /dist/
+# make cloudflare-pack (ignored, so GoReleaser's clean-tree check passes)
+/dist-npm/
 /backyard
 /backyard-lambda
 *.test

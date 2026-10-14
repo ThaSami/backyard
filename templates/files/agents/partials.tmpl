@@ -58,7 +58,9 @@ backyard sites list [filter]  # existing sites; `backyard pull <site>` downloads
   `backyard login{{if .Server}} --server {{.Server}}{{else}} --server <hub URL>{{end}}` in a terminal (it opens the browser), then retry.
 {{- if not .Server}}
   No Backyard server yet? `backyard cloudflare setup` (run by the user; it opens a browser) deploys
-  one to their own Cloudflare account on the free plan and logs the CLI in.
+  one to their own Cloudflare account on the free plan and logs the CLI in. It needs a release
+  build of the CLI (`install.sh`): one from `go install` needs a checkout of the Backyard
+  repository or `--package`.
 {{- end}}
 - AI and warehouse calls answer `unsupported` under a plain `backyard dev`; they work with
   `backyard dev --config backyard.yaml` (providers configured) or once deployed.

@@ -1,9 +1,6 @@
 package cli
 
 import (
-	"archive/tar"
-	"bytes"
-	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -741,168 +738,64 @@ func TestServeGatewayDev(t *testing.T) {
 func TestCloudflareSetup(t *testing.T) {
 	h := newHarness(t)
 	repo := filepath.Join(h.cwd, "backyard")
-	cf := filepath.Join(repo, "deploy", "cloudflare")
-	writeFiles(t, cf, map[string]string{"package.json": cfPackageJSON, "package-lock.json": "{}"})
+	cf := cfCheckout(t, repo)
 
-	// node/npm are required.
+	// node and npm are required.
 	h.cwd = filepath.Join(repo, "internal")
 	if errOut := h.mustFail("cloudflare", "setup"); !strings.Contains(errOut, "nodejs.org") {
 		t.Fatalf("stderr = %s", errOut)
 	}
-	h.tools["node"], h.tools["npm"] = true, true
+	newCFEngine(h)
 	h.mustRun("cloudflare", "setup", "--", "--worker-name", "acme-backyard")
 	calls := h.runner.Calls()
-	if len(calls) != 2 {
+	if len(calls) != 3 || strings.Join(calls[0].Args, " ") != "--version" {
 		t.Fatalf("calls = %+v", calls)
 	}
-	if calls[0].Name != "npm" || strings.Join(calls[0].Args, " ") != "ci" || calls[0].Dir != cf || calls[0].Stdout == nil {
-		t.Fatalf("install = %+v", calls[0])
+	if calls[1].Name != "npm" || strings.Join(calls[1].Args, " ") != "ci" || calls[1].Dir != cf || calls[1].Stdout == nil {
+		t.Fatalf("install = %+v", calls[1])
 	}
-	if strings.Join(calls[1].Args, " ") != "run setup -- --worker-name acme-backyard" || calls[1].Dir != cf || calls[1].Stdin == nil {
-		t.Fatalf("setup = %+v", calls[1])
+	if calls[2].Name != "node" || strings.Join(calls[2].Args, " ") != "bin/backyard-cloudflare.mjs setup --worker-name acme-backyard" ||
+		calls[2].Dir != cf || calls[2].Stdin == nil {
+		t.Fatalf("setup = %+v", calls[2])
 	}
 	// Without a lock file: npm install; --skip-install skips it; --dir works from anywhere.
 	os.Remove(filepath.Join(cf, "package-lock.json"))
 	h.cwd = t.TempDir()
 	h.mustRun("cloudflare", "setup", "--dir", cf)
-	if c := h.runner.Calls(); strings.Join(c[2].Args, " ") != "install" || strings.Join(c[3].Args, " ") != "run setup" {
-		t.Fatalf("calls = %+v", c[2:])
+	if c := npmRuns(h); len(c) != 2 || strings.Join(c[1].Args, " ") != "install" {
+		t.Fatalf("calls = %+v", c)
+	}
+	if c := engineRuns(h); len(c) != 2 || strings.Join(c[1].Args, " ") != "bin/backyard-cloudflare.mjs setup" || c[1].Dir != cf {
+		t.Fatalf("calls = %+v", c)
 	}
 	h.mustRun("cloudflare", "setup", "--dir", cf, "--skip-install")
-	if c := h.runner.Calls(); len(c) != 5 || strings.Join(c[4].Args, " ") != "run setup" {
+	if len(npmRuns(h)) != 2 || len(engineRuns(h)) != 3 {
+		t.Fatalf("calls = %+v", h.runner.Calls())
+	}
+	// Positional arguments go to the engine (which checks them).
+	h.mustRun("cloudflare", "setup", "--dir", cf, "--skip-install", "stray")
+	if c := engineRuns(h); strings.Join(c[3].Args, " ") != "bin/backyard-cloudflare.mjs setup stray" {
 		t.Fatalf("calls = %+v", c)
 	}
 	// Errors.
-	if errOut := h.mustFail("cloudflare", "setup"); !strings.Contains(errOut, "--download") || !strings.Contains(errOut, "deploy/cloudflare") {
+	if errOut := h.mustFail("cloudflare", "setup"); !strings.Contains(errOut, "--package") || !strings.Contains(errOut, "deploy/cloudflare") {
 		t.Fatalf("stderr = %s", errOut)
 	}
 	if errOut := h.mustFail("cloudflare", "setup", "--dir", h.cwd); !strings.Contains(errOut, "package.json") {
 		t.Fatalf("stderr = %s", errOut)
 	}
-	if errOut := h.mustFail("cloudflare", "setup", "stray"); !strings.Contains(errOut, `after "--"`) {
-		t.Fatalf("stderr = %s", errOut)
-	}
 	h.runner.fn = func(c Command) error {
-		if len(c.Args) > 0 && c.Args[0] == "run" {
+		if c.Name == "node" && len(c.Args) > 0 && c.Args[0] == "--version" {
+			_, _ = c.Stdout.Write([]byte("v22.0.0\n"))
+			return nil
+		}
+		if c.Name == "node" {
 			return &ExitError{Code: 3, Err: os.ErrInvalid}
 		}
 		return nil
 	}
 	if code := h.run("cloudflare", "setup", "--dir", cf); code != 3 {
 		t.Fatalf("exit = %d", code)
-	}
-}
-
-// tarGz builds a gzipped tarball with the given entries (name → content;
-// names ending in "/" are directories, "->target" suffix makes a symlink).
-func tarGz(t *testing.T, entries map[string]string) []byte {
-	t.Helper()
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gz)
-	names := keys(entries)
-	for _, name := range names {
-		content := entries[name]
-		switch {
-		case strings.HasSuffix(name, "/"):
-			_ = tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeDir, Mode: 0o755})
-		case strings.HasPrefix(content, "->"):
-			_ = tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeSymlink, Linkname: strings.TrimPrefix(content, "->")})
-		default:
-			_ = tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(content))})
-			_, _ = tw.Write([]byte(content))
-		}
-	}
-	if err := tw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := gz.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return buf.Bytes()
-}
-
-func TestCloudflareSetupDownload(t *testing.T) {
-	h := newHarness(t)
-	h.tools["node"], h.tools["npm"] = true, true
-	archive := tarGz(t, map[string]string{
-		"backyard-main/": "",
-		"backyard-main/deploy/cloudflare/package.json":  cfPackageJSON,
-		"backyard-main/deploy/cloudflare/src/worker.ts": "export default {}",
-		"backyard-main/web/sdk/backyard.js":             "sdk",
-		"backyard-main/link":                            "->/etc/passwd",
-	})
-	var gotPath string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		if r.URL.Path != "/main" {
-			http.NotFound(w, r)
-			return
-		}
-		_, _ = w.Write(archive)
-	}))
-	defer srv.Close()
-	d := h.deps()
-	d.downloadBase = srv.URL + "/"
-	run := func(args ...string) (int, string) {
-		h.out.Reset()
-		h.err.Reset()
-		streams := IOStreams{In: strings.NewReader(h.stdin), Out: &h.out, ErrOut: &h.err}
-		code := execute(t.Context(), newRootCommand(streams, d), streams, args)
-		return code, h.err.String()
-	}
-	if code, errOut := run("cloudflare", "setup", "--download"); code != 0 {
-		t.Fatalf("exit %d: %s", code, errOut)
-	}
-	cf := filepath.Join(h.cache, "backyard", "src", "main", "deploy", "cloudflare")
-	if gotPath != "/main" || !fileExists(filepath.Join(cf, "src", "worker.ts")) ||
-		!fileExists(filepath.Join(h.cache, "backyard", "src", "main", "web", "sdk", "backyard.js")) {
-		t.Fatalf("download: path=%s", gotPath)
-	}
-	if _, err := os.Lstat(filepath.Join(h.cache, "backyard", "src", "main", "link")); err == nil {
-		t.Fatal("symlink extracted")
-	}
-	if c := h.runner.Calls(); len(c) != 2 || c[1].Dir != cf {
-		t.Fatalf("calls = %+v", c)
-	}
-	// Second run reuses the cached download without --download.
-	gotPath = ""
-	if code, errOut := run("cloudflare", "setup"); code != 0 || gotPath != "" {
-		t.Fatalf("exit %d (path %q): %s", code, gotPath, errOut)
-	}
-	// Unknown ref.
-	if code, errOut := run("cloudflare", "setup", "--download", "--ref", "v9.9.9"); code == 0 || !strings.Contains(errOut, "HTTP 404") {
-		t.Fatalf("exit %d: %s", code, errOut)
-	}
-	if code, errOut := run("cloudflare", "setup", "--download", "--ref", "../x"); code == 0 || !strings.Contains(errOut, "invalid --ref") {
-		t.Fatalf("exit %d: %s", code, errOut)
-	}
-}
-
-func TestExtractTarGzRejectsTraversal(t *testing.T) {
-	for _, name := range []string{"root/../../evil.txt", "root/a/../../../evil.txt"} {
-		dest := t.TempDir()
-		archive := tarGz(t, map[string]string{name: "x"})
-		err := extractTarGz(bytes.NewReader(archive), dest)
-		if err == nil && fileExists(filepath.Join(filepath.Dir(dest), "evil.txt")) {
-			t.Fatalf("%s escaped", name)
-		}
-	}
-	if err := extractTarGz(strings.NewReader("not gzip"), t.TempDir()); err == nil {
-		t.Fatal("garbage accepted")
-	}
-}
-
-func TestDefaultSourceRef(t *testing.T) {
-	for in, want := range map[string]string{"0.1.0": "v0.1.0", "v1.2.3": "v1.2.3", "0.1.0-dev": "main", "": "main"} {
-		if got := defaultSourceRef(in); got != want {
-			t.Errorf("defaultSourceRef(%q) = %q", in, got)
-		}
-	}
-	for ref, ok := range map[string]bool{"main": true, "v1.2.3": true, "feature/x": true, "../x": false, "-x": false, "a b": false} {
-		if validRef(ref) != ok {
-			t.Errorf("validRef(%q) != %v", ref, ok)
-		}
 	}
 }
 

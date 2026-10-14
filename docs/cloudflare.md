@@ -10,31 +10,63 @@ with it unchanged, and a shared conformance suite keeps the two editions in step
 
 ## Set it up
 
-You need a Cloudflare account with a `workers.dev` subdomain and Node.js 20+.
+You need a Cloudflare account (the free plan; a `workers.dev` subdomain is registered for you
+if the account has none) and Node.js 22 or later with npm. Terraform is not needed, and with a
+release build of the `backyard` CLI (or, once it is on npm, the package alone) neither is a
+checkout or a build; any of these works:
 
 ```sh
-backyard cloudflare setup --download     # no checkout needed; or run it inside a checkout
-# or, from a checkout:
-cd deploy/cloudflare && npm ci && npm run setup
+backyard cloudflare setup                 # with the backyard CLI; it logs the CLI in afterwards
+npx backyard-cloudflare@latest setup      # with only Node.js, once the package is on npm
+cd deploy/cloudflare && npm ci && npm run setup   # from a checkout of this repository
 ```
 
-The setup script logs in with wrangler (browser), creates the secrets (`BACKYARD_SECRET` and a
-`DEPLOY_TOKEN`), optionally an R2 bucket (`-- --r2`), deploys the Worker and prints the hub URL.
-`backyard cloudflare setup` also logs the CLI in with the deploy token, so this works right
-away:
+All three run the same engine, `backyard-cloudflare`: an npm package with a prebuilt Worker
+and a pinned wrangler (a checkout builds the Worker from source). `backyard cloudflare setup`
+installs the package of its own release, checked against the SHA-256 built into the CLI. A
+`backyard` built from source (`go install`, `make build`) has none pinned: run it inside a
+checkout, or pass `--dir <checkout>/deploy/cloudflare` or `--package` with a release's
+`https://github.com/thasami/backyard/releases/download/v<version>/backyard-cloudflare-<version>.tgz`
+(not verified against a digest). Before the first release of Backyard, the package is neither
+on npm nor attached to a release: use a checkout, or build it with `make cloudflare-pack` (see
+the [edition's README](../deploy/cloudflare/README.md#building-the-npm-package)). Run
+`npx backyard-cloudflare` only once a Backyard release has published it to npm: until then npm
+serves nothing under that name, or something that is not Backyard.
+
+Behind an HTTP proxy, wrangler uses `HTTPS_PROXY`, but Backyard's own API calls and checks use
+Node's `fetch`: set `NODE_USE_ENV_PROXY=1` as well, on Node 22.21 or later. The engine warns when
+it sees a proxy variable that `fetch` would ignore.
+
+Setup logs in with wrangler (browser), registers the account's workers.dev subdomain when it
+has none, creates the secrets (`BACKYARD_SECRET` and a `DEPLOY_TOKEN`), an R2 bucket when R2 is
+enabled, deploys the Worker and prints the hub URL. `backyard cloudflare setup` also logs the
+CLI in with the deploy token, so this works right away:
 
 ```sh
 backyard init my-site && cd my-site
 backyard deploy          # → https://backyard.<account>.workers.dev/s/my-site/
 ```
 
-Re-run setup to upgrade; earlier choices are remembered on the machine that made them. A
-Worker's existing `DEPLOY_TOKEN` is never replaced unless you pass `--rotate-token`: on another
-machine (or in CI) setup keeps the token it does not know and tells you to run it with
-`DEPLOY_TOKEN=<token>` to remember it there. Options after `--`:
-`--worker-name <name>`, `--r2`, `--var KEY:VALUE` (e.g. `--var AUTH_MODE:access`),
-`--rotate-token`. A GitHub Actions workflow and Terraform for a custom domain with Cloudflare
-Access ([`deploy/terraform/cloudflare`](../deploy/terraform/cloudflare/README.md)) are included.
+Each further step is one command that checks its own result:
+
+```sh
+backyard cloudflare domain add backyard.acme.com                  # the hub on your own domain
+backyard cloudflare domain add acme-sites.dev --host-mode         # or sites at https://<site>.acme-sites.dev/
+backyard cloudflare access enable --allow-email-domain acme.com   # company login with Cloudflare Access
+backyard cloudflare status                                        # read-only live check
+```
+
+Re-run setup to upgrade: every choice is kept (secrets, the deploy token, R2, the domain,
+Access and `--var` overrides). A machine without saved state (a teammate, a new laptop, CI)
+adopts the deployed configuration, and keeps a Worker's existing `DEPLOY_TOKEN` unless you pass
+`--rotate-token` (run it with `DEPLOY_TOKEN=<token>` to remember the token there). A deploy that
+would turn a live Cloudflare Access off is refused unless you confirm it, and deploys never
+change routes or custom domains. Every command and flag:
+[`backyard cloudflare`](cli.md#backyard-cloudflare) and the
+[edition's README](../deploy/cloudflare/README.md#command-reference). A GitHub Actions workflow
+is included, and an optional Terraform module
+([`deploy/terraform/cloudflare`](../deploy/terraform/cloudflare/README.md)) for teams that
+manage Cloudflare as code.
 
 ## How it maps
 
@@ -50,8 +82,9 @@ Access ([`deploy/terraform/cloudflare`](../deploy/terraform/cloudflare/README.md
 | Deploy methods | `api` only |
 | Rate limits | Daily caps per user / IP and per platform (`LIMITS`) |
 
-URLs default to path mode on `workers.dev` (`/s/<site>/`); a custom domain works in path mode,
-and host mode needs a wildcard route and certificate. Note that **path mode shares one origin
+URLs default to path mode on `workers.dev` (`/s/<site>/`); `domain add` adds a custom domain in
+path mode, and `domain add --host-mode` host mode, which needs a wildcard route, DNS record and
+certificate. Note that **path mode shares one origin
 between all sites and the hub** — see [security](security.md#host-mode-vs-path-mode).
 
 With the default `AUTH_MODE=none`, anyone with a link can open sites and use their APIs as an
@@ -64,9 +97,11 @@ tail` shows it — rather than silently running without sign-in.
 Access must let through the paths the Worker authenticates itself: `/__backyard/api/deploy`
 and `/__backyard/api/deploy/*` (deploys with `DEPLOY_TOKEN` or API tokens, signed upload URLs),
 `/__backyard/api/tokens` (`backyard token create`; a minted token never outlives the token that
-asked for it) and the health checks `/__backyard/healthz` and `/__backyard/readyz`. The
-[Terraform module](../deploy/terraform/cloudflare/README.md) creates this Bypass policy
-(`bypass_paths`).
+asked for it) and the health checks `/__backyard/healthz` and `/__backyard/readyz`.
+`backyard cloudflare access enable` creates this Bypass application (with an API token in
+`BACKYARD_CF_API_TOKEN`) or prints the dashboard steps, and verifies at the edge that all five
+paths reach the Worker before it switches the Worker to Access. The optional
+[Terraform module](../deploy/terraform/cloudflare/README.md) creates the same (`bypass_paths`).
 
 Within the shared contract, a few edition differences are visible to pages and CLIs (all
 listed in the [specification](spec/SPEC.md#16-cloudflare-edition-free-tier)):

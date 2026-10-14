@@ -17,3 +17,8 @@ output "setup_command" {
   description = "Run in deploy/cloudflare to switch the Worker to this domain and Access."
   value       = module.backyard.setup_command
 }
+
+output "setup_args" {
+  description = "Arguments for backyard cloudflare setup / npx backyard-cloudflare setup that switch the Worker to this domain and Access."
+  value       = module.backyard.setup_args
+}

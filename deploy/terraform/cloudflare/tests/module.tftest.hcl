@@ -1,7 +1,7 @@
 # Offline tests for the Cloudflare module: `terraform test` (Terraform >= 1.7).
 # The provider is mocked, so no Cloudflare credentials are needed and nothing
 # is created. The runs check resource selection per URL mode, the Access
-# rules and the Worker variables handed back to `npm run setup`.
+# rules and the Worker variables handed back to setup (setup_args, setup_command).
 
 mock_provider "cloudflare" {
   mock_data "cloudflare_zone" {
@@ -105,6 +105,21 @@ run "path_mode_with_access" {
   assert {
     condition     = strcontains(output.setup_command, "--var ACCESS_AUD:737646a5") && startswith(output.setup_command, "npm run setup -- --worker-name backyard ")
     error_message = "setup_command redeploys the Worker with the variables"
+  }
+  assert {
+    condition = output.setup_args == join(" ", [
+      "--worker-name backyard",
+      "--var ACCESS_AUD:737646a56ab1df6ec9bddc7e5ca84eaf3b0768850f3ffb5d74f1534911fe3893",
+      "--var ACCESS_TEAM_DOMAIN:acme.cloudflareaccess.com",
+      "--var AUTH_MODE:access",
+      "--var BASE_DOMAIN:backyard.example.com",
+      "--var URL_MODE:path",
+    ])
+    error_message = "setup_args are the arguments of setup (backyard cloudflare setup / npx backyard-cloudflare setup), without npm run setup --"
+  }
+  assert {
+    condition     = output.setup_command == "npm run setup -- ${output.setup_args}"
+    error_message = "setup_command is npm run setup -- <setup_args>"
   }
   assert {
     condition     = output.site_url_pattern == "https://backyard.example.com/s/<site>/" && output.gateway_url == "https://backyard.example.com/__backyard/api/deploy"
@@ -214,6 +229,10 @@ run "without_access" {
   assert {
     condition     = output.worker_vars == { BASE_DOMAIN = "backyard.example.com", URL_MODE = "path", AUTH_MODE = "none" } && output.access_aud == ""
     error_message = "the Worker runs with AUTH_MODE=none"
+  }
+  assert {
+    condition     = output.setup_args == "--worker-name backyard --var AUTH_MODE:none --var BASE_DOMAIN:backyard.example.com --var URL_MODE:path"
+    error_message = "setup_args carry the variables without Access"
   }
 }
 

@@ -4,8 +4,12 @@ import { HttpError, unwrap } from "./http";
 import { chargeAmount, type Charge, type RegistryDO } from "./registry-do";
 import type { SiteDO } from "./site-do";
 
-/** Version reported by /info. */
-export const VERSION = "0.1.0";
+/**
+ * Version reported by /info: BACKYARD_VERSION at build time (scripts/pack.mjs
+ * sets it for a release), else "<package.json version>-dev". Written by
+ * scripts/sync-assets.mjs.
+ */
+export { BUILD_VERSION as VERSION } from "./generated/version";
 
 /** The public methods of T (RPC surface of a Durable Object, with its plain types). */
 type RPC<T> = { [K in keyof T as T[K] extends (...args: never[]) => Promise<unknown> ? K : never]: T[K] };

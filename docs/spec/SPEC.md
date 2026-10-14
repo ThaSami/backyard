@@ -911,7 +911,7 @@ backyard token   create [--name cli] [--ttl 720h|90d] | hash [token|-] [--name c
 backyard skill   install [--global|--project] [-y]
 backyard mcp                                   MCP server over stdio (for agents)
 backyard config  example | validate [file] [--dev]
-backyard cloudflare setup [--dir d] [--download] [--ref r] [--no-login] [--skip-install] [-- args]
+backyard cloudflare setup|domain add <host>|domain remove|access enable|access disable|status [--dir d] [--package p] [--no-login] [--skip-install] [options]
 backyard version | completion <shell>
 ```
 
@@ -1028,9 +1028,11 @@ storage are available on free); R2 and paid features are optional.
 * **Topology:** one Worker (router, auth, SDK/hub/docs serving, deploy gateway) + one
   `SiteDO` Durable Object per site (SQLite: site files, manifest, documents, uploads, websocket
   hub with hibernation) + one `RegistryDO` (site list/metadata, platform-wide counters/quotas).
-* **URLs:** default path mode on `https://<worker>.<account>.workers.dev/s/<site>/`; custom domain
-  in path mode; or host mode with a wildcard route `*.<base_domain>/*` (Universal SSL covers one
-  wildcard level; deeper needs Advanced Certificate Manager). Configured via `vars`.
+* **URLs:** default path mode on `https://<worker>.<account>.workers.dev/s/<site>/`; a custom
+  domain in path mode (a Workers custom domain); or host mode = the hub's custom domain + a
+  proxied `*.<base_domain>` record + the route `*.<base_domain>/*` (Universal SSL covers one
+  wildcard level; deeper needs Advanced Certificate Manager). Configured via `vars`
+  (`BASE_DOMAIN`, `URL_MODE`), which `backyard cloudflare domain add` sets.
 * **Storage:** files ≤ `FILE_INLINE_MAX` (default 5 MiB) stored chunked in DO SQLite (chunks <
   2 MB); larger files go to the optional `R2` binding (`sites/<site>/…`, `uploads/<site>/…`);
   the per-file cap is 25 MiB without R2 and 95 MiB with it (100 MB request limit). Deploy uploads
@@ -1072,15 +1074,23 @@ storage are available on free); R2 and paid features are optional.
   `/__backyard/api/deploy/*` (bearer tokens, signed upload URLs, the public `info`),
   `/__backyard/api/tokens` (`backyard token create` sends an API token) and the health checks
   `/__backyard/healthz` and `/__backyard/readyz` — with a Bypass policy (or service tokens);
-  Terraform in `deploy/terraform/cloudflare` sets this up.
+  `backyard cloudflare access enable` creates or verifies this (or the optional Terraform module
+  in `deploy/terraform/cloudflare`).
 * **Guardrails (free tier):** per-user/IP daily caps for AI calls, generated images, deploys,
   uploads and document writes, platform-wide daily AI caps, and a platform-wide site cap
   (reserved atomically, so parallel first deploys cannot exceed it), stored in `RegistryDO`;
   configurable via the `LIMITS` JSON var. The image caps count images: an `/ai/image` request
   with `n: 4` uses 4, and is refused (`429`) without running the model when fewer are left.
-* **Deploying the platform:** `cd deploy/cloudflare && npm ci && npm run setup` (wrangler login,
-  secrets, optional R2 bucket, deploy, prints the `backyard login` command), or
-  `backyard cloudflare setup` which runs the same script; GitHub Actions example included.
+* **Deploying the platform:** the npm package `backyard-cloudflare` holds a prebuilt Worker and
+  its engine (Node.js 22+, wrangler pinned): `npx backyard-cloudflare setup` (wrangler login,
+  workers.dev subdomain, secrets, optional R2 bucket, deploy, prints the `backyard login`
+  command); `backyard cloudflare setup` installs the package of its own release (SHA-256
+  checked) and logs the CLI in; `npm run setup` in a checkout of `deploy/cloudflare` builds from
+  source. `domain add <host> [--host-mode]` and `access enable` add the custom domain and
+  Cloudflare Access; deploys (setup and the CI deployer) never change routes or custom domains,
+  and refuse to turn a live Access off unless confirmed. `/info` (§7.1) reports the build
+  version (the release version, `<package version>-dev` for checkout builds). GitHub Actions
+  example included.
 
 ## 17. Cross-edition API conformance
 

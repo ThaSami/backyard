@@ -47,7 +47,7 @@ export function hasBearer(req: Request): boolean {
 
 /** Message for requests that need BACKYARD_SECRET. */
 export function secretMissing(): HttpError {
-  return new HttpError(503, "internal", "this Backyard is not configured yet: BACKYARD_SECRET is missing (run npm run setup)");
+  return new HttpError(503, "internal", "this Backyard is not configured yet: BACKYARD_SECRET is missing (re-run setup: backyard cloudflare setup or npx backyard-cloudflare setup)");
 }
 
 /**

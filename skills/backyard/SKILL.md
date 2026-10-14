@@ -62,9 +62,11 @@ backyard deploy               # publishes the folder and prints the URL
 - `backyard deploy` needs a login once: `backyard login --server https://backyard.example.com`
   opens the browser (company SSO). An agent cannot complete it — ask the user to run it.
 - No Backyard server yet? `backyard cloudflare setup` deploys one to the user's own Cloudflare
-  account on the **free plan** (needs a Cloudflare account and Node.js 20+; the user completes
-  a browser login) and logs the CLI in, so `backyard deploy` works right after. See
-  [references/deploy.md](references/deploy.md#cloudflare-edition-free-tier).
+  account on the **free plan** (needs a Cloudflare account and Node.js 22+; the user completes
+  a browser login in their terminal) and logs the CLI in, so `backyard deploy` works right
+  after. A release build of the CLI (`install.sh`) brings its engine; one from `go install` or
+  a source build needs a checkout of the Backyard repository or `--package`. Never ask for
+  Cloudflare tokens in chat. See [references/deploy.md](references/deploy.md#cloudflare-edition-free-tier).
 - The site name comes from `--site`, `.backyard.json` (`{"site": "lunch-vote"}`) or the folder
   name. Names: lowercase letters, digits and `-`, ≤ 63 chars, not reserved (`www`, `api`,
   `docs`, `admin`…).

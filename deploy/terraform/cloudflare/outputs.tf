@@ -47,10 +47,19 @@ output "worker_vars" {
   value       = local.worker_vars
 }
 
-output "setup_command" {
-  description = "Redeploys the Worker with these variables (run in deploy/cloudflare; they are remembered for later runs)."
-  value = join(" ", concat(
-    ["npm run setup --", "--worker-name", var.worker_name],
+locals {
+  setup_args = join(" ", concat(
+    ["--worker-name", var.worker_name],
     [for k, v in local.worker_vars : "--var ${k}:${v}"],
   ))
+}
+
+output "setup_args" {
+  description = "Arguments of setup that redeploy the Worker with these variables (they are remembered for later runs): backyard cloudflare setup <setup_args>, or npx backyard-cloudflare@latest setup <setup_args>."
+  value       = local.setup_args
+}
+
+output "setup_command" {
+  description = "Redeploys the Worker with these variables from a checkout (run in deploy/cloudflare; they are remembered for later runs). setup_args holds the same arguments for backyard cloudflare setup or npx backyard-cloudflare."
+  value       = "npm run setup -- ${local.setup_args}"
 }

@@ -134,7 +134,7 @@ Useful next commands: `backyard sites list`, `backyard open lunch-vote`,
 | Kubernetes | [deploy/helm/backyard](../deploy/helm/backyard/README.md) |
 | One VM without a bucket (Docker Compose + Caddy) | [deploy/docker-compose](../deploy/docker-compose/README.md) |
 | One VM without a bucket (systemd) | [deploy/systemd](../deploy/systemd/README.md) |
-| Cloudflare free tier (no server at all) | [deploy/cloudflare](../deploy/cloudflare/README.md) — or just `backyard cloudflare setup --download` |
+| Cloudflare free tier (no server at all) | `backyard cloudflare setup` (Node.js 22+; no Terraform; a release build of the CLI installs its engine, one from `go install` needs a checkout or `--package`), see [Cloudflare](cloudflare.md#set-it-up); custom domain and Cloudflare Access with `backyard cloudflare domain add` / `access enable`, or the optional [Terraform module](../deploy/terraform/cloudflare/README.md) |
 
 Every kit renders a `backyard.yaml`; [configuration](configuration.md) documents every key and
 [authentication](authentication.md) walks through Okta, Entra ID, Google IAP, AWS ALB and the

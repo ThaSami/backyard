@@ -1,617 +1,427 @@
 #!/usr/bin/env node
-// Deploys (or upgrades) Backyard on your Cloudflare account, free plan included.
-// Safe to re-run: existing secrets are kept (a DEPLOY_TOKEN that only another
-// machine knows too), the deploy token is remembered.
+// `backyard-cloudflare setup`: deploys (or upgrades) Backyard on your
+// Cloudflare account, free plan included. Safe to re-run: every choice is kept
+// (secrets, the deploy token, R2, the domain, Access, --var overrides), and a
+// machine without state adopts the deployed configuration first.
 //
-//   npm run setup                         log in (browser) if needed, deploy, set secrets
-//                                         (and an R2 bucket for big files when R2 is enabled)
-//   npm run setup -- --no-r2              never use R2 (files capped at 25 MiB)
-//   npm run setup -- --worker-name team   deploy under another Worker name
-//   npm run setup -- --var AUTH_MODE:access --var ACCESS_TEAM_DOMAIN:acme --var ACCESS_AUD:<aud>
-//   npm run setup -- --rotate-token       issue a new DEPLOY_TOKEN
+//   setup                          log in (browser) if needed, register the account's
+//                                  workers.dev subdomain if it has none, deploy, set secrets
+//                                  (and an R2 bucket for big files when R2 is enabled)
+//   setup --no-r2                  never use R2 (files capped at 25 MiB)
+//   setup --worker-name team       deploy under another Worker name
+//   setup --var LIMITS:'{"ai_per_day":50}'   override a variable (remembered; KEY: drops it)
+//   setup --rotate-token           issue a new DEPLOY_TOKEN
+//   setup --dry-run                bundle and validate only (offline, no login, no changes)
 //
-// Non-interactive use (CI): set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID.
-// State (the deploy token, URL, account, bucket, --var overrides) is kept in
-// $XDG_CONFIG_HOME/backyard/cloudflare/<worker>.json (mode 0600), so a plain
-// re-run keeps every earlier choice.
+// A custom domain and company login come afterwards: `domain add <host>` and
+// `access enable` (scripts/domain.mjs, scripts/access.mjs).
+//
+// Non-interactive use (CI): set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID
+// (and --workers-subdomain for an account without one). State is kept in
+// $XDG_CONFIG_HOME/backyard/cloudflare/<worker>.json (mode 0600).
 //
 // Secrets are never guessed: BACKYARD_SECRET is generated only when wrangler
 // clearly reports that the Worker has none (or does not exist yet), since a new
 // one revokes every API token; any other failure to list the secrets stops the
 // setup. Generated secrets are printed only to an interactive terminal; in CI
 // (CI=true) or when the output is redirected, the deploy token is masked and
-// only written to the state file. BACKYARD_SECRET is never printed.
+// only written to the state file. BACKYARD_SECRET is never printed. A deploy
+// that would turn a live Cloudflare Access off is refused unless
+// --confirm-auth-change.
+//
+// `node scripts/setup.mjs <args>` is the same as `backyard-cloudflare setup <args>`.
 
-import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { createInterface } from "node:readline";
-import { dirname, join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const pkgDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const GENERATED_CONFIG = "wrangler.setup.jsonc";
-const color = process.stdout.isTTY && !process.env.NO_COLOR;
-const paint = (code) => (s) => (color ? `\x1b[${code}m${s}\x1b[0m` : String(s));
-const bold = paint("1");
-const dim = paint("2");
-const green = paint("32");
-const yellow = paint("33");
-const cyan = paint("36");
-const red = paint("31");
+import { GO_CLI_INVOCATION } from "./cli.mjs";
+import { CfError } from "./lib/cfapi.mjs";
+import { MANAGED_ACCESS_KEYS, MANAGED_DOMAIN_KEYS, hostOf } from "./lib/live.mjs";
+import { probe } from "./lib/net.mjs";
+import { CliError, EXIT, bold, cyan, dim, green, isCI, maskSecret, revealSecrets, ui, yellow } from "./lib/ui.mjs";
 
-function fail(msg) {
-  console.error(`${red("✗")} ${msg}`);
-  process.exit(1);
+export { parseJSONC } from "./lib/layout.mjs";
+export { isCI, maskSecret, revealSecrets } from "./lib/ui.mjs";
+export { isMissingWorker, parseSecretList } from "./lib/wrangler.mjs";
+
+const BUCKET_RE = /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/;
+const VAR_RE = /^([A-Z_][A-Z0-9_]*):([\s\S]*)$/;
+/** A workers.dev subdomain (wrangler's rule). */
+export const SUBDOMAIN_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+
+/**
+ * The default workers.dev subdomain for an account name: lowercased, runs of
+ * anything but a-z and 0-9 replaced by "-", trimmed, at most 63 characters.
+ */
+export function suggestSubdomain(accountName) {
+  return String(accountName ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+/, "")
+    .slice(0, 63)
+    .replace(/-+$/, "");
 }
 
-const HELP = `Usage: npm run setup -- [options]
+/**
+ * Secrets of the Worker (src/env.ts): never a --var, which would put the value
+ * on the command line, into a plain-text variable everyone with dashboard
+ * access sees, and into the state file (scripts/cloudflare-ci.mjs refuses them too).
+ */
+export const SECRET_NAMES = ["BACKYARD_SECRET", "DEPLOY_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "WAREHOUSE_TOKEN"];
 
-Deploys Backyard to your Cloudflare account (Workers free plan) and prints the
-"backyard login" command. Re-running upgrades the Worker and keeps its secrets.
+/** The refusal of a secret given with --var (the value is never echoed). */
+function secretVarError(name, worker) {
+  const how =
+    name === "DEPLOY_TOKEN"
+      ? "pass it as the environment variable DEPLOY_TOKEN=<token> (or --rotate-token for a new one)"
+      : name === "BACKYARD_SECRET"
+        ? "setup generates it once (--rotate-secret replaces it)"
+        : `set it with \`npx wrangler secret put ${name} --name ${worker}\` (setup keeps it)`;
+  return new CliError(EXIT.USAGE, `${name} is a secret, not a variable: never pass it with --var; ${how}`);
+}
 
-Options:
-  --worker-name <name>   Worker name (default: "name" in wrangler.jsonc)
-  --r2                   use an R2 bucket for big files (the default when R2 is
-                         enabled on the account; re-enables after --no-r2)
-  --r2-bucket <name>     bucket name (default: <worker>-files)
-  --no-r2                never use R2 (remembered; files are capped at 25 MiB)
-  --var KEY:VALUE        override a variable of wrangler.jsonc (repeatable), e.g.
-                         --var URL_MODE:host --var BASE_DOMAIN:backyard.acme.com
-                         Remembered for later runs; --var KEY: (empty) drops it.
-  --rotate-token         replace DEPLOY_TOKEN with a new random token
-  --rotate-secret        replace BACKYARD_SECRET (revokes every API token)
-  --skip-deploy          only (re)set secrets
-  -h, --help             show this help
-`;
+/** Parses the --var flags ({KEY: value}; "" drops a key). */
+function parseVarFlags(list, worker) {
+  const out = {};
+  for (const v of list ?? []) {
+    const m = VAR_RE.exec(v);
+    if (!m) {
+      // Never echo the value: it may be a secret typed as KEY=VALUE.
+      const key = /^([A-Za-z_][A-Za-z0-9_]*)[=:]/.exec(v)?.[1] ?? "";
+      if (SECRET_NAMES.includes(key.toUpperCase())) throw secretVarError(key.toUpperCase(), worker);
+      throw new CliError(EXIT.USAGE, key ? `--var expects KEY:VALUE (with ":"), got ${JSON.stringify(key)} followed by a value` : "--var expects KEY:VALUE");
+    }
+    if (SECRET_NAMES.includes(m[1]) && m[2] !== "") throw secretVarError(m[1], worker);
+    out[m[1]] = m[2];
+  }
+  return out;
+}
 
-function parseArgs(argv) {
-  const o = { vars: {}, r2: undefined, r2Bucket: "", workerName: "", rotateToken: false, rotateSecret: false, skipDeploy: false };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    const next = () => {
-      const v = argv[++i];
-      if (v === undefined) fail(`${a} needs a value`);
-      return v;
-    };
-    const [flag, inline] = a.includes("=") && a.startsWith("--") ? [a.slice(0, a.indexOf("=")), a.slice(a.indexOf("=") + 1)] : [a, undefined];
-    const val = () => (inline !== undefined ? inline : next());
-    switch (flag) {
-      case "-h":
-      case "--help":
-        console.log(HELP);
-        process.exit(0);
-        break;
-      case "--worker-name":
-      case "--name":
-        o.workerName = val();
-        break;
-      case "--r2":
-        o.r2 = true;
-        break;
-      case "--no-r2":
-        o.r2 = false;
-        break;
-      case "--r2-bucket":
-        o.r2Bucket = val();
-        o.r2 = true;
-        break;
-      case "--var": {
-        const v = val();
-        const m = /^([A-Z_][A-Z0-9_]*):([\s\S]*)$/.exec(v);
-        if (!m) fail(`--var expects KEY:VALUE, got ${JSON.stringify(v)}`);
-        o.vars[m[1]] = m[2];
-        break;
-      }
-      case "--rotate-token":
-        o.rotateToken = true;
-        break;
-      case "--rotate-secret":
-        o.rotateSecret = true;
-        break;
-      case "--skip-deploy":
-        o.skipDeploy = true;
-        break;
-      default:
-        fail(`unknown option ${a}\n\n${HELP}`);
+/** Refuses --var for a key that `domain add` / `access enable` manage right now. */
+function refuseManagedVars(overrides, state, inv) {
+  for (const k of Object.keys(overrides)) {
+    if (state.domain && MANAGED_DOMAIN_KEYS.includes(k)) {
+      throw new CliError(EXIT.USAGE, `${k} is managed by \`${inv} domain add\` (use \`${inv} domain remove\`)`);
+    }
+    if (state.access && MANAGED_ACCESS_KEYS.includes(k)) {
+      throw new CliError(EXIT.USAGE, `${k} is managed by \`${inv} access enable\` (use \`${inv} access disable\`)`);
     }
   }
-  if (o.workerName && !/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(o.workerName)) fail(`invalid worker name ${JSON.stringify(o.workerName)}`);
-  if (o.r2Bucket && !/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(o.r2Bucket)) fail(`invalid bucket name ${JSON.stringify(o.r2Bucket)}`);
-  return o;
-}
-
-/** Strips // and /* *\/ comments and trailing commas from JSONC (string-aware). */
-export function parseJSONC(text) {
-  let out = "";
-  let inStr = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (inStr) {
-      out += c;
-      if (c === "\\") out += text[++i] ?? "";
-      else if (c === '"') inStr = false;
-    } else if (c === '"') {
-      inStr = true;
-      out += c;
-    } else if (c === "/" && text[i + 1] === "/") {
-      while (i < text.length && text[i] !== "\n") i++;
-      out += "\n";
-    } else if (c === "/" && text[i + 1] === "*") {
-      i += 2;
-      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++;
-      i++;
-    } else {
-      out += c;
-    }
-  }
-  return JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"));
-}
-
-function wranglerBin() {
-  const p = join(pkgDir, "node_modules", "wrangler", "bin", "wrangler.js");
-  if (!existsSync(p)) fail(`wrangler is not installed: run ${bold("npm ci")} in ${pkgDir} first`);
-  return p;
 }
 
 /**
- * Runs wrangler. Output is streamed (unless quiet) and captured (output: stdout
- * and stderr, stdout: stdout only); stdin is inherited so wrangler's prompts
- * work, or fed from opts.input.
+ * A domain or Access adopted in this very run whose keys are also given with
+ * --var stays "externally managed" (e.g. the Terraform module's setup_args on
+ * a second machine): its live values go to state.vars, where --var applies.
  */
-function wrangler(args, opts = {}) {
-  return new Promise((resolvePromise) => {
-    const child = spawn(process.execPath, [wranglerBin(), ...args], {
-      cwd: pkgDir,
-      env: { ...process.env, WRANGLER_SEND_METRICS: process.env.WRANGLER_SEND_METRICS ?? "false" },
-      stdio: [opts.input !== undefined ? "pipe" : "inherit", "pipe", "pipe"],
-    });
-    if (opts.input !== undefined) {
-      child.stdin.write(opts.input);
-      child.stdin.end();
-    }
-    let output = "";
-    let stdout = "";
-    const onData = (stream, isStdout) => (chunk) => {
-      output += chunk.toString();
-      if (isStdout) stdout += chunk.toString();
-      if (!opts.quiet) stream.write(chunk);
-    };
-    child.stdout.on("data", onData(process.stdout, true));
-    child.stderr.on("data", onData(process.stderr, false));
-    child.on("error", (e) => resolvePromise({ code: 1, output: String(e), stdout: "" }));
-    child.on("close", (code) => resolvePromise({ code: code ?? 1, output, stdout }));
-  });
-}
-
-function stateFile(worker) {
-  const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
-  return join(base, "backyard", "cloudflare", `${worker}.json`);
-}
-
-/**
- * Reads the saved state ({} when there is none). A state file that exists but
- * cannot be read stops the setup: carrying on would silently replace the
- * remembered deploy token.
- */
-function loadState(worker) {
-  const p = stateFile(worker);
-  let text;
-  try {
-    text = readFileSync(p, "utf8");
-  } catch (e) {
-    if (e?.code === "ENOENT") return {};
-    fail(`cannot read ${p}: ${e?.message ?? e}`);
-  }
-  try {
-    const state = JSON.parse(text);
-    if (state && typeof state === "object" && !Array.isArray(state)) return state;
-  } catch {
-    /* reported below */
-  }
-  fail(`${p} is not a valid state file (a JSON object): repair it, or delete it to start over (a new DEPLOY_TOKEN is then issued)`);
-}
-
-/**
- * Writes the state atomically as a private file (0600, also when an older
- * version left it readable by others): it holds the deploy token.
- */
-function saveState(worker, state) {
-  const p = stateFile(worker);
-  mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
-  const tmp = `${p}.${process.pid}.tmp`;
-  try {
-    writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
-    chmodSync(tmp, 0o600);
-    renameSync(tmp, p);
-  } finally {
-    rmSync(tmp, { force: true });
-  }
-  return p;
-}
-
-/** Whether CI=… marks a CI run (any value but "", "0" or "false"). */
-export function isCI(env = process.env) {
-  const v = String(env.CI ?? "").trim().toLowerCase();
-  return v !== "" && v !== "0" && v !== "false";
-}
-
-/**
- * Whether generated secrets may be shown: only on an interactive terminal,
- * never in CI, where logs are kept and often shared.
- */
-export function revealSecrets(env = process.env, isTTY = Boolean(process.stdout.isTTY)) {
-  return isTTY && !isCI(env);
-}
-
-/** A recognizable but useless form of a secret: "byd_…wxyz". */
-export function maskSecret(s) {
-  const v = String(s ?? "");
-  const prefix = /^[a-z]{2,8}_/.exec(v)?.[0] ?? "";
-  return prefix + "…" + (v.length >= 24 ? v.slice(-4) : "");
-}
-
-/**
- * Extracts the secret names from the stdout of `wrangler secret list
- * --format json`. Wrangler may print other lines first (e.g. "▲ [WARNING]
- * Proxy environment variables detected", or "[…]" notices), so the list is
- * looked for in every line starting with "[" from which a JSON array parses
- * (up to a line-final "]"): the first non-empty array of {name} objects is
- * the list. An empty array ("[]", no secrets) counts only when nothing else
- * parses as a list: a stray "[]" line before the real list must never make
- * the setup believe the Worker has no secrets (it would then replace
- * BACKYARD_SECRET, revoking every API token). Anything else throws: never
- * guess. (The same rules as scripts/cloudflare-ci.mjs.)
- */
-export function parseSecretList(stdout) {
-  const s = String(stdout ?? "");
-  const lineFinal = (j) => {
-    let k = j + 1;
-    while (k < s.length && (s[k] === " " || s[k] === "\t" || s[k] === "\r")) k++;
-    return k === s.length || s[k] === "\n";
+function externalizeAdopted(state, overrides, baseVars) {
+  const keep = (k, v) => {
+    const def = String(baseVars[k] ?? "");
+    if (v !== def) state.vars = { ...(state.vars ?? {}), [k]: v };
   };
-  const isEntry = (x) => x !== null && typeof x === "object" && !Array.isArray(x) && typeof x.name === "string" && x.name !== "";
-  const ends = [];
-  for (let j = s.indexOf("]"); j >= 0; j = s.indexOf("]", j + 1)) if (lineFinal(j)) ends.push(j);
-  let empty = false;
-  let foreign = false;
-  for (let i = s.indexOf("["); i >= 0; i = s.indexOf("[", i + 1)) {
-    if (i > 0 && s[i - 1] !== "\n") continue;
-    for (let k = ends.length - 1; k >= 0 && ends[k] > i; k--) {
-      let list;
-      try {
-        list = JSON.parse(s.slice(i, ends[k] + 1));
-      } catch {
-        continue;
-      }
-      if (!Array.isArray(list)) continue;
-      if (list.length === 0) empty = true;
-      else if (list.every(isEntry)) return new Set(list.map((x) => x.name));
-      else foreign = true;
+  const given = Object.keys(overrides);
+  if (state.domain?.source === "adopted" && given.some((k) => MANAGED_DOMAIN_KEYS.includes(k))) {
+    keep("BASE_DOMAIN", state.domain.host);
+    keep("URL_MODE", state.domain.mode === "host" ? "host" : "path");
+    delete state.domain;
+  }
+  if (state.access?.source === "adopted" && given.some((k) => MANAGED_ACCESS_KEYS.includes(k))) {
+    keep("AUTH_MODE", "access");
+    keep("ACCESS_TEAM_DOMAIN", state.access.team ?? "");
+    keep("ACCESS_AUD", state.access.aud ?? "");
+    delete state.access;
+  }
+}
+
+/**
+ * Resolves the workers.dev URL of the Worker: the account's subdomain, which
+ * is registered when there is none (never renamed). "" when the credential
+ * cannot read it (a scoped API token): the deploy output tells then. With
+ * {register: false} (workers.dev is off or being turned off) it only looks
+ * the URL up, best effort: no registration, no prompt, no failure.
+ * @param {import("./cli.mjs").Ctx} ctx
+ * @param {import("./lib/cfapi.mjs").Api} api
+ * @param {Record<string, any>} opts
+ * @param {{register?: boolean}} [ro]
+ */
+async function resolveWorkersDev(ctx, api, opts, ro = {}) {
+  const register = ro.register !== false;
+  let sub;
+  try {
+    sub = (await api.get(`/accounts/${ctx.accountId}/workers/subdomain`))?.subdomain;
+  } catch (e) {
+    if (!register) return "";
+    if (e instanceof CfError && e.has(10007)) {
+      sub = await registerSubdomain(ctx, api, opts);
+    } else if (e instanceof CfError && e.forbidden) {
+      ui.note("The credential cannot read the account's workers.dev subdomain: the URL comes from the deploy output.");
+      return "";
+    } else {
+      throw new CliError(EXIT.FAILED, `could not read the workers.dev subdomain of the account (nothing was changed): ${e?.message ?? e}`);
     }
   }
-  if (empty && !foreign) return new Set();
-  throw new Error(
-    foreign
-      ? "no JSON list of secrets in the output of wrangler secret list (a JSON array that is not a list of {name} objects)"
-      : "no JSON list of secrets in the output of wrangler secret list",
-  );
+  if (!sub) return "";
+  if (opts.workersSubdomain && opts.workersSubdomain !== sub) ui.warn(`account already uses ${sub}; --workers-subdomain ignored`);
+  return `https://${ctx.worker}.${sub}.workers.dev`;
 }
 
 /**
- * True when wrangler reports that the Worker does not exist yet (`Worker
- * "<name>" not found`, API error 10007). Authentication, permission and
- * network errors must never be mistaken for a first deploy.
+ * Registers the account's workers.dev subdomain (the endpoints and error
+ * codes wrangler uses: 10032 available, 10031 taken).
+ * @param {import("./cli.mjs").Ctx} ctx
+ * @param {import("./lib/cfapi.mjs").Api} api
+ * @param {Record<string, any>} opts
  */
-export function isMissingWorker(output) {
-  return /Worker "[^"]*"(?: \(env: [^)]*\))? not found|\[code: 10007\]|does not exist on your account/i.test(String(output ?? ""));
-}
-
-/** Parses `wrangler whoami --json` ({loggedIn, email, accounts: [{id, name}]}); null when not logged in. */
-function parseWhoami(r) {
-  if (r.code !== 0) return null;
-  try {
-    const out = r.stdout ?? r.output;
-    const j = JSON.parse(out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1));
-    if (!j.loggedIn) return null;
-    const accounts = Array.isArray(j.accounts)
-      ? j.accounts.filter((a) => a && typeof a.id === "string").map((a) => ({ id: a.id, name: String(a.name ?? a.id) }))
-      : [];
-    return { email: typeof j.email === "string" ? j.email : "", accounts };
-  } catch {
-    return { email: "", accounts: [] };
+async function registerSubdomain(ctx, api, opts) {
+  const a = ctx.accountId;
+  const onboarding = `https://dash.cloudflare.com/${a}/workers/onboarding`;
+  let name = opts.workersSubdomain ?? "";
+  if (!name && !ctx.interactive) {
+    throw new CliError(EXIT.USAGE, `this account has no workers.dev subdomain: pass --workers-subdomain <name>, or register one at ${onboarding}`);
   }
-}
-
-/** Makes sure wrangler can act for us; returns who we are (accounts may be empty for scoped API tokens). */
-async function ensureLogin() {
-  const fromEnv = Boolean(process.env.CLOUDFLARE_API_TOKEN);
-  if (fromEnv) console.log(dim("Using CLOUDFLARE_API_TOKEN from the environment."));
-  if (fromEnv && process.env.CLOUDFLARE_ACCOUNT_ID) return { email: "", accounts: [] };
-  let who = parseWhoami(await wrangler(["whoami", "--json"], { quiet: true }));
-  if (who) {
-    if (!fromEnv) console.log(`${green("✓")} Logged in to Cloudflare${who.email ? ` as ${bold(who.email)}` : ""}`);
-    return who;
-  }
-  if (fromEnv) return { email: "", accounts: [] }; // let wrangler report token problems itself
-  if (!process.stdin.isTTY) fail("not logged in to Cloudflare: run `npx wrangler login`, or set CLOUDFLARE_API_TOKEN (and CLOUDFLARE_ACCOUNT_ID)");
-  console.log(`${yellow("!")} wrangler is not logged in — opening the Cloudflare login in your browser…`);
-  const login = await wrangler(["login"]);
-  if (login.code !== 0) fail("wrangler login failed");
-  who = parseWhoami(await wrangler(["whoami", "--json"], { quiet: true }));
-  if (!who) fail("wrangler login did not complete");
-  return who;
-}
-
-function ask(question) {
-  return new Promise((resolveAnswer) => {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    rl.question(question, (answer) => {
-      rl.close();
-      resolveAnswer(answer.trim());
-    });
-  });
-}
-
-/**
- * Picks the Cloudflare account to deploy to (like OpenQuick): CLOUDFLARE_ACCOUNT_ID,
- * the one used last time, the only one, or a choice. Every later wrangler call
- * gets it through CLOUDFLARE_ACCOUNT_ID, so none of them stops to ask (a quiet
- * call would wait for an answer to a question nobody sees).
- */
-async function pickAccount(accounts, saved) {
-  if (process.env.CLOUDFLARE_ACCOUNT_ID) return process.env.CLOUDFLARE_ACCOUNT_ID;
-  if (saved && accounts.some((a) => a.id === saved)) return saved;
-  if (accounts.length === 0) return "";
-  if (accounts.length === 1) return accounts[0].id;
-  if (!process.stdin.isTTY) {
-    fail(`this login can deploy to ${accounts.length} Cloudflare accounts: set CLOUDFLARE_ACCOUNT_ID to one of ${accounts.map((a) => a.id).join(", ")}`);
-  }
-  console.log(`\nYour Cloudflare login can deploy to ${accounts.length} accounts:`);
-  accounts.forEach((a, i) => console.log(`  ${bold(String(i + 1))}. ${a.name} ${dim(a.id)}`));
+  const suggestion = suggestSubdomain(ctx.accountName);
+  if (!name) ui.log("This Cloudflare account has no workers.dev subdomain yet (Workers are served at https://<worker>.<subdomain>.workers.dev).");
   for (;;) {
-    const answer = await ask(`Deploy Backyard to which account? ${dim(`[1-${accounts.length}]`)} `);
-    const i = Number(answer) - 1;
-    if (Number.isInteger(i) && accounts[i]) return accounts[i].id;
-    console.log(yellow("  Please enter a number from the list."));
+    if (!name) {
+      name = (await ctx.prompt.ask("workers.dev subdomain for this account", { default: suggestion, flag: "--workers-subdomain" })).toLowerCase();
+    }
+    if (!SUBDOMAIN_RE.test(name)) {
+      if (!ctx.interactive) throw new CliError(EXIT.USAGE, `invalid workers.dev subdomain ${JSON.stringify(name)} (a-z, 0-9 and -, at most 63 characters)`);
+      ui.warn(`${JSON.stringify(name)} is not a valid subdomain (a-z, 0-9 and -, at most 63 characters)`);
+      name = "";
+      continue;
+    }
+    let available = true;
+    try {
+      await api.get(`/accounts/${a}/workers/subdomains/${name}`);
+    } catch (e) {
+      if (e instanceof CfError && e.has(10032)) available = true;
+      else if (e instanceof CfError && e.has(10031)) available = false;
+      else throw new CliError(EXIT.FAILED, `could not check whether the workers.dev subdomain ${name} is available: ${e?.message ?? e}`);
+    }
+    if (available) {
+      try {
+        const r = await api.put(`/accounts/${a}/workers/subdomain`, { subdomain: name });
+        const got = String(r?.subdomain || name);
+        ui.ok(`workers.dev subdomain ${bold(got)} registered (DNS can take a few minutes)`);
+        return got;
+      } catch (e) {
+        if (!(e instanceof CfError && e.has(10031))) throw new CliError(EXIT.FAILED, `could not register the workers.dev subdomain ${name}: ${e?.message ?? e}`);
+      }
+    }
+    if (!ctx.interactive) throw new CliError(EXIT.FAILED, `the workers.dev subdomain ${name} is taken: pick another with --workers-subdomain <name> (or register one at ${onboarding})`);
+    ui.warn(`${name}.workers.dev is taken; please choose another`);
+    name = "";
   }
+}
+
+/** How to get the `backyard` CLI (printed when the Go CLI did not run the engine). */
+export const CLI_INSTALL = "curl -fsSL https://raw.githubusercontent.com/thasami/backyard/main/scripts/install.sh | sh";
+
+/**
+ * Polls <url>/__backyard/readyz (15 × 3 s): "" when ready, else why not,
+ * with the Worker's own reason when it answers (e.g. "not ready: AUTH_MODE
+ * must be …").
+ * @param {string} url
+ */
+async function waitReady(url) {
+  let last;
+  for (let i = 0; i < 15; i++) {
+    // manual: a Cloudflare Access login redirect is not "ready".
+    last = await probe(`${url}/__backyard/readyz`, { timeoutMs: 10_000 });
+    if (last.ok && last.status === 200) return "";
+    if (i < 14) await new Promise((res) => setTimeout(res, 3000));
+  }
+  if (!last.ok) {
+    return last.kind === "dns" || last.kind === "certificate"
+      ? "DNS or the certificate is still provisioning (a new workers.dev subdomain can take a few minutes)"
+      : `it does not answer (${last.error})`;
+  }
+  if (last.status >= 300 && last.status < 400) return `/__backyard/readyz redirects (${last.location || `HTTP ${last.status}`})`;
+  const reason = String(last.text ?? "").split("\n")[0].replace(/[\x00-\x1f\x7f]/g, "").trim().slice(0, 300);
+  return `/__backyard/readyz answers HTTP ${last.status}${reason ? `: ${reason}` : ""}`;
 }
 
 /**
- * The Worker's secrets: {exists, names}. Only wrangler's explicit "Worker not
- * found" means a first deploy (no secrets); any other failure, or output that
- * is not the JSON list, stops the setup, so that a warning line, an expired
- * login or a network hiccup can never make it replace BACKYARD_SECRET (which
- * would revoke every token).
+ * `setup`: from nothing to a live Worker, and every later upgrade.
+ * @param {Record<string, any>} opts   parsed flags (lib/args.mjs)
+ * @param {import("./cli.mjs").Ctx} ctx
+ * @returns {Promise<number>}
  */
-async function existingSecrets(worker) {
-  const r = await wrangler(["secret", "list", "--name", worker, "--format", "json"], { quiet: true });
-  if (r.code !== 0) {
-    if (isMissingWorker(r.output)) return { exists: false, names: new Set() };
-    fail(`could not list the secrets of Worker ${worker} (nothing was changed):\n${r.output.trim()}`);
+export async function runSetup(opts, ctx) {
+  const inv = ctx.invokedAs;
+  const w = ctx.worker;
+  const overrides = parseVarFlags(opts.var, w);
+  if (opts.r2 && opts.noR2) throw new CliError(EXIT.USAGE, "--r2 and --no-r2 contradict each other");
+  if (opts.noR2 && opts.r2Bucket) throw new CliError(EXIT.USAGE, "--r2-bucket and --no-r2 contradict each other");
+  if (opts.workersDev && opts.noWorkersDev) throw new CliError(EXIT.USAGE, "--workers-dev and --no-workers-dev contradict each other");
+  if (opts.r2Bucket && !BUCKET_RE.test(opts.r2Bucket)) throw new CliError(EXIT.USAGE, `invalid bucket name ${JSON.stringify(opts.r2Bucket)}`);
+  if (opts.workersSubdomain !== undefined && !SUBDOMAIN_RE.test(opts.workersSubdomain)) {
+    throw new CliError(EXIT.USAGE, `invalid workers.dev subdomain ${JSON.stringify(opts.workersSubdomain)} (a-z, 0-9 and -, at most 63 characters)`);
   }
-  try {
-    return { exists: true, names: parseSecretList(r.stdout) };
-  } catch {
-    fail(`unexpected output of wrangler secret list for Worker ${worker} (nothing was changed):\n${r.output.trim()}`);
+  if (opts.dryRun && (opts.skipDeploy || opts.rotateToken || opts.rotateSecret)) {
+    throw new CliError(EXIT.USAGE, "--dry-run changes nothing: it cannot be combined with --skip-deploy, --rotate-token or --rotate-secret");
   }
-}
+  /** @type {boolean | undefined} */
+  const r2Choice = opts.noR2 ? false : opts.r2 || opts.r2Bucket ? true : undefined;
+  const baseVars = ctx.base.vars ?? {};
 
-async function putSecret(worker, name, value) {
-  const r = await wrangler(["secret", "put", name, "--name", worker], { input: value + "\n", quiet: true });
-  if (r.code !== 0) fail(`could not set the ${name} secret:\n${r.output}`);
-  console.log(`${green("✓")} Secret ${bold(name)} set`);
-}
-
-async function ensureBucket(bucket) {
-  const r = await wrangler(["r2", "bucket", "create", bucket], { quiet: true });
-  if (r.code === 0 || /already exists|already own|10004/i.test(r.output)) {
-    console.log(`${green("✓")} R2 bucket ${bold(bucket)} ready (files above FILE_INLINE_MAX go there, up to 95 MiB each)`);
-    return true;
-  }
-  const notEnabled = /enable R2|10042|not.*(enabled|subscribed)/i.test(r.output);
-  console.log(
-    `${yellow("!")} ${notEnabled ? "R2 is not enabled on this account" : `Could not create the R2 bucket ${bucket}`}` +
-      ` (enable it once at dash.cloudflare.com → R2 — the free tier includes 10 GB — then re-run npm run setup).`,
-  );
-  console.log(dim("  Continuing without R2: everything works, files are just capped at 25 MiB each."));
-  return false;
-}
-
-function findURL(output, worker) {
-  const urls = [...output.matchAll(/https:\/\/[a-z0-9.-]+\.workers\.dev/gi)].map((m) => m[0]);
-  const exact = urls.find((u) => u.startsWith(`https://${worker}.`));
-  if (exact || urls[0]) return exact ?? urls[0];
-  const custom = output.match(/^\s+([a-z0-9.-]+\.[a-z]{2,})(?:\/\*)? \((?:custom domain|route)/im);
-  return custom ? `https://${custom[1].replace(/^\*\./, "")}` : "";
-}
-
-async function waitReady(url) {
-  for (let i = 0; i < 15; i++) {
-    try {
-      // manual: a Cloudflare Access login redirect is not "ready".
-      const res = await fetch(`${url}/__backyard/readyz`, { redirect: "manual", signal: AbortSignal.timeout(10_000) });
-      if (res.status === 200) return true;
-    } catch {
-      /* not yet reachable */
+  if (opts.dryRun) {
+    await ctx.syncAssets();
+    const state = ctx.loadState();
+    refuseManagedVars(overrides, state, inv);
+    const vars = { ...(state.vars ?? {}) };
+    for (const [k, v] of Object.entries(overrides)) {
+      if (v === "") delete vars[k];
+      else vars[k] = v;
     }
-    await new Promise((r) => setTimeout(r, 3000));
+    const view = { ...state, vars };
+    if (opts.workersDev) view.workersDev = true;
+    if (opts.noWorkersDev) view.workersDev = false;
+    const bucket = r2Choice === false ? "" : opts.r2Bucket || (state.r2 !== false ? state.r2Bucket : "") || (r2Choice ? `${w}-files` : "");
+    return ctx.dryRun(view, { bucket });
   }
-  return false;
-}
 
-async function main() {
-  const opts = parseArgs(process.argv.slice(2));
-  console.log(bold("\nBackyard on Cloudflare — setup\n"));
+  ui.log(bold("\nBackyard on Cloudflare — setup\n"));
+  // Source layout: bundle the SDK, hub and docs from the checkout.
+  await ctx.syncAssets();
+  const state = ctx.loadState();
+  const previousUrl = state.url ?? "";
+  refuseManagedVars(overrides, state, inv);
 
-  // Bundle the SDK, hub and docs from the repository.
-  await new Promise((res) => {
-    const c = spawn(process.execPath, [join(pkgDir, "scripts", "sync-assets.mjs"), "--strict"], { stdio: "inherit" });
-    c.on("close", (code) => (code === 0 ? res() : fail("syncing assets failed")));
-  });
+  await ctx.login(state);
+  const api = await ctx.api();
 
-  const config = parseJSONC(readFileSync(join(pkgDir, "wrangler.jsonc"), "utf8"));
-  const worker = opts.workerName || config.name || "backyard";
-  const state = loadState(worker);
+  // The live Worker: adopted by a machine without state, checked by the guard.
+  const live = await ctx.readLive();
+  if (ctx.adopt(state, live)) externalizeAdopted(state, overrides, baseVars);
 
-  const who = await ensureLogin();
-  const accountId = await pickAccount(who.accounts, state.accountId);
-  if (accountId) {
-    process.env.CLOUDFLARE_ACCOUNT_ID = accountId;
-    const name = who.accounts.find((a) => a.id === accountId)?.name;
-    if (who.accounts.length > 1 || name) console.log(dim(`Account: ${name ? `${name} (${accountId})` : accountId}`));
+  // The account's workers.dev subdomain (registered when there is none), once
+  // the adopted setting and the flags are known: a Worker that does not serve
+  // workers.dev never needs one, its URL is only looked up for later.
+  if (opts.workersDev) state.workersDev = true;
+  const servesWorkersDev = !opts.noWorkersDev && state.workersDev !== false;
+  if (servesWorkersDev || !state.workersDevUrl) {
+    const workersDevUrl = await resolveWorkersDev(ctx, api, opts, { register: servesWorkersDev });
+    if (workersDevUrl) state.workersDevUrl = workersDevUrl;
   }
-  state.accountId = accountId || state.accountId || undefined;
 
   // R2 is used automatically when the account has it (like OpenQuick); --no-r2
-  // opts out for good, --r2 opts back in. A failed attempt is retried next run.
-  if (opts.r2 !== undefined) state.r2 = opts.r2;
+  // opts out for good, --r2 opts back in. A failed attempt is retried next run,
+  // and never drops or forgets a bucket in use: files above FILE_INLINE_MAX live there.
+  if (r2Choice !== undefined) state.r2 = r2Choice;
   let bucket = "";
   if (state.r2 !== false) {
-    const name = opts.r2Bucket || state.r2Bucket || `${worker}-files`;
-    if (await ensureBucket(name)) bucket = name;
+    const known = opts.r2Bucket || state.r2Bucket || live.r2Bucket || "";
+    const name = known || `${w}-files`;
+    const created = await ctx.ensureBucket(name);
+    if (created.ok) bucket = name;
+    else if (live.r2Bucket && live.r2Bucket === name) {
+      // Bound to the live Worker, so it exists: a failed create (a transient
+      // error, a token without R2 permission) must not unbind it.
+      ui.warn(`could not confirm the R2 bucket ${name}: keeping it bound (the Worker already uses it)`);
+      bucket = name;
+    } else {
+      ui.warn(
+        created.notEnabled
+          ? `R2 is not enabled on this account (enable it once at dash.cloudflare.com → R2 — the free tier includes 10 GB — then re-run ${inv} setup).`
+          : `Could not create the R2 bucket ${name} (re-run ${inv} setup to try again).`,
+      );
+      ui.note("  Continuing without R2: everything works, files are just capped at 25 MiB each.");
+    }
+    // Only --no-r2 forgets the bucket: a failed attempt keeps the known name for the next run.
+    state.r2Bucket = bucket || known || undefined;
+  } else {
+    state.r2Bucket = undefined;
   }
-  state.r2Bucket = bucket || undefined;
 
   // Variable overrides: remembered across runs, an empty value drops one.
+  refuseManagedVars(overrides, state, inv);
   const vars = { ...(state.vars ?? {}) };
-  for (const [k, v] of Object.entries(opts.vars)) {
+  for (const [k, v] of Object.entries(overrides)) {
     if (v === "") delete vars[k];
     else vars[k] = v;
   }
   state.vars = Object.keys(vars).length ? vars : undefined;
-  const merged = { ...(config.vars ?? {}), ...vars };
-
-  // Secrets: keep what exists, generate what is missing. They are uploaded
-  // with the new version (wrangler deploy --secrets-file), so a first deploy
-  // never runs without BACKYARD_SECRET.
-  const listed = await existingSecrets(worker);
-  const have = listed.names;
-  if (opts.skipDeploy && !listed.exists) fail(`Worker ${worker} does not exist yet: run npm run setup without --skip-deploy first`);
-  const secrets = {};
-  // Generated only when the Worker has none (or on request): a new value
-  // revokes every API token. It is never printed.
-  if (!have.has("BACKYARD_SECRET") || opts.rotateSecret) secrets.BACKYARD_SECRET = randomBytes(32).toString("hex");
-  const newToken = () => "byd_" + randomBytes(24).toString("base64url");
-  // The deploy token: the one from the environment, a new one on request,
-  // the one remembered here, or a new one when the Worker has none. A token
-  // the Worker already has is never replaced just because this machine does
-  // not know it (another machine, a teammate, CI, a fresh $XDG_CONFIG_HOME):
-  // every CLI login and pipeline using it would stop working, and in CI
-  // nobody would ever learn the new one.
-  let token = "";
-  if (process.env.DEPLOY_TOKEN) {
-    token = process.env.DEPLOY_TOKEN; // explicit choice (e.g. CI)
-    secrets.DEPLOY_TOKEN = token;
-  } else if (opts.rotateToken) {
-    token = newToken();
-    secrets.DEPLOY_TOKEN = token;
-  } else if (state.deployToken) {
-    token = state.deployToken;
-    if (!have.has("DEPLOY_TOKEN")) secrets.DEPLOY_TOKEN = token;
-  } else if (!have.has("DEPLOY_TOKEN")) {
-    token = newToken();
-    secrets.DEPLOY_TOKEN = token;
-  } else {
-    console.log(
-      `${yellow("!")} Worker ${worker} already has a DEPLOY_TOKEN that this machine does not know: keeping it. ` +
-        `Run with DEPLOY_TOKEN=<token> to remember it here, or with --rotate-token to issue a new one.`,
-    );
+  if (opts.noWorkersDev) {
+    if (state.domain?.status !== "active") throw new CliError(EXIT.USAGE, `turning workers.dev off needs a working custom domain (${inv} domain add <host>)`);
+    state.workersDev = false;
   }
-  if (listed.exists && !state.updatedAt) {
-    console.log(
-      `${yellow("!")} No saved setup for ${worker} on this machine: variable overrides from earlier runs elsewhere ` +
-        `(--var, e.g. AUTH_MODE:access) are not known here and the deploy uses wrangler.jsonc plus this run's --var.`,
-    );
-  }
+  state.workersDev = state.workersDev ?? true;
 
-  let url = state.url || "";
-  if (!opts.skipDeploy) {
-    // --env= targets the top-level environment explicitly (wrangler.jsonc also defines "local").
-    const args = ["deploy", "--name", worker, "--env="];
-    let generated = "";
-    if (bucket || state.vars) {
-      // wrangler.jsonc plus the R2 binding and the overrides, written next to it
-      // so relative paths resolve (vars as data: JSON values need no quoting).
-      generated = join(pkgDir, GENERATED_CONFIG);
-      const effective = { ...config, name: worker, vars: merged };
-      if (bucket) effective.r2_buckets = [{ binding: "R2", bucket_name: bucket }];
-      writeFileSync(generated, "// Generated by scripts/setup.mjs from wrangler.jsonc — do not edit.\n" + JSON.stringify(effective, null, 2) + "\n");
-      args.push("--config", generated);
-    }
-    // A private temporary file (0600), removed right after the deploy.
-    const secretDir = Object.keys(secrets).length ? mkdtempSync(join(tmpdir(), "backyard-setup-")) : "";
-    if (secretDir) {
-      const secretsFile = join(secretDir, "secrets.json");
-      writeFileSync(secretsFile, JSON.stringify(secrets), { mode: 0o600 });
-      args.push("--secrets-file", secretsFile);
-    }
-    if (state.vars) console.log(dim(`Variable overrides: ${Object.keys(vars).sort().join(", ")}`));
-    console.log(`\nDeploying Worker ${bold(worker)}${bucket ? ` with R2 bucket ${bold(bucket)}` : ""}…\n`);
-    let r;
-    try {
-      r = await wrangler(args);
-    } finally {
-      if (generated) rmSync(generated, { force: true });
-      if (secretDir) rmSync(secretDir, { recursive: true, force: true });
-    }
-    if (r.code !== 0) {
-      if (/workers\.dev subdomain/i.test(r.output)) {
-        fail("register a workers.dev subdomain first: dash.cloudflare.com → Workers & Pages → (set up your subdomain), then re-run npm run setup");
-      }
-      fail("wrangler deploy failed (see the output above)");
-    }
-    url = findURL(r.output, worker) || url;
-    for (const name of ["BACKYARD_SECRET", "DEPLOY_TOKEN"]) {
-      console.log(`${green("✓")} Secret ${bold(name)} ${secrets[name] !== undefined ? "set" : "kept"}`);
-    }
-  } else {
-    for (const name of ["BACKYARD_SECRET", "DEPLOY_TOKEN"]) {
-      if (secrets[name] !== undefined) await putSecret(worker, name, secrets[name]);
-      else console.log(`${green("✓")} Secret ${bold(name)} kept`);
-    }
-  }
-  // A custom domain (BASE_DOMAIN / PUBLIC_URL) is the hub URL to hand out.
-  const publicURL = String(merged.PUBLIC_URL ?? "").replace(/\/+$/, "");
-  if (publicURL) url = publicURL;
-  else if (merged.BASE_DOMAIN) url = `https://${merged.BASE_DOMAIN}`;
+  const d = await ctx.deploy(state, {
+    live,
+    bucket,
+    confirmAuthChange: opts.confirmAuthChange,
+    rotateToken: opts.rotateToken,
+    rotateSecret: opts.rotateSecret,
+    skipDeploy: opts.skipDeploy,
+  });
 
-  state.deployToken = token || undefined;
+  // The hub URL to hand out: PUBLIC_URL, the custom domain, workers.dev.
+  const publicURL = String(d.vars.PUBLIC_URL ?? "").trim().replace(/\/+$/, "");
+  const baseDomain = hostOf(d.vars.BASE_DOMAIN);
+  if (!state.workersDevUrl && /^https:\/\/[^/]+\.workers\.dev$/.test(d.url)) state.workersDevUrl = d.url;
+  const url =
+    publicURL || (baseDomain ? `https://${baseDomain}` : "") || (state.workersDev !== false ? state.workersDevUrl ?? "" : "") || d.url || state.url || "";
   state.url = url || undefined;
-  state.updatedAt = new Date().toISOString();
-  const saved = saveState(worker, state);
+  const saved = ctx.saveState(state);
+  ctx.writeResult(state, { previousUrl });
 
+  let notReady = "";
   if (url) {
     process.stdout.write(`\nWaiting for ${url} to answer…`);
-    const ready = await waitReady(url);
-    console.log(ready ? ` ${green("ready")}` : ` ${yellow("not yet (workers.dev can take a minute on a first deploy)")}`);
+    notReady = await waitReady(url);
+    ui.log(notReady ? ` ${yellow("not yet")}` : ` ${green("ready")}`);
   }
 
   const hub = url || "https://<your-worker>.<your-subdomain>.workers.dev";
-  console.log(`\n${green("✔")} Backyard is live at ${bold(cyan(hub))}\n`);
+  const token = d.token;
+  // The Go CLI (BACKYARD_CF_CLI_LOGIN=1) logs in with the deploy token itself and prints the next step.
+  const wrapperLogsIn = process.env.BACKYARD_CF_CLI_LOGIN === "1" && Boolean(token);
+  if (notReady) {
+    ui.log(`\n${yellow("!")} Deployed to ${bold(cyan(hub))}, but it is not ready: ${notReady}.`);
+    ui.log(`  Check with ${inv} status; re-run ${inv} setup once it is fixed.\n`);
+  } else {
+    ui.log(`\n${green("✔")} Backyard is live at ${bold(cyan(hub))}\n`);
+  }
   if (!token) {
     // The Worker keeps a deploy token this machine does not know.
-    console.log("Connect the CLI with the Worker's existing deploy token (not known on this machine):\n");
-    console.log(`  ${bold(`backyard login --server ${hub} --token <DEPLOY_TOKEN>`)}\n`);
+    ui.log("Connect the CLI with the Worker's existing deploy token (not known on this machine):\n");
+    ui.log(`  ${bold(`backyard login --server ${hub} --token <DEPLOY_TOKEN>`)}\n`);
   } else if (revealSecrets()) {
-    console.log("Connect the CLI (keep the token secret — it can deploy and delete sites):\n");
-    console.log(`  ${bold(`backyard login --server ${hub} --token ${token}`)}\n`);
-  } else {
+    ui.log(`Publish in the browser: ${bold(`${hub}/#token=${token}`)}   ${dim("(the hub asks before using it)")}\n`);
+    if (!wrapperLogsIn) {
+      ui.log("Or connect the CLI (keep the token secret — it can deploy and delete sites):\n");
+      ui.log(`  ${bold(`backyard login --server ${hub} --token ${token}`)}\n`);
+    }
+  } else if (!wrapperLogsIn) {
     // CI logs are kept and shared: the token stays in the state file (0600).
     const where = process.env.DEPLOY_TOKEN ? "$DEPLOY_TOKEN" : `<"deployToken" in ${saved}>`;
     const why = isCI() ? "CI" : "the output is not a terminal";
-    console.log(`Connect the CLI with the deploy token ${maskSecret(token)} (not printed: ${why}):\n`);
-    console.log(`  ${bold(`backyard login --server ${hub} --token ${where}`)}\n`);
+    ui.log(`Connect the CLI with the deploy token ${maskSecret(token)} (not printed: ${why}):\n`);
+    ui.log(`  ${bold(`backyard login --server ${hub} --token ${where}`)}\n`);
   }
-  console.log(`Then: ${bold("backyard init my-site && cd my-site && backyard deploy")}`);
-  if (token) console.log(dim(`\nThe deploy token is saved in ${saved} (mode 0600).`));
-  console.log(dim(`AI runs on Workers AI (free daily allowance); caps: LIMITS in wrangler.jsonc.`));
-  const noR2 = state.r2 === false ? "R2 is off (--r2 turns it on)" : "enable R2 on the account and re-run setup for files up to 95 MiB";
-  console.log(dim(`Files: ${bucket ? `R2 bucket ${bucket} for files above FILE_INLINE_MAX` : `stored in Durable Objects (25 MiB per file); ${noR2}`}.`));
-  console.log(dim("Custom domain, host mode and Cloudflare Access: see README.md and deploy/terraform/cloudflare.\n"));
+  if (!wrapperLogsIn) {
+    if (inv !== GO_CLI_INVOCATION) ui.note(`No backyard CLI yet? ${CLI_INSTALL}`);
+    ui.log(`Then: ${bold("backyard init my-site && cd my-site && backyard deploy")}`);
+  }
+  if (token) ui.note(`\nThe deploy token is saved in ${saved} (mode 0600).`);
+  ui.note("AI runs on Workers AI (free daily allowance); caps: --var LIMITS:'{\"ai_per_day\":50}'.");
+  const noR2 = state.r2 === false ? "R2 is off (--r2 turns it on)" : `enable R2 on the account and re-run ${inv} setup for files up to 95 MiB`;
+  ui.note(`Files: ${bucket ? `R2 bucket ${bucket} for files above FILE_INLINE_MAX` : `stored in Durable Objects (25 MiB per file); ${noR2}`}.`);
+  if (!state.domain) ui.note(`Your own domain: ${inv} domain add <host>`);
+  else if (!state.access) ui.note(`Company login: ${inv} access enable --allow-email-domain <your-domain>`);
+  ui.log("");
+  // Applied, but not verified (design: exit 4); the result file and the login lines are there.
+  return notReady ? EXIT.PENDING : EXIT.OK;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch((e) => fail(e?.stack || String(e)));
+  // No top-level await: cli.mjs imports this module to run the command.
+  import("./cli.mjs")
+    .then(({ main }) => main(["setup", ...process.argv.slice(2)]))
+    .then((code) => {
+      process.exitCode = code;
+    });
 }

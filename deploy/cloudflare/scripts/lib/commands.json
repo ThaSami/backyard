@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "global": [
+    { "name": "worker-name", "alias": ["name"], "type": "string", "value": "name", "help": "Worker name (default \"backyard\")" },
+    { "name": "yes", "short": "y", "type": "bool", "help": "answer yes to confirmations (never implies --take-over, --replace-dns-record or --confirm-auth-change)" },
+    { "name": "non-interactive", "type": "bool", "help": "never prompt (also when CI is set or there is no terminal)" },
+    { "name": "help", "short": "h", "type": "bool", "help": "show help" }
+  ],
+  "commands": [
+    {
+      "name": "setup",
+      "args": [],
+      "summary": "Deploy or upgrade Backyard on your Cloudflare account (Workers free plan); re-running keeps every choice",
+      "flags": [
+        { "name": "r2", "type": "bool", "help": "use an R2 bucket for big files (default when R2 is enabled)" },
+        { "name": "no-r2", "type": "bool", "help": "never use R2 (remembered)" },
+        { "name": "r2-bucket", "type": "string", "value": "name", "help": "bucket name (default <worker>-files)" },
+        { "name": "var", "type": "string", "value": "KEY:VALUE", "repeatable": true, "help": "override a Worker variable (remembered; KEY: drops it)" },
+        { "name": "rotate-token", "type": "bool", "help": "issue a new DEPLOY_TOKEN" },
+        { "name": "rotate-secret", "type": "bool", "help": "replace BACKYARD_SECRET (revokes every API token)" },
+        { "name": "skip-deploy", "type": "bool", "help": "only (re)set secrets" },
+        { "name": "workers-subdomain", "type": "string", "value": "name", "help": "workers.dev subdomain to register when the account has none" },
+        { "name": "workers-dev", "type": "bool", "help": "serve on workers.dev (default)" },
+        { "name": "no-workers-dev", "type": "bool", "help": "stop serving on workers.dev (needs a custom domain)" },
+        { "name": "confirm-auth-change", "type": "bool", "help": "allow a deploy that turns Cloudflare Access off or changes its team" },
+        { "name": "dry-run", "type": "bool", "help": "build and validate only (no login, no changes)" }
+      ]
+    },
+    {
+      "name": "domain add",
+      "args": ["host"],
+      "summary": "Serve Backyard on your own domain (path mode), or sites on their own hosts (--host-mode)",
+      "flags": [
+        { "name": "host-mode", "type": "bool", "help": "sites at https://<site>.<host>/ (wildcard route and DNS record)" },
+        { "name": "zone", "type": "string", "value": "zone", "help": "Cloudflare zone of <host> (default: found automatically)" },
+        { "name": "take-over", "type": "bool", "help": "move <host> or the *.<host>/* route from another Worker to this one" },
+        { "name": "replace-dns-record", "type": "bool", "help": "replace existing DNS records at <host>" },
+        { "name": "wait", "type": "string", "value": "seconds", "help": "how long to wait for DNS, certificate and readiness (default 300)" }
+      ]
+    },
+    {
+      "name": "domain remove",
+      "args": [],
+      "summary": "Remove the custom domain this tool added: back to workers.dev",
+      "flags": []
+    },
+    {
+      "name": "access enable",
+      "args": [],
+      "summary": "Turn on company login with Cloudflare Access (needs a custom domain)",
+      "flags": [
+        { "name": "allow-email", "type": "string", "value": "email", "repeatable": true, "help": "allow this email" },
+        { "name": "allow-email-domain", "type": "string", "value": "domain", "repeatable": true, "help": "allow every email at this domain" },
+        { "name": "team", "type": "string", "value": "team", "help": "Zero Trust team of existing Access applications" },
+        { "name": "aud", "type": "string", "value": "tag", "help": "AUD tag of the existing hub application" },
+        { "name": "wait", "type": "string", "value": "seconds", "help": "how long to wait for Access (default 120; 900 while waiting for dashboard steps)" }
+      ]
+    },
+    {
+      "name": "access disable",
+      "args": [],
+      "summary": "Turn company login (Cloudflare Access) off",
+      "flags": [
+        { "name": "delete-apps", "type": "bool", "help": "also delete the Access applications and policies this tool created (needs BACKYARD_CF_API_TOKEN)" }
+      ]
+    },
+    {
+      "name": "status",
+      "args": [],
+      "summary": "Read-only live check of the Worker, its domain and Cloudflare Access",
+      "flags": [
+        { "name": "json", "type": "bool", "help": "machine-readable output" }
+      ]
+    }
+  ]
+}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -91,6 +92,10 @@ type harness struct {
 	render     func(templates.InitOptions) (map[string][]byte, error)
 	skills     fs.FS
 	now        time.Time
+	// releaseBase is the release download base of `backyard cloudflare`;
+	// httpClient, when set, replaces the HTTP client (e.g. a TLS test server's).
+	releaseBase string
+	httpClient  *http.Client
 
 	mu       sync.Mutex
 	opened   []string
@@ -126,9 +131,10 @@ func newHarness(t *testing.T) *harness {
 			"references/deploy.md":    {Data: []byte("# Deploy\n")},
 			"references/sub/extra.md": {Data: []byte("extra")},
 		},
-		now:      time.Now(),
-		timeout:  5 * time.Second,
-		pollUnit: time.Millisecond,
+		now:         time.Now(),
+		releaseBase: "http://127.0.0.1:1/",
+		timeout:     5 * time.Second,
+		pollUnit:    time.Millisecond,
 	}
 	for _, d := range []string{h.cwd, h.home, h.cache} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -176,7 +182,8 @@ func (h *harness) deps() *deps {
 		configPath:     h.configPath,
 		loginTimeout:   h.timeout,
 		devicePollUnit: h.pollUnit,
-		downloadBase:   "http://127.0.0.1:1/",
+		releaseBase:    h.releaseBase,
+		httpClient:     h.httpClient,
 		retryDelay:     time.Millisecond,
 	}
 }

@@ -71,6 +71,43 @@ zero-config backend for every site.
 - A TypeScript Worker with Durable Objects that implements the same public contract on
   Cloudflare's free plan, with Workers AI, optional R2 and Cloudflare Access;
   `backyard cloudflare setup` provisions it.
+- Terraform-free setup: the npm package `backyard-cloudflare` ships a prebuilt Worker with a
+  pinned wrangler (`npx backyard-cloudflare setup`; a checkout runs it with `npm run setup` and
+  `npm run cf -- <command>`), registers the account's workers.dev subdomain from the terminal,
+  and adds `domain add <host> [--host-mode]` / `domain remove` (Workers custom domain, wildcard
+  route and DNS record, automatic or guided), `access enable` / `access disable` (the two Access
+  applications, created with `BACKYARD_CF_API_TOKEN` or from printed dashboard steps, verified
+  at the edge before the Worker switches) and a read-only `status` (`--json`). Every command
+  and flag is in `deploy/cloudflare/scripts/lib/commands.json`; exit codes 3 (refused, nothing
+  changed) and 4 (applied, a check pending) are shared with the Go CLI.
+- `backyard cloudflare setup|domain|access|status` runs the package of its own release,
+  installed once into the user cache and checked against the SHA-256 built into the CLI (or a
+  checkout's `deploy/cloudflare`, or `--package <file or https URL>`), and moves the CLI's
+  profiles when the Worker's URL changes. Releases attach `backyard-cloudflare-<version>.tgz`
+  (listed in `checksums.txt`) and can publish it to npm (`vars.BACKYARD_NPM_PUBLISH`);
+  `make cloudflare-pack` builds it locally. A release build uses a checkout only with `--dir`
+  (a build from source finds one from the current directory, never outside its repository);
+  `npm ci` is skipped while `node_modules` is newer than `package-lock.json`, and a new engine
+  install removes older ones from the cache, keeping the previous one and the release's.
+- After `setup` and `domain add`/`remove` the CLI logs itself in with the deploy token, and
+  `setup` prints the next step (or the `backyard login` command when it cannot log in). A
+  setup re-run or a domain change keeps a current profile for another server current; while
+  Access is on, a personal login (browser, device or `--token`) is never replaced by the deploy
+  token, and `--profile` is honoured.
+- `setup` exits 4 (applied, not verified) when the hub does not become ready, with the Worker's
+  own reason; a failed `r2 bucket create` never unbinds a bucket the Worker uses; an interrupted
+  deploy leaves no secrets file behind. `access enable` keeps what was added to its Access
+  applications in the dashboard (require and exclude rules, other policies, identity
+  providers), and a re-run with new `--allow-*` lists needs an API token
+  (`BACKYARD_CF_API_TOKEN`, or pasted when asked; exit 2, nothing changed, without one). Behind an HTTP proxy the engine warns until
+  `NODE_USE_ENV_PROXY=1` (Node 22.21 or later) makes its own API calls use it.
+- Deploys never change routes or custom domains, and an auth guard refuses a deploy that would
+  turn a live Cloudflare Access off, change its team or run against an unreadable live state
+  (`setup --confirm-auth-change`; in `scripts/cloudflare-ci.mjs`
+  `BACKYARD_CF_CONFIRM_AUTH_CHANGE=true`, which `cloudflare-deploy.yml` sets only for a manual
+  run with its `confirm_auth_change` input checked). A machine without saved state adopts the
+  deployed configuration (R2 bucket, variables, domain, Access).
+- `/__backyard/api/deploy/info` reports the Worker's real build version.
 
 #### Agents
 
@@ -159,6 +196,15 @@ zero-config backend for every site.
   image request that does not fit what is left is refused before the model runs; a document
   query page carries at most about 8 MiB, so a page may hold fewer than `limit` documents with
   `has_more` — page by advancing `offset` by the documents received (both editions).
+- Cloudflare edition: Node.js 22 or later is required (wrangler 4 needs it). `backyard
+  cloudflare setup --download`/`--ref` (a source tarball) are replaced by `--package`; a
+  `backyard` from `go install` or a source build has no package pinned, so outside a checkout
+  it needs `--dir`, `--package` (such as a release's `backyard-cloudflare-<version>.tgz`) or a
+  release build of the CLI. The
+  `npm run deploy` and `deploy:ci` scripts of `deploy/cloudflare` are removed: they deployed
+  `wrangler.jsonc`'s defaults past the saved state and the auth guard, and `setup` and
+  `scripts/cloudflare-ci.mjs` replace them. The Terraform module is now
+  optional, with a new `setup_args` output for `backyard cloudflare setup`.
 
 ### Fixed
 

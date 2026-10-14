@@ -35,9 +35,13 @@ backyard deploy examples/lunch-vote --site lunch-vote
 
 Pick a site name that is not taken (`backyard sites info <name>` says "not found"); deploying
 replaces whatever is live under that name. No Backyard server yet? `backyard cloudflare setup`
-creates one on your own Cloudflare account (free plan) and logs the CLI in; the same command then
-publishes to `https://backyard.<account>.workers.dev/s/lunch-vote/`. To customize an example, copy the folder, run `backyard init <name>` inside it
-to add `.backyard.json` and the agent docs, and edit away.
+creates one on your own Cloudflare account (free plan; Node.js 22 or later, no Terraform; no
+checkout with a release build of the CLI, while one from `go install` needs a checkout or
+`--package`, see [Cloudflare](../docs/cloudflare.md#set-it-up)) and logs the CLI in; the same
+`backyard deploy` command then publishes to
+`https://backyard.<account>.workers.dev/s/lunch-vote/`. To customize an example, copy the
+folder, run `backyard init <name>` inside it to add `.backyard.json` and the agent docs, and
+edit away.
 
 ## Notes
 

@@ -30,15 +30,39 @@ name: Deploy to Cloudflare
 #   vars.BACKYARD_CF_AUTO_DEPLOY   "true" to deploy on every push to main that changes
 #                                  the Worker, the SDK, the hub or the agent docs
 #
+# A custom domain, host mode and company login are set up once, outside this
+# workflow, with `backyard cloudflare domain add <host>` and `backyard
+# cloudflare access enable` (or the optional Terraform module in
+# deploy/terraform/cloudflare). Deploys from here never change routes or custom
+# domains; copy the variables those commands manage (BASE_DOMAIN, URL_MODE,
+# AUTH_MODE, ACCESS_TEAM_DOMAIN, ACCESS_AUD) into vars.BACKYARD_CF_VARS so that
+# every deploy keeps them. Likewise, when `backyard cloudflare setup` bound an
+# R2 bucket (`backyard cloudflare status`; by default <worker>-files), set
+# vars.BACKYARD_CF_R2_BUCKET to it: a deploy without it removes the R2 binding,
+# and the files stored in R2 answer 500 until a deploy binds the bucket again.
+# Deploys from here always serve on workers.dev (workers_dev in wrangler.jsonc),
+# even after `setup --no-workers-dev`.
+#
 # Then run it from the Actions tab ("Run workflow"). The job summary shows the
 # hub URL and the `backyard login` command. Everything is done by
 # scripts/cloudflare-ci.mjs, which works in other CI systems too.
+#
+# A deploy is refused (and nothing changes) when the live Worker runs with
+# AUTH_MODE=access and BACKYARD_CF_VARS asks for weaker auth or another team,
+# or when the live auth mode cannot be read. To make such a change on purpose,
+# run the workflow with the confirm_auth_change input checked: it sets
+# BACKYARD_CF_CONFIRM_AUTH_CHANGE=true for that run only. Push deploys never
+# skip the guard.
 
 on:
   workflow_dispatch:
     inputs:
       dry_run:
         description: Test and bundle only (wrangler deploy --dry-run)
+        type: boolean
+        default: false
+      confirm_auth_change:
+        description: Let this run turn Cloudflare Access off or change its team (sets BACKYARD_CF_CONFIRM_AUTH_CHANGE=true)
         type: boolean
         default: false
   push:
@@ -109,6 +133,8 @@ jobs:
           BACKYARD_CF_VARS: ${{ vars.BACKYARD_CF_VARS }}
           BACKYARD_CF_R2_BUCKET: ${{ vars.BACKYARD_CF_R2_BUCKET }}
           BACKYARD_CF_DEPLOY_ARGS: ${{ vars.BACKYARD_CF_DEPLOY_ARGS }}
+          # Only a manual run can confirm (inputs is empty on push).
+          BACKYARD_CF_CONFIRM_AUTH_CHANGE: ${{ inputs.confirm_auth_change && 'true' || '' }}
         run: |
           if [ "$DRY_RUN" = "true" ]; then
             node scripts/cloudflare-ci.mjs deploy --dry-run

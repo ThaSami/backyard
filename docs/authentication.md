@@ -311,9 +311,15 @@ your IdP (Okta, Entra ID, Google…), and a **Bypass** policy for `/__backyard/a
 bearer tokens (drag-and-drop deploys on the hub then also need a token, which the hub asks
 for). Access JWTs carry the email but usually no groups.
 
-The [Cloudflare edition](cloudflare.md) supports Access natively (`AUTH_MODE=access`), and
-[`deploy/terraform/cloudflare`](../deploy/terraform/cloudflare/README.md) creates the
-application, the bypass policy and an Okta identity provider.
+The [Cloudflare edition](cloudflare.md) supports Access natively (`AUTH_MODE=access`).
+`backyard cloudflare access enable --allow-email-domain acme.com` sets it up from the terminal:
+with an API token in `BACKYARD_CF_API_TOKEN` it creates the hub application with its allow
+policy and the bypass application for the paths the Worker authenticates itself, and without
+one it prints the dashboard steps and detects the result. Either way it verifies Access at the
+edge before it switches the Worker over (see the
+[edition's README](../deploy/cloudflare/README.md#company-login-cloudflare-access)). The
+optional [`deploy/terraform/cloudflare`](../deploy/terraform/cloudflare/README.md) module
+creates the same as infrastructure as code, plus an Okta identity provider.
 
 ## `none`
 
@@ -409,7 +415,8 @@ path the proxy lets through:
 
 - a **proxy-exempt route** on the hub for `/__backyard/api/deploy/*` — and, for `backyard token
   create`, `/__backyard/api/tokens` with an `Authorization` header — (ALB rule, a GCP backend
-  service without IAP, an Access bypass policy; the Terraform modules set these up), or
+  service without IAP, an Access bypass policy; the Terraform modules set these up, and on the
+  Cloudflare edition `backyard cloudflare access enable` does), or
 - a **standalone gateway** — `backyard gateway` on its own host, or the
   [AWS Lambda gateway](deploying-sites.md#the-aws-lambda-gateway) — advertised to CLIs with
   `deploy.gateway_url`. `backyard login` adopts it automatically, or pass

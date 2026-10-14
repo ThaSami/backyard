@@ -1,8 +1,15 @@
 # Backyard — Cloudflare Workers edition: domain, routing and Cloudflare Access.
 #
-# The Worker itself is deployed by `npm run setup` in deploy/cloudflare (wrangler
-# manages the code, Durable Objects, secrets and variables). This module puts it
-# on your domain and, optionally, behind Cloudflare Access:
+# Optional infrastructure as code. Without Terraform, `backyard cloudflare
+# domain add <host> [--host-mode]` and `backyard cloudflare access enable` (or
+# `npx backyard-cloudflare …`) set up the same; use one or the other for a
+# Worker, not both.
+#
+# The Worker itself is deployed by `backyard cloudflare setup` (or `npx
+# backyard-cloudflare setup`, or `npm run setup` in deploy/cloudflare; Node.js
+# 22+): wrangler manages the code, Durable Objects, secrets and variables, and
+# the setup_args output hands this module's variables to setup. This module puts
+# it on your domain and, optionally, behind Cloudflare Access:
 #
 #   path mode  https://<base_domain>/s/<site>/   Workers custom domain (DNS + certificate included)
 #   host mode  https://<site>.<base_domain>/     proxied wildcard DNS + Worker routes
@@ -12,8 +19,10 @@
 #              groups, Okta groups), plus a bypass application for the paths the
 #              Worker authenticates itself (deploy gateway, health checks).
 #
-# wrangler only rewrites a Worker's routes when wrangler.jsonc lists some, so
-# keep "routes" out of wrangler.jsonc when this module manages them.
+# Backyard's deploys (setup, scripts/cloudflare-ci.mjs) never change routes or
+# custom domains, so they leave what this module creates alone. Keep "routes"
+# out of wrangler.jsonc anyway: a plain `wrangler deploy` of a wrangler.jsonc
+# that lists routes would change them.
 
 data "cloudflare_zone" "this" {
   filter = {

@@ -1,9 +1,20 @@
 name: Release
 
 # Pushing a tag vX.Y.Z publishes the GitHub release (binaries, Lambda zips,
+# the Cloudflare edition's npm package backyard-cloudflare-X.Y.Z.tgz,
 # checksums, SBOMs) and the multi-arch image ghcr.io/thasami/backyard with
 # GoReleaser (.goreleaser.yaml). Tags with a pre-release suffix (v1.2.0-rc.1)
 # are marked as pre-releases and do not move the "latest" image tag.
+#
+# The package is tested (make cloudflare) and built (make cloudflare-pack) by
+# the read-only cloudflare-package job, so the npm toolchain never runs where
+# the release's write token is. GoReleaser's job gets only the .tgz, checks it
+# against the digest that job reported and embeds that SHA-256 in the backyard
+# CLI, so `backyard cloudflare setup` installs exactly the package of its own
+# release. When vars.BACKYARD_NPM_PUBLISH is 'true', the npm job then
+# publishes the same bytes, downloaded from the release and checked against
+# checksums.txt, to npm (with provenance, which needs a public repository),
+# using the NPM_TOKEN secret. See CONTRIBUTING.md, "Releases".
 
 on:
   push:
@@ -18,17 +29,56 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # npm ci runs the install scripts of the whole dev toolchain (workerd,
+  # esbuild, …), and the tests and the build run its code: keep all of that in
+  # a job that can write nothing and pass only the package on.
+  cloudflare-package:
+    name: Build the backyard-cloudflare package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.pack.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Test the Cloudflare edition
+        run: make cloudflare
+      # scripts/pack.mjs writes sha256=<hex> to $GITHUB_OUTPUT.
+      - name: Build the backyard-cloudflare package
+        id: pack
+        run: make cloudflare-pack CF_PACK_VERSION="${GITHUB_REF_NAME#v}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-npm
+          path: dist-npm/
+          if-no-files-found: error
+
   goreleaser:
     name: GoReleaser
+    needs: cloudflare-package
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: write # create the GitHub release and upload assets
       packages: write # push ghcr.io/thasami/backyard
     steps:
+      # npm accepts --provenance only from a public source repository; fail
+      # before the GitHub release exists rather than in the npm job after it.
+      - name: npm provenance needs a public repository
+        if: vars.BACKYARD_NPM_PUBLISH == 'true' && github.event.repository.private
+        run: |
+          echo "::error::vars.BACKYARD_NPM_PUBLISH is 'true' but the repository is private; npm rejects --provenance from private repositories"
+          exit 1
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # changelog needs the history and previous tag
+          persist-credentials: false # GoReleaser reads GITHUB_TOKEN from env
       - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
@@ -41,6 +91,28 @@ jobs:
           node web/sdk/build.mjs --check
           go vet ./...
           go test -short -count=1 ./...
+      - name: Download the backyard-cloudflare package
+        uses: actions/download-artifact@v8
+        with:
+          name: dist-npm
+          path: dist-npm
+      # GoReleaser attaches dist-npm/backyard-cloudflare-<version>.tgz and
+      # passes this digest to the CLI's ldflags (cli.cloudflarePackageSHA256).
+      - name: Embed its digest in the CLI
+        env:
+          PACKAGE_SHA256: ${{ needs.cloudflare-package.outputs.sha256 }}
+        run: |
+          f="dist-npm/backyard-cloudflare-${GITHUB_REF_NAME#v}.tgz"
+          sha="$(sha256sum "$f" | cut -d' ' -f1)"
+          if ! printf '%s\n' "$sha" | grep -Eqx '[0-9a-f]{64}'; then
+            echo "::error::$f is missing"
+            exit 1
+          fi
+          if [ "$sha" != "$PACKAGE_SHA256" ] || [ "$(cut -d' ' -f1 "$f.sha256")" != "$sha" ]; then
+            echo "::error::$f does not match the digest the cloudflare-package job reported (${PACKAGE_SHA256:-none})"
+            exit 1
+          fi
+          echo "BACKYARD_CF_PACKAGE_SHA256=$sha" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -55,4 +127,46 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The release notes name the npm package only when the npm job publishes it.
+          BACKYARD_NPM_PUBLISH: ${{ vars.BACKYARD_NPM_PUBLISH }}
           # HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+  # The npm package is published only after the GitHub release exists, from
+  # the release's own asset, so npm and the release hold the same bytes. The
+  # ./ matters: npm reads "pkg/<name>.tgz" as the GitHub repository pkg/<name>.
+  npm:
+    name: Publish backyard-cloudflare to npm
+    needs: goreleaser
+    if: vars.BACKYARD_NPM_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Download the package from the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern 'backyard-cloudflare-*.tgz' --pattern checksums.txt --dir pkg
+      - name: Verify
+        run: |
+          cd pkg
+          grep -Eq "^[0-9a-f]{64}  backyard-cloudflare-${GITHUB_REF_NAME#v}\.tgz$" checksums.txt || {
+            echo "::error::checksums.txt does not list backyard-cloudflare-${GITHUB_REF_NAME#v}.tgz"
+            exit 1
+          }
+          sha256sum --ignore-missing -c checksums.txt
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::vars.BACKYARD_NPM_PUBLISH is 'true' but the NPM_TOKEN secret is not set"
+            exit 1
+          fi
+          tag=latest; case "$GITHUB_REF_NAME" in *-*) tag=next ;; esac
+          npm publish "./pkg/backyard-cloudflare-${GITHUB_REF_NAME#v}.tgz" --provenance --access public --tag "$tag"

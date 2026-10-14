@@ -40,9 +40,11 @@ rules and patterns; its `references/recipes.md` has complete apps to start from 
 6. **Deploy.** Run `backyard deploy` in the site folder (or the `backyard_deploy` tool). If it
    reports that you are not logged in, stop and ask the user to run
    `backyard login --server <their Backyard URL>` in a terminal, then retry. If the user has no
-   Backyard server at all, offer the free option: they run `backyard cloudflare setup` (their own
-   Cloudflare account on the free plan; needs Node.js 20+ and a browser login), which also logs
-   the CLI in; then deploy. Sites there are path-mode URLs, open to anyone with the link by
-   default, with no warehouse.
+   Backyard server at all, offer the free option: they run `backyard cloudflare setup` in their
+   own terminal (their own Cloudflare account on the free plan; needs Node.js 22+, a browser
+   login and a release build of the CLI, since one from `go install` needs a checkout of the
+   Backyard repository or `--package`), which also logs the CLI in; then deploy. Never ask
+   them to paste Cloudflare tokens into the chat. Sites there are path-mode URLs, open to
+   anyone with the link by default, with no warehouse.
 7. **Report.** Reply with the live URL, a two-line summary of what the app does and where its
    data lives, and how to change it (edit the files, then `/backyard:deploy`).

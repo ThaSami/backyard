@@ -157,7 +157,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.cloudflare == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: deploy/cloudflare
@@ -172,6 +172,23 @@ jobs:
         run: npm run typecheck
       - name: Test
         run: npm test
+      # The npm package backyard-cloudflare as a user gets it: built like a
+      # release (prebuilt Worker, shrinkwrap), installed from the .tgz outside
+      # the checkout with the real wrangler, then bundled and validated offline.
+      - name: Build the npm package (scripts/pack.mjs)
+        run: node scripts/pack.mjs --version "0.0.0-ci.$GITHUB_RUN_NUMBER" --out "$RUNNER_TEMP/cf-pack"
+      - name: Install the package like a user (npm install of the .tgz)
+        working-directory: ${{ runner.temp }}
+        run: npm install --no-audit --no-fund --prefix "$RUNNER_TEMP/cf-user" "$RUNNER_TEMP"/cf-pack/backyard-cloudflare-*.tgz
+      - name: The installed package runs (--version, setup --dry-run)
+        working-directory: ${{ runner.temp }}
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/cfg
+        run: |
+          engine="$RUNNER_TEMP/cf-user/node_modules/backyard-cloudflare/bin/backyard-cloudflare.mjs"
+          node "$engine" --version | tee "$RUNNER_TEMP/cf-version.txt"
+          grep -Fq "backyard-cloudflare 0.0.0-ci.$GITHUB_RUN_NUMBER (wrangler " "$RUNNER_TEMP/cf-version.txt"
+          node "$engine" setup --dry-run --non-interactive
       - name: Bundle like a deploy (scripts/cloudflare-ci.mjs deploy --dry-run)
         working-directory: .
         run: node scripts/cloudflare-ci.mjs deploy --dry-run

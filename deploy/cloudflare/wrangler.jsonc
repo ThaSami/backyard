@@ -42,14 +42,16 @@
     // Optional absolute hub URL (default: https://<BASE_DOMAIN> or the request origin).
     "PUBLIC_URL": "",
     // "path": sites at /s/<site>/ (works on workers.dev); "host": <site>.<BASE_DOMAIN>
-    // (needs a wildcard DNS record + route, see deploy/terraform/cloudflare).
+    // (needs a wildcard DNS record + route: `backyard cloudflare domain add <host> --host-mode`).
+    // BASE_DOMAIN and URL_MODE are set by `domain add` (or Terraform).
     "URL_MODE": "path",
     // "none": anonymous cookie identities (deploys need DEPLOY_TOKEN unless
     // ALLOW_ANONYMOUS_DEPLOY); "access": Cloudflare Access (Zero Trust) in front.
     // Any other value fails closed: every request but the health checks gets 503.
     "AUTH_MODE": "none",
     // Cloudflare Access team ("acme" or "acme.cloudflareaccess.com") and the
-    // application AUD tag (Terraform output access_aud). Used when AUTH_MODE=access.
+    // application AUD tag, set by `backyard cloudflare access enable` (or Terraform,
+    // output access_aud). Used when AUTH_MODE=access.
     "ACCESS_TEAM_DOMAIN": "",
     "ACCESS_AUD": "",
     // "true" lets anyone deploy without a token (playground; guarded by LIMITS).
@@ -94,9 +96,7 @@
     }
   },
 
-  // Custom domain (path mode) or wildcard routes (host mode) — or use Terraform:
-  // "routes": [
-  //   { "pattern": "backyard.example.com", "custom_domain": true }
-  //   { "pattern": "*.backyard.example.com/*", "zone_name": "example.com" }
-  // ]
+  // Routes and custom domains are managed by `backyard cloudflare domain add` (or
+  // Terraform); never list them here: setup and the CI deployer drop "routes" from
+  // the config they deploy, so a deploy never changes the Worker's domains.
 }

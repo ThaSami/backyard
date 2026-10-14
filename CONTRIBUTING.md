@@ -55,12 +55,13 @@ summarizes the layout and invariants for coding agents (and humans in a hurry).
 | `make cloudflare` / `make cloudflare-dev` | Install, typecheck and test the Workers edition / run it locally without a Cloudflare login |
 | `make cloudflare-bundle` | Bundle the Worker like a CI deploy (`wrangler deploy --dry-run`) |
 | `make cloudflare-setup` | Deploy the Workers edition to your own Cloudflare account (`CF_SETUP_ARGS`) |
+| `make cloudflare-pack` | Build the npm package `backyard-cloudflare` (prebuilt Worker and setup CLI) into `dist-npm/` (`CF_PACK_VERSION`, default: `deploy/cloudflare/package.json`'s version; `CF_PACK_OUT`) |
 | `make validate-configs` | Validate the sample `backyard.yaml` files under `deploy/` (and the Helm chart's) |
 | `make tf-validate` / `make helm-lint` / `make compose-config` | Validate the Terraform modules, the Helm chart, the Compose files |
 | `make lambda` | Build `dist/backyard-lambda.zip` (Lambda deploy gateway, arm64) |
 | `make docker` / `make docker-multiarch` | Container image for this machine / for `PLATFORMS` with buildx (no push) |
-| `make release-snapshot` | All release artifacts with GoReleaser (no publish) |
-| `make clean` | Remove `bin/`, `dist/` and coverage files |
+| `make release-snapshot` | All release artifacts with GoReleaser (no publish); builds the Cloudflare package first |
+| `make clean` | Remove `bin/`, `dist/`, `dist-npm/` and coverage files |
 
 ## Tests
 
@@ -252,7 +253,86 @@ and the docs. A change to any of them must, in the same pull request:
 
 ## Releases
 
-Maintainers tag `vX.Y.Z`; GoReleaser builds the binaries, archives, checksums and the
-multi-arch image `ghcr.io/thasami/backyard` (`make release-snapshot` builds the same locally
-without publishing). The version is stamped into `internal/version` (`make build
-VERSION=1.2.3`).
+Maintainers tag `vX.Y.Z`. In the [release workflow](.github/workflows/release.yml), the
+read-only `cloudflare-package` job runs `make cloudflare` and builds the Cloudflare edition's npm
+package with `make cloudflare-pack CF_PACK_VERSION=X.Y.Z` (`dist-npm/backyard-cloudflare-X.Y.Z.tgz`:
+the prebuilt Worker, the setup CLI and an `npm-shrinkwrap.json` that pins wrangler), so the npm
+toolchain never runs next to the release's write token. The `goreleaser` job runs the
+pre-release checks, downloads only the package, checks it against the digest the first job
+reported and embeds that SHA-256 in the CLI. GoReleaser then builds the binaries, archives,
+checksums and the multi-arch image `ghcr.io/thasami/backyard`, and attaches the package, which
+`checksums.txt` lists. By default, `backyard cloudflare setup` of a release installs exactly
+that package: it checks the download against the embedded digest. `make release-snapshot`
+builds the same locally without publishing (snapshot binaries embed no package digest). The
+version is stamped into `internal/version` (`make build VERSION=1.2.3`).
+
+To try the packaged Cloudflare flow before a release, run `make cloudflare-pack`, then
+`npx ./dist-npm/backyard-cloudflare-0.1.0.tgz setup` or
+`backyard cloudflare setup --package ./dist-npm/backyard-cloudflare-0.1.0.tgz`.
+
+### npm
+
+When the repository variable `BACKYARD_NPM_PUBLISH` is `true`, the release's `npm` job downloads
+the package from the GitHub release, verifies it against `checksums.txt` and publishes exactly
+those bytes to npm as `backyard-cloudflare`, with provenance (dist-tag `latest`, or `next` for a
+pre-release tag such as `v1.2.0-rc.1`). It is the only job with an OIDC token
+(`id-token: write`). The guides show `npx backyard-cloudflare@latest setup` for people with only
+Node.js (saying it works once a release has published the package), so the canonical repository
+should publish:
+
+1. **Public repository.** npm accepts `--provenance` only from a public source repository
+   (private repositories are rejected even for public packages). Make the repository public
+   before setting `BACKYARD_NPM_PUBLISH` to `true`: while it is private, the `goreleaser` job
+   fails before anything is published when the variable is on. If an `npm` job failed for this
+   reason, make the repository public and re-run that job.
+2. **First release (name registration).** The first real release registers `backyard-cloudflare`
+   on npm under the maintainer account. The docs name the package, so register it before the
+   repository becomes public, where anyone could read the name and publish it first: with the
+   manual first publish below, or with a placeholder `backyard-cloudflare@0.0.0` published by
+   hand, after which `NPM_TOKEN` can be limited to the package right away (step 3). Registering
+   `backyard-cf` as well is optional, against typosquatting. Otherwise, a token limited to
+   selected packages can name only packages that already exist, so the first `NPM_TOKEN` secret is a short-lived granular token (a few days) with read
+   and write access to "All packages"; if the account requires two-factor authentication for
+   publishing, the token also needs "Bypass two-factor authentication". Add it, set the variable
+   `BACKYARD_NPM_PUBLISH` to `true` (Settings → Secrets and variables → Actions) and tag the
+   release. The job fails if the variable is on and the secret is missing. Check that this
+   first `npm publish --provenance` succeeds: provenance compares the package's `repository.url`
+   (spelled `ThaSami/backyard`, as in the git remote) with the repository.
+
+   Alternatively, leave `BACKYARD_NPM_PUBLISH` off for the first tag and publish the release
+   asset by hand with `npm publish ./backyard-cloudflare-X.Y.Z.tgz --access public`, without
+   `--provenance` (npm generates provenance only in CI); the provenance check then moves to the
+   next release.
+3. **Right after that.** Replace `NPM_TOKEN` with a granular token that can publish only
+   `backyard-cloudflare` (selectable now that the package exists) and revoke the bootstrap
+   token. Trusted publishing (OIDC without a token) also needs an existing package, plus a
+   change to the `npm` job (npm 11.5.1 or later, and no `NPM_TOKEN` check), so it is a later step.
+
+Without npm publishing (forks, for example), every GitHub release still carries the package:
+`npx --package https://github.com/thasami/backyard/releases/download/vX.Y.Z/backyard-cloudflare-X.Y.Z.tgz backyard-cloudflare setup`.
+
+### Real-account checklist (Cloudflare)
+
+CI tests the Cloudflare edition only against a fake wrangler and a fake Cloudflare API. Before
+the first tag, and whenever wrangler is bumped, run these by hand on a free Cloudflare account
+with the release candidate's package (`make cloudflare-pack`, then
+`npx ./dist-npm/backyard-cloudflare-<version>.tgz <command>`):
+
+1. A fresh account without a workers.dev subdomain: `setup` registers one and the hub answers.
+2. `domain add backyard.<zone>` with the browser (OAuth) login: the custom domain is attached
+   with OAuth; another custom domain of the Worker survives; an existing A record at the host is
+   reported as a conflict; `domain remove` detaches the domain with OAuth.
+3. Host mode at the apex of a dedicated zone (`domain add <zone> --host-mode`): the route, the
+   guided wildcard DNS record and its detection, the certificate probe, and sites served with
+   `URL_MODE=host`.
+4. `access enable`: in API mode (`BACKYARD_CF_API_TOKEN`) Cloudflare accepts the applications and
+   policies, all five machine endpoints bypass Access (including `/__backyard/api/deploy/*`) and
+   the default one-time PIN login works; in guided mode the Access redirect carries the
+   application's AUD.
+5. `access disable --delete-apps` deletes what `access enable` created.
+6. A second machine (an empty `XDG_CONFIG_HOME`): `setup` adopts the deployed configuration, and
+   a deploy that would turn Access off is refused.
+7. The CI deployer (`scripts/cloudflare-ci.mjs`) refuses the same downgrade unless
+   `BACKYARD_CF_CONFIRM_AUTH_CHANGE=true` (in `cloudflare-deploy.yml`: a manual run with the
+   `confirm_auth_change` input checked; a push deploy never skips the guard).
+8. The release's `npm publish --provenance` succeeds.

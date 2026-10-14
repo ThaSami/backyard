@@ -2,11 +2,16 @@
 # in ../.. (copy this directory and change `source` to a pinned Git reference,
 # e.g. "git::https://github.com/thasami/backyard.git//deploy/terraform/cloudflare?ref=v0.1.0").
 #
-#   (cd ../../../../cloudflare && npm ci && npm run setup)   # deploy the Worker first
+# Optional: `backyard cloudflare domain add` / `access enable` do the same
+# without Terraform (use one or the other for a Worker). Node.js 22+.
+#
+#   backyard cloudflare setup        # deploy the Worker first (or: npx backyard-cloudflare@latest setup,
+#                                    # or npm ci && npm run setup in deploy/cloudflare)
 #   cp terraform.tfvars.example terraform.tfvars && $EDITOR terraform.tfvars
 #   export CLOUDFLARE_API_TOKEN=...   # Zone: DNS + Workers Routes, Account: Workers Scripts + Access
 #   terraform init && terraform apply
-#   terraform output -raw setup_command   # run it in deploy/cloudflare
+#   terraform output -raw setup_command   # run it in deploy/cloudflare (a checkout), or:
+#   backyard cloudflare setup $(terraform output -raw setup_args)
 
 terraform {
   required_version = ">= 1.6.0"

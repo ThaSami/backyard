@@ -6,6 +6,7 @@
 #   make services-up test       ... with postgres, redis, dynamodb-local and azurite
 #   make lint sdk-test          what CI checks besides the Go tests
 #   make cloudflare-setup       deploy the Workers edition to your Cloudflare account (free plan)
+#   make cloudflare-pack        build the backyard-cloudflare npm package into dist-npm/
 
 SHELL         := /bin/sh
 .DEFAULT_GOAL := help
@@ -64,8 +65,15 @@ LAMBDA_ARCH ?= arm64
 TF_DIRS    ?= $(patsubst %/,%,$(sort $(dir $(wildcard deploy/terraform/*/versions.tf deploy/terraform/*/main.tf))))
 HELM_CHART := deploy/helm/backyard
 CF_DIR     := deploy/cloudflare
-# `make cloudflare-setup CF_SETUP_ARGS="--r2 --var URL_MODE:host --var BASE_DOMAIN:example.com"`
+# `make cloudflare-setup CF_SETUP_ARGS="--worker-name team --r2"` (a custom domain and
+# Cloudflare Access come afterwards, from the repository root: npm --prefix deploy/cloudflare
+# run cf -- domain add <host>; setup prints its next steps in that form)
 CF_SETUP_ARGS ?=
+# `make cloudflare-pack CF_PACK_VERSION=1.2.3` → dist-npm/backyard-cloudflare-1.2.3.tgz and its
+# .sha256 (the version defaults to deploy/cloudflare/package.json's; CF_PACK_OUT is relative to
+# the repository root, or absolute).
+CF_PACK_VERSION ?=
+CF_PACK_OUT     ?= dist-npm
 # dev:local runs offline (no Workers AI); dev uses your Cloudflare login for Workers AI.
 CF_DEV_SCRIPT ?= dev:local
 
@@ -113,8 +121,10 @@ docker-multiarch: ## Build the image for PLATFORMS with buildx (no push)
 		--build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) \
 		-t $(IMAGE):$(IMAGE_TAG) .
 
+# cloudflare-pack first: GoReleaser attaches dist-npm/backyard-cloudflare-*.tgz
+# (extra_files), and a glob that matches nothing fails the build.
 .PHONY: release-snapshot
-release-snapshot: ## Build all release artifacts locally with GoReleaser (no publish)
+release-snapshot: cloudflare-pack ## Build all release artifacts locally with GoReleaser (no publish)
 	@command -v $(GORELEASER) >/dev/null 2>&1 || { echo "goreleaser not found: https://goreleaser.com/install/"; exit 1; }
 	$(GORELEASER) check
 	$(GORELEASER) release --snapshot --clean --skip=publish
@@ -292,15 +302,19 @@ cloudflare-dev: ## Run the Workers edition locally without a Cloudflare login (C
 
 .PHONY: cloudflare-setup
 cloudflare-setup: ## Deploy (or upgrade) the Workers edition on your Cloudflare account, free plan (CF_SETUP_ARGS)
-	cd $(CF_DIR) && $(NPM) ci && $(NPM) run setup -- $(CF_SETUP_ARGS)
+	cd $(CF_DIR) && $(NPM) ci && BACKYARD_CF_INVOKED_AS="npm --prefix $(CF_DIR) run cf --" $(NPM) run setup -- $(CF_SETUP_ARGS)
 
 .PHONY: cloudflare-bundle
 cloudflare-bundle: ## Bundle and validate the Worker like a CI deploy would (wrangler deploy --dry-run)
 	cd $(CF_DIR) && $(NPM) ci
 	$(NODE) scripts/cloudflare-ci.mjs deploy --dry-run
 
+.PHONY: cloudflare-pack
+cloudflare-pack: ## Build the backyard-cloudflare npm package into dist-npm/ (CF_PACK_VERSION)
+	cd $(CF_DIR) && $(NPM) ci --no-audit --no-fund && $(NODE) scripts/pack.mjs$(if $(CF_PACK_VERSION), --version $(CF_PACK_VERSION)) --out $(if $(filter /%,$(CF_PACK_OUT)),$(CF_PACK_OUT),../../$(CF_PACK_OUT))
+
 ##@ Housekeeping
 
 .PHONY: clean
-clean: ## Remove build output (bin/, dist/, coverage files); keeps .backyard-data
-	rm -rf $(BIN_DIR) $(DIST_DIR) coverage.out coverage.html
+clean: ## Remove build output (bin/, dist/, dist-npm/, coverage files); keeps .backyard-data
+	rm -rf $(BIN_DIR) $(DIST_DIR) dist-npm coverage.out coverage.html

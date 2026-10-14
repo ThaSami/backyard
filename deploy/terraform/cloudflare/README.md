@@ -1,12 +1,27 @@
 # Terraform: Backyard on Cloudflare (domain + Access)
 
-This module puts the Backyard Workers edition ([`deploy/cloudflare`](../../cloudflare)) on your
-own domain and, optionally, behind **Cloudflare Access**. Access is free for up to 50 users
-and supports Okta, Entra ID, Google Workspace, GitHub, SAML/OIDC and one-time PIN.
+**Optional.** You don't need Terraform to run the Backyard Workers edition
+([`deploy/cloudflare`](../../cloudflare)): `backyard cloudflare domain add <host> [--host-mode]` and
+`backyard cloudflare access enable` (or `npx backyard-cloudflare@latest …`, once a Backyard
+release has published it to npm) put the Worker on your own domain and behind Cloudflare
+Access from the terminal, and check the result. Use this module if you manage Cloudflare as
+infrastructure as code anyway.
 
-The module does **not** deploy the Worker's code. `npm run setup` (or `wrangler deploy`) does
-that, and it keeps the Durable Objects, secrets and variables. Terraform manages what sits
-around the Worker:
+It puts the Worker on your own domain and, optionally, behind **Cloudflare Access**. Access is
+free for up to 50 users and supports Okta, Entra ID, Google Workspace, GitHub, SAML/OIDC and
+one-time PIN.
+
+**One owner per Worker.** Manage a Worker's domain and Access either with this module or with
+the CLI commands, not both. Their objects have different names (the module's Access
+applications and policies are called `Backyard…` after `access_app_name`, the CLI's
+`Backyard (<worker>)…`), and with an API token `access enable` refuses (exit 3) to change an
+Access application it did not create, such as this module's.
+
+The module does **not** deploy the Worker's code. `backyard cloudflare setup` does that (or
+`npx backyard-cloudflare@latest setup` once a Backyard release has published it to npm, or
+`npm run setup` in a checkout of `deploy/cloudflare`; Node.js 22 or later; see
+[the edition's quickstart](../../cloudflare/README.md#quickstart-free-plan)), and it keeps the
+Durable Objects, secrets and variables. Terraform manages what sits around the Worker:
 
 | Resource | When |
 | --- | --- |
@@ -32,10 +47,10 @@ verifies the Access JWT (`AUTH_MODE=access`), so the `workers.dev` URL is protec
 
 ```sh
 # 1. Deploy the Worker (workers.dev URL, AUTH_MODE=none).
-cd deploy/cloudflare && npm ci && npm run setup
+backyard cloudflare setup               # or, once it is on npm: npx backyard-cloudflare@latest setup
 
 # 2. Domain + Access.
-cd ../terraform/cloudflare/examples/basic
+cd deploy/terraform/cloudflare/examples/basic
 cp terraform.tfvars.example terraform.tfvars   # account_id, zone_name, base_domain, who may sign in
 export CLOUDFLARE_API_TOKEN=…
 terraform init && terraform apply
@@ -44,11 +59,24 @@ terraform init && terraform apply
 terraform output -raw setup_command
 #   npm run setup -- --worker-name backyard --var ACCESS_AUD:… --var ACCESS_TEAM_DOMAIN:acme.cloudflareaccess.com
 #                    --var AUTH_MODE:access --var BASE_DOMAIN:backyard.example.com --var URL_MODE:path
-cd ../../../../cloudflare && <run it>
+cd ../../../../cloudflare && <run it>          # in a checkout of deploy/cloudflare
 
 # 4. Sign in from the CLI (browser login through Access).
 backyard login --server https://backyard.example.com
 ```
+
+Without a checkout, step 3 uses the module's `setup_args` output, the same arguments without
+`npm run setup --`. `examples/basic` exports it; in your own configuration, re-export it
+(`output "setup_args" { value = module.backyard.setup_args }`), then:
+
+```sh
+backyard cloudflare setup $(terraform output -raw setup_args)
+npx backyard-cloudflare@latest setup $(terraform output -raw setup_args)   # the same without the backyard CLI (once on npm)
+```
+
+These variables are then managed by Terraform: `setup` deploys and remembers them, and the
+CLI's `domain add` and `access enable` refuse to take them over (exit 2, with how to drop them
+with `--var KEY:`).
 
 ```hcl
 module "backyard" {
@@ -87,7 +115,7 @@ API token permissions:
 2. Set `okta_account_url`, `okta_client_id`, `okta_client_secret` (`TF_VAR_okta_client_secret`
    keeps it out of files) and `allowed_okta_groups`.
 3. To make an Okta group admin of Backyard (admins can delete any site), run
-   `npm run setup -- --var ADMIN_GROUPS:backyard-admins`.
+   `backyard cloudflare setup --var ADMIN_GROUPS:backyard-admins`.
 
 With an Okta provider that already exists, pass `okta_identity_provider_id` instead of the
 `okta_*` credentials.
@@ -99,8 +127,9 @@ Universal SSL (free) covers `<zone>` and `*.<zone>`, which is one wildcard level
 `<site>.backyard.example.com` need `advanced_certificate = true`, which uses Advanced
 Certificate Manager (paid). A `check` block warns when neither applies.
 
-`wrangler deploy` only replaces a Worker's routes when `wrangler.jsonc` lists some, so leave
-`routes` out of `wrangler.jsonc` while this module manages them.
+Backyard's deploys (`setup` and `scripts/cloudflare-ci.mjs`) never change routes or custom
+domains, so they leave the module's alone. Leave `routes` out of `wrangler.jsonc` anyway: a plain
+`wrangler deploy` of a `wrangler.jsonc` that lists routes would change them.
 
 ## Inputs
 
@@ -132,7 +161,8 @@ Certificate Manager (paid). A `check` block warns when neither applies.
 | `access_team_domain` | `<team>.cloudflareaccess.com`, used as the Worker's `ACCESS_TEAM_DOMAIN`. |
 | `okta_identity_provider_id` | Okta provider id (created or passed in). |
 | `worker_vars` | Map of the Worker variables for this setup. |
-| `setup_command` | The `npm run setup -- --var …` command that applies them. |
+| `setup_args` | The arguments of `setup` that apply them: `--worker-name <worker> --var KEY:VALUE …`, for `backyard cloudflare setup` or `npx backyard-cloudflare setup`. |
+| `setup_command` | The `npm run setup -- <setup_args>` command that applies them in a checkout. |
 
 ## Tests
 

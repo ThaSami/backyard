@@ -1,7 +1,7 @@
 // Package cli implements the `backyard` command line (SPEC §13): the server
 // entry points (serve, gateway, dev), the developer workflow (init, deploy,
 // login, sites, open, pull, token, skill), the MCP server for agents, and
-// `backyard cloudflare setup` for the Workers edition.
+// `backyard cloudflare setup|domain|access|status` for the Workers edition.
 //
 // NewRootCommand builds the cobra command tree; every side effect (process
 // execution, browser launch, templates, the embedded skill, the server
@@ -86,8 +86,10 @@ type deps struct {
 	configPath     string
 	loginTimeout   time.Duration
 	devicePollUnit time.Duration
-	// downloadBase is the GitHub codeload base for `cloudflare setup --download`.
-	downloadBase string
+	// releaseBase is where `backyard cloudflare` downloads the
+	// backyard-cloudflare package of its release:
+	// <base>v<version>/backyard-cloudflare-<version>.tgz.
+	releaseBase string
 	// retryDelay spaces out retries of a freshly deployed server's /info.
 	retryDelay time.Duration
 }
@@ -110,7 +112,7 @@ func defaultDeps(streams IOStreams) *deps {
 		stderrTTY:      func() bool { return isTerminal(streams.ErrOut) },
 		loginTimeout:   5 * time.Minute,
 		devicePollUnit: time.Second,
-		downloadBase:   "https://codeload.github.com/thasami/backyard/tar.gz/",
+		releaseBase:    cloudflareReleaseBase(os.Getenv("BACKYARD_GITHUB_URL")),
 		retryDelay:     3 * time.Second,
 	}
 }
@@ -166,7 +168,7 @@ Get started:
   backyard deploy       # publish
 
 No server yet? Run your own on Cloudflare's free tier (logs this CLI in when done):
-  backyard cloudflare setup --download`,
+  backyard cloudflare setup`,
 		Version:       version.String(),
 		SilenceUsage:  true,
 		SilenceErrors: true,

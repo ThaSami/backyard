@@ -4,10 +4,18 @@
 # .github/workflows/release.yml, which publishes:
 #   * backyard_<version>_<os>_<arch>.tar.gz|zip   the CLI/server for linux, darwin, windows (amd64, arm64)
 #   * backyard-lambda_<version>_linux_<arch>.zip  the AWS Lambda deploy gateway ("bootstrap" at the zip root)
+#   * backyard-cloudflare-<version>.tgz            the Cloudflare edition's npm package (prebuilt Worker +
+#                                                  setup CLI), built by `make cloudflare-pack` in the release
+#                                                  workflow's read-only cloudflare-package job and downloaded
+#                                                  into dist-npm/ before GoReleaser runs; its SHA-256 is
+#                                                  embedded in the CLI (BACKYARD_CF_PACKAGE_SHA256), and the
+#                                                  workflow's npm job publishes these bytes
+#                                                  (vars.BACKYARD_NPM_PUBLISH)
 #   * checksums.txt (+ SBOMs)                      used by scripts/install.sh and deploy/systemd/install.sh
 #   * ghcr.io/thasami/backyard:<version>           multi-arch image (linux/amd64, linux/arm64)
 #
-# Try it locally: make release-snapshot (or goreleaser release --snapshot --clean).
+# Try it locally: make release-snapshot (it runs make cloudflare-pack first: the
+# extra_files globs below must match). Snapshot builds embed no package digest.
 version: 2
 
 project_name: backyard
@@ -32,6 +40,9 @@ builds:
       - -X github.com/thasami/backyard/internal/version.Version={{ .Version }}
       - -X github.com/thasami/backyard/internal/version.Commit={{ .FullCommit }}
       - -X github.com/thasami/backyard/internal/version.Date={{ .CommitDate }}
+      # SHA-256 of dist-npm/backyard-cloudflare-<version>.tgz: `backyard
+      # cloudflare` installs only that package (empty = development build).
+      - -X github.com/thasami/backyard/internal/cli.cloudflarePackageSHA256={{ envOrDefault "BACKYARD_CF_PACKAGE_SHA256" "" }}
     goos:
       - linux
       - darwin
@@ -93,6 +104,8 @@ archives:
 checksum:
   name_template: checksums.txt
   algorithm: sha256
+  extra_files:
+    - glob: ./dist-npm/backyard-cloudflare-*.tgz
 
 # SPDX SBOMs for every archive (needs syft on the PATH; the release workflow
 # installs it).
@@ -176,6 +189,8 @@ release:
     name: backyard
   prerelease: auto
   name_template: "Backyard {{ .Version }}"
+  extra_files:
+    - glob: ./dist-npm/backyard-cloudflare-*.tgz
   footer: |
     ## Install
 
@@ -188,7 +203,12 @@ release:
     **Server** — container image `ghcr.io/thasami/backyard:{{ .Version }}`, the Helm chart in
     `deploy/helm/backyard`, docker-compose in `deploy/docker-compose`, a single VM with
     `deploy/systemd/install.sh`, Terraform for AWS/GCP/Azure/Cloudflare in `deploy/terraform`, or
-    the Cloudflare free-plan edition with `backyard cloudflare setup`.
+    the Cloudflare free-plan edition with `backyard cloudflare setup`
+    {{- if eq (envOrDefault "BACKYARD_NPM_PUBLISH" "") "true" }} or
+    `npx backyard-cloudflare@{{ .Version }} setup`
+    {{- else }} or, with only Node.js,
+    `npx --package https://github.com/thasami/backyard/releases/download/{{ .Tag }}/backyard-cloudflare-{{ .Version }}.tgz backyard-cloudflare setup`
+    {{- end }} (Terraform for a custom domain and Access is optional).
 
     Verify downloads with `sha256sum --ignore-missing -c checksums.txt`.
 

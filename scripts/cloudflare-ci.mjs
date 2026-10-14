@@ -25,12 +25,36 @@
 //   BACKYARD_CF_DEPLOY_ARGS   extra `wrangler deploy` arguments (split on spaces)
 //   BACKYARD_CF_DIR           the Worker project (default: deploy/cloudflare)
 //   BACKYARD_CF_WAIT_SECONDS  how long to wait for /__backyard/readyz (default 60, 0 = skip)
+//   BACKYARD_CF_CONFIRM_AUTH_CHANGE  "true" lets this deploy turn Cloudflare Access off,
+//                             change its team, or go ahead when the live auth mode cannot
+//                             be read (the auth guard below); set it for one run only
+//                             (cloudflare-deploy.yml: the confirm_auth_change input)
+//   CLOUDFLARE_API_BASE_URL   Cloudflare API base for wrangler and the guard's REST calls
+//                             (default https://api.cloudflare.com/client/v4)
 //   WRANGLER_BIN              wrangler entry point (default: the project's node_modules)
 //
 // Secrets are uploaded together with the new version (`wrangler deploy
 // --secrets-file`), so a first deploy never runs without BACKYARD_SECRET. In
 // GitHub Actions the hub URL is written to $GITHUB_OUTPUT (url, worker) and a
 // summary to $GITHUB_STEP_SUMMARY; secret values are masked and never logged.
+//
+// Auth guard (the rules of `backyard cloudflare setup`, from
+// deploy/cloudflare/scripts/lib/live.mjs): before a deploy (not a dry run) the
+// live Worker's settings are read with CLOUDFLARE_API_TOKEN
+// (GET /accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/<worker>/settings). The
+// deploy is refused, and nothing is changed, when the live Worker runs
+// AUTH_MODE=access and this deploy (wrangler.jsonc + BACKYARD_CF_VARS + --var in
+// BACKYARD_CF_DEPLOY_ARGS) would turn it off or switch its team, or when the
+// live auth mode cannot be read (the Worker's own /__backyard/api/deploy/info on
+// workers.dev is the fallback), unless BACKYARD_CF_CONFIRM_AUTH_CHANGE=true. A
+// first deploy (wrangler reports the Worker missing) is not guarded. So keep
+// AUTH_MODE, ACCESS_TEAM_DOMAIN and ACCESS_AUD (and BASE_DOMAIN, URL_MODE) in
+// BACKYARD_CF_VARS once `backyard cloudflare access enable` / `domain add` set them.
+//
+// Routes and custom domains are never deployed from here: the generated config
+// has no "routes" (wrangler.jsonc's are ignored with a warning), and
+// BACKYARD_CF_DEPLOY_ARGS may not set --route(s), --domain(s), --config, --env
+// or --name. They belong to `backyard cloudflare domain add` (or Terraform).
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -38,6 +62,14 @@ import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFil
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { apiBase, createApi } from "../deploy/cloudflare/scripts/lib/cfapi.mjs";
+import { authGuard, authModeOf, fillAuthFromInfo, readLive } from "../deploy/cloudflare/scripts/lib/live.mjs";
+import { proxyHint } from "../deploy/cloudflare/scripts/lib/net.mjs";
+import { CliError } from "../deploy/cloudflare/scripts/lib/ui.mjs";
+import { isMissingWorker, parseSecretList as parseSecretListOutput } from "../deploy/cloudflare/scripts/lib/wrangler.mjs";
+
+export { isMissingWorker };
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -151,26 +183,69 @@ export function parseVars(raw) {
   return out;
 }
 
-/** Splits BACKYARD_CF_DEPLOY_ARGS on whitespace. Secrets are refused. */
+/**
+ * Arguments of `wrangler deploy` that BACKYARD_CF_DEPLOY_ARGS may not set: they
+ * would attach routes or custom domains, or deploy another config, environment
+ * or Worker than the one the auth guard checked.
+ */
+const RESERVED_DEPLOY_ARGS = [
+  [/^--(routes?|domains?)(=|$)/, "routes and custom domains are managed by `backyard cloudflare domain add` (or Terraform); deploys never change them"],
+  [/^(--config|-c)(=|$)/, "the deploy uses wrangler.jsonc in BACKYARD_CF_DIR with BACKYARD_CF_VARS"],
+  [/^(--env|-e)(=|$)/, "the deploy uses the top-level environment of wrangler.jsonc"],
+  [/^--name(=|$)/, "set BACKYARD_CF_WORKER_NAME instead"],
+];
+
+/** Splits BACKYARD_CF_DEPLOY_ARGS on whitespace. Secrets and the reserved arguments are refused. */
 export function parseDeployArgs(raw) {
   const args = String(raw ?? "").split(/\s+/).filter(Boolean);
   for (const a of args) {
     if (/^--secrets?-file/.test(a)) throw new CIError("BACKYARD_CF_DEPLOY_ARGS may not set --secrets-file (secrets come from the environment)");
-    const m = /(?:^|=)([A-Z_][A-Z0-9_]*):/.exec(a);
+    // KEY:VALUE, and KEY=VALUE (a typo wrangler would take as a variable name): never a secret.
+    const m = /(?:^|=)([A-Z_][A-Z0-9_]*)[:=]/.exec(a);
     if (m && SECRET_NAMES.includes(m[1])) {
       throw new CIError(`BACKYARD_CF_DEPLOY_ARGS: ${m[1]} is a secret; never pass it with --var`);
+    }
+    for (const [re, why] of RESERVED_DEPLOY_ARGS) {
+      if (re.test(a)) throw new CIError(`BACKYARD_CF_DEPLOY_ARGS may not set ${a.split("=")[0]}: ${why}`);
     }
   }
   return args;
 }
 
 /**
+ * The variables BACKYARD_CF_DEPLOY_ARGS sets with `--var KEY:VALUE` (or
+ * `--var=KEY:VALUE`; wrangler takes several values after one --var). wrangler
+ * lets them override the config, so the auth guard sees them too.
+ */
+export function deployArgVars(args) {
+  const out = {};
+  for (let i = 0; i < args.length; i++) {
+    const values = [];
+    if (args[i].startsWith("--var=")) values.push(args[i].slice("--var=".length));
+    else if (args[i] === "--var") while (i + 1 < args.length && !args[i + 1].startsWith("-")) values.push(args[++i]);
+    for (const v of values) {
+      const c = v.indexOf(":");
+      if (c > 0) out[v.slice(0, c)] = v.slice(c + 1);
+    }
+  }
+  return out;
+}
+
+/** Whether a wrangler config lists routes (or custom domains, which are routes too). */
+export function hasRoutes(config) {
+  return config?.routes !== undefined || config?.route !== undefined;
+}
+
+/**
  * Builds the effective wrangler configuration: wrangler.jsonc with variable
- * overrides and the optional R2 binding. Returns null when nothing changes.
+ * overrides and the optional R2 binding, and never routes (a deploy must not
+ * attach or move routes and custom domains). Returns null when nothing changes.
  */
 export function effectiveConfig(config, { vars = {}, bucket = "" } = {}) {
-  if (!Object.keys(vars).length && !bucket) return null;
+  if (!Object.keys(vars).length && !bucket && !hasRoutes(config)) return null;
   const out = { ...config, vars: { ...(config.vars ?? {}), ...vars } };
+  delete out.routes;
+  delete out.route;
   if (bucket) {
     const others = (config.r2_buckets ?? []).filter((b) => b.binding !== "R2");
     out.r2_buckets = [...others, { binding: "R2", bucket_name: bucket }];
@@ -204,62 +279,19 @@ export function hubURL(vars, outputText) {
 }
 
 /**
- * Extracts the secret names from the stdout of `wrangler secret list
- * --format json`. Wrangler may print other lines around the array (e.g.
- * "▲ [WARNING] Proxy environment variables detected", or "[…]" notices), so
- * every line-initial "[" is tried with every line-final "]" after it, and only
- * a JSON array of {name: "<non-empty string>"} objects counts (the same rules
- * as deploy/cloudflare/scripts/setup.mjs).
- *
- * An empty result makes the deploy generate BACKYARD_SECRET, which would
- * rotate it (and revoke every API token) on an existing Worker, so an empty
- * list must never win by accident: a non-empty list anywhere in the output
- * beats a stray "[]" line, and "[]" next to some other non-empty JSON array
- * (a list in a format this parser does not know) is ambiguous and throws.
- * Anything else throws too: never guess.
+ * Extracts the secret names from the stdout of `wrangler secret list --format
+ * json` (deploy/cloudflare/scripts/lib/wrangler.mjs, shared with setup): only a
+ * JSON list of {name} objects counts, a stray "[]" line never hides the real
+ * list, and anything else throws a CIError. An empty result would make the
+ * deploy generate BACKYARD_SECRET, rotating it (and revoking every API token)
+ * on an existing Worker: never guess.
  */
 export function parseSecretList(output) {
-  const s = String(output ?? "");
-  const lineFinal = (j) => {
-    let k = j + 1;
-    while (k < s.length && (s[k] === " " || s[k] === "\t" || s[k] === "\r")) k++;
-    return k === s.length || s[k] === "\n";
-  };
-  const isEntry = (x) => x !== null && typeof x === "object" && !Array.isArray(x) && typeof x.name === "string" && x.name !== "";
-  const ends = [];
-  for (let j = s.indexOf("]"); j >= 0; j = s.indexOf("]", j + 1)) if (lineFinal(j)) ends.push(j);
-  let empty = false;
-  let foreign = false;
-  for (let i = s.indexOf("["); i >= 0; i = s.indexOf("[", i + 1)) {
-    if (i > 0 && s[i - 1] !== "\n") continue;
-    for (let k = ends.length - 1; k >= 0 && ends[k] > i; k--) {
-      let list;
-      try {
-        list = JSON.parse(s.slice(i, ends[k] + 1));
-      } catch {
-        continue;
-      }
-      if (!Array.isArray(list)) continue;
-      if (list.length === 0) empty = true;
-      else if (list.every(isEntry)) return new Set(list.map((x) => x.name));
-      else foreign = true;
-    }
+  try {
+    return parseSecretListOutput(output);
+  } catch (e) {
+    throw new CIError(`unexpected \`wrangler secret list\` output (${e?.message ?? e})`);
   }
-  if (empty && !foreign) return new Set();
-  throw new CIError(
-    foreign
-      ? "unexpected `wrangler secret list` output (a JSON array that is not a list of {name} objects)"
-      : "unexpected `wrangler secret list` output (no JSON list of secrets)",
-  );
-}
-
-/**
- * True when wrangler reports that the Worker does not exist yet (`Worker
- * "<name>" not found.`, API error 10007). Anything else (authentication,
- * network) must not be mistaken for a first deploy.
- */
-export function isMissingWorker(output) {
-  return /Worker "[^"]*"(?: \(env: [^)]*\))? not found|\[code: 10007\]|does not exist on your account/i.test(String(output ?? ""));
 }
 
 /**
@@ -293,6 +325,100 @@ export function planSecrets(env, existing, vars, random = () => randomBytes(32).
     );
   }
   return { secrets, generated, warnings };
+}
+
+// ---------------------------------------------------------------------------
+// Auth guard
+
+/** The managed variables a CI deploy must carry to keep what the live Worker has. */
+const KEEP_KEYS = ["AUTH_MODE", "ACCESS_TEAM_DOMAIN", "ACCESS_AUD", "BASE_DOMAIN", "URL_MODE"];
+
+/** A live snapshot that says "unknown" (see readLive in deploy/cloudflare/scripts/lib/live.mjs). */
+function unknownLive(error) {
+  return { exists: null, vars: {}, secretNames: [], r2Bucket: "", workersDev: null, authMode: "", team: "", aud: "", source: "", error };
+}
+
+/** What to do about a refusal of the guard (reason: downgrade, team, fail-closed or unknown). */
+function guardRemedy(reason, live) {
+  const confirm =
+    "If this change is deliberate, run this one deploy with BACKYARD_CF_CONFIRM_AUTH_CHANGE=true (in GitHub Actions: Run workflow with confirm_auth_change checked).";
+  if (reason === "unknown") {
+    return [
+      "  Check that CLOUDFLARE_ACCOUNT_ID is set and that CLOUDFLARE_API_TOKEN may read the Worker (Account · Workers Scripts · Read;",
+      '  the "Edit Cloudflare Workers" template has it).',
+      `  ${confirm}`,
+      "  BACKYARD_CF_VARS must then carry AUTH_MODE, ACCESS_TEAM_DOMAIN and ACCESS_AUD if the Worker uses Cloudflare Access.",
+    ].join("\n");
+  }
+  const keep = {};
+  for (const k of KEEP_KEYS) if (live.vars?.[k]) keep[k] = live.vars[k];
+  if (!keep.AUTH_MODE && live.authMode === "access") Object.assign(keep, { AUTH_MODE: "access", ACCESS_TEAM_DOMAIN: live.team || "<team>", ACCESS_AUD: live.aud || "<aud>" });
+  return [
+    `  To keep the live configuration, put it into BACKYARD_CF_VARS: ${JSON.stringify(keep)} (with your other variables).`,
+    `  ${confirm}`,
+  ].join("\n");
+}
+
+/**
+ * The auth guard of `backyard cloudflare setup` for CI: reads the live Worker
+ * (settings with CLOUDFLARE_API_TOKEN; when unreadable, the Worker's own
+ * /__backyard/api/deploy/info on workers.dev) and throws a CIError, before
+ * anything is changed, when `desired` would turn a live AUTH_MODE=access off,
+ * change its team, open a fail-closed AUTH_MODE, or when the live auth mode
+ * cannot be read, unless BACKYARD_CF_CONFIRM_AUTH_CHANGE=true. `wrangler` is
+ * what `wrangler secret list` said: {exists} (secrets listed) or {missing}
+ * (an explicit "Worker not found": a first deploy, not guarded).
+ * @param {{env: NodeJS.ProcessEnv, worker: string, desired: Record<string, string>, wrangler: {exists: boolean, missing: boolean}, log: (m: string) => void, warn: (m: string) => void}} o
+ * @returns {Promise<import("../deploy/cloudflare/scripts/lib/live.mjs").Live>}
+ */
+export async function guardAuth(o) {
+  const { env, worker, desired, wrangler } = o;
+  const allow = String(env.BACKYARD_CF_CONFIRM_AUTH_CHANGE ?? "").trim().toLowerCase() === "true";
+  let base;
+  try {
+    base = apiBase(env);
+  } catch (e) {
+    throw new CIError(e?.message ?? String(e));
+  }
+  const api = createApi({ credential: { type: "api_token", token: env.CLOUDFLARE_API_TOKEN ?? "" }, base, label: "CLOUDFLARE_API_TOKEN" });
+  const account = String(env.CLOUDFLARE_ACCOUNT_ID ?? "").trim();
+  let live = account ? await readLive({ api, accountId: account, worker }) : unknownLive("CLOUDFLARE_ACCOUNT_ID is not set");
+  if (live.exists === false && wrangler.exists) {
+    // wrangler sees the Worker but the API does not (another account?): never assume a first deploy.
+    live = unknownLive(`the Cloudflare API reports no Worker ${worker} in account ${account}, but wrangler lists its secrets`);
+  }
+  if (live.exists === null) {
+    // The Worker's own answer on its workers.dev URL (<worker>.<account subdomain>.workers.dev).
+    let workersDev = "";
+    if (account) {
+      try {
+        const sub = await api.get(`/accounts/${account}/workers/subdomain`);
+        if (sub?.subdomain) workersDev = `https://${worker}.${sub.subdomain}.workers.dev`;
+      } catch {
+        /* unknown: no workers.dev candidate */
+      }
+    }
+    if (workersDev) live = await fillAuthFromInfo(live, [workersDev]);
+    // The configured hub URL may belong to anything: it may only make the guard stricter.
+    if (live.exists === null) {
+      const configured = hubURL(desired, "");
+      const other = configured ? await fillAuthFromInfo({ ...live }, [configured]) : live;
+      if (other.authMode === "access") live = other;
+    }
+  }
+  if (live.exists === null && wrangler.missing) live = { ...live, exists: false };
+  try {
+    const g = authGuard(live, desired, { allow, worker });
+    for (const n of g.notes) o.warn(n);
+    if (g.checked) {
+      const team = live.team ? ` (team ${live.team})` : "";
+      o.log(`Auth guard: the live Worker runs AUTH_MODE=${live.authMode}${team}; this deploy sets AUTH_MODE=${authModeOf(desired.AUTH_MODE)}.`);
+    }
+  } catch (e) {
+    if (e instanceof CliError && e.code === 3) throw new CIError(`${e.message}\n${guardRemedy(e.reason, live)}`);
+    throw e;
+  }
+  return live;
 }
 
 // ---------------------------------------------------------------------------
@@ -347,11 +473,11 @@ async function waitReady(url, seconds) {
   return false;
 }
 
-function gha(env) {
+function gha(env, log = console.log) {
   const on = env.GITHUB_ACTIONS === "true";
   return {
     mask: (v) => on && v && process.stdout.write(`::add-mask::${v}\n`),
-    warn: (msg) => console.log(on ? `::warning title=Backyard on Cloudflare::${msg}` : `warning: ${msg}`),
+    warn: (msg) => log(on ? `::warning title=Backyard on Cloudflare::${msg}` : `warning: ${msg}`),
     output: (k, v) => env.GITHUB_OUTPUT && appendFileSync(env.GITHUB_OUTPUT, `${k}=${v}\n`),
     summary: (text) => env.GITHUB_STEP_SUMMARY && appendFileSync(env.GITHUB_STEP_SUMMARY, text),
   };
@@ -372,9 +498,13 @@ export async function deploy({ env = process.env, dryRun = false, log = console.
   if (bucket && !BUCKET_RE.test(bucket)) throw new CIError(`invalid R2 bucket name ${JSON.stringify(bucket)}`);
   const vars = parseVars(env.BACKYARD_CF_VARS);
   const extraArgs = parseDeployArgs(env.BACKYARD_CF_DEPLOY_ARGS);
-  const merged = { ...(config.vars ?? {}), ...vars };
-  const ci = gha(env);
+  // What the Worker will run with: wrangler.jsonc < BACKYARD_CF_VARS < --var in BACKYARD_CF_DEPLOY_ARGS.
+  const merged = { ...(config.vars ?? {}), ...vars, ...deployArgVars(extraArgs) };
+  const ci = gha(env, log);
   for (const name of SECRET_NAMES) ci.mask(env[name]);
+  // wrangler uses HTTPS_PROXY; the auth guard's API calls and the readiness check only with NODE_USE_ENV_PROXY=1.
+  const proxy = proxyHint(env);
+  if (proxy) ci.warn(proxy);
 
   const work = mkdtempSync(join(env.RUNNER_TEMP || tmpdir(), "backyard-cf-"));
   const generatedPath = join(cfDir, GENERATED_CONFIG);
@@ -389,16 +519,20 @@ export async function deploy({ env = process.env, dryRun = false, log = console.
     if (!dryRun) {
       const listed = await runWrangler(cfDir, env, ["secret", "list", "--name", worker, "--format", "json"], { quiet: true });
       let existing;
+      let missing = false;
       if (listed.code === 0) {
         existing = parseSecretList(listed.stdout);
       } else if (isMissingWorker(listed.output)) {
         log(`Worker ${worker} does not exist yet: first deploy.`);
         existing = new Set();
+        missing = true;
       } else {
         // Never guess here: a wrong guess would rotate BACKYARD_SECRET and
         // revoke every API token.
         throw new CIError(`could not list the secrets of Worker ${worker}:\n${listed.output.trim()}`);
       }
+      // Before anything changes (R2 bucket, secrets, the new version).
+      await guardAuth({ env, worker, desired: merged, wrangler: { exists: !missing, missing }, log, warn: ci.warn });
       plan = planSecrets(env, existing, merged);
       ci.mask(plan.secrets.BACKYARD_SECRET);
       for (const w of plan.warnings) ci.warn(w);
@@ -413,6 +547,9 @@ export async function deploy({ env = process.env, dryRun = false, log = console.
       log(`R2 bucket ${bucket} ready.`);
     }
 
+    if (hasRoutes(config)) {
+      ci.warn("routes in wrangler.jsonc are ignored: routes and custom domains are managed by `backyard cloudflare domain add` (or Terraform), and deploys never change them");
+    }
     const effective = effectiveConfig(config, { vars, bucket });
     // --env= selects the top-level environment explicitly (wrangler.jsonc also
     // defines "local" for offline development).

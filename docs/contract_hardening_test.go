@@ -4,10 +4,13 @@ package docs
 // about the hardened behaviour of both editions: which uploads are served
 // without a sandbox, the warehouse and realtime size limits, the direct-sync
 // commands, the ignore rules no configuration can override, the login state
-// cookie, the Cloudflare edition's query page budget and its Access bypass
-// list.
+// cookie, the Cloudflare edition's query page budget, its Access bypass list,
+// the commands and flags of its engine (backyard-cloudflare), what the entry
+// points promise about `backyard cloudflare setup` and what a CI deploy must
+// carry over from it.
 
 import (
+	"encoding/json"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -385,29 +388,239 @@ func TestCloudflareQueryPageBudgetDocumented(t *testing.T) {
 	}
 }
 
-// TestAccessBypassPathsDocumented checks that SPEC §16 and the Cloudflare
-// guide list every path the Cloudflare Terraform module lets bypass Access.
+// quotedStrings returns the double-quoted strings of a list literal.
+func quotedStrings(list string) []string {
+	var out []string
+	for _, s := range regexp.MustCompile(`"([^"]+)"`).FindAllStringSubmatch(list, -1) {
+		out = append(out, s[1])
+	}
+	return out
+}
+
+// TestAccessBypassPathsDocumented checks that the Cloudflare Terraform module
+// and `backyard cloudflare access enable` (ACCESS_BYPASS_PATHS in
+// deploy/cloudflare/scripts/lib/access-plan.mjs) let the same paths bypass
+// Access, in the same order, and that SPEC §16 and the Cloudflare guides list
+// every one of them.
 func TestAccessBypassPathsDocumented(t *testing.T) {
 	tf := readRepoFile(t, "deploy/terraform/cloudflare/variables.tf")
 	m := regexp.MustCompile(`(?s)variable "bypass_paths" \{.*?default = \[(.*?)\]`).FindStringSubmatch(tf)
 	if m == nil {
 		t.Fatal("the default of bypass_paths not found in deploy/terraform/cloudflare/variables.tf")
 	}
-	var paths []string
-	for _, s := range regexp.MustCompile(`"([^"]+)"`).FindAllStringSubmatch(m[1], -1) {
-		paths = append(paths, s[1])
-	}
+	paths := quotedStrings(m[1])
 	if !slices.Contains(paths, "/__backyard/api/tokens") {
 		t.Fatalf("bypass_paths = %q (parser broken?)", paths)
+	}
+	m = regexp.MustCompile(`(?s)export const ACCESS_BYPASS_PATHS = \[(.*?)\];`).FindStringSubmatch(readRepoFile(t, "deploy/cloudflare/scripts/lib/access-plan.mjs"))
+	if m == nil {
+		t.Fatal("ACCESS_BYPASS_PATHS not found in deploy/cloudflare/scripts/lib/access-plan.mjs")
+	}
+	if engine := quotedStrings(m[1]); !slices.Equal(engine, paths) {
+		t.Errorf("access enable bypasses %q (ACCESS_BYPASS_PATHS), the Terraform module %q (bypass_paths)", engine, paths)
 	}
 	for where, text := range map[string]string{
 		"SPEC §16":           specSection(t, "16"),
 		"docs/cloudflare.md": readRepoFile(t, "docs/cloudflare.md"),
+		"deploy/cloudflare/README.md (Company login)": markdownSection(t, readRepoFile(t, "deploy/cloudflare/README.md"), "Company login (Cloudflare Access)"),
 	} {
 		for _, p := range paths {
 			if !strings.Contains(text, "`"+p+"`") {
 				t.Errorf("%s does not list the Access bypass path %s", where, p)
 			}
 		}
+	}
+}
+
+// engineCommands is deploy/cloudflare/scripts/lib/commands.json, the single
+// source of the commands and flags of backyard-cloudflare.
+type engineCommands struct {
+	Schema   int          `json:"schema"`
+	Global   []engineFlag `json:"global"`
+	Commands []struct {
+		Name  string       `json:"name"`
+		Flags []engineFlag `json:"flags"`
+	} `json:"commands"`
+}
+
+type engineFlag struct {
+	Name  string   `json:"name"`
+	Alias []string `json:"alias"`
+	Short string   `json:"short"`
+}
+
+// TestCloudflareEngineFlagsDocumented checks the "Command reference" of
+// deploy/cloudflare/README.md against commands.json: every command and every
+// flag (with its short form) is documented there, and every --flag it
+// mentions exists (a flag, an alias, or --version, which the engine handles
+// before parsing).
+func TestCloudflareEngineFlagsDocumented(t *testing.T) {
+	var cmds engineCommands
+	if err := json.Unmarshal([]byte(readRepoFile(t, "deploy/cloudflare/scripts/lib/commands.json")), &cmds); err != nil {
+		t.Fatalf("deploy/cloudflare/scripts/lib/commands.json: %v", err)
+	}
+	if cmds.Schema != 1 || len(cmds.Global) == 0 || len(cmds.Commands) < 6 {
+		t.Fatalf("unexpected commands.json (schema %d, %d global flags, %d commands): parser broken?", cmds.Schema, len(cmds.Global), len(cmds.Commands))
+	}
+	if !strings.Contains(readRepoFile(t, "deploy/cloudflare/scripts/lib/args.mjs"), `a0 === "--version"`) {
+		t.Fatal("deploy/cloudflare/scripts/lib/args.mjs no longer handles --version (update this test)")
+	}
+	section := markdownSection(t, readRepoFile(t, "deploy/cloudflare/README.md"), "Command reference")
+
+	known := map[string]bool{"version": true}
+	var flags []engineFlag
+	flags = append(flags, cmds.Global...)
+	for _, c := range cmds.Commands {
+		if !strings.Contains(section, "`"+c.Name) {
+			t.Errorf("deploy/cloudflare/README.md (Command reference) does not document the command %q", c.Name)
+		}
+		flags = append(flags, c.Flags...)
+	}
+	for _, f := range flags {
+		known[f.Name] = true
+		for _, a := range f.Alias {
+			known[a] = true
+		}
+		if !regexp.MustCompile("`--" + regexp.QuoteMeta(f.Name) + "[` ]").MatchString(section) {
+			t.Errorf("deploy/cloudflare/README.md (Command reference) does not document --%s", f.Name)
+		}
+		if f.Short != "" && !strings.Contains(section, "`-"+f.Short+"`") {
+			t.Errorf("deploy/cloudflare/README.md (Command reference) does not document -%s (--%s)", f.Short, f.Name)
+		}
+	}
+	mentioned := regexp.MustCompile(`(?:^|[^A-Za-z0-9-])--([a-z][a-z0-9-]*)`).FindAllStringSubmatch(section, -1)
+	if len(mentioned) < len(flags) {
+		t.Fatalf("only %d flags found in the Command reference: parser broken?", len(mentioned))
+	}
+	for _, m := range mentioned {
+		if !known[m[1]] {
+			t.Errorf("deploy/cloudflare/README.md (Command reference) mentions --%s, which is not in commands.json", m[1])
+		}
+	}
+}
+
+// cloudflareEntryPoints are the docs that offer `backyard cloudflare setup`
+// to people who have no Backyard server yet: the pages read first, and what
+// agents read (the skill behind /llms.txt, the agent files of `backyard init`,
+// the plugin commands).
+var cloudflareEntryPoints = []string{
+	"README.md",
+	"docs/getting-started.md",
+	"examples/README.md",
+	"skills/backyard/SKILL.md",
+	"templates/files/agents/partials.tmpl",
+	"commands/new.md",
+	"commands/deploy.md",
+}
+
+// cloudflareNpxGuides are the guides that show `npx backyard-cloudflare`.
+var cloudflareNpxGuides = []string{
+	"docs/cloudflare.md",
+	"deploy/cloudflare/README.md",
+	"deploy/terraform/cloudflare/README.md",
+	"skills/backyard/references/deploy.md",
+}
+
+// TestCloudflareSetupEntryPoints checks what the docs promise about getting
+// the engine. Only release builds pin an engine package
+// (cloudflarePackageSHA256 is set by the release's ldflags), so a CLI from
+// `go install` or a source build runs `backyard cloudflare setup` only in a
+// checkout or with --package: every entry point that offers the command says
+// so right there. And the npm name backyard-cloudflare is Backyard's only once
+// a release has published it (CONTRIBUTING.md, npm): until then `npx` would
+// run whatever someone else published under it, so the entry points do not
+// send anyone there, and the guides that show it say when it works.
+func TestCloudflareSetupEntryPoints(t *testing.T) {
+	if !regexp.MustCompile(`(?m)^var cloudflarePackageSHA256 string$`).MatchString(readRepoFile(t, "internal/cli/cloudflare_engine.go")) {
+		t.Fatal("internal/cli/cloudflare_engine.go: cloudflarePackageSHA256 is no longer a variable only release builds set (update this test and the docs it checks)")
+	}
+	for _, rel := range cloudflareEntryPoints {
+		text := flatten(readRepoFile(t, rel))
+		if strings.Contains(text, "npx backyard-cloudflare") {
+			t.Errorf("%s sends people to `npx backyard-cloudflare`; only the guides that say it needs a Backyard release on npm may show it", rel)
+		}
+		i := strings.Index(text, "`backyard cloudflare setup`")
+		if i < 0 {
+			t.Errorf("%s no longer offers `backyard cloudflare setup` (update cloudflareEntryPoints)", rel)
+			continue
+		}
+		near := text[i:min(len(text), i+600)]
+		if !strings.Contains(near, "`go install`") || !strings.Contains(near, "`--package`") {
+			t.Errorf("%s offers `backyard cloudflare setup` without saying that a CLI from `go install` needs a checkout or `--package`:\n%s", rel, near)
+		}
+	}
+	for _, rel := range cloudflareNpxGuides {
+		text := flatten(readRepoFile(t, rel))
+		if !strings.Contains(text, "npx backyard-cloudflare") {
+			t.Errorf("%s no longer shows `npx backyard-cloudflare` (update cloudflareNpxGuides)", rel)
+		} else if !strings.Contains(text, "release has published it to npm") {
+			t.Errorf("%s shows `npx backyard-cloudflare` without saying that it works only once a Backyard release has published it to npm", rel)
+		}
+	}
+}
+
+// TestCloudflareCIDeployCarriesSetup checks the "Deploying from GitHub
+// Actions" section of deploy/cloudflare/README.md against
+// scripts/cloudflare-ci.mjs. A CI deploy names the Worker, its variables and
+// its R2 bucket from its environment only, and wrangler removes a binding the
+// configuration leaves out, so the section's workflow passes all three and
+// says what to carry over from a Worker that `setup` made: the bucket (or the
+// files stored in R2 fail) and that workers.dev stays on.
+func TestCloudflareCIDeployCarriesSetup(t *testing.T) {
+	ci := readRepoFile(t, "scripts/cloudflare-ci.mjs")
+	section := markdownSection(t, readRepoFile(t, "deploy/cloudflare/README.md"), "Deploying from GitHub Actions")
+	for _, name := range []string{"BACKYARD_CF_WORKER_NAME", "BACKYARD_CF_VARS", "BACKYARD_CF_R2_BUCKET"} {
+		if !strings.Contains(ci, "env."+name) {
+			t.Errorf("scripts/cloudflare-ci.mjs no longer reads %s (update this test and the README)", name)
+		}
+		if !strings.Contains(section, name+": ${{ vars."+name+" }}") {
+			t.Errorf("the workflow in deploy/cloudflare/README.md (Deploying from GitHub Actions) does not pass %s", name)
+		}
+	}
+	if !strings.Contains(ci, `const bucket = (env.BACKYARD_CF_R2_BUCKET || "").trim();`) {
+		t.Error("scripts/cloudflare-ci.mjs picks the R2 bucket differently now: check what deploy/cloudflare/README.md (Deploying from GitHub Actions) says about BACKYARD_CF_R2_BUCKET, then update this test")
+	}
+	flat := flatten(section)
+	for _, want := range []string{
+		"`backyard cloudflare status`", "`r2Bucket`", "set `BACKYARD_CF_R2_BUCKET` to it",
+		"A deploy without it removes the R2 binding", "`workers_dev`", "`setup --no-workers-dev`",
+	} {
+		if !strings.Contains(flat, want) {
+			t.Errorf("deploy/cloudflare/README.md (Deploying from GitHub Actions) lacks %q", want)
+		}
+	}
+	if !regexp.MustCompile(`(?m)^\s*"workers_dev": true,`).MatchString(readRepoFile(t, "deploy/cloudflare/wrangler.jsonc")) {
+		t.Error("deploy/cloudflare/wrangler.jsonc no longer sets workers_dev to true: update what deploy/cloudflare/README.md says CI deploys serve on, then this test")
+	}
+}
+
+// TestCloudflareJSONFlagDocumented checks the skill's global-flags sentence
+// against commands.json: `backyard cloudflare` passes --json to the engine,
+// which accepts it only on the commands that declare it (status), so the
+// skill names them.
+func TestCloudflareJSONFlagDocumented(t *testing.T) {
+	var cmds engineCommands
+	if err := json.Unmarshal([]byte(readRepoFile(t, "deploy/cloudflare/scripts/lib/commands.json")), &cmds); err != nil {
+		t.Fatalf("deploy/cloudflare/scripts/lib/commands.json: %v", err)
+	}
+	for _, f := range cmds.Global {
+		if f.Name == "json" {
+			t.Skip("--json is a global engine flag now: every backyard cloudflare command accepts it")
+		}
+	}
+	var with []string
+	for _, c := range cmds.Commands {
+		for _, f := range c.Flags {
+			if f.Name == "json" {
+				with = append(with, "`"+c.Name+"`")
+			}
+		}
+	}
+	if len(with) == 0 || len(with) == len(cmds.Commands) {
+		t.Fatalf("--json on %d of %d engine commands: update this test", len(with), len(cmds.Commands))
+	}
+	want := "`--json` only for " + strings.Join(with, ", ")
+	if text := flatten(readRepoFile(t, "skills/backyard/references/deploy.md")); !strings.Contains(text, want) {
+		t.Errorf("skills/backyard/references/deploy.md lists --json as a global flag without %q", want)
 	}
 }

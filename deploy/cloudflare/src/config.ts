@@ -338,7 +338,7 @@ export function parseConfig(rawEnv: Env): Config {
   }
 
   const secret = typeof env.BACKYARD_SECRET === "string" ? env.BACKYARD_SECRET : "";
-  if (!secret) problems.push("BACKYARD_SECRET is not set (run npm run setup or wrangler secret put BACKYARD_SECRET)");
+  if (!secret) problems.push("BACKYARD_SECRET is not set (re-run setup: backyard cloudflare setup or npx backyard-cloudflare setup; or npx wrangler secret put BACKYARD_SECRET, at least 32 characters)");
   else if (secret.length < 32) problems.push("BACKYARD_SECRET must be at least 32 characters");
 
   const ownership = str(env.OWNERSHIP).toLowerCase() === "owner" ? "owner" : "none";

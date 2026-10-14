@@ -4,7 +4,7 @@ import { readSSE } from "../src/ai/sse";
 import { retryHint, safeUpstreamMessage } from "../src/ai/types";
 import { extractText } from "../src/ai/workersai";
 import { DEFAULT_LIMITS, normalizeTeam, parseConfig } from "../src/config";
-import { cookiePathPrefixes } from "../src/auth";
+import { cookiePathPrefixes, secretMissing } from "../src/auth";
 import { b64urlDecode, base64Decode, base64Encode, base64Head, base64Size, decodeAnyBase64, normalizeBase64 } from "../src/crypto";
 import { buildQuery, normalizeQuery, parseListParams } from "../src/db/query";
 import { formatMicros, formatMillisFixed, MicroClock, parseRFC3339Micros, toFixedMillis } from "../src/db/time";
@@ -350,6 +350,10 @@ describe("config", () => {
     expect(c.problems.join("\n")).toContain("AI_MODELS.bad");
     expect(parseConfig({ ...base, URL_MODE: "host" } as unknown as Env).urlMode).toBe("path");
     expect(parseConfig({} as Env).problems.join()).toContain("BACKYARD_SECRET");
+    // The remedy works without a checkout (npm run setup does not).
+    const missing = [parseConfig({} as Env).problems.join(), secretMissing().message].join("\n");
+    expect(missing).not.toContain("npm run setup");
+    expect(missing).toContain("backyard cloudflare setup or npx backyard-cloudflare setup");
     expect(normalizeTeam("https://Team.cloudflareaccess.com/")).toBe("team.cloudflareaccess.com");
   });
 

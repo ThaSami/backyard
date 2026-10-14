@@ -6,7 +6,10 @@
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
+  },
+  "bin": {
+    "backyard-cloudflare": "bin/backyard-cloudflare.mjs"
   },
   "scripts": {
     "sync": "node scripts/sync-assets.mjs",
@@ -20,10 +23,9 @@
     "pretypecheck": "npm run sync",
     "typecheck": "tsc --noEmit",
     "build": "node scripts/sync-assets.mjs --strict && wrangler deploy --dry-run --env= --outdir .wrangler/dist",
-    "predeploy": "node scripts/sync-assets.mjs --strict",
-    "deploy": "wrangler deploy --env=",
-    "deploy:ci": "node scripts/sync-assets.mjs --strict && wrangler deploy --env=",
-    "setup": "node scripts/setup.mjs"
+    "setup": "node bin/backyard-cloudflare.mjs setup",
+    "cf": "node bin/backyard-cloudflare.mjs",
+    "package": "node scripts/pack.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.4.0",

@@ -5,12 +5,15 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -151,7 +154,8 @@ func (a *cliApp) runLogin(ctx context.Context, fl loginFlags) error {
 	case info.Auth.Mode == "none":
 		// No identity provider and no anonymous deploys: deploys need a
 		// pre-shared token (auth.tokens, or DEPLOY_TOKEN on Cloudflare,
-		// which `backyard cloudflare setup` saved on this machine).
+		// which `backyard cloudflare setup` saved on this machine, matched
+		// by the Worker's URL or its workers.dev URL).
 		method = clientconfig.LoginToken
 		if tok, path := a.savedCloudflareToken(chosen...); tok != "" {
 			a.errf("Using the deploy token saved by the Cloudflare setup (%s).\n", path)
@@ -609,4 +613,67 @@ func (a *cliApp) newWhoamiCommand() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// cloudflareState is the part of the state the Cloudflare engine keeps per
+// Worker in $XDG_CONFIG_HOME/backyard/cloudflare/<worker>.json (mode 0600)
+// that this CLI reads.
+type cloudflareState struct {
+	// URL is the Worker's public hub URL.
+	URL string `json:"url"`
+	// DeployToken is the Worker's DEPLOY_TOKEN ("" when unknown).
+	DeployToken string `json:"deployToken"`
+	// WorkersDevURL is the Worker's workers.dev URL (also served next to a
+	// custom domain unless workers.dev is turned off).
+	WorkersDevURL string `json:"workersDevUrl"`
+}
+
+// cloudflareStateDir mirrors the engine: $XDG_CONFIG_HOME (a relative value
+// resolves against base) or ~/.config, then backyard/cloudflare.
+func (a *cliApp) cloudflareStateDir(base string) (string, error) {
+	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
+		return filepath.Join(absFrom(base, x), "backyard", "cloudflare"), nil
+	}
+	home, err := a.deps.homeDir()
+	if err != nil {
+		return "", fmt.Errorf("locate home directory: %w", err)
+	}
+	return filepath.Join(home, ".config", "backyard", "cloudflare"), nil
+}
+
+// savedCloudflareToken returns the deploy token the Cloudflare engine saved
+// for a Worker served at one of urls (its public URL or its workers.dev
+// URL), and the state file holding it, or "".
+func (a *cliApp) savedCloudflareToken(urls ...string) (token, path string) {
+	cwd, err := a.cwd()
+	if err != nil {
+		return "", ""
+	}
+	dir, err := a.cloudflareStateDir(cwd)
+	if err != nil {
+		return "", ""
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "*.json"))
+	for _, m := range matches {
+		b, err := readSmallFile(m)
+		if err != nil {
+			continue
+		}
+		var st cloudflareState
+		if json.Unmarshal(b, &st) != nil || strings.TrimSpace(st.DeployToken) == "" {
+			continue
+		}
+		for _, raw := range []string{st.URL, st.WorkersDevURL} {
+			saved, err := clientconfig.NormalizeURL(raw)
+			if err != nil {
+				continue
+			}
+			for _, u := range urls {
+				if u != "" && strings.EqualFold(strings.TrimSuffix(u, "/"), saved) {
+					return strings.TrimSpace(st.DeployToken), m
+				}
+			}
+		}
+	}
+	return "", ""
 }

@@ -38,12 +38,14 @@ backyard mcp                                 MCP server over stdio, for agents
 backyard config  example | validate [file]   server configuration
 backyard serve   [--config f] [--dev]        run the server
 backyard gateway [--config f]                run only the deploy gateway
-backyard cloudflare setup [--dir d] [--download] [--no-login] [-- setup-args…]   own server on Cloudflare's free plan
+backyard cloudflare setup|domain|access|status [--dir d] [--package p] [--no-login] [options]   own server on Cloudflare's free plan
 backyard version
 ```
 
 Global flags: `--server`, `--gateway`, `--token`, `--profile`, `--json` (machine-readable
-output, handy for agents and scripts), `-v`.
+output, handy for agents and scripts), `-v`. `backyard cloudflare` is the exception: it takes
+`--profile` and `-v`, not `--server`, `--gateway` or `--token`, and `--json` only for `status`
+(`setup`, `domain` and `access` reject it with exit code 2).
 
 ## Log in
 
@@ -198,22 +200,31 @@ Backyard also runs entirely on **Cloudflare's free Workers plan**, in the spirit
 implements the same public contract (URLs, SDK, site API, websockets, deploy gateway), so the
 CLI, this skill and the MCP server work unchanged — `backyard deploy` publishes straight to it.
 
-**1. Set it up once** (needs a Cloudflare account with a `workers.dev` subdomain, plus Node.js 20+):
+**1. Set it up once** (needs a Cloudflare account on the free plan and Node.js 22+; no
+Terraform, and no checkout or build with a release build of the CLI):
 
 ```sh
-backyard cloudflare setup                 # from a checkout of the Backyard repository
-backyard cloudflare setup --download      # no checkout: fetches the matching source release
-cd deploy/cloudflare && npm ci && npm run setup   # the same script, without the backyard CLI
+backyard cloudflare setup                 # installs this CLI release's engine, deploys, logs the CLI in
+npx backyard-cloudflare@latest setup      # the same without the backyard CLI, once it is on npm
+cd deploy/cloudflare && npm ci && npm run setup   # from a checkout of the Backyard repository
 ```
 
-The setup script opens the Cloudflare login in the browser (wrangler) when needed — an agent
-cannot complete that step, so ask the user to run it. It then deploys the Worker (one Worker plus
-SQLite Durable Objects), creates the secrets (`BACKYARD_SECRET` and a `DEPLOY_TOKEN`
-`byd_…`), optionally an R2 bucket (`-- --r2`), and prints the hub URL. `backyard cloudflare
-setup` also **logs the CLI in** to the new server with the deploy token (skip with
-`--no-login`). Re-run it any time to upgrade; earlier choices are remembered. Script options go
-after `--`: `--worker-name <name>`, `--r2`, `--var KEY:VALUE` (e.g. `--var AUTH_MODE:access`),
-`--rotate-token`.
+Before Backyard's first release only the checkout works. A `backyard` from `go install` or a
+source build has no engine pinned: it runs one only inside a checkout, with
+`--dir <checkout>/deploy/cloudflare`, or with `--package` and a release's
+`https://github.com/thasami/backyard/releases/download/v<version>/backyard-cloudflare-<version>.tgz`;
+a release build (`install.sh`) needs none of these. Suggest `npx backyard-cloudflare` only once a
+Backyard release has published it to npm: until then npm serves nothing under that name, or
+something that is not Backyard. Setup opens the Cloudflare login in the browser (wrangler) when
+needed, registers the account's `workers.dev` subdomain if it has none, deploys the Worker (one
+Worker plus SQLite Durable Objects), creates the secrets (`BACKYARD_SECRET` and a `DEPLOY_TOKEN`
+`byd_…`), an R2 bucket when R2 is enabled, and prints the hub URL. `backyard cloudflare setup`
+also **logs the CLI in** to the new server with the deploy token (skip with `--no-login`).
+Re-run it any time to upgrade: every choice is remembered, and a machine without saved state
+adopts the deployed configuration. Options: `--worker-name <name>`, `--no-r2`,
+`--var KEY:VALUE` (e.g. `--var ADMINS:alice@acme.com`), `--rotate-token`,
+`--workers-subdomain <name>` (without a terminal), `--dry-run`; `backyard cloudflare setup
+--help` lists them all.
 
 **2. Deploy sites** exactly as usual:
 
@@ -222,17 +233,42 @@ backyard init my-site && cd my-site
 backyard deploy                     # → https://backyard.<account>.workers.dev/s/my-site/
 ```
 
+**3. Optional: own domain and company login**, one command each (each checks its own result):
+
+```sh
+backyard cloudflare domain add backyard.example.net                 # sites at https://backyard.example.net/s/<site>/
+backyard cloudflare domain add acme-sites.dev --host-mode            # or at https://<site>.acme-sites.dev/
+backyard cloudflare access enable --allow-email-domain example.com   # Cloudflare Access (needs the domain)
+backyard cloudflare status                                           # read-only check of everything
+```
+
+**For agents:** the browser login, the one-time Zero Trust onboarding and the dashboard steps
+that `domain add --host-mode` and `access enable` print without an API token need the user —
+ask them to run the command in their own terminal. Never ask the user to paste Cloudflare tokens
+into the chat: for the automatic path they export `BACKYARD_CF_API_TOKEN` themselves for that
+one command. Without a terminal (`--non-interactive`, CI) a missing answer exits `2` and names
+the flag. Exit `3` means refused for safety, nothing changed: the message names the fix (such as
+`--take-over`, `domain remove` or `access disable`), which needs the user's agreement — never add
+`--take-over`, `--replace-dns-record` or `--confirm-auth-change` on your own. Exit `4` means
+applied, but DNS, a certificate or Access is still pending: re-run the same command later, or
+run `backyard cloudflare status`.
+
 On another machine (or for a teammate who may publish), log in with the deploy token:
 `backyard login --server https://backyard.<account>.workers.dev --token byd_…` (or `--token -`
 to read it from stdin). Without a terminal: fork the repository and run the **Deploy to
 Cloudflare** GitHub Actions workflow (secrets `CLOUDFLARE_API_TOKEN` and
 `CLOUDFLARE_ACCOUNT_ID`, recommended `DEPLOY_TOKEN`; `BACKYARD_SECRET` is optional and generated
-when unset), or use the Terraform in `deploy/terraform/cloudflare`.
+when unset). A CI deploy binds only what the workflow names, so before moving a Worker that
+`setup` made to it, set `vars.BACKYARD_CF_R2_BUCKET` to its R2 bucket (`backyard cloudflare
+status` shows it; without it the files stored in R2 answer `500`) and copy its variables
+(`BASE_DOMAIN`, `URL_MODE`, `AUTH_MODE`, `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`) into
+`vars.BACKYARD_CF_VARS`. Teams that manage Cloudflare as code can use the optional Terraform module in
+`deploy/terraform/cloudflare` for the domain and Access instead.
 
 | Topic | Cloudflare edition |
 |---|---|
-| URLs | Path mode on `https://<worker>.<account>.workers.dev/s/<site>/` by default; a custom domain (path mode) or host mode with a wildcard route `*.<domain>/*`. |
-| Who can open sites | `AUTH_MODE=none` (default): **anyone with the link** can open sites and use their APIs; visitors get anonymous guest identities (`me.anonymous === true`); only holders of the `DEPLOY_TOKEN` can deploy (unless `ALLOW_ANONYMOUS_DEPLOY`). `AUTH_MODE=access`: Cloudflare Access (free for up to 50 users; Okta, Entra ID, Google… as identity providers) protects the hub and every site, `backyard login` uses the browser flow, and `/__backyard/api/deploy/*` (plus `/__backyard/api/tokens` for `backyard token create`) must bypass Access. Any other `AUTH_MODE` value makes the Worker answer `503` until it is fixed. |
+| URLs | Path mode on `https://<worker>.<account>.workers.dev/s/<site>/` by default; a custom domain (`domain add`, path mode) or host mode with a wildcard route `*.<domain>/*` (`domain add --host-mode`). |
+| Who can open sites | `AUTH_MODE=none` (default): **anyone with the link** can open sites and use their APIs; visitors get anonymous guest identities (`me.anonymous === true`); only holders of the `DEPLOY_TOKEN` can deploy (unless `ALLOW_ANONYMOUS_DEPLOY`). `AUTH_MODE=access` (`access enable`): Cloudflare Access (free for up to 50 users; Okta, Entra ID, Google… as identity providers) protects the hub and every site, `backyard login` uses the browser flow, and `/__backyard/api/deploy/*` (plus `/__backyard/api/tokens` for `backyard token create`) must bypass Access. Any other `AUTH_MODE` value makes the Worker answer `503` until it is fixed. |
 | Database & realtime | Per-site Durable Object with SQLite — same query semantics; realtime runs in that object. |
 | Files | Up to 25 MiB per file (95 MiB with the optional R2 bucket); 200 MiB and 2,000 files per site. Files up to 5 MiB live in the Durable Object, bigger ones in R2. |
 | AI | Workers AI (free daily allowance) behind the aliases `smart`, `fast`, `image`, `embed` (configurable with `AI_MODELS`), plus optional Anthropic/OpenAI keys. `max_tokens` is capped at 4096. |
