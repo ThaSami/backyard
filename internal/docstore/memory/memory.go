@@ -143,6 +143,16 @@ func (s *Store) Put(ctx context.Context, site, collection, id string, data map[s
 
 // Update shallow-merges patch into an existing document; see docstore.Store.
 func (s *Store) Update(ctx context.Context, site, collection, id string, patch map[string]any, actor string) (*docstore.Doc, error) {
+	return s.update(ctx, site, collection, id, nil, patch, actor)
+}
+
+// UpdateIf is Update while the document is at rev; see docstore.Store.
+func (s *Store) UpdateIf(ctx context.Context, site, collection, id string, rev docstore.Rev, patch map[string]any, actor string) (*docstore.Doc, error) {
+	return s.update(ctx, site, collection, id, &rev, patch, actor)
+}
+
+// update merges patch, if rev is set only into the document at rev.
+func (s *Store) update(ctx context.Context, site, collection, id string, rev *docstore.Rev, patch map[string]any, actor string) (*docstore.Doc, error) {
 	actor, err := dsutil.CheckWrite(site, collection, id, actor)
 	if err != nil {
 		return nil, err
@@ -161,6 +171,9 @@ func (s *Store) Update(ctx context.Context, site, collection, id string, patch m
 	if !ok {
 		return nil, docstore.ErrNotFound
 	}
+	if rev != nil && !old.At(*rev) {
+		return nil, fmt.Errorf("%w: document %q has changed", docstore.ErrConflict, id)
+	}
 	// Stored documents are never mutated: build a new one. Sharing values
 	// with old.Data is safe for the same reason, and the patch values are
 	// fresh copies made by PreparePatch.
@@ -175,6 +188,16 @@ func (s *Store) Update(ctx context.Context, site, collection, id string, patch m
 
 // Delete removes a document; see docstore.Store.
 func (s *Store) Delete(ctx context.Context, site, collection, id string) (bool, error) {
+	return s.delete(ctx, site, collection, id, nil)
+}
+
+// DeleteIf removes a document while it is at rev; see docstore.Store.
+func (s *Store) DeleteIf(ctx context.Context, site, collection, id string, rev docstore.Rev) (bool, error) {
+	return s.delete(ctx, site, collection, id, &rev)
+}
+
+// delete removes a document, if rev is set only while it is at rev.
+func (s *Store) delete(ctx context.Context, site, collection, id string, rev *docstore.Rev) (bool, error) {
 	if err := dsutil.CheckKey(site, collection, id); err != nil {
 		return false, err
 	}
@@ -184,7 +207,7 @@ func (s *Store) Delete(ctx context.Context, site, collection, id string) (bool, 
 		return false, err
 	}
 	docs := s.collection(site, collection, false)
-	if _, ok := docs[id]; !ok {
+	if d, ok := docs[id]; !ok || (rev != nil && !d.At(*rev)) {
 		return false, nil
 	}
 	delete(docs, id)

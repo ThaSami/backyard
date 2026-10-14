@@ -47,6 +47,23 @@ type Doc struct {
 	Version    int64
 }
 
+// Rev identifies one state of a document: its incarnation (CreatedAt: a
+// document deleted and created again is another one) and its write count
+// within it (Version). UpdateIf and DeleteIf apply only while a document is
+// still at the Rev that was read.
+type Rev struct {
+	Version   int64
+	CreatedAt time.Time
+}
+
+// Rev returns the revision of d.
+func (d *Doc) Rev() Rev { return Rev{Version: d.Version, CreatedAt: d.CreatedAt} }
+
+// At reports whether d is at revision r.
+func (d *Doc) At(r Rev) bool {
+	return d.Version == r.Version && TruncTime(d.CreatedAt).Equal(TruncTime(r.CreatedAt))
+}
+
 // Meta is the "_meta" object of the wire representation.
 type Meta struct {
 	CreatedAt time.Time `json:"created_at"`
@@ -134,8 +151,16 @@ type Store interface {
 	// Update shallow-merges patch into an existing document; nil values delete
 	// keys. Returns ErrNotFound if missing. Must be atomic w.r.t. concurrent updates.
 	Update(ctx context.Context, site, collection, id string, patch map[string]any, actor string) (*Doc, error)
+	// UpdateIf is Update applied only while the document is at rev (a
+	// compare-and-set): ErrConflict when it has been written since, or
+	// deleted and created again; ErrNotFound when it does not exist.
+	UpdateIf(ctx context.Context, site, collection, id string, rev Rev, patch map[string]any, actor string) (*Doc, error)
 	// Delete removes a document. Returns (false, nil) if it did not exist.
 	Delete(ctx context.Context, site, collection, id string) (bool, error)
+	// DeleteIf removes a document only while it is at rev, atomically. It
+	// reports whether it removed it: (false, nil) when the document does
+	// not exist or is at another revision.
+	DeleteIf(ctx context.Context, site, collection, id string, rev Rev) (bool, error)
 	// Query returns matching documents (q must be Normalize'd).
 	Query(ctx context.Context, site, collection string, q Query) (*Page, error)
 	// Collections lists non-empty collection names of a site, sorted

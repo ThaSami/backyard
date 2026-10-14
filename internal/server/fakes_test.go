@@ -332,6 +332,14 @@ func (m *memDocs) Put(ctx context.Context, site, c, id string, data map[string]a
 }
 
 func (m *memDocs) Update(ctx context.Context, site, c, id string, patch map[string]any, actor string) (*docstore.Doc, error) {
+	return m.update(site, c, id, nil, patch, actor)
+}
+
+func (m *memDocs) UpdateIf(ctx context.Context, site, c, id string, rev docstore.Rev, patch map[string]any, actor string) (*docstore.Doc, error) {
+	return m.update(site, c, id, &rev, patch, actor)
+}
+
+func (m *memDocs) update(site, c, id string, rev *docstore.Rev, patch map[string]any, actor string) (*docstore.Doc, error) {
 	if err := m.injected("update"); err != nil {
 		return nil, err
 	}
@@ -341,6 +349,9 @@ func (m *memDocs) Update(ctx context.Context, site, c, id string, patch map[stri
 	if !ok {
 		return nil, docstore.ErrNotFound
 	}
+	if rev != nil && !d.At(*rev) {
+		return nil, docstore.ErrConflict
+	}
 	d.Data = docstore.ApplyPatch(d.Data, patch)
 	d.UpdatedAt, d.UpdatedBy = m.tick(), actor
 	d.Version++
@@ -348,13 +359,21 @@ func (m *memDocs) Update(ctx context.Context, site, c, id string, patch map[stri
 }
 
 func (m *memDocs) Delete(ctx context.Context, site, c, id string) (bool, error) {
+	return m.delete(site, c, id, nil)
+}
+
+func (m *memDocs) DeleteIf(ctx context.Context, site, c, id string, rev docstore.Rev) (bool, error) {
+	return m.delete(site, c, id, &rev)
+}
+
+func (m *memDocs) delete(site, c, id string, rev *docstore.Rev) (bool, error) {
 	if err := m.injected("delete"); err != nil {
 		return false, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cc := m.coll(site, c, false)
-	if _, ok := cc[id]; !ok {
+	if d, ok := cc[id]; !ok || (rev != nil && !d.At(*rev)) {
 		return false, nil
 	}
 	delete(cc, id)

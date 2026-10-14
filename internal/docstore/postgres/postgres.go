@@ -340,6 +340,17 @@ func (s *Store) Put(ctx context.Context, site, collection, id string, data map[s
 // Update shallow-merges patch into an existing document in a single atomic
 // statement; see docstore.Store.
 func (s *Store) Update(ctx context.Context, site, collection, id string, patch map[string]any, actor string) (*docstore.Doc, error) {
+	return s.update(ctx, site, collection, id, nil, patch, actor)
+}
+
+// UpdateIf is Update while the document is at rev, checked by the same
+// statement; see docstore.Store.
+func (s *Store) UpdateIf(ctx context.Context, site, collection, id string, rev docstore.Rev, patch map[string]any, actor string) (*docstore.Doc, error) {
+	return s.update(ctx, site, collection, id, &rev, patch, actor)
+}
+
+// update merges patch, if rev is set only into the document at rev.
+func (s *Store) update(ctx context.Context, site, collection, id string, rev *docstore.Rev, patch map[string]any, actor string) (*docstore.Doc, error) {
 	actor, err := dsutil.CheckWrite(site, collection, id, actor)
 	if err != nil {
 		return nil, err
@@ -362,17 +373,32 @@ func (s *Store) Update(ctx context.Context, site, collection, id string, patch m
 		return nil, err
 	}
 	now := docstore.Now()
-	row := s.pool.QueryRow(ctx,
-		`UPDATE `+s.table+` AS d SET
+	stmt := `UPDATE ` + s.table + ` AS d SET
 		   data = (d.data || $4::jsonb) - $5::text[],
 		   updated_at = $6,
 		   updated_by = $7,
 		   version = d.version + 1
-		 WHERE site = $1 AND collection = $2 AND id = $3
-		 RETURNING `+docColumns,
-		site, collection, id, string(raw), del, now, actor)
+		 WHERE site = $1 AND collection = $2 AND id = $3`
+	args := []any{site, collection, id, string(raw), del, now, actor}
+	if rev != nil {
+		stmt += ` AND d.version = $8 AND d.created_at = $9`
+		args = append(args, rev.Version, docstore.TruncTime(rev.CreatedAt))
+	}
+	row := s.pool.QueryRow(ctx, stmt+` RETURNING `+docColumns, args...)
 	d, err := scanDoc(row, site, collection)
 	if errors.Is(err, pgx.ErrNoRows) {
+		if rev != nil {
+			// Missing, or at another revision: tell them apart.
+			var one int
+			err := s.pool.QueryRow(ctx, `SELECT 1 FROM `+s.table+` WHERE site = $1 AND collection = $2 AND id = $3`,
+				site, collection, id).Scan(&one)
+			switch {
+			case err == nil:
+				return nil, fmt.Errorf("%w: document %q has changed", docstore.ErrConflict, id)
+			case !errors.Is(err, pgx.ErrNoRows):
+				return nil, mapErr("update", err)
+			}
+		}
 		return nil, docstore.ErrNotFound
 	}
 	if err != nil {
@@ -388,6 +414,21 @@ func (s *Store) Delete(ctx context.Context, site, collection, id string) (bool, 
 	}
 	tag, err := s.pool.Exec(ctx,
 		`DELETE FROM `+s.table+` WHERE site = $1 AND collection = $2 AND id = $3`, site, collection, id)
+	if err != nil {
+		return false, mapErr("delete", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// DeleteIf removes a document while it is at rev, in one statement; see
+// docstore.Store.
+func (s *Store) DeleteIf(ctx context.Context, site, collection, id string, rev docstore.Rev) (bool, error) {
+	if err := dsutil.CheckKey(site, collection, id); err != nil {
+		return false, err
+	}
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM `+s.table+` WHERE site = $1 AND collection = $2 AND id = $3 AND version = $4 AND created_at = $5`,
+		site, collection, id, rev.Version, docstore.TruncTime(rev.CreatedAt))
 	if err != nil {
 		return false, mapErr("delete", err)
 	}

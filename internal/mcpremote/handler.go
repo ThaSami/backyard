@@ -151,10 +151,12 @@ type handler struct {
 	usersMu   sync.Mutex
 	users     map[string]*userSlot // users waiting for or holding a slot
 	admitWait time.Duration
-	// bodyGrace and minBodyRate pace bodies (constants but for tests).
-	bodyGrace   time.Duration
-	minBodyRate float64
-	version     string
+	// bodyGrace, minBodyRate and releaseTimeout are constants but for
+	// tests.
+	bodyGrace      time.Duration
+	minBodyRate    float64
+	releaseTimeout time.Duration
+	version        string
 	// publish is Gateway.Publish (replaced by tests).
 	publish func(ctx context.Context, req deploy.PublishRequest) (*deploy.PublishResult, *deploy.PublishError)
 }
@@ -178,7 +180,7 @@ func newHandler(o Options) (*handler, error) {
 		o: o, cfg: o.Config, auth: o.Auth, reg: o.Sites, store: o.Blob, docs: o.Docs, gw: o.Gateway,
 		docsFor: o.DocsFor, log: o.Logger, now: o.Now, cat: cat, version: o.Version,
 		slots: make(chan struct{}, admissionSlots), users: map[string]*userSlot{}, admitWait: admissionWait,
-		bodyGrace: bodyGrace, minBodyRate: minBodyRate,
+		bodyGrace: bodyGrace, minBodyRate: minBodyRate, releaseTimeout: releaseTimeout,
 	}
 	if h.cfg == nil {
 		h.cfg = &config.Config{}
@@ -324,7 +326,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "too_large", tooLarge)
 		return
 	}
-	if r.ContentLength < 0 || r.ContentLength > largeBody {
+	large := r.ContentLength < 0 || r.ContentLength > largeBody
+	if large {
 		release, ok := h.admit(r.Context(), user.ID)
 		if !ok {
 			hdr.Set("Retry-After", "5")
@@ -333,14 +336,20 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer release()
 	}
-	// Authenticated and admitted: the body is paced, and the answer gets
-	// the deadline of a large publish.
+	// Authenticated (and admitted): the answer gets the deadline of a large
+	// publish. A large body is paced; a small one is read under the
+	// server's read timeout.
 	rc := http.NewResponseController(w)
 	start := time.Now()
 	limit := start.Add(requestDeadline)
 	_ = rc.SetWriteDeadline(limit)
-	paced := &pacedBody{ReadCloser: r.Body, rc: rc, start: start, limit: limit, grace: h.bodyGrace, rate: h.minBodyRate, want: r.ContentLength}
-	body, err := io.ReadAll(http.MaxBytesReader(w, paced, h.maxBody))
+	in := r.Body
+	if large {
+		in = &pacedBody{ReadCloser: r.Body, rc: rc, start: start, limit: limit, grace: h.bodyGrace, rate: h.minBodyRate, want: r.ContentLength}
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, in, h.maxBody))
+	// Once it is read, net/http's background read of the connection
+	// inherits the read deadline: the publish's own.
 	_ = rc.SetReadDeadline(limit)
 	if err != nil {
 		var mbe *http.MaxBytesError

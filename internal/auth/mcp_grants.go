@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -21,18 +20,19 @@ import (
 )
 
 // The grant store (SPEC §8.4, §10): one record per consent in
-// _system/_mcp_grants/<gid>, plus the rotation markers of the newest two
-// issued refresh generations in _system/_mcp_rotations/<gid>.<n>. The grant record is the
-// single source of truth: every token check reads it, and revocation
+// _system/_mcp_grants/<gid>, which also holds the newest issued refresh
+// generation. The record is the single source of truth: every token check
+// reads it, every transition is a guarded update of it, and revocation
 // deletes it.
 
 const (
-	grantsCollection    = "_mcp_grants"
-	rotationsCollection = "_mcp_rotations"
-	auditCollection     = "_audit"
-	storeTimeout        = 5 * time.Second
-	prunePageGrants     = 100
-	prunePageRotations  = 500
+	grantsCollection = "_mcp_grants"
+	auditCollection  = "_audit"
+	storeTimeout     = 5 * time.Second
+	prunePageGrants  = 100
+	// rotateAttempts bounds how often rotate decides again after another
+	// transition of the grant came first.
+	rotateAttempts = 4
 )
 
 // Outcomes of rotate.
@@ -52,8 +52,9 @@ type grantUser struct {
 	Anonymous bool
 }
 
-// grantRecord is a stored grant (times are unix seconds; RedeemedAt 0 =
-// not redeemed).
+// grantRecord is a stored grant (times are unix seconds but GenAt, unix
+// ms; RedeemedAt 0 = not redeemed). Gen is the newest issued refresh
+// generation (0 before redemption).
 type grantRecord struct {
 	ID            string
 	User          grantUser
@@ -68,6 +69,8 @@ type grantRecord struct {
 	CodeExp       int64
 	RedeemedAt    int64
 	Exp           int64
+	Gen           int64
+	GenAt         int64
 }
 
 // data returns the document body (the doc id is the gid).
@@ -96,6 +99,9 @@ func (g *grantRecord) data() map[string]any {
 	if g.RedeemedAt > 0 {
 		d["redeemed_at"] = g.RedeemedAt
 	}
+	if g.Gen > 0 {
+		d["gen"], d["gen_at"] = g.Gen, g.GenAt
+	}
 	return d
 }
 
@@ -115,6 +121,8 @@ func grantFromDoc(d *docstore.Doc) (*grantRecord, error) {
 		CodeExp:       intValue(d.Data["code_exp"]),
 		RedeemedAt:    intValue(d.Data["redeemed_at"]),
 		Exp:           intValue(d.Data["exp"]),
+		Gen:           intValue(d.Data["gen"]),
+		GenAt:         intValue(d.Data["gen_at"]),
 	}
 	u, _ := d.Data["user"].(map[string]any)
 	g.User = grantUser{ID: str(u, "id"), Email: str(u, "email"), Name: str(u, "name")}
@@ -212,24 +220,31 @@ func (m *MCP) createGrant(ctx context.Context, g *grantRecord) error {
 
 // loadGrant returns a grant, or nil, nil when it does not exist.
 func (m *MCP) loadGrant(ctx context.Context, gid string) (*grantRecord, error) {
-	if !validGrantID(gid) {
-		return nil, nil
-	}
 	sctx, cancel := storeCtx(ctx)
 	defer cancel()
-	d, err := m.docs.Get(sctx, docstore.SystemSite, grantsCollection, gid)
+	g, _, err := m.readGrant(sctx, gid)
+	return g, err
+}
+
+// readGrant returns a grant and the revision read (nil, {}, nil when it
+// does not exist); ctx bounds the call.
+func (m *MCP) readGrant(ctx context.Context, gid string) (*grantRecord, docstore.Rev, error) {
+	if !validGrantID(gid) {
+		return nil, docstore.Rev{}, nil
+	}
+	d, err := m.docs.Get(ctx, docstore.SystemSite, grantsCollection, gid)
 	if errors.Is(err, docstore.ErrNotFound) {
-		return nil, nil
+		return nil, docstore.Rev{}, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, docstore.Rev{}, err
 	}
 	g, err := grantFromDoc(d)
 	if err != nil {
 		m.log.Warn("auth: ignoring a malformed mcp grant", "grant", shortGID(gid), "error", err)
-		return nil, nil
+		return nil, docstore.Rev{}, nil
 	}
-	return g, nil
+	return g, d.Rev(), nil
 }
 
 // deleteGrant removes a grant; it reports whether it existed.
@@ -241,120 +256,67 @@ func (m *MCP) deleteGrant(ctx context.Context, gid string) (bool, error) {
 
 // rotate is the only state transition of a grant (SPEC §8.4.8). Code redemption
 // calls it with from=0, grace=false; refreshing RT(n) with from=n,
-// grace=true. It returns the outcome and, for ok and grace, the current
-// grant (nil when the grant disappeared concurrently).
+// grace=true. It returns the outcome and, for ok and grace, the grant as it
+// is now.
 //
-// Only the markers of the newest two generations are kept (O(1) state per
-// grant): a refresh of RT(n) deletes marker n-1 before it creates marker
-// n+1, so a presented generation without its marker is an old one, and a
-// redeemed grant proves a replayed code.
+// The grant record holds the newest issued generation (gen, issued at
+// gen_at), and a transition is a guarded update of the record as read
+// (docstore UpdateIf): of concurrent requests exactly one rotates, and the
+// others decide again on the record it wrote (a grace answer, or a reuse).
 func (m *MCP) rotate(ctx context.Context, gid string, from int64, grace bool) (string, *grantRecord, error) {
 	now := m.now()
-	g, err := m.loadGrant(ctx, gid)
-	if err != nil {
-		return "", nil, err
-	}
-	if g == nil || g.Exp <= now.Unix() || (from >= 1 && g.RedeemedAt == 0) {
-		return rotateMissing, nil, nil
-	}
 	sctx, cancel := storeCtx(ctx)
 	defer cancel()
-	reuse := func() (string, *grantRecord, error) {
-		if _, err := m.docs.Delete(sctx, docstore.SystemSite, grantsCollection, gid); err != nil {
+	for range rotateAttempts {
+		g, rev, err := m.readGrant(sctx, gid)
+		if err != nil {
 			return "", nil, err
 		}
-		return rotateReuse, g, nil
-	}
-	hasMarker := func(n int64) (bool, error) {
-		_, err := m.docs.Get(sctx, docstore.SystemSite, rotationsCollection, markerID(gid, n))
-		if errors.Is(err, docstore.ErrNotFound) {
-			return false, nil
+		if g == nil || g.Exp <= now.Unix() || (from >= 1 && g.RedeemedAt == 0) {
+			return rotateMissing, nil, nil
 		}
-		return err == nil, err
-	}
-	switch {
-	case from == 0 && g.RedeemedAt > 0:
-		return reuse() // a replayed code
-	case from >= 1:
-		if ok, err := hasMarker(from); err != nil {
-			return "", nil, err
-		} else if !ok {
-			return reuse() // an old generation, compacted away
+		var patch map[string]any
+		switch {
+		case from == 0 && g.RedeemedAt > 0:
+			return m.revokeReused(sctx, g) // a replayed code
+		case from == 0:
+			// The family's exp is fixed at redemption (created_at + the
+			// token TTL then in force) and never extended.
+			patch = map[string]any{"redeemed_at": now.Unix(), "exp": g.CreatedAt + int64(m.family/time.Second), "gen": 1, "gen_at": now.UnixMilli()}
+		case from == g.Gen:
+			patch = map[string]any{"gen": from + 1, "gen_at": now.UnixMilli()}
+		case grace && from+1 == g.Gen && now.UnixMilli()-g.GenAt <= mcpRefreshGrace.Milliseconds():
+			return rotateGrace, g, nil // re-presented just after its rotation
+		default:
+			return m.revokeReused(sctx, g) // an old generation
 		}
-		if from >= 2 {
-			// Compaction comes first: a failure leaves nothing created.
-			if _, err := m.docs.Delete(sctx, docstore.SystemSite, rotationsCollection, markerID(gid, from-1)); err != nil {
-				return "", nil, err
-			}
-		}
-	}
-	// The family's exp is fixed at redemption (created_at + the token TTL
-	// then in force) and never extended; refresh markers carry it as stored,
-	// so a later, lower auth.token_ttl cannot prune them before the grant.
-	familyExp := g.Exp
-	if from == 0 {
-		familyExp = g.CreatedAt + int64(m.family/time.Second)
-	}
-	marker := map[string]any{"gid": gid, "n": from + 1, "at": now.UnixMilli(), "exp": familyExp}
-	_, err = m.docs.Create(sctx, docstore.SystemSite, rotationsCollection, markerID(gid, from+1), marker, g.User.ID)
-	switch {
-	case err == nil:
-		// The checks above read the store before the Create: a request that
-		// read it before later rotations compacted the markers has just
-		// filled a gap (marker from is gone now, or the code was redeemed).
-		if from == 0 {
-			cur, err := m.loadGrant(ctx, gid)
-			switch {
-			case err != nil:
-				return "", nil, err
-			case cur == nil:
-				return rotateOK, nil, nil // revoked concurrently
-			case cur.RedeemedAt > 0:
-				return reuse()
-			}
-			d, err := m.docs.Update(sctx, docstore.SystemSite, grantsCollection, gid,
-				map[string]any{"redeemed_at": now.Unix(), "exp": familyExp}, g.User.ID)
-			if errors.Is(err, docstore.ErrNotFound) {
-				return rotateOK, nil, nil // revoked concurrently
-			}
-			if err != nil {
-				return "", nil, err
-			}
+		d, err := m.docs.UpdateIf(sctx, docstore.SystemSite, grantsCollection, gid, rev, patch, g.User.ID)
+		switch {
+		case err == nil:
 			if g, err = grantFromDoc(d); err != nil {
 				return "", nil, err
 			}
-		} else if ok, err := hasMarker(from); err != nil {
-			return "", nil, err
-		} else if !ok {
-			return reuse()
-		}
-		return rotateOK, g, nil
-	case !errors.Is(err, docstore.ErrConflict):
-		return "", nil, err
-	}
-	if grace {
-		md, err := m.docs.Get(sctx, docstore.SystemSite, rotationsCollection, markerID(gid, from+1))
-		if err != nil && !errors.Is(err, docstore.ErrNotFound) {
+			return rotateOK, g, nil
+		case errors.Is(err, docstore.ErrNotFound):
+			return rotateMissing, nil, nil // revoked concurrently
+		case !errors.Is(err, docstore.ErrConflict):
 			return "", nil, err
 		}
-		if err == nil && now.UnixMilli()-intValue(md.Data["at"]) <= mcpRefreshGrace.Milliseconds() {
-			next, err := hasMarker(from + 2)
-			switch {
-			case err != nil:
-				return "", nil, err
-			case !next:
-				return rotateGrace, g, nil
-			}
-		}
+		// Another transition came first: decide again on what it wrote.
 	}
-	return reuse()
+	return "", nil, fmt.Errorf("auth: mcp grant %s changed %d times during one rotation", shortGID(gid), rotateAttempts)
 }
 
-// markerID is the document id of rotation marker n of a grant.
-func markerID(gid string, n int64) string { return gid + "." + strconv.FormatInt(n, 10) }
+// revokeReused revokes a grant whose old token was presented again.
+func (m *MCP) revokeReused(ctx context.Context, g *grantRecord) (string, *grantRecord, error) {
+	if _, err := m.docs.Delete(ctx, docstore.SystemSite, grantsCollection, g.ID); err != nil {
+		return "", nil, err
+	}
+	return rotateReuse, g, nil
+}
 
-// startPrune deletes expired grants and rotation markers in the background
-// (best effort, one prune at a time).
+// startPrune deletes expired grants in the background (best effort, one
+// prune at a time).
 func (m *MCP) startPrune() {
 	select {
 	case m.pruneRunning <- struct{}{}:
@@ -371,26 +333,20 @@ func (m *MCP) startPrune() {
 	}()
 }
 
-// prune deletes one page of expired grants and one of expired markers.
+// prune deletes one page of expired grants.
 func (m *MCP) prune(ctx context.Context) {
-	now := float64(m.now().Unix())
-	for _, p := range []struct {
-		coll  string
-		limit int
-	}{{grantsCollection, prunePageGrants}, {rotationsCollection, prunePageRotations}} {
-		q := docstore.Query{Where: []docstore.Filter{{Field: "exp", Op: docstore.OpLt, Value: now}}, Limit: p.limit}
-		if err := q.Normalize(p.limit); err != nil {
-			return
-		}
-		page, err := m.docs.Query(ctx, docstore.SystemSite, p.coll, q)
-		if err != nil {
-			m.log.Debug("auth: mcp prune query failed", "collection", p.coll, "error", err)
-			continue
-		}
-		for _, d := range page.Docs {
-			if _, err := m.docs.Delete(ctx, docstore.SystemSite, p.coll, d.ID); err != nil {
-				m.log.Debug("auth: mcp prune delete failed", "collection", p.coll, "error", err)
-			}
+	q := docstore.Query{Where: []docstore.Filter{{Field: "exp", Op: docstore.OpLt, Value: float64(m.now().Unix())}}, Limit: prunePageGrants}
+	if err := q.Normalize(prunePageGrants); err != nil {
+		return
+	}
+	page, err := m.docs.Query(ctx, docstore.SystemSite, grantsCollection, q)
+	if err != nil {
+		m.log.Debug("auth: mcp prune query failed", "error", err)
+		return
+	}
+	for _, d := range page.Docs {
+		if _, err := m.docs.Delete(ctx, docstore.SystemSite, grantsCollection, d.ID); err != nil {
+			m.log.Debug("auth: mcp prune delete failed", "error", err)
 		}
 	}
 }

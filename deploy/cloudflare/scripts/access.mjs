@@ -699,6 +699,7 @@ export async function runAccessEnable(opts, ctx) {
   // 3. The mode: --team/--aud, API (credential A), or the dashboard (guided).
   let plan = null;
   let saved = false;
+  let upgradeWithoutToken = false;
   const onCreated = () => {
     saved = true;
   };
@@ -727,6 +728,8 @@ export async function runAccessEnable(opts, ctx) {
     let ask = !remembered || allowChanged;
     // So does a bypass application this tool made that lacks paths (one of an
     // earlier version, before the Claude connector's four): found at the edge.
+    // Without a token the verification below still waits for them (added in
+    // the dashboard meanwhile, or just now and not yet at the edge).
     let missing = [];
     if (!ask && remembered?.source === "api") {
       missing = (await accessEdgeFailures({ host, mode, team: remembered.team, aud: remembered.aud, worker: w })).missing;
@@ -737,14 +740,7 @@ export async function runAccessEnable(opts, ctx) {
       const r = await apiMode(ctx, state, { admin, host, mode, allow, explicit, onCreated });
       if (r) plan = { ...r, source: "api" };
     }
-    if (!plan && missing.length) {
-      throw new CliError(
-        EXIT.USAGE,
-        `the Access application "${accessNames(w).bypassApp}" lacks paths this version needs (${missing.join(", ")}). ` +
-          `Updating it needs an API token with ${ACCESS_TOKEN_PERMISSIONS}: set BACKYARD_CF_API_TOKEN (it is never stored) and re-run, ` +
-          `or add these destinations to it in the dashboard (Zero Trust → Access → Applications → "${accessNames(w).bypassApp}" → Destinations) and re-run (if you just did, give it a minute). Nothing was changed.`,
-      );
-    }
+    upgradeWithoutToken = !plan && missing.length > 0;
     if (!plan && remembered && allowChanged) {
       // The remembered team and AUD would verify fine, but the policy would keep the old list.
       const where = remembered.source === "api" ? `Policies → "${accessNames(w).allowPolicy}"` : "Applications → the hub's application → Policies";
@@ -764,11 +760,23 @@ export async function runAccessEnable(opts, ctx) {
   const verify = async () => {
     const f = await accessEdgeFailures({ host, mode, team, aud, worker: w });
     const failures = [...f.certs, ...f.redirect, ...f.wildcard, ...f.bypass, ...f.connector];
-    return { done: failures.length === 0, failures };
+    return { done: failures.length === 0, failures, missing: f.missing };
   };
   const v = await waitFor(verify, { timeoutSec: opts.wait ?? VERIFY_WAIT, intervalSec: 5, onPending: progress("waiting for Cloudflare Access") });
   if (v.failures.length) {
     if (saved) ctx.writeResult(state, { previousUrl });
+    if (upgradeWithoutToken && v.missing.length) {
+      // The bypass application this tool made still lacks paths, and there was no token to update it.
+      const others = v.failures.filter((f) => !f.startsWith("the bypass application is missing "));
+      throw new CliError(
+        EXIT.PENDING,
+        `the Access application "${accessNames(w).bypassApp}" lacks paths this version needs (${v.missing.join(", ")}), so the Worker was not changed. ` +
+          `Updating it needs an API token with ${ACCESS_TOKEN_PERMISSIONS}: set BACKYARD_CF_API_TOKEN (it is never stored) and re-run, ` +
+          `or add these destinations to it in the dashboard (Zero Trust → Access → Applications → "${accessNames(w).bypassApp}" → Destinations) and re-run (if you just did, give it a minute).` +
+          (others.length ? `\nAlso not ready:\n${others.map((f) => `  - ${f}`).join("\n")}` : ""),
+        { applied: plan.applied },
+      );
+    }
     throw new CliError(
       EXIT.PENDING,
       `Cloudflare Access in front of https://${host} is not ready, so the Worker was not changed:\n${v.failures.map((f) => `  - ${f}`).join("\n")}\n` +

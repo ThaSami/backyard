@@ -509,6 +509,56 @@ func (s *Store) Update(ctx context.Context, site, collection, id string, patch m
 	}
 }
 
+// UpdateIf is Update while the document is at rev: the item read must be at
+// rev, and the write is conditioned on it being unchanged; see
+// docstore.Store.
+func (s *Store) UpdateIf(ctx context.Context, site, collection, id string, rev docstore.Rev, patch map[string]any, actor string) (*docstore.Doc, error) {
+	actor, err := dsutil.CheckWrite(site, collection, id, actor)
+	if err != nil {
+		return nil, err
+	}
+	p, err := dsutil.PreparePatch(patch)
+	if err != nil {
+		return nil, err
+	}
+	changed := fmt.Errorf("%w: document %q has changed", docstore.ErrConflict, id)
+	cur, item, err := s.getRawItem(ctx, site, collection, id)
+	if err != nil {
+		return nil, err
+	}
+	if !cur.At(rev) {
+		return nil, changed
+	}
+	merged, raw, err := dsutil.MergePatch(cur.Data, p)
+	if err != nil {
+		return nil, err
+	}
+	next := *cur
+	next.Data = merged
+	next.UpdatedAt = docstore.Now()
+	next.UpdatedBy = actor
+	next.Version = cur.Version + 1
+	cond, names, values := unchangedCondition(item)
+	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:                 aws.String(s.table),
+		Item:                      docItem(&next, raw),
+		ConditionExpression:       aws.String(cond),
+		ExpressionAttributeNames:  names,
+		ExpressionAttributeValues: values,
+	})
+	if err == nil {
+		return &next, nil
+	}
+	if !isConditionFailed(err) {
+		return nil, mapErr("update", err)
+	}
+	// Written since the read, or deleted: tell them apart.
+	if _, err := s.getItem(ctx, site, collection, id); err != nil {
+		return nil, err
+	}
+	return nil, changed
+}
+
 // Delete removes a document; see docstore.Store.
 func (s *Store) Delete(ctx context.Context, site, collection, id string) (bool, error) {
 	if err := dsutil.CheckKey(site, collection, id); err != nil {
@@ -524,6 +574,31 @@ func (s *Store) Delete(ctx context.Context, site, collection, id string) (bool, 
 	}
 	if len(out.Attributes) == 0 {
 		return false, nil
+	}
+	s.bumpCounter(ctx, site, collection, -1)
+	return true, nil
+}
+
+// DeleteIf removes a document while it is at rev, with one conditional
+// DeleteItem; see docstore.Store.
+func (s *Store) DeleteIf(ctx context.Context, site, collection, id string, rev docstore.Rev) (bool, error) {
+	if err := dsutil.CheckKey(site, collection, id); err != nil {
+		return false, err
+	}
+	_, err := s.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName:                aws.String(s.table),
+		Key:                      key(site, collection, id),
+		ConditionExpression:      aws.String("#v = :v AND #ca = :ca"),
+		ExpressionAttributeNames: map[string]string{"#v": attrVersion, "#ca": attrCreatedAt},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":v": attrN(rev.Version), ":ca": attrN(docstore.TruncTime(rev.CreatedAt).UnixNano()),
+		},
+	})
+	if isConditionFailed(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, mapErr("delete", err)
 	}
 	s.bumpCounter(ctx, site, collection, -1)
 	return true, nil

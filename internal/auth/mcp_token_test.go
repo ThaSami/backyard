@@ -314,9 +314,9 @@ func TestMCPRefresh(t *testing.T) {
 	})
 }
 
-// A lower auth.token_ttl after redemption must not shorten the rotation
-// markers of an existing family: they carry the grant's stored exp, so
-// pruning keeps them and a replayed rotated refresh token still revokes.
+// A lower auth.token_ttl after redemption must not shorten an existing
+// family: its exp is fixed at redemption, so pruning keeps the grant (and
+// its generation) and a replayed rotated refresh token still revokes.
 func TestMCPRefreshReuseAfterTTLChange(t *testing.T) {
 	storeVariants(t, func(t *testing.T, opts ...func(*Options)) {
 		e := newMCPEnv(t, ModeNone, nil, opts...)
@@ -340,16 +340,8 @@ func TestMCPRefreshReuseAfterTTLChange(t *testing.T) {
 		e.code(newBrowser(), newFlow(id, loopbackCB)) // triggers a prune
 		e.m.waitBackground()
 
-		q := docstore.Query{Where: []docstore.Filter{{Field: "gid", Op: docstore.OpEq, Value: gid}}, Limit: 100}
-		_ = q.Normalize(100)
-		page, err := e.docs.Query(context.Background(), docstore.SystemSite, rotationsCollection, q)
-		if err != nil || len(page.Docs) != 2 {
-			t.Fatalf("rotation markers after pruning: %d %v (want the newest two)", len(page.Docs), err)
-		}
-		for _, d := range page.Docs {
-			if intValue(d.Data["exp"]) != g.Exp {
-				t.Errorf("marker %s exp = %v, want the grant's %d", d.ID, d.Data["exp"], g.Exp)
-			}
+		if g2, err := e.m.loadGrant(context.Background(), gid); err != nil || g2 == nil || g2.Exp != g.Exp || g2.Gen != 3 {
+			t.Fatalf("grant after pruning = %+v, %v; want exp %d (fixed at redemption) and gen 3", g2, err, g.Exp)
 		}
 
 		e.clock.Advance(2 * time.Minute)
@@ -363,10 +355,10 @@ func TestMCPRefreshReuseAfterTTLChange(t *testing.T) {
 	})
 }
 
-// Rotation keeps O(1) state per grant: the markers of the newest two
-// generations. Reuse detection and the grace window work as before, and a
-// replayed code still revokes after its marker is gone.
-func TestMCPRefreshCompactsMarkers(t *testing.T) {
+// Rotation keeps O(1) state per grant: the grant record itself holds the
+// newest generation. Reuse detection and the grace window work as ever, and
+// a replayed code revokes after any number of refreshes.
+func TestMCPRefreshKeepsOneRecord(t *testing.T) {
 	storeVariants(t, func(t *testing.T, opts ...func(*Options)) {
 		e := newMCPEnv(t, ModeNone, nil, opts...)
 		f := newFlow(e.register("App", loopbackCB), loopbackCB)
@@ -377,28 +369,18 @@ func TestMCPRefreshCompactsMarkers(t *testing.T) {
 		for n := 1; n <= 20; n++ {
 			rts = append(rts, jsonBody(t, e.refresh(f, rts[n], nil))["refresh_token"].(string))
 		}
-		markers := func() []string {
-			q := docstore.Query{Where: []docstore.Filter{{Field: "gid", Op: docstore.OpEq, Value: gid}}, Limit: 100}
-			_ = q.Normalize(100)
-			page, err := e.docs.Query(context.Background(), docstore.SystemSite, rotationsCollection, q)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var ids []string
-			for _, d := range page.Docs {
-				ids = append(ids, d.ID)
-			}
-			slices.Sort(ids)
-			return ids
+		colls, err := e.docs.Collections(context.Background(), docstore.SystemSite)
+		if err != nil || !slices.Equal(colls, []string{auditCollection, grantsCollection}) {
+			t.Fatalf("system collections after 20 refreshes = %v, %v; want the audit log and the grant", colls, err)
 		}
-		if got := markers(); !slices.Equal(got, []string{markerID(gid, 20), markerID(gid, 21)}) {
-			t.Fatalf("rotation markers after 20 refreshes = %v, want the newest two", got)
+		if g, _ := e.m.loadGrant(context.Background(), gid); g == nil || g.Gen != 21 || e.grantCount() != 1 {
+			t.Fatalf("grant after 20 refreshes = %+v (%d grants), want gen 21", g, e.grantCount())
 		}
 		// RT(20) again within the grace window: the same RT(21).
 		if g := jsonBody(t, e.refresh(f, rts[20], nil)); g["refresh_token"] != rts[21] {
 			t.Fatalf("grace = %v, want RT(21)", g["refresh_token"])
 		}
-		// The code again: a replay, whose marker is long gone.
+		// The code again: a replay.
 		oauthErr(t, e.exchange(f, code, nil), http.StatusBadRequest, "invalid_grant")
 		if e.grantCount() != 0 {
 			t.Fatal("a replayed code did not revoke the grant")
@@ -407,7 +389,7 @@ func TestMCPRefreshCompactsMarkers(t *testing.T) {
 			t.Errorf("audit = %v", acts)
 		}
 
-		// An old generation whose marker was compacted away is a reuse.
+		// An old generation is a reuse.
 		f2 := newFlow(f.clientID, loopbackCB)
 		_, r1 := e.tokens(newBrowser(), f2)
 		r := r1
@@ -422,49 +404,72 @@ func TestMCPRefreshCompactsMarkers(t *testing.T) {
 	})
 }
 
-// A refresh that read the grant before later rotations compacted the
-// markers must not fill a gap: it is a reuse.
-func TestMCPRotateStaleGap(t *testing.T) {
-	e := newMCPEnv(t, ModeNone, nil)
-	f := newFlow(e.register("App", loopbackCB), loopbackCB)
-	_, r1 := e.tokens(newBrowser(), f)
-	p, _ := e.m.parseRefresh(r1)
-	ctx := context.Background()
-	r := r1
-	for range 4 {
-		r = jsonBody(t, e.refresh(f, r, nil))["refresh_token"].(string)
-	}
-	// Markers {4, 5}. A request presenting RT(2) that had seen marker 2
-	// (before it was compacted) creates marker 3 now: the re-check of
-	// marker 2 finds it gone.
-	e.clock.Advance(2 * time.Minute)
-	if _, err := e.docs.Create(ctx, docstore.SystemSite, rotationsCollection, markerID(p.G, 2), map[string]any{"gid": p.G, "n": 2, "at": e.clock.Now().UnixMilli(), "exp": e.clock.Now().Add(time.Hour).Unix()}, "x"); err != nil {
-		t.Fatal(err)
-	}
-	e.m.waitBackground() // the prune of the consent reads m.docs
-	e.m.docs = &deletingDocs{Store: e.docs, id: markerID(p.G, 2), after: markerID(p.G, 3)}
-	out, _, err := e.m.rotate(ctx, p.G, 2, true)
-	if err != nil || out != rotateReuse {
-		t.Fatalf("stale rotate = %q %v, want reuse", out, err)
-	}
-	if g, _ := e.m.loadGrant(ctx, p.G); g != nil {
-		t.Fatal("the grant survived a stale rotation")
-	}
+// A rotation that read the grant before another transition landed decides
+// again on what that one wrote: RT(n) that lost to one rotation of RT(n) gets
+// the grace answer, one that lost to two rotations is a reuse, and one whose
+// grant was revoked in between is missing.
+func TestMCPRotateDecidesAgain(t *testing.T) {
+	storeVariants(t, func(t *testing.T, opts ...func(*Options)) {
+		e := newMCPEnv(t, ModeNone, nil, opts...)
+		f := newFlow(e.register("App", loopbackCB), loopbackCB)
+		ctx := context.Background()
+		connect := func() (gid string) {
+			_, r1 := e.tokens(newBrowser(), f)
+			p, _ := e.m.parseRefresh(r1)
+			e.m.waitBackground() // the prune of the consent reads m.docs
+			return p.G
+		}
+		raw := e.m.docs
+		defer func() { e.m.docs = raw }()
+		race := func(gid string, before func()) (string, *grantRecord) {
+			e.m.docs = &beforeUpdateIf{Store: raw, hook: before}
+			defer func() { e.m.docs = raw }()
+			out, g, err := e.m.rotate(ctx, gid, 1, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return out, g
+		}
+		rotate := func(gid string, from int64) {
+			if out, _, err := e.m.rotate(ctx, gid, from, true); err != nil || out != rotateOK {
+				t.Fatalf("rotate(%d) = %q, %v", from, out, err)
+			}
+		}
+
+		gid := connect()
+		if out, g := race(gid, func() { rotate(gid, 1) }); out != rotateGrace || g == nil || g.Gen != 2 {
+			t.Fatalf("lost to one rotation = %q %+v, want grace at gen 2", out, g)
+		}
+		gid = connect()
+		if out, _ := race(gid, func() { rotate(gid, 1); rotate(gid, 2) }); out != rotateReuse {
+			t.Fatalf("lost to two rotations = %q, want reuse", out)
+		}
+		if g, _ := e.m.loadGrant(ctx, gid); g != nil {
+			t.Fatal("the grant survived a reuse")
+		}
+		gid = connect()
+		if out, _ := race(gid, func() {
+			if _, err := e.m.deleteGrant(ctx, gid); err != nil {
+				t.Fatal(err)
+			}
+		}); out != rotateMissing {
+			t.Fatalf("revoked in between = %q, want missing", out)
+		}
+	})
 }
 
-// deletingDocs deletes document id of _mcp_rotations right after document
-// after is created there (another request's compaction landing in between).
-type deletingDocs struct {
+// beforeUpdateIf runs its hook once, before the first guarded update.
+type beforeUpdateIf struct {
 	docstore.Store
-	id, after string
+	hook func()
 }
 
-func (d *deletingDocs) Create(ctx context.Context, site, collection, id string, data map[string]any, actor string) (*docstore.Doc, error) {
-	doc, err := d.Store.Create(ctx, site, collection, id, data, actor)
-	if err == nil && collection == rotationsCollection && id == d.after {
-		_, _ = d.Store.Delete(ctx, site, collection, d.id)
+func (b *beforeUpdateIf) UpdateIf(ctx context.Context, site, collection, id string, rev docstore.Rev, patch map[string]any, actor string) (*docstore.Doc, error) {
+	if f := b.hook; f != nil {
+		b.hook = nil
+		f()
 	}
-	return doc, err
+	return b.Store.UpdateIf(ctx, site, collection, id, rev, patch, actor)
 }
 
 func TestMCPRefreshGraceWindow(t *testing.T) {
@@ -905,18 +910,12 @@ func TestMCPPrune(t *testing.T) {
 		if e.grantCount() != 2 { // the live one and the new pending one
 			t.Fatalf("after pruning: %d grants", e.grantCount())
 		}
-		// Expired families and their rotation markers go as well.
+		// Expired families go as well.
 		e.clock.Advance(721 * time.Hour)
 		e.code(newBrowser(), newFlow(id, loopbackCB))
 		e.m.waitBackground()
 		if e.grantCount() != 1 {
 			t.Fatalf("after the family expired: %d grants", e.grantCount())
-		}
-		q := docstore.Query{Limit: 100}
-		_ = q.Normalize(100)
-		page, err := e.docs.Query(context.Background(), docstore.SystemSite, rotationsCollection, q)
-		if err != nil || len(page.Docs) != 0 {
-			t.Fatalf("rotation markers left: %d %v", len(page.Docs), err)
 		}
 		_ = rt
 	})

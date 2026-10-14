@@ -56,6 +56,8 @@ func Run(t *testing.T, newStore func(t *testing.T) docstore.Store) {
 		{"Update", testUpdate},
 		{"UpdateNotFound", testUpdateNotFound},
 		{"Delete", testDelete},
+		{"GuardedWrites", testGuardedWrites},
+		{"ConcurrentGuardedWrites", testConcurrentGuardedWrites},
 		{"Filters", testFilters},
 		{"SystemFieldFilters", testSystemFieldFilters},
 		{"OrderNumbers", testOrderNumbers},
@@ -529,6 +531,98 @@ func testDelete(t *testing.T, s docstore.Store) {
 	d := mustCreate(t, s, site, "c", "d1", doc{"again": true}, "")
 	if d.Version != 1 {
 		t.Errorf("re-created version = %d", d.Version)
+	}
+}
+
+// testGuardedWrites covers UpdateIf and DeleteIf: they apply only while the
+// document is at the revision read, also across a delete and re-create.
+func testGuardedWrites(t *testing.T, s docstore.Store) {
+	site := newSite(t)
+	ctx := newCtx(t)
+	c := mustCreate(t, s, site, "c", "g", doc{"a": 1}, "alice")
+	u, err := s.UpdateIf(ctx, site, "c", "g", c.Rev(), doc{"b": 2}, "bob")
+	if err != nil {
+		t.Fatalf("UpdateIf at the current revision: %v", err)
+	}
+	assertData(t, "UpdateIf", u.Data, doc{"a": 1, "b": 2})
+	if u.Version != 2 || !u.CreatedAt.Equal(c.CreatedAt) || u.UpdatedBy != "bob" || !u.At(mustGet(t, s, site, "c", "g").Rev()) {
+		t.Errorf("UpdateIf metadata = %+v", u)
+	}
+	// The revision read before that write is stale now.
+	_, err = s.UpdateIf(ctx, site, "c", "g", c.Rev(), doc{"c": 3}, "")
+	assertIs(t, "UpdateIf at a stale revision", err, docstore.ErrConflict)
+	if ok, err := s.DeleteIf(ctx, site, "c", "g", c.Rev()); ok || err != nil {
+		t.Fatalf("DeleteIf at a stale revision = %v, %v; want false, nil", ok, err)
+	}
+	g := mustGet(t, s, site, "c", "g")
+	assertData(t, "after stale guarded writes", g.Data, doc{"a": 1, "b": 2})
+	if g.Version != 2 {
+		t.Errorf("version after stale guarded writes = %d", g.Version)
+	}
+	// Deleted and created again: the first incarnation's revisions match nothing.
+	if ok, err := s.DeleteIf(ctx, site, "c", "g", g.Rev()); !ok || err != nil {
+		t.Fatalf("DeleteIf at the current revision = %v, %v", ok, err)
+	}
+	_, err = s.UpdateIf(ctx, site, "c", "g", g.Rev(), doc{"c": 3}, "")
+	assertIs(t, "UpdateIf of a deleted document", err, docstore.ErrNotFound)
+	if ok, err := s.DeleteIf(ctx, site, "c", "g", g.Rev()); ok || err != nil {
+		t.Fatalf("DeleteIf of a deleted document = %v, %v; want false, nil", ok, err)
+	}
+	again := mustCreate(t, s, site, "c", "g", doc{"again": true}, "")
+	if again.Version != c.Version || again.CreatedAt.Equal(c.CreatedAt) {
+		t.Fatalf("re-created = %+v, first = %+v", again, c)
+	}
+	_, err = s.UpdateIf(ctx, site, "c", "g", c.Rev(), doc{"c": 3}, "")
+	assertIs(t, "UpdateIf at the first incarnation's revision", err, docstore.ErrConflict)
+	if ok, err := s.DeleteIf(ctx, site, "c", "g", c.Rev()); ok || err != nil {
+		t.Fatalf("DeleteIf at the first incarnation's revision = %v, %v; want false, nil", ok, err)
+	}
+	assertData(t, "the second incarnation", mustGet(t, s, site, "c", "g").Data, doc{"again": true})
+	_, err = s.UpdateIf(ctx, site, "c", "nope", again.Rev(), doc{}, "")
+	assertIs(t, "UpdateIf missing", err, docstore.ErrNotFound)
+	if _, err := s.Get(ctx, site, "c", "nope"); !errors.Is(err, docstore.ErrNotFound) {
+		t.Errorf("UpdateIf created a document: %v", err)
+	}
+}
+
+// testConcurrentGuardedWrites: of the writers that read one revision,
+// exactly one guarded write applies.
+func testConcurrentGuardedWrites(t *testing.T, s docstore.Store) {
+	site := newSite(t)
+	d := mustCreate(t, s, site, "c", "hot", doc{}, "")
+	const n = 10
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	won, conflicts := 0, 0
+	for i := range n {
+		wg.Go(func() {
+			var err error
+			if i%2 == 0 {
+				_, err = s.UpdateIf(newCtx(t), site, "c", "hot", d.Rev(), doc{"w": i}, "")
+			} else {
+				var ok bool
+				if ok, err = s.DeleteIf(newCtx(t), site, "c", "hot", d.Rev()); err == nil && !ok {
+					err = docstore.ErrConflict
+				}
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				won++
+			case errors.Is(err, docstore.ErrConflict), errors.Is(err, docstore.ErrNotFound):
+				conflicts++
+			default:
+				t.Errorf("guarded write %d: %v", i, err)
+			}
+		})
+	}
+	wg.Wait()
+	if won != 1 || conflicts != n-1 {
+		t.Errorf("concurrent guarded writes: %d applied, %d refused; want 1 and %d", won, conflicts, n-1)
+	}
+	if got, err := s.Get(newCtx(t), site, "c", "hot"); err == nil && got.Version != 2 {
+		t.Errorf("after one guarded update: version %d", got.Version)
 	}
 }
 
@@ -1428,6 +1522,17 @@ func testWithLimits(t *testing.T, base docstore.Store) {
 	assertIs(t, "Update growing past max size", err, docstore.ErrTooLarge)
 	_, err = s.Update(ctx, site, "c", "nope", doc{"a": 1}, "")
 	assertIs(t, "Update missing via limits", err, docstore.ErrNotFound)
+	d1, err := base.Get(ctx, site, "c", "d1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.UpdateIf(ctx, site, "c", "d1", d1.Rev(), doc{"pad": strings.Repeat("z", 250)}, "")
+	assertIs(t, "UpdateIf growing past max size", err, docstore.ErrTooLarge)
+	if _, err := s.UpdateIf(ctx, site, "c", "d1", d1.Rev(), doc{"guarded": true}, ""); err != nil {
+		t.Errorf("UpdateIf at quota: %v", err)
+	}
+	_, err = s.UpdateIf(ctx, site, "c", "d1", d1.Rev(), doc{}, "")
+	assertIs(t, "UpdateIf at a stale revision via limits", err, docstore.ErrConflict)
 	if d, err := base.Get(ctx, site, "c", "d1"); err != nil {
 		t.Fatal(err)
 	} else if _, ok := d.Data["pad"]; ok {
@@ -1447,6 +1552,14 @@ func testWithLimits(t *testing.T, base docstore.Store) {
 	}
 	_, err = s.Create(ctx, site, "c", "d5", doc{}, "")
 	assertIs(t, "Create over quota again", err, docstore.ErrQuota)
+	// So does a guarded delete.
+	d4 := mustGet(t, base, site, "c", "d4")
+	if ok, err := s.DeleteIf(ctx, site, "c", "d4", d4.Rev()); err != nil || !ok {
+		t.Fatalf("DeleteIf = %v, %v", ok, err)
+	}
+	if _, err := s.Create(ctx, site, "c", "d5", doc{}, ""); err != nil {
+		t.Errorf("Create after DeleteIf freed quota: %v", err)
+	}
 	if err := s.DeleteSite(ctx, site); err != nil {
 		t.Fatal(err)
 	}

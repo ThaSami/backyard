@@ -298,10 +298,11 @@ describe("backyard-cloudflare access enable (API mode)", () => {
     reset();
     sb.calls();
     sb.requests();
-    // No token and no terminal: refused with the remedy, nothing changed.
+    // No token and no terminal: still missing once the wait is over, so it
+    // ends pending with the remedy, and nothing is changed.
     for (const args of [["access", "enable", "--wait", "0"], ENABLE]) {
       r = await sb.run(args);
-      assert.equal(r.code, 2, r.out);
+      assert.equal(r.code, 4, r.out);
       assert.match(r.out, /BACKYARD_CF_API_TOKEN/);
       assert.match(r.out, new RegExp(`"${N.bypassApp.replace(/[()]/g, "\\$&")}"`));
       for (const p of CONNECTOR_RULES) assert.ok(r.out.includes(HOST + p), `names ${HOST}${p}:\n${r.out}`);
@@ -322,6 +323,29 @@ describe("backyard-cloudflare access enable (API mode)", () => {
     const w = writesOf(sb.requests());
     assert.deepEqual(w.map((x) => `${x.method} ${x.path}`), [`PUT /accounts/acc1/access/apps/${ids.bypassAppId}`]);
     assert.deepEqual(w[0].body.destinations.map((d) => d.uri), ACCESS_BYPASS_PATHS.map((p) => HOST + p));
+    assert.deepEqual(sb.state().access, ids);
+  });
+
+  it("waits for destinations added in the dashboard to reach the edge, without a token", async () => {
+    const sb = await accessSandbox();
+    let r = await sb.run(ENABLE, WITH_ADMIN);
+    assert.equal(r.code, 0, r.out);
+    const ids = sb.state().access;
+    const full = sb.cf().access.acc1.apps.find((a) => a.id === ids.bypassAppId).destinations;
+    const old = ACCESS_BYPASS_PATHS.filter((p) => !CONNECTOR_RULES.includes(p));
+    sb.updateCf((s) => (s.access.acc1.apps.find((a) => a.id === ids.bypassAppId).destinations = old.map((p) => ({ type: "public", uri: HOST + p }))));
+    sb.calls();
+    sb.requests();
+    // The person adds the four destinations in the dashboard; Access takes a few seconds to apply them.
+    const added = setTimeout(() => sb.updateCf((s) => (s.access.acc1.apps.find((a) => a.id === ids.bypassAppId).destinations = full)), 3000);
+    try {
+      r = await sb.run(["access", "enable", "--wait", "60"]);
+    } finally {
+      clearTimeout(added);
+    }
+    assert.equal(r.code, 0, r.out);
+    assert.deepEqual(writesOf(accessReqs(sb.requests())), []);
+    assert.ok(deployOf(sb.calls()), r.out);
     assert.deepEqual(sb.state().access, ids);
   });
 

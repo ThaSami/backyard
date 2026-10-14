@@ -142,8 +142,41 @@ func (l *limitedStore) Update(ctx context.Context, site, collection, id string, 
 	return l.Store.Update(ctx, site, collection, id, patch, actor)
 }
 
+func (l *limitedStore) UpdateIf(ctx context.Context, site, collection, id string, rev Rev, patch map[string]any, actor string) (*Doc, error) {
+	patch, err := PrepareData(patch, 0)
+	if err != nil {
+		return nil, err
+	}
+	if l.maxDocBytes > 0 {
+		// The document must be at rev anyway, so the size checked is exact.
+		cur, err := l.Store.Get(ctx, site, collection, id)
+		if err != nil {
+			return nil, err
+		}
+		if !cur.At(rev) {
+			return nil, fmt.Errorf("%w: document %q has changed", ErrConflict, id)
+		}
+		if _, err := PrepareData(ApplyPatch(cur.Data, patch), l.maxDocBytes); err != nil {
+			return nil, err
+		}
+	}
+	return l.Store.UpdateIf(ctx, site, collection, id, rev, patch, actor)
+}
+
 func (l *limitedStore) Delete(ctx context.Context, site, collection, id string) (bool, error) {
 	ok, err := l.Store.Delete(ctx, site, collection, id)
+	l.deleted(site, ok, err)
+	return ok, err
+}
+
+func (l *limitedStore) DeleteIf(ctx context.Context, site, collection, id string, rev Rev) (bool, error) {
+	ok, err := l.Store.DeleteIf(ctx, site, collection, id, rev)
+	l.deleted(site, ok, err)
+	return ok, err
+}
+
+// deleted keeps the cached count current after a delete.
+func (l *limitedStore) deleted(site string, ok bool, err error) {
 	if err == nil && ok {
 		l.mu.Lock()
 		if c, cached := l.counts[site]; cached && c.n > 0 {
@@ -152,7 +185,6 @@ func (l *limitedStore) Delete(ctx context.Context, site, collection, id string) 
 		}
 		l.mu.Unlock()
 	}
-	return ok, err
 }
 
 func (l *limitedStore) DeleteSite(ctx context.Context, site string) error {

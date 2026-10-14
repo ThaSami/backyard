@@ -440,6 +440,31 @@ func TestBodyPace(t *testing.T) {
 	}
 }
 
+// A body of at most 1 MiB is not paced: sent slower than the pace of large
+// bodies, it is read in full within the server's read timeout.
+func TestSmallBodyKeepsServerTimeout(t *testing.T) {
+	e := newTenv(t)
+	e.h.bodyGrace, e.h.minBodyRate = 200*time.Millisecond, 1<<20
+	srv := httptest.NewUnstartedServer(e.h)
+	srv.Config.ReadTimeout = 5 * time.Second
+	srv.Start()
+	t.Cleanup(srv.Close)
+	ping := `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":"`
+	small := ping + strings.Repeat("a", 512<<10-len(ping)-4) + `"}}`
+	chunks := []string{}
+	for i := 0; i < len(small); i += 16 << 10 {
+		chunks = append(chunks, small[i:min(i+16<<10, len(small))])
+	}
+	// 32 chunks, one every 60 ms: about 270 KiB/s, behind the pace.
+	res, d, err := rawPost(t, srv.Listener.Addr().String(), aliceToken, len(small), chunks, 60*time.Millisecond)
+	if err != nil {
+		t.Fatalf("no answer after %v: %v", d, err)
+	}
+	if b, _ := io.ReadAll(res.Body); res.StatusCode != http.StatusOK || !strings.Contains(string(b), `"result":{}`) {
+		t.Fatalf("a small slow body after %v: %d %s", d, res.StatusCode, b)
+	}
+}
+
 // deadlineWriter records the deadlines set through http.ResponseController.
 type deadlineWriter struct {
 	*httptest.ResponseRecorder
@@ -474,18 +499,34 @@ func TestDeadlinesBeforeBody(t *testing.T) {
 	if w.Code != http.StatusOK || !read {
 		t.Fatalf("status %d, body read %v", w.Code, read)
 	}
-	if !w.readSet || !w.writeSet || !w.readBefore {
+	// A small body is read under the server's read timeout (no read
+	// deadline before it); the answer, and the connection once the body is
+	// read, get 5 minutes.
+	if !w.readSet || !w.writeSet || w.readBefore {
 		t.Fatalf("deadlines: read %v (before body %v), write %v", w.readSet, w.readBefore, w.writeSet)
-	}
-	// The body is paced (due within the grace for its first bytes); the
-	// answer, and the connection once the body is read, get 5 minutes.
-	if d := time.Until(w.firstRead); d <= 0 || d > bodyGrace+time.Second {
-		t.Fatalf("first read deadline in %v", d)
 	}
 	for _, dl := range []time.Time{w.read, w.write} {
 		if d := time.Until(dl); d < 4*time.Minute || d > 5*time.Minute+time.Second {
 			t.Fatalf("deadline in %v", d)
 		}
+	}
+	// A body of unknown length is admitted and paced: due within the grace
+	// for its first bytes.
+	read = false
+	r = request(initialize)
+	body = strings.NewReader(initialize)
+	r.ContentLength = -1
+	r.Body = io.NopCloser(readFunc(func(p []byte) (int, error) { read = true; return body.Read(p) }))
+	w = &deadlineWriter{ResponseRecorder: httptest.NewRecorder(), bodyRead: &read}
+	e.h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK || !w.readBefore {
+		t.Fatalf("unknown length: status %d, read deadline before the body %v", w.Code, w.readBefore)
+	}
+	if d := time.Until(w.firstRead); d <= 0 || d > bodyGrace+time.Second {
+		t.Fatalf("first read deadline in %v", d)
+	}
+	if d := time.Until(w.read); d < 4*time.Minute || d > 5*time.Minute+time.Second {
+		t.Fatalf("read deadline once the body is read in %v", d)
 	}
 	// Requests refused before the body is read (Origin, credentials) keep
 	// the server's timeouts.

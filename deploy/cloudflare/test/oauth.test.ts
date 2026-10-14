@@ -1219,7 +1219,7 @@ describe("refresh tokens (SPEC §8.4.6, §8.4.8)", () => {
     expect(tokens.size).toBe(1);
   });
 
-  it("keeps the rotation markers of the newest two generations only", async () => {
+  it("keeps one row per grant, which holds its newest generation", async () => {
     const e = testEnv({ ...MCP_ENV });
     const sql = <T>(q: string, ...args: unknown[]) =>
       runInDurableObject(e.REGISTRY.get(e.REGISTRY.idFromName("registry")), (_o, st) => st.storage.sql.exec(q, ...args).toArray() as T[]);
@@ -1228,22 +1228,22 @@ describe("refresh tokens (SPEC §8.4.6, §8.4.8)", () => {
     const gid = payloadOf(first.refresh_token).g as string;
     const rts = ["", first.refresh_token]; // rts[n] = RT(n)
     for (let n = 1; n <= 20; n++) rts.push(((await (await refresh(a.clientId, rts[n]!)).json()) as { refresh_token: string }).refresh_token);
-    expect((await sql<{ n: number }>("SELECT n FROM mcp_rotations WHERE gid = ? ORDER BY n", gid)).map((r) => r.n)).toEqual([20, 21]);
+    expect(await sql<{ gen: number }>("SELECT gen FROM mcp_grants WHERE id = ?", gid)).toEqual([{ gen: 21 }]);
+    expect(await sql("SELECT name FROM sqlite_master WHERE name LIKE 'mcp_rot%'")).toEqual([]);
     // RT(20) again within the grace window: the same RT(21).
     expect(((await (await refresh(a.clientId, rts[20]!)).json()) as { refresh_token: string }).refresh_token).toBe(rts[21]);
-    // The code again: a replay, whose marker is long gone.
+    // The code again: a replay.
     await expectOAuthError(await exchange(a), 400, "invalid_grant", "a replayed code");
     expect(await registry(testEnv()).mcpGrantGet(gid)).toEqual({ ok: true, value: null });
-    expect(await sql("SELECT n FROM mcp_rotations WHERE gid = ?", gid)).toEqual([]);
-    // An old generation whose marker was compacted away is a reuse.
+    // An old generation is a reuse.
     const c = await mcpConnect();
     let r = c.refresh_token;
     for (let i = 0; i < 3; i++) r = ((await (await refresh(c.clientId, r)).json()) as { refresh_token: string }).refresh_token;
     await expectOAuthError(await refresh(c.clientId, c.refresh_token), 400, "invalid_grant", "RT(1) after RT(4)");
     await expectOAuthError(await refresh(c.clientId, r), 400, "invalid_grant", "RT(4) after the reuse");
     // Pruning uses the expiry index and is bounded.
-    const plan = await sql<{ detail: string }>("EXPLAIN QUERY PLAN SELECT rowid FROM mcp_rotations WHERE exp < ? LIMIT 500", 0);
-    expect(plan.map((p) => p.detail).join(" ")).toMatch(/mcp_rotations_exp/);
+    const plan = await sql<{ detail: string }>("EXPLAIN QUERY PLAN SELECT id FROM mcp_grants WHERE exp < ? LIMIT 500", 0);
+    expect(plan.map((p) => p.detail).join(" ")).toMatch(/mcp_grants_exp/);
   });
 
   it("revokes a token re-presented after the 60 s grace window", async () => {

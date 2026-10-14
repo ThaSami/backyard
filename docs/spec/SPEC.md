@@ -1299,11 +1299,12 @@ error messages never contain these values.
 `client_name`, `client_kind` (`metadata_document` or `registered`), `redirect_uri` (exactly as
 authorized), `code_challenge`, `scope` (`mcp` or `mcp offline_access`), `resource` (R at
 consent), `created_at` (unix s), `code_exp` (`created_at` + 300), `redeemed_at` (set at
-redemption) and `exp` (pending: `code_exp` + 600; after redemption: `created_at` + the family
+redemption), `exp` (pending: `code_exp` + 600; after redemption: `created_at` + the family
 lifetime, which is `auth.token_ttl` on Go and `TOKEN_TTL_HOURS` on the Worker, counted from
-consent and never extended). Revocation deletes the record; a missing grant fails every check.
-Storage: §10 (Go) and §16 (Worker). Expired grants and rotation markers are pruned, a bounded
-page at a time, when grants are created.
+consent and never extended), `gen` (the newest issued refresh generation; 0 until redemption)
+and `gen_at` (when it was issued: unix ms on Go, unix s on the Worker). Revocation deletes the
+record; a missing grant fails every check. Storage: §10 (Go) and §16 (Worker). Expired grants
+are pruned, a bounded page at a time, when grants are created.
 
 **`rotate(gid, from, grace)`** is the only state transition (codes: `from=0, grace=false`;
 refreshing generation n: `from=n, grace=true`):
@@ -1312,26 +1313,25 @@ refreshing generation n: `from=n, grace=true`):
 rotate(gid, from, grace, now):
   g := grant(gid); if g missing or g.exp <= now → "missing"
   (from ≥ 1 additionally requires g.redeemed_at, else "missing")
-  if from == 0 and g.redeemed_at → revoke(gid) → return "reuse"
-  if from ≥ 1 and marker(gid, from) does not exist → revoke(gid) → return "reuse"
-  if from ≥ 2: delete marker (gid, from-1)
-  try atomically create marker (gid, from+1) with at=now
-    success → if from == 0: g.redeemed_at = now, g.exp = g.created_at + family lifetime
-              return "ok"
-    conflict →
-      m := marker(gid, from+1)
-      if grace and now - m.at <= 60 s and marker(gid, from+2) does not exist → return "grace"
-      revoke(gid) → return "reuse"
+  if from == 0:
+    if g.redeemed_at → revoke(gid) → return "reuse"                  (a replayed code)
+    write g.redeemed_at = now, g.exp = g.created_at + family lifetime, g.gen = 1, g.gen_at = now
+  else if from == g.gen:
+    write g.gen = from + 1, g.gen_at = now
+  else if grace and from + 1 == g.gen and now - g.gen_at <= 60 s:
+    return "grace"                                                   (the same successor)
+  else:
+    revoke(gid) → return "reuse"                                     (an old generation)
+  the write applies only to g as read: if g changed meanwhile, start over; if it is gone → "missing"
+  return "ok"
 ```
 
-Markers are created in order only, and only the newest two are kept (a grant holds at most two,
-so refreshing adds no state): a presented generation without its marker, a conflict at n+1
-together with an existing marker n+2, and a code of a redeemed grant all prove an old token. Go
-creates the marker with an atomic docstore `Create` (a conflict is the conflict) after the
-delete has succeeded, and re-checks after a successful `Create` that marker `from` still exists
-(for a code: that the grant is still unredeemed) — else the request read the store before later
-rotations and has filled a gap: revoke, `reuse`. The Worker runs the whole function in one
-RegistryDO transaction.
+A grant holds only its newest generation, so refreshing adds no state, and every transition is
+a compare-and-set of the record as read: of concurrent requests exactly one rotates, and the
+others decide again on what it wrote (a `grace` answer or a `reuse`). Go writes with a guarded
+docstore update (`UpdateIf` at the revision read — its version and creation time; a conflict
+starts over, at most 4 times); the Worker runs the whole function in one RegistryDO
+transaction.
 
 **Verifying an access token** (every request to `/__backyard/mcp`; there is no cache, so a
 revocation takes effect at once): the `byat_` prefix, ≤ 4096 bytes, a valid MAC and valid JSON
@@ -1421,14 +1421,10 @@ in the reserved site `_system` (`_users` user cache, `_audit` audit log). They a
 `GET /db` and cannot be accessed through the site DB API.
 
 The Claude connector (§8.4) keeps its state in `_system` too (quotas do not apply):
-`_system/_mcp_grants/<gid>` (the grant record, `id` = the document id),
-`_system/_mcp_rotations/<gid>.<n>` (`{"gid","n","at":<unix ms>,"exp":<the grant family's
-exp>}`, created with an atomic `Create` so that a code is redeemed and a refresh token rotated
-exactly once; the newest two per grant are kept, §8.4.8), `_system/_mcp_locks/<site>` (the publish lease
-`{"exp":<unix s>,"holder":<32 hex>}`, §14.1) and
-`_system/_mcp_lock_takeovers/<site>.<version>.<µs>.<k>` (`{"exp"}`, the claim of an expired lease
-taken over, §14.1). The Cloudflare edition keeps the same records in
-`RegistryDO` tables (§16).
+`_system/_mcp_grants/<gid>` (the grant record, `id` = the document id; `rotate` updates it with
+a guarded `UpdateIf`, so that a code is redeemed and a refresh token rotated exactly once,
+§8.4.8) and `_system/_mcp_locks/<site>` (the publish lease `{"exp":<unix s>}`, §14.1). The
+Cloudflare edition keeps the grants in a `RegistryDO` table (§16).
 
 ## 11. Limits & rate limiting
 
@@ -1477,8 +1473,8 @@ that user (guests included). The Cloudflare edition's daily caps are in §16. It
 | files per publish call | ≤ 1000 in `files`, ≤ 1000 in `delete` |
 | `backyard_read_site_file` | ≤ 131072 bytes, text only |
 | `backyard_list_sites` / `backyard_site_files` | ≤ 200 sites / ≤ 2000 files |
-| Go MCP request deadline | 5 min (write, set before the body is read; the paced read ends by then too) |
-| Go MCP body pace | byte n due 10 s + n / 65536 s after the body is first read (an average of ≥ 64 KiB/s), else `400` |
+| Go MCP request deadline | 5 min (write, set before the body is read; a paced read ends by then too) |
+| Go MCP body pace | bodies > 1 MiB or of unknown length: byte n due 10 s + n / 65536 s after the body is first read (an average of ≥ 64 KiB/s), else `400`; smaller ones: `server.read_timeout` |
 | Go large-body admission | ≤ 4 concurrent MCP requests with a body > 1 MiB or of unknown length, ≤ 1 of them per user; others wait ≤ 30 s, then `429` |
 | Go publish lease | 300 s |
 
@@ -1685,10 +1681,12 @@ the §5 envelope unless noted:
    `{"error":{"code":"too_large","message":"MCP requests are limited to <N> bytes; publish over several calls"}}`.
    Go only: a body over 1 MiB or of unknown length needs one of 4 admission slots — a user holds
    at most one, so their other large requests wait for it — waited for ≤ 30 s in all, else
-   `429 rate_limited` with `Retry-After: 5`; then the write deadline becomes now + 5 min and the
-   body is read at a minimum pace: byte n must arrive within 10 s + n / 65536 s (an average of
-   64 KiB/s, never later than the 5 min), else `400 bad_request` (the connection's read deadline
-   moves with the body, and becomes now + 5 min once it is read).
+   `429 rate_limited` with `Retry-After: 5`, and such a body is read at a minimum pace: byte n
+   must arrive within 10 s + n / 65536 s (an average of 64 KiB/s, never later than the 5 min
+   below), else `400 bad_request` (the connection's read deadline moves with the body). A
+   smaller body is read under `server.read_timeout`. For every request the write deadline
+   becomes now + 5 min before the body is read, and the read deadline now + 5 min once it is
+   read.
 10. **JSON-RPC parsing** (`400`, `id: null`): invalid JSON — a body that is not valid UTF-8
     included — →
     `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}`; a JSON array →
@@ -1770,18 +1768,14 @@ makes the site exactly the given files. The steps, normative on both editions:
    (else E1; default: by extension). The decoded total must stay within the per-call cap (E11),
    and the `delete` paths must be valid (E8).
 5. Concurrency: Go takes a publish lease — `Create` of `_system/_mcp_locks/<site>` with
-   `exp` = now + 300 s and a random `holder`. On a conflict a live lease → E20. An expired one
-   is taken over only by the taker that first claims the state it read: an atomic `Create` of
-   the takeover claim `_system/_mcp_lock_takeovers/<site>.<version>.<created_at in µs>.<k>`
-   (`{"exp"}` of the new lease; k = 1, or the next k while claim k has expired, its claimant
-   having died before it wrote; a live claim → E20 with nothing written), then an `Update` of the
-   lease to the new fields, which must be the very next write to the document as read (same
-   `created_at`, `version` + 1), else E20 (a lease gone in between → the `Create` is retried
-   once). No taker deletes or rewrites a lease another one holds; expired claims are pruned at
-   takeovers. When the publish ends the lease is deleted if it still names its `holder` and
-   expires no sooner than 30 s from now (a lease left behind expires by itself). The Worker
-   needs none (step 9 is one transaction). CLI and hub deploys take no lease and keep the
-   semantics of §7.3.
+   `exp` = now + 300 s. On a conflict a live lease → E20; an expired one is taken over with a
+   guarded update to the new `exp` (`UpdateIf` at the revision read — its version and creation
+   time), which only one of the takers that read it wins: the others → E20 with nothing written
+   (a lease gone in between → the `Create` is retried once). When the publish ends the lease is
+   deleted with a guarded delete at the revision this publish wrote, so a release never removes
+   a lease taken over meanwhile; the release is abandoned after 10 s (a lease left behind
+   expires by itself). The Worker needs none (step 9 is one transaction). CLI and hub deploys
+   take no lease and keep the semantics of §7.3.
 6. Ownership (`sites.ownership: owner` / `OWNERSHIP=owner`): the caller must be an owner or an
    admin (E15); guests are never owners; the first publisher of a new site becomes its owner
    unless anonymous.
@@ -1947,10 +1941,9 @@ storage are available on free); R2 and paid features are optional.
   (using `BASE_DOMAIN` and the `PUBLIC_URL` host). An invalid entry does not make the Worker
   fail closed: it turns the connector off (every connector path `404`) and adds a problem line
   to `/__backyard/readyz`; the connector is also off unless the hub origin is https or a
-  loopback host. Grants live in `RegistryDO` tables (`mcp_grants`: `id`, `user_id`, `data`,
-  `created_at`, `code_exp`, `redeemed_at`, `exp`; `mcp_rotations`: `gid`, `n`, `at`, `exp`,
-  primary key (`gid`, `n`), the newest two generations per grant), both indexed by `exp`, and
-  `rotate` (§8.4.8) runs in one transaction; each consent prunes up to 500 expired rows of each. `backyard_publish`
+  loopback host. Grants live in a `RegistryDO` table (`mcp_grants`: `id`, `user_id`, `data`,
+  `created_at`, `code_exp`, `redeemed_at`, `exp`, `gen`, `gen_at`; indexed by `exp`), `rotate`
+  (§8.4.8) runs in one transaction, and each consent prunes up to 500 expired grants. `backyard_publish`
   is atomic per site: `SiteDO.deployMerge` computes the merged file set, checks the limits and
   switches the manifest in one transaction, so concurrent calls never lose each other's files;
   a call that the site limits refuse (E6, E13, E14) for the site as it is uploads nothing.

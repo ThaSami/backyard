@@ -66,7 +66,13 @@ func (s *fakeStore) Put(ctx context.Context, site, coll, id string, data map[str
 func (s *fakeStore) Update(ctx context.Context, site, coll, id string, patch map[string]any, actor string) (*docstore.Doc, error) {
 	return nil, errors.New("not used")
 }
+func (s *fakeStore) UpdateIf(ctx context.Context, site, coll, id string, rev docstore.Rev, patch map[string]any, actor string) (*docstore.Doc, error) {
+	return nil, errors.New("not used")
+}
 func (s *fakeStore) Delete(ctx context.Context, site, coll, id string) (bool, error) {
+	return false, errors.New("not used")
+}
+func (s *fakeStore) DeleteIf(ctx context.Context, site, coll, id string, rev docstore.Rev) (bool, error) {
 	return false, errors.New("not used")
 }
 func (s *fakeStore) Query(ctx context.Context, site, coll string, q docstore.Query) (*docstore.Page, error) {
