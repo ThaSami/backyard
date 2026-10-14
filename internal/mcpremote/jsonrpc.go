@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"regexp"
+	"unicode/utf8"
 )
 
 // JSON-RPC error codes.
@@ -60,10 +61,12 @@ type message struct {
 var integerID = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
 
 // parseMessage parses a request body. A non-nil error is answered with HTTP
-// 400 and id null.
+// 400 and id null. A body that is not UTF-8 is no JSON text (RFC 8259 §8.1):
+// encoding/json would replace each invalid byte with U+FFFD, and the Worker
+// each maximal invalid sequence, so both refuse it instead.
 func parseMessage(body []byte) (*message, *rpcError) {
 	body = bytes.TrimSpace(body)
-	if !json.Valid(body) {
+	if !utf8.Valid(body) || !json.Valid(body) {
 		return nil, newRPCError(codeParseError, "Parse error")
 	}
 	switch body[0] {

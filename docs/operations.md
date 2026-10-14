@@ -73,7 +73,8 @@ Ship the log stream to your SIEM for retention. In addition, the server stores `
 document store (site `_system`, collection `_audit`), which is not reachable through the site
 API. The Claude connector's connections live in the same site (`_mcp_grants`, `_mcp_rotations`;
 expired ones are pruned as new ones are created), and so do its publish leases (`_mcp_locks`, one
-per site while a publish runs; a lease left behind by a crashed replica expires after 300 s).
+per site while a publish runs; a lease left behind by a crashed replica expires after 300 s, and
+taking it over leaves a claim in `_mcp_lock_takeovers` that later takeovers prune).
 
 ## Backups
 
@@ -147,8 +148,9 @@ Backyard is one binary (or image). To upgrade:
    a Backyard release has published it to npm), or `npm run setup` in an updated checkout. Every
    earlier choice is kept. With Cloudflare Access, run `backyard cloudflare access enable` (or
    `terraform apply` of the Cloudflare module) again when the bypass list changes — for the
-   [Claude connector](claude-connector.md) it now holds nine paths;
-   `backyard cloudflare status` reports missing ones as `access-connector`.
+   [Claude connector](claude-connector.md) it now holds nine paths; updating a bypass
+   application the CLI created needs `BACKYARD_CF_API_TOKEN` again (or the destinations added in
+   the dashboard); `backyard cloudflare status` reports missing ones as `access-connector`.
 6. Terraform kits: `terraform apply` with the new module version, which may change proxy
    exemptions (as for the Claude connector's machine paths in the AWS, GCP and Cloudflare
    modules).

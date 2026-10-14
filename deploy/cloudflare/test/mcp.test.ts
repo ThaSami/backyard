@@ -65,7 +65,7 @@ interface PostOptions {
 
 /**
  * Sends one message to /__backyard/mcp (body: a value to encode, or a raw
- * string). Every answer must carry no Mcp-Session-Id and set no cookie.
+ * string or bytes). Every answer must carry no Mcp-Session-Id and set no cookie.
  */
 async function post(body: unknown, o: PostOptions = {}): Promise<Sent> {
   const h = new Headers({ "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": "2025-11-25" });
@@ -76,7 +76,8 @@ async function post(body: unknown, o: PostOptions = {}): Promise<Sent> {
   }
   for (const [k, v] of o.headerList ?? []) h.append(k, v);
   const method = o.method ?? "POST";
-  const payload = method === "GET" || method === "HEAD" || body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body);
+  const payload =
+    method === "GET" || method === "HEAD" || body === undefined ? undefined : typeof body === "string" || body instanceof Uint8Array ? body : JSON.stringify(body);
   const res = await call(o.url ?? "/__backyard/mcp", { method, headers: h, body: payload }, o.env ?? PUB);
   const text = await res.text();
   let json: unknown;
@@ -584,6 +585,27 @@ describe("JSON-RPC (SPEC §14.1 steps 10–11)", () => {
     expect(neg.text).toBe('{"jsonrpc":"2.0","id":-0,"result":{}}');
     const zero = await mcp.post('{"jsonrpc":"2.0","id":0,"method":"ping"}');
     expect(zero.text).toBe('{"jsonrpc":"2.0","id":0,"result":{}}');
+  });
+
+  it("refuses a body that is not UTF-8 as invalid JSON, as the Go server does", async () => {
+    const { mcp } = await guest();
+    const site = uniqueSite("utf8");
+    const enc = new TextEncoder();
+    const parts = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "backyard_publish", arguments: { site, files: [{ path: "index.html", content: "x" }, { path: "aBAD.html", content: "y" }] } },
+    }).split("BAD");
+    // A truncated four-byte sequence (F0 9F 98) inside a path, and a stray byte in an id.
+    const truncated = new Uint8Array([...enc.encode(parts[0]!), 0xf0, 0x9f, 0x98, ...enc.encode(parts[1]!)]);
+    const stray = new Uint8Array([...enc.encode('{"jsonrpc":"2.0","id":"'), 0xff, ...enc.encode('","method":"ping"}')]);
+    for (const body of [truncated, stray]) {
+      const r = await mcp.post(body);
+      expect(r.status).toBe(400);
+      expect(r.text).toBe('{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}');
+    }
+    expect((await mcp.rpc("tools/call", { name: "backyard_site_files", arguments: { site } })).isError).toBe(true);
   });
 
   it("decodes lone surrogate escapes as U+FFFD, like encoding/json, but echoes the id as sent", async () => {

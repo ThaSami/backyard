@@ -110,7 +110,9 @@ backyard cloudflare setup --var MCP_ENABLED:true
 With the optional Terraform module, set `mcp_enabled = true`: its `worker_vars` and `setup_args`
 outputs always carry `MCP_ENABLED` (`true` or `false`), so `mcp_enabled = false` and a `setup`
 run with the new `setup_args` turn the connector off again. With Cloudflare Access, re-run
-`backyard cloudflare access enable` (or `terraform apply`) once after upgrading: the bypass
+`backyard cloudflare access enable` (or `terraform apply`) once after upgrading — with the admin
+API token in `BACKYARD_CF_API_TOKEN` (or pasted when asked) when the CLI made the bypass
+application, else it names the four destinations to add in the dashboard: the bypass
 application then lets nine paths through, the four machine paths included, and
 `backyard cloudflare status` reports a check `access-connector` (pending while they are missing
 and the connector is off, failed once it is on). Publishing from Claude needs
@@ -218,10 +220,11 @@ URLs or the server secret.
 |---|---|---|
 | File content per `backyard_publish` call (decoded) | 4 MiB (`mcp.max_publish_bytes`, 64 KiB to 64 MiB) | 2 MiB (`LIMITS.mcp_publish_bytes`) |
 | Request body at `/__backyard/mcp` | 2 × that + 1 MiB (9 MiB) | 2 × that + 1 MiB (5 MiB) |
+| Requests with a body over 1 MiB | 4 at once, 1 per user; the body must arrive at 64 KiB/s on average (after 10 s) | — |
 | Files per call | 1,000 in `files`, 1,000 in `delete` | same |
 | Tool calls | `ratelimit.api_per_minute` per user | `LIMITS.mcp_calls_per_day` (5,000) per user |
 | Publishes | `ratelimit.deploys_per_hour` per user (guests included) | `LIMITS.deploys_per_day` per user |
-| Sign-in endpoints | `ratelimit.api_per_minute` per person (sign-in page, code and refresh exchanges), per client IP for requests that identify no one and for app registration | — |
+| Sign-in endpoints | `ratelimit.api_per_minute` per person (sign-in page, code and refresh exchanges), per client IP for requests that identify no one and for app registration (the way of a signed-out browser to the company login is never charged) | — |
 
 **One call carries at most that much file content.** Claude writes files into the conversation,
 so expect a few hundred KB per call in practice. A bigger site goes over several calls, one after

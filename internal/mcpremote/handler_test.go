@@ -12,12 +12,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/thasami/backyard/internal/auth"
 	"github.com/thasami/backyard/internal/docstore/memory"
+	"github.com/thasami/backyard/internal/identity"
 )
 
 const initialize = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`
@@ -251,25 +251,43 @@ type readFunc func([]byte) (int, error)
 
 func (f readFunc) Read(p []byte) (int, error) { return f(p) }
 
+// addUser lets token authenticate u.
+func (e *tenv) addUser(token string, u *identity.User) {
+	e.auth.mu.Lock()
+	defer e.auth.mu.Unlock()
+	g := *e.auth.grants[aliceToken]
+	g.User = *u
+	e.auth.grants[token] = &g
+}
+
+// stalledLarge starts a large request of token whose body arrives only when
+// the returned pipe is written and closed; done is closed once it was
+// answered with the status in *code.
+func (e *tenv) stalledLarge(token string, code *int) (*io.PipeWriter, chan struct{}) {
+	pr, pw := io.Pipe()
+	r := request("", "Authorization", "Bearer "+token)
+	r.Body, r.ContentLength = pr, -1
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w := httptest.NewRecorder()
+		e.h.ServeHTTP(w, r)
+		*code = w.Code
+	}()
+	return pw, done
+}
+
 func TestAdmission(t *testing.T) {
 	e := newTenv(t)
 	e.h.admitWait = 50 * time.Millisecond
+	carol := "byat_carol.0000000000000000000000"
+	e.addUser(carol, &identity.User{ID: "carol@acme.com", Email: "carol@acme.com", Name: "Carol"})
 	var pipes []*io.PipeWriter
-	var wg sync.WaitGroup
-	for range admissionSlots {
-		pr, pw := io.Pipe()
-		pipes = append(pipes, pw)
-		r := request("")
-		r.Body, r.ContentLength = pr, -1
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			w := httptest.NewRecorder()
-			e.h.ServeHTTP(w, r)
-			if w.Code != http.StatusOK {
-				t.Errorf("admitted request: %d %s", w.Code, w.Body)
-			}
-		}()
+	var dones []chan struct{}
+	codes := make([]int, admissionSlots)
+	for i, tok := range []string{aliceToken, bobToken, guestToken, adminToken} {
+		pw, done := e.stalledLarge(tok, &codes[i])
+		pipes, dones = append(pipes, pw), append(dones, done)
 	}
 	// Wait until the four hold their slots.
 	for deadline := time.Now().Add(5 * time.Second); len(e.h.slots) < admissionSlots; time.Sleep(time.Millisecond) {
@@ -277,7 +295,7 @@ func TestAdmission(t *testing.T) {
 			t.Fatal("slots not taken")
 		}
 	}
-	r := request(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+	r := request(`{"jsonrpc":"2.0","id":1,"method":"ping"}`, "Authorization", "Bearer "+carol)
 	r.ContentLength = -1
 	w := e.serve(r)
 	wantResponse(t, w, http.StatusTooManyRequests, "")
@@ -286,13 +304,139 @@ func TestAdmission(t *testing.T) {
 	}
 	// Small bodies of known length need no slot.
 	wantResponse(t, e.post(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), http.StatusOK, "")
-	for _, pw := range pipes {
+	for i, pw := range pipes {
 		_, _ = pw.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
 		_ = pw.Close()
+		<-dones[i]
+		if codes[i] != http.StatusOK {
+			t.Errorf("admitted request %d: %d", i, codes[i])
+		}
 	}
-	wg.Wait()
-	if len(e.h.slots) != 0 {
-		t.Fatalf("%d slots still taken", len(e.h.slots))
+	if len(e.h.slots) != 0 || len(e.h.users) != 0 {
+		t.Fatalf("%d slots, %d users still taken", len(e.h.slots), len(e.h.users))
+	}
+}
+
+// One user holds at most one admission slot at a time: their other large
+// requests wait for it, and other users are admitted meanwhile.
+func TestAdmissionPerUser(t *testing.T) {
+	e := newTenv(t)
+	e.h.admitWait = 100 * time.Millisecond
+	var first, second int
+	pw, done := e.stalledLarge(aliceToken, &first)
+	for deadline := time.Now().Add(5 * time.Second); len(e.h.slots) < 1; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("slot not taken")
+		}
+	}
+	// Alice's second large request waits for her slot, then gives up.
+	pw2, done2 := e.stalledLarge(aliceToken, &second)
+	t.Cleanup(func() { _ = pw.Close(); _ = pw2.Close() })
+	select {
+	case <-done2:
+	case <-time.After(5 * time.Second):
+		t.Fatal("alice's second large request was admitted while her first holds a slot")
+	}
+	if second != http.StatusTooManyRequests {
+		t.Fatalf("alice's second large request: %d, want 429", second)
+	}
+	// Bob's is admitted.
+	r := request(`{"jsonrpc":"2.0","id":1,"method":"ping"}`, "Authorization", "Bearer "+bobToken)
+	r.ContentLength = -1
+	wantResponse(t, e.serve(r), http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":{}}`)
+	// Once alice's first is answered, her next one gets the slot again.
+	_, _ = pw.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+	_ = pw.Close()
+	<-done
+	pw3, done3 := e.stalledLarge(aliceToken, &second)
+	_, _ = pw3.Write([]byte(`{"jsonrpc":"2.0","id":2,"method":"ping"}`))
+	_ = pw3.Close()
+	<-done3
+	if first != http.StatusOK || second != http.StatusOK {
+		t.Fatalf("alice's requests: %d, %d", first, second)
+	}
+	if len(e.h.slots) != 0 || len(e.h.users) != 0 {
+		t.Fatalf("%d slots, %d users still taken", len(e.h.slots), len(e.h.users))
+	}
+}
+
+// rawPost sends the headers of a POST with Content-Length n and the given
+// body chunks (after each wait), then reads the answer.
+func rawPost(t *testing.T, addr, token string, n int, chunks []string, wait time.Duration) (*http.Response, time.Duration, error) {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil, 0, err
+	}
+	t.Cleanup(func() { conn.Close() })
+	start := time.Now()
+	_, _ = fmt.Fprintf(conn, "POST /__backyard/mcp HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n", hubHost, token, n)
+	go func() {
+		for _, c := range chunks {
+			time.Sleep(wait)
+			if _, err := io.WriteString(conn, c); err != nil {
+				return
+			}
+		}
+	}()
+	_ = conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+	res, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		return nil, time.Since(start), err
+	}
+	b, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	res.Body = io.NopCloser(bytes.NewReader(b))
+	return res, time.Since(start), nil
+}
+
+// A body that falls below the minimum rate is cut off with 400, which frees
+// its admission slot long before the 5-minute deadline; a body that keeps
+// the pace is read in full.
+func TestBodyPace(t *testing.T) {
+	e := newTenv(t)
+	e.h.bodyGrace, e.h.minBodyRate, e.h.admitWait = 500*time.Millisecond, 1<<20, 10*time.Second
+	carol := "byat_carol.0000000000000000000000"
+	e.addUser(carol, &identity.User{ID: "carol@acme.com", Email: "carol@acme.com", Name: "Carol"})
+	srv := httptest.NewServer(e.h)
+	t.Cleanup(srv.Close)
+	addr := srv.Listener.Addr().String()
+	ping := `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":"` // padded below
+	big := ping + strings.Repeat("a", 1536<<10) + `"}}`
+	type answer struct {
+		res     *http.Response
+		elapsed time.Duration
+		err     error
+	}
+	stalled := make(chan answer, admissionSlots)
+	for _, tok := range []string{aliceToken, bobToken, guestToken, adminToken} {
+		go func() {
+			// 4 KiB, then nothing: far behind 1 MiB/s.
+			res, d, err := rawPost(t, addr, tok, len(big), []string{big[:4096]}, 0)
+			stalled <- answer{res, d, err}
+		}()
+	}
+	for deadline := time.Now().Add(5 * time.Second); len(e.h.slots) < admissionSlots; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("slots not taken")
+		}
+	}
+	// Carol waits for a slot: the stalled bodies are cut, and hers is read.
+	chunks := []string{}
+	for i := 0; i < len(big); i += 256 << 10 {
+		chunks = append(chunks, big[i:min(i+256<<10, len(big))])
+	}
+	res, d, err := rawPost(t, addr, carol, len(big), chunks, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("a paced body: no answer after %v: %v", d, err)
+	}
+	if b, _ := io.ReadAll(res.Body); res.StatusCode != http.StatusOK || !strings.Contains(string(b), `"result":{}`) {
+		t.Fatalf("a paced body after %v: %d %s", d, res.StatusCode, b)
+	}
+	for range admissionSlots {
+		a := <-stalled
+		if a.err != nil || a.res.StatusCode != http.StatusBadRequest || a.elapsed > 5*time.Second {
+			t.Fatalf("a stalled body: %v %v after %v", a.res, a.err, a.elapsed)
+		}
 	}
 }
 
@@ -301,12 +445,16 @@ type deadlineWriter struct {
 	*httptest.ResponseRecorder
 	bodyRead          *bool
 	readSet, writeSet bool
-	readBefore        bool
-	read, write       time.Time
+	readBefore        bool      // the first read deadline was set before the body was read
+	firstRead         time.Time // the first read deadline
+	read, write       time.Time // the last ones
 }
 
 func (d *deadlineWriter) SetReadDeadline(t time.Time) error {
-	d.readSet, d.read, d.readBefore = true, t, !*d.bodyRead
+	if !d.readSet {
+		d.firstRead, d.readBefore = t, !*d.bodyRead
+	}
+	d.readSet, d.read = true, t
 	return nil
 }
 
@@ -329,8 +477,15 @@ func TestDeadlinesBeforeBody(t *testing.T) {
 	if !w.readSet || !w.writeSet || !w.readBefore {
 		t.Fatalf("deadlines: read %v (before body %v), write %v", w.readSet, w.readBefore, w.writeSet)
 	}
-	if d := time.Until(w.read); d < 4*time.Minute || d > 5*time.Minute+time.Second {
-		t.Fatalf("read deadline in %v", d)
+	// The body is paced (due within the grace for its first bytes); the
+	// answer, and the connection once the body is read, get 5 minutes.
+	if d := time.Until(w.firstRead); d <= 0 || d > bodyGrace+time.Second {
+		t.Fatalf("first read deadline in %v", d)
+	}
+	for _, dl := range []time.Time{w.read, w.write} {
+		if d := time.Until(dl); d < 4*time.Minute || d > 5*time.Minute+time.Second {
+			t.Fatalf("deadline in %v", d)
+		}
 	}
 	// Requests refused before the body is read (Origin, credentials) keep
 	// the server's timeouts.
@@ -393,6 +548,9 @@ func TestJSONRPCErrors(t *testing.T) {
 		{`{"jsonrpc":"2.0","id":1}`, invalid},
 		{`{"jsonrpc":"2.0","id":true,"method":"ping"}`, invalid},
 		{`{"jsonrpc":"2.0","id":"x","method":"ping","params":[1}`, parseError},
+		// Not UTF-8 (a truncated sequence, a stray byte) is no JSON text.
+		{"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{\"path\":\"a\xf0\x9f\x98.html\"}}", parseError},
+		{"{\"jsonrpc\":\"2.0\",\"id\":\"\xff\",\"method\":\"ping\"}", parseError},
 		{"\n {\"jsonrpc\":\"2.0\",\"id\":\"a\",\"method\":\"ping\"} ", `{"jsonrpc":"2.0","id":"a","result":{}}`},
 	}
 	for _, c := range cases {

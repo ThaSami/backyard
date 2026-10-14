@@ -1104,6 +1104,19 @@ function connectorSuite() {
       assert.equal(await mcp.callText("backyard_read_site_file", { site: site3, path: "a\ufffd.html" }), "y");
     });
 
+    test("a body that is not UTF-8 is invalid JSON (a truncated sequence in a path)", async (t) => {
+      if (signInSkip) return t.skip(signInSkip);
+      const site4 = uniqueSite("mcp4");
+      const [head, tail] = JSON.stringify(
+        mcp.request("tools/call", { name: "backyard_publish", arguments: { site: site4, files: [{ path: "aBAD.html", content: "y" }, { path: "index.html", content: "x" }] } }),
+      ).split("BAD");
+      const body = Buffer.concat([Buffer.from(head), Buffer.from([0xf0, 0x9f, 0x98]), Buffer.from(tail)]);
+      const r = await mcp.post(body, { what: "a truncated UTF-8 sequence" });
+      assert.equal(r.status, 400, `${r}`);
+      assertBody(r, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, "not UTF-8");
+      await mcp.callError("backyard_site_files", { site: site4 }); // nothing was published
+    });
+
     test("the read tools: list_sites, site_files, read_site_file and docs", async (t) => {
       if (signInSkip) return t.skip(signInSkip);
       const list = await mcp.callJSON("backyard_list_sites", { query: site.toUpperCase() });

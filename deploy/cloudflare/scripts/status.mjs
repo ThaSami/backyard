@@ -229,7 +229,11 @@ export async function runStatus(opts, ctx) {
       const info = await infoP;
       const on = Boolean(info?.ok && info.status === 200 && info.json?.mcp_url);
       if (on) return check("access-connector", "failed", f.connector.join("; "));
-      return check("access-connector", "pending", `the Claude connector paths are not bypassed yet: run ${inv} access enable before setting MCP_ENABLED (${f.connector.join("; ")})`);
+      return check(
+        "access-connector",
+        "pending",
+        `the Claude connector paths are not bypassed yet: run ${inv} access enable (with BACKYARD_CF_API_TOKEN when it made the bypass application, or add the paths in the dashboard) before setting MCP_ENABLED (${f.connector.join("; ")})`,
+      );
     },
     async "workers-dev-closed"() {
       if (!access || !workersDevOn || !workersDevUrl) return null;

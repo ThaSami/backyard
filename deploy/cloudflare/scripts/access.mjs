@@ -164,9 +164,11 @@ function progress(label) {
  * endpoints of the bypass application reaching the Worker, (e) the Claude
  * connector's four paths of it reaching the Worker (SPEC §8.4; they pass
  * whether or not MCP_ENABLED is on, and on a Worker that predates the
- * connector). Returns the failures of each group (empty = ok).
+ * connector). Returns the failures of each group (empty = ok), and the
+ * destinations of (d) and (e) that Access blocks (missing from the bypass
+ * application).
  * @param {{host: string, mode?: string, team: string, aud: string, worker: string}} o
- * @returns {Promise<{certs: string[], redirect: string[], wildcard: string[], bypass: string[], connector: string[]}>}
+ * @returns {Promise<{certs: string[], redirect: string[], wildcard: string[], bypass: string[], connector: string[], missing: string[]}>}
  */
 export async function accessEdgeFailures(o) {
   const { host, team } = o;
@@ -221,6 +223,7 @@ export async function accessEdgeFailures(o) {
     { path: "/.well-known/oauth-authorization-server", rule: "/.well-known/oauth-authorization-server", want: "200, 401 or 404", ok: discovery },
     { path: "/.well-known/oauth-protected-resource/__backyard/mcp", rule: "/.well-known/oauth-protected-resource/__backyard/mcp", want: "200, 401 or 404", ok: discovery },
   ];
+  const missing = [];
   const probeAll = async (list) => {
     const results = await Promise.all(list.map((b) => probe(`https://${host}${b.path}`, { accept: "application/json" })));
     const out = [];
@@ -228,8 +231,10 @@ export async function accessEdgeFailures(o) {
       const b = list[i];
       let f = "";
       if (!r.ok) f = `https://${host}${b.path} does not answer (${failText(r)})`;
-      else if (accessBlocked(r)) f = `the bypass application is missing ${host}${b.rule}`;
-      else if (!b.ok(r)) f = `https://${host}${b.path} answers HTTP ${r.status}, not ${b.want}`;
+      else if (accessBlocked(r)) {
+        f = `the bypass application is missing ${host}${b.rule}`;
+        if (!missing.includes(host + b.rule)) missing.push(host + b.rule);
+      } else if (!b.ok(r)) f = `https://${host}${b.path} answers HTTP ${r.status}, not ${b.want}`;
       if (f && !out.includes(f)) out.push(f);
     }
     return out;
@@ -242,7 +247,7 @@ export async function accessEdgeFailures(o) {
     probeAll(BYPASS),
     probeAll(CONNECTOR),
   ]);
-  return { certs: c, redirect: red, wildcard: wild, bypass: by, connector: conn };
+  return { certs: c, redirect: red, wildcard: wild, bypass: by, connector: conn, missing };
 }
 
 /** The origin of a URL, for messages ("" when it is not one). */
@@ -719,10 +724,26 @@ export async function runAccessEnable(opts, ctx) {
     plan = useRemembered();
   } else {
     // A new allow list needs the API: offer to paste a token even on a re-run.
-    const admin = await ctx.admin("access", { prompt: !remembered || allowChanged });
+    let ask = !remembered || allowChanged;
+    // So does a bypass application this tool made that lacks paths (one of an
+    // earlier version, before the Claude connector's four): found at the edge.
+    let missing = [];
+    if (!ask && remembered?.source === "api") {
+      missing = (await accessEdgeFailures({ host, mode, team: remembered.team, aud: remembered.aud, worker: w })).missing;
+      ask = missing.length > 0;
+    }
+    const admin = await ctx.admin("access", { prompt: ask });
     if (admin) {
       const r = await apiMode(ctx, state, { admin, host, mode, allow, explicit, onCreated });
       if (r) plan = { ...r, source: "api" };
+    }
+    if (!plan && missing.length) {
+      throw new CliError(
+        EXIT.USAGE,
+        `the Access application "${accessNames(w).bypassApp}" lacks paths this version needs (${missing.join(", ")}). ` +
+          `Updating it needs an API token with ${ACCESS_TOKEN_PERMISSIONS}: set BACKYARD_CF_API_TOKEN (it is never stored) and re-run, ` +
+          `or add these destinations to it in the dashboard (Zero Trust → Access → Applications → "${accessNames(w).bypassApp}" → Destinations) and re-run (if you just did, give it a minute). Nothing was changed.`,
+      );
     }
     if (!plan && remembered && allowChanged) {
       // The remembered team and AUD would verify fine, but the policy would keep the old list.

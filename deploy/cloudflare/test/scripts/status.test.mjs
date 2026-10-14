@@ -172,7 +172,7 @@ describe("backyard-cloudflare status", () => {
     assert.equal(r.code, 4, r.out);
     let c = checksOf(JSON.parse(r.stdout));
     assert.equal(c["access-connector"].status, "pending");
-    assert.equal(c["access-connector"].detail, `the Claude connector paths are not bypassed yet: run npm run cf -- access enable before setting MCP_ENABLED (${missing})`);
+    assert.equal(c["access-connector"].detail, `the Claude connector paths are not bypassed yet: run npm run cf -- access enable (with BACKYARD_CF_API_TOKEN when it made the bypass application, or add the paths in the dashboard) before setting MCP_ENABLED (${missing})`);
     assert.equal(c["access-bypass"].status, "ok", "the machine endpoints are fine");
     const human = await sb.run(["status"]);
     assert.match(human.out, /^ {2}pending {2}access-connector {4}the Claude connector paths are not bypassed yet/m);

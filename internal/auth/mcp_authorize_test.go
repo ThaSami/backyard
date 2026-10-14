@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -576,4 +577,50 @@ func TestMCPConsentPostOIDC(t *testing.T) {
 		t.Errorf("allow: %v", q)
 	}
 	_ = context.Background()
+}
+
+// A signed-out browser in oidc mode is sent to the login (or shown the
+// sign-in-ended page) whatever junk from its address has spent: those answers
+// identify no one, are cheap and only lead to the IdP, so they are not
+// charged to the address (SPEC §11).
+func TestMCPAuthorizeSignedOutNotLimited(t *testing.T) {
+	var mu sync.Mutex
+	counts := map[string]int{}
+	allow := func(k string) (bool, time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		counts[k]++
+		return counts[k] <= 5, time.Minute
+	}
+	e := newMCPEnv(t, ModeOIDC, nil, func(o *Options) { o.MCPAllow = allow })
+	id := e.register("App", loopbackCB)
+	f := newFlow(id, loopbackCB)
+	fields, _ := consentFields(t, e.authorize(newBrowser(e.oidc.session()), authzParams(id, loopbackCB, f.challenge, f.state)))
+	junk := func() *http.Response {
+		return e.do(newBrowser().request(http.MethodGet, testIssuer+AuthorizePath+"?client_id=x", nil))
+	}
+	limited := false
+	for range 10 {
+		if junk().StatusCode == http.StatusTooManyRequests {
+			limited = true
+		}
+	}
+	if !limited {
+		t.Fatal("junk was never limited")
+	}
+	params := authzParams(id, loopbackCB, f.challenge, f.state)
+	for range 3 {
+		res := e.authorize(newBrowser(), params)
+		if loc := res.Header.Get("Location"); res.StatusCode != http.StatusFound || !strings.HasPrefix(loc, e.a.LoginURL("")+"?rd=") {
+			t.Fatalf("signed out, after junk: %d %q", res.StatusCode, loc)
+		}
+		res = e.consentPost(newBrowser(), fields, "allow")
+		if b := body(t, res); res.StatusCode != http.StatusUnauthorized || !strings.Contains(b, "Your Backyard sign-in ended") {
+			t.Fatalf("signed-out consent, after junk: %d\n%s", res.StatusCode, b)
+		}
+	}
+	// Junk stays limited.
+	if res := junk(); res.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("junk after the login redirects: %d", res.StatusCode)
+	}
 }

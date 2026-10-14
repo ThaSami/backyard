@@ -48,8 +48,8 @@ export class MCPClient {
   }
 
   /**
-   * POSTs body (an object, or a string sent as is) and returns the response
-   * after the transport checks. headers replace the defaults (a null value
+   * POSTs body (an object, or a string or Buffer sent as is) and returns the
+   * response after the transport checks. headers replace the defaults (a null value
    * removes one); token: null sends no Authorization.
    */
   async post(body, { token, headers = {}, method = "POST", what } = {}) {
@@ -60,7 +60,7 @@ export class MCPClient {
     if (this.origin) h.Origin = this.origin;
     Object.assign(h, headers);
     for (const [k, v] of Object.entries(h)) if (v === null || v === undefined) delete h[k];
-    const payload = method === "GET" || method === "HEAD" ? undefined : typeof body === "string" ? body : JSON.stringify(body);
+    const payload = method === "GET" || method === "HEAD" ? undefined : typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body);
     const r = await send(this.endpoint, { method, headers: h, body: payload });
     assertTransport(r, what ?? `${method} ${JSON.stringify(body)?.slice(0, 80)}`);
     return r;

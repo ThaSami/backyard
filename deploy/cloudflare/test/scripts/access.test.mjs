@@ -288,6 +288,43 @@ describe("backyard-cloudflare access enable (API mode)", () => {
     for (const [p, status] of Object.entries(on)) assert.ok(sb.fake.edgeRequests.some((x) => x.host === HOST && x.path === p && x.status === status), p);
   });
 
+  it("upgrades a bypass application of an earlier version without a token in the environment", async () => {
+    const sb = await accessSandbox();
+    let r = await sb.run(ENABLE, WITH_ADMIN);
+    assert.equal(r.code, 0, r.out);
+    const ids = sb.state().access;
+    const old = ACCESS_BYPASS_PATHS.filter((p) => !CONNECTOR_RULES.includes(p));
+    const reset = () => sb.updateCf((s) => (s.access.acc1.apps.find((a) => a.id === ids.bypassAppId).destinations = old.map((p) => ({ type: "public", uri: HOST + p }))));
+    reset();
+    sb.calls();
+    sb.requests();
+    // No token and no terminal: refused with the remedy, nothing changed.
+    for (const args of [["access", "enable", "--wait", "0"], ENABLE]) {
+      r = await sb.run(args);
+      assert.equal(r.code, 2, r.out);
+      assert.match(r.out, /BACKYARD_CF_API_TOKEN/);
+      assert.match(r.out, new RegExp(`"${N.bypassApp.replace(/[()]/g, "\\$&")}"`));
+      for (const p of CONNECTOR_RULES) assert.ok(r.out.includes(HOST + p), `names ${HOST}${p}:\n${r.out}`);
+      assert.doesNotMatch(r.out, /re-run the same command/);
+      assert.deepEqual(writesOf(sb.requests()), []);
+      assert.ok(!deployOf(sb.calls()));
+    }
+    // From a terminal: it offers to paste a token, and one PUT upgrades the application.
+    if (!ttyAvailable()) return;
+    r = await sb.runTTY(["access", "enable", "--wait", "0"], {}, {
+      answers: [
+        [/How do you want to continue\? \S*\[1-2\]/, "2\r"],
+        [/API token \(not stored\):/, `${ADMIN}\r`],
+      ],
+    });
+    sb.outputs.push(r.out);
+    assert.equal(r.code, 0, r.out);
+    const w = writesOf(sb.requests());
+    assert.deepEqual(w.map((x) => `${x.method} ${x.path}`), [`PUT /accounts/acc1/access/apps/${ids.bypassAppId}`]);
+    assert.deepEqual(w[0].body.destinations.map((d) => d.uri), ACCESS_BYPASS_PATHS.map((p) => HOST + p));
+    assert.deepEqual(sb.state().access, ids);
+  });
+
   it("keeps what an admin set in the dashboard when it updates a policy or an application", async () => {
     const sb = await accessSandbox();
     let r = await sb.run(ENABLE, WITH_ADMIN);

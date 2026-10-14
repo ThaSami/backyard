@@ -326,10 +326,12 @@ func (m *MCP) consentUser(w http.ResponseWriter, r *http.Request, back string, f
 			// Not a redirect: the consent page's form-action CSP binds every
 			// redirect of the form submission, and the login goes on to the
 			// IdP's origin. A link starts a new navigation.
+			exemptLimit(w)
 			renderError(w, http.StatusUnauthorized, "Your Backyard sign-in ended",
 				"You were signed out of Backyard before you allowed the app. Sign in again to continue connecting it.",
 				a.LoginURL(back), "Sign in again")
 		case a.oidc != nil:
+			exemptLimit(w)
 			noStore(w)
 			http.Redirect(w, r, a.LoginURL(back), http.StatusFound)
 		default:

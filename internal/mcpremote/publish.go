@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,8 +24,20 @@ import (
 const (
 	// leaseTTL is how long a publish lease holds when its holder vanishes.
 	leaseTTL = 300 * time.Second
+	// releaseMargin: a publish that ends less than this before its lease
+	// expires leaves the lease to expire, as a taker may already be taking
+	// it over (no release lands on a lease taken over meanwhile).
+	releaseMargin = 30 * time.Second
 	// lockCollection holds the leases, one document per site.
 	lockCollection = "_mcp_locks"
+	// takeoverCollection holds the takeover claims of expired leases, one
+	// per lease state taken over (and per claimant that died before it
+	// wrote): <site>.<version>.<created_at µs>.<k>.
+	takeoverCollection = "_mcp_lock_takeovers"
+	// maxTakeoverClaims bounds the claims of one lease state.
+	maxTakeoverClaims = 100
+	// prunePageTakeovers bounds the expired claims one takeover prunes.
+	prunePageTakeovers = 100
 )
 
 type publishArgs struct {
@@ -157,9 +170,10 @@ func decodeBase64(s string) ([]byte, bool) {
 // the publish returned. Without a document store there is no lease.
 //
 // The lease document carries a random holder. An expired lease is taken
-// over with an Update that must be the very next write to the document it
-// was read as (same CreatedAt, Version + 1): of concurrent takers exactly
-// one wins, and no taker ever deletes a lease another one holds.
+// over only by the taker that first claims the state it read (its version
+// and creation time) with an atomic Create of a takeover claim: the others
+// answer E20 without writing, so no taker deletes or renames a lease
+// another one holds.
 func (h *handler) acquireLease(ctx context.Context, site, actor string) (func(), *deploy.PublishError) {
 	if h.docs == nil {
 		return func() {}, nil
@@ -193,8 +207,15 @@ func (h *handler) acquireLease(ctx context.Context, site, actor string) (func(),
 		case leaseExp(doc) >= h.now().Unix():
 			return nil, busy
 		}
-		// Expired: its holder died. Take it over, unless another taker
-		// (or a new lease) wrote the document first.
+		// Expired: its holder died. Claim the state read, so that of the
+		// takers that read it exactly one writes the lease.
+		claimed, err := h.claimTakeover(ctx, site, doc, exp, actor)
+		switch {
+		case err != nil:
+			return failed(err)
+		case !claimed:
+			return nil, busy // another taker claimed it first
+		}
 		taken, err := h.docs.Update(ctx, docstore.SystemSite, lockCollection, site, lease, actor)
 		switch {
 		case errors.Is(err, docstore.ErrNotFound):
@@ -204,7 +225,62 @@ func (h *handler) acquireLease(ctx context.Context, site, actor string) (func(),
 		case taken.Version != doc.Version+1 || !taken.CreatedAt.Equal(doc.CreatedAt):
 			return nil, busy
 		}
+		h.pruneTakeovers(ctx)
 		return release, nil
+	}
+}
+
+// claimTakeover claims the takeover of the expired lease doc with an atomic
+// Create of a claim (exp: the new lease's): only the taker whose Create
+// succeeds may write the lease. A claim is kept until it expires, after any
+// taker that read that state. A claim that expired while the lease is still
+// in the state read lost its claimant before it wrote: the next claim of
+// the chain may be taken.
+func (h *handler) claimTakeover(ctx context.Context, site string, doc *docstore.Doc, exp int64, actor string) (bool, error) {
+	for k := 1; k <= maxTakeoverClaims; k++ {
+		id := takeoverID(site, doc, k)
+		_, err := h.docs.Create(ctx, docstore.SystemSite, takeoverCollection, id, map[string]any{"exp": exp}, actor)
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, docstore.ErrConflict) {
+			return false, err
+		}
+		claim, err := h.docs.Get(ctx, docstore.SystemSite, takeoverCollection, id)
+		switch {
+		case errors.Is(err, docstore.ErrNotFound):
+			continue // pruned: it had expired
+		case err != nil:
+			return false, err
+		case leaseExp(claim) >= h.now().Unix():
+			return false, nil // a live claim: another taker is taking it over
+		}
+	}
+	return false, nil
+}
+
+// takeoverID is the id of claim k of the takeover of a lease state:
+// <site>.<version>.<created_at µs>.<k>.
+func takeoverID(site string, doc *docstore.Doc, k int) string {
+	return site + "." + strconv.FormatInt(doc.Version, 10) + "." + strconv.FormatInt(doc.CreatedAt.UnixMicro(), 10) + "." + strconv.Itoa(k)
+}
+
+// pruneTakeovers deletes a page of expired takeover claims (best effort;
+// takeovers are rare, so are claims).
+func (h *handler) pruneTakeovers(ctx context.Context) {
+	q := docstore.Query{Where: []docstore.Filter{{Field: "exp", Op: docstore.OpLt, Value: float64(h.now().Unix())}}, Limit: prunePageTakeovers}
+	if err := q.Normalize(prunePageTakeovers); err != nil {
+		return
+	}
+	page, err := h.docs.Query(ctx, docstore.SystemSite, takeoverCollection, q)
+	if err != nil {
+		h.log.DebugContext(ctx, "mcp: prune takeover claims", "error", err)
+		return
+	}
+	for _, d := range page.Docs {
+		if _, err := h.docs.Delete(ctx, docstore.SystemSite, takeoverCollection, d.ID); err != nil {
+			h.log.DebugContext(ctx, "mcp: prune takeover claims", "error", err)
+		}
 	}
 }
 
@@ -216,8 +292,9 @@ func newHolder() string {
 }
 
 // releaseLease deletes the lease of site if this publish still holds it and
-// it has not expired (an expired one may be taken over at any moment and is
-// left to the next taker).
+// it expires no sooner than releaseMargin from now (an expired one may be
+// taken over at any moment, and a delete must not land after that: such a
+// lease is left to expire).
 func (h *handler) releaseLease(ctx context.Context, site, holder string) {
 	ctx = context.WithoutCancel(ctx)
 	doc, err := h.docs.Get(ctx, docstore.SystemSite, lockCollection, site)
@@ -227,7 +304,7 @@ func (h *handler) releaseLease(ctx context.Context, site, holder string) {
 	case err != nil:
 		h.log.WarnContext(ctx, "mcp: release publish lease (it expires by itself)", "site", site, "error", err)
 		return
-	case doc.Data["holder"] != holder || leaseExp(doc) < h.now().Unix():
+	case doc.Data["holder"] != holder || leaseExp(doc) < h.now().Add(releaseMargin).Unix():
 		return
 	}
 	if _, err := h.docs.Delete(ctx, docstore.SystemSite, lockCollection, site); err != nil {

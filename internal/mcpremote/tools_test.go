@@ -548,8 +548,9 @@ func TestLeaseExpiryAndRelease(t *testing.T) {
 	e.toolOK(bobToken, "backyard_publish", map[string]any{"site": "s1", "files": files("index.html", "y"), "overwrite": true}, nil)
 }
 
-// pausingDocs holds the first lease write (the takeover of whoever arms
-// it) until proceed is closed.
+// pausingDocs holds the first write a lease taker makes after reading the
+// lease (the takeover claim, or the lease Update or Delete) of whoever arms
+// it until proceed is closed.
 type pausingDocs struct {
 	docstore.Store
 	armed            atomic.Bool
@@ -557,10 +558,17 @@ type pausingDocs struct {
 }
 
 func (p *pausingDocs) pause(collection string) {
-	if collection == lockCollection && p.armed.CompareAndSwap(true, false) {
+	if (collection == lockCollection || collection == takeoverCollection) && p.armed.CompareAndSwap(true, false) {
 		close(p.blocked)
 		<-p.proceed
 	}
+}
+
+func (p *pausingDocs) Create(ctx context.Context, site, collection, id string, data map[string]any, actor string) (*docstore.Doc, error) {
+	if collection == takeoverCollection {
+		p.pause(collection)
+	}
+	return p.Store.Create(ctx, site, collection, id, data, actor)
 }
 
 func (p *pausingDocs) Update(ctx context.Context, site, collection, id string, patch map[string]any, actor string) (*docstore.Doc, error) {
@@ -573,12 +581,15 @@ func (p *pausingDocs) Delete(ctx context.Context, site, collection, id string) (
 	return p.Store.Delete(ctx, site, collection, id)
 }
 
-// Two replicas taking over one expired lease at once: exactly one gets it,
-// and the loser never removes the winner's lease.
-func TestLeaseContestedTakeover(t *testing.T) {
-	docs := &pausingDocs{Store: memory.New(), blocked: make(chan struct{}), proceed: make(chan struct{})}
-	r1 := newTenv(t, tenvOption{opts: func(o *Options) { o.Docs = docs }})
-	r2 := newTenv(t, tenvOption{opts: func(o *Options) { o.Docs = docs }})
+// leaseRace sets up two replicas over one store holding the expired lease
+// of a dead holder, and starts r2 taking it over: it returns once r2 has
+// read the lease and is about to write. go resumes r2 and returns its
+// result.
+func leaseRace(t *testing.T) (docs *pausingDocs, r1, r2 *tenv, resume func() (func(), *deploy.PublishError)) {
+	t.Helper()
+	docs = &pausingDocs{Store: memory.New(), blocked: make(chan struct{}), proceed: make(chan struct{})}
+	r1 = newTenv(t, tenvOption{opts: func(o *Options) { o.Docs = docs }})
+	r2 = newTenv(t, tenvOption{opts: func(o *Options) { o.Docs = docs }})
 	ctx := context.Background()
 	if _, err := docs.Create(ctx, docstore.SystemSite, lockCollection, "s", map[string]any{"exp": time.Now().Unix() - 60, "holder": "dead"}, "x"); err != nil {
 		t.Fatal(err)
@@ -593,24 +604,144 @@ func TestLeaseContestedTakeover(t *testing.T) {
 		release, err := r2.h.acquireLease(ctx, "s", "bob")
 		slow <- result{release, err}
 	}()
-	<-docs.blocked // r2 read the expired lease and is about to take it over
+	<-docs.blocked
+	return docs, r1, r2, func() (func(), *deploy.PublishError) {
+		close(docs.proceed)
+		r := <-slow
+		return r.release, r.err
+	}
+}
+
+// wantNoLease fails unless site has no lease and a new publish gets one.
+func wantNoLease(t *testing.T, e *tenv, docs docstore.Store, site string) {
+	t.Helper()
+	if d, err := docs.Get(context.Background(), docstore.SystemSite, lockCollection, site); !errors.Is(err, docstore.ErrNotFound) {
+		t.Fatalf("a lease nobody holds is left behind: %+v %v", d, err)
+	}
+	release, err := e.h.acquireLease(context.Background(), site, "carol")
+	if err != nil {
+		t.Fatalf("the next publish = %v", err)
+	}
+	release()
+}
+
+// Two replicas taking over one expired lease at once: exactly one gets it,
+// the loser writes nothing (it neither removes nor renames the winner's
+// lease), and the winner's release frees the site.
+func TestLeaseContestedTakeover(t *testing.T) {
+	docs, r1, r2, resume := leaseRace(t)
+	ctx := context.Background()
+	// r2 read the expired lease and is about to take it over; r1 does first.
 	release1, err1 := r1.h.acquireLease(ctx, "s", "alice")
-	close(docs.proceed)
-	r := <-slow
-	if (err1 == nil) == (r.err == nil) {
-		t.Fatalf("both or neither replica got the lease: r1 %v, r2 %v", err1, r.err)
+	_, err2 := resume()
+	if err1 != nil || err2 == nil || err2.ID != "E20" {
+		t.Fatalf("r1 = %v, r2 = %v; want r1 to hold the lease and r2 E20", err1, err2)
 	}
-	if err1 != nil || r.err.ID != "E20" {
-		t.Fatalf("r1 = %v, r2 = %v; want r1 to hold the lease and r2 E20", err1, r.err)
-	}
-	if _, err := docs.Get(ctx, docstore.SystemSite, lockCollection, "s"); err != nil {
-		t.Fatalf("the lease r1 holds is gone: %v", err)
+	if d, err := docs.Get(ctx, docstore.SystemSite, lockCollection, "s"); err != nil || d.Version != 2 {
+		t.Fatalf("the lease r1 holds = %+v, %v; want it untouched by r2", d, err)
 	}
 	// While r1 holds it, nobody else gets it.
 	if _, err := r2.h.acquireLease(ctx, "s", "bob"); err == nil || err.ID != "E20" {
 		t.Fatalf("a third publish got the lease: %v", err)
 	}
 	release1()
+	wantNoLease(t, r2, docs, "s")
+}
+
+// A taker that read the expired lease before another took it over, published
+// and released it, and a third publish made a new lease: the stale taker
+// leaves the new lease alone, so the third publish's release frees the site.
+func TestLeaseStaleTakeover(t *testing.T) {
+	docs, r1, r2, resume := leaseRace(t)
+	ctx := context.Background()
+	release1, err := r1.h.acquireLease(ctx, "s", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release1()
+	release3, err := r1.h.acquireLease(ctx, "s", "carol")
+	if err != nil {
+		t.Fatalf("a fresh lease = %v", err)
+	}
+	if _, err := resume(); err == nil || err.ID != "E20" {
+		t.Fatalf("the stale taker = %v, want E20", err)
+	}
+	if d, err := docs.Get(ctx, docstore.SystemSite, lockCollection, "s"); err != nil || d.Version != 1 {
+		t.Fatalf("the third publish's lease = %+v, %v; want it untouched", d, err)
+	}
+	release3()
+	wantNoLease(t, r2, docs, "s")
+}
+
+// Takeover claims are pruned once they have expired.
+func TestLeaseTakeoverClaimsPruned(t *testing.T) {
+	e := newTenv(t)
+	now := time.Unix(1_800_000_000, 0)
+	e.h.now = func() time.Time { return now }
+	ctx := context.Background()
+	for i := range 3 {
+		if _, err := e.docs.Create(ctx, docstore.SystemSite, lockCollection, "s", map[string]any{"exp": now.Unix() - 1, "holder": "dead"}, "x"); err != nil {
+			t.Fatal(err)
+		}
+		release, err := e.h.acquireLease(ctx, "s", "alice")
+		if err != nil {
+			t.Fatalf("takeover %d = %v", i, err)
+		}
+		release()
+		now = now.Add(leaseTTL + time.Second)
+	}
+	q := docstore.Query{}
+	if err := q.Normalize(100); err != nil {
+		t.Fatal(err)
+	}
+	page, err := e.docs.Query(ctx, docstore.SystemSite, takeoverCollection, q)
+	if err != nil || len(page.Docs) != 1 {
+		t.Fatalf("takeover claims = %d (%v), want only the live one", len(page.Docs), err)
+	}
+}
+
+// A taker that claimed an expired lease and died before it wrote blocks the
+// site until its claim expires; then the next taker claims it anew.
+func TestLeaseDeadClaimant(t *testing.T) {
+	e := newTenv(t)
+	now := time.Unix(1_800_000_000, 0)
+	e.h.now = func() time.Time { return now }
+	ctx := context.Background()
+	doc, err := e.docs.Create(ctx, docstore.SystemSite, lockCollection, "s", map[string]any{"exp": now.Unix() - 1, "holder": "dead"}, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.docs.Create(ctx, docstore.SystemSite, takeoverCollection, takeoverID("s", doc, 1), map[string]any{"exp": now.Add(leaseTTL).Unix()}, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.h.acquireLease(ctx, "s", "alice"); err == nil || err.ID != "E20" {
+		t.Fatalf("with a live claim: %v, want E20", err)
+	}
+	now = now.Add(leaseTTL + time.Second)
+	release, perr := e.h.acquireLease(ctx, "s", "alice")
+	if perr != nil {
+		t.Fatalf("after the claim expired: %v", perr)
+	}
+	release()
+	wantNoLease(t, e, e.docs, "s")
+}
+
+// A publish that ends close to its lease's expiry leaves the lease to expire:
+// a taker may already be taking it over.
+func TestLeaseReleaseMargin(t *testing.T) {
+	e := newTenv(t)
+	now := time.Unix(1_800_000_000, 0)
+	e.h.now = func() time.Time { return now }
+	ctx := context.Background()
+	release, err := e.h.acquireLease(ctx, "s", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(leaseTTL - releaseMargin + time.Second)
+	release()
+	if _, err := e.docs.Get(ctx, docstore.SystemSite, lockCollection, "s"); err != nil {
+		t.Fatalf("a lease about to expire was deleted: %v", err)
+	}
 }
 
 func TestScrub(t *testing.T) {

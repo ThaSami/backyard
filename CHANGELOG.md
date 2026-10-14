@@ -60,7 +60,9 @@ All notable changes to Backyard are documented here. The format follows
   login (it answers `404` there until `MCP_ENABLED`). `access enable` verifies them at the edge
   too, so applications made in the dashboard from the earlier steps need the four paths added.
   `bypass_paths` now also accepts the two OAuth discovery documents. **Upgrade:** re-run
-  `backyard cloudflare access enable` (or `terraform apply`) once.
+  `backyard cloudflare access enable` (or `terraform apply`) once; for a bypass application it
+  created, that needs the admin API token in `BACKYARD_CF_API_TOKEN` (or pasted when asked), or
+  the four destinations added in the dashboard.
 - The AWS and GCP modules exempt the connector's four machine paths from the ALB login and IAP
   whether or not the connector is on (Backyard answers `404` there until `mcp.enabled`).
   **Upgrade:** `terraform apply`.

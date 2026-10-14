@@ -28,6 +28,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/thasami/backyard/internal/auth"
@@ -106,10 +107,15 @@ var supportedVersions = []string{versionLatest, versionFallback}
 const (
 	// requestDeadline bounds reading the body and writing the answer.
 	requestDeadline = 5 * time.Minute
+	// bodyGrace and minBodyRate pace the body: byte n is due bodyGrace +
+	// n / minBodyRate after the body is first read, so a body sent slower
+	// than that on average is cut off (and frees its admission slot).
+	bodyGrace   = 10 * time.Second
+	minBodyRate = 64 << 10 // bytes per second
 	// largeBody is the size above which a request needs an admission slot.
 	largeBody = 1 << 20
 	// admissionSlots bounds concurrent large requests (their bodies are
-	// held in memory).
+	// held in memory); one user holds at most one.
 	admissionSlots = 4
 	// admissionWait is how long a large request waits for a slot.
 	admissionWait = 30 * time.Second
@@ -142,8 +148,13 @@ type handler struct {
 	hubHost   string // H
 	maxBody   int64
 	slots     chan struct{}
+	usersMu   sync.Mutex
+	users     map[string]*userSlot // users waiting for or holding a slot
 	admitWait time.Duration
-	version   string
+	// bodyGrace and minBodyRate pace bodies (constants but for tests).
+	bodyGrace   time.Duration
+	minBodyRate float64
+	version     string
 	// publish is Gateway.Publish (replaced by tests).
 	publish func(ctx context.Context, req deploy.PublishRequest) (*deploy.PublishResult, *deploy.PublishError)
 }
@@ -166,7 +177,8 @@ func newHandler(o Options) (*handler, error) {
 	h := &handler{
 		o: o, cfg: o.Config, auth: o.Auth, reg: o.Sites, store: o.Blob, docs: o.Docs, gw: o.Gateway,
 		docsFor: o.DocsFor, log: o.Logger, now: o.Now, cat: cat, version: o.Version,
-		slots: make(chan struct{}, admissionSlots), admitWait: admissionWait,
+		slots: make(chan struct{}, admissionSlots), users: map[string]*userSlot{}, admitWait: admissionWait,
+		bodyGrace: bodyGrace, minBodyRate: minBodyRate,
 	}
 	if h.cfg == nil {
 		h.cfg = &config.Config{}
@@ -313,19 +325,23 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.ContentLength < 0 || r.ContentLength > largeBody {
-		if !h.admit(r.Context()) {
+		release, ok := h.admit(r.Context(), user.ID)
+		if !ok {
 			hdr.Set("Retry-After", "5")
 			writeError(w, http.StatusTooManyRequests, "rate_limited", "too many large MCP requests at once; retry in a few seconds")
 			return
 		}
-		defer func() { <-h.slots }()
+		defer release()
 	}
-	// Authenticated and admitted: the deadlines of a large publish.
+	// Authenticated and admitted: the body is paced, and the answer gets
+	// the deadline of a large publish.
 	rc := http.NewResponseController(w)
-	deadline := time.Now().Add(requestDeadline)
-	_ = rc.SetReadDeadline(deadline)
-	_ = rc.SetWriteDeadline(deadline)
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, h.maxBody))
+	start := time.Now()
+	limit := start.Add(requestDeadline)
+	_ = rc.SetWriteDeadline(limit)
+	paced := &pacedBody{ReadCloser: r.Body, rc: rc, start: start, limit: limit, grace: h.bodyGrace, rate: h.minBodyRate, want: r.ContentLength}
+	body, err := io.ReadAll(http.MaxBytesReader(w, paced, h.maxBody))
+	_ = rc.SetReadDeadline(limit)
 	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
@@ -462,23 +478,78 @@ func (h *handler) originAllowed(origin, reqOrigin string) bool {
 	return o == h.hubOrigin || o == reqOrigin || h.auth.AllowedOrigin(o)
 }
 
-// admit takes an admission slot for a large body, waiting at most
-// admitWait.
-func (h *handler) admit(ctx context.Context) bool {
-	select {
-	case h.slots <- struct{}{}:
-		return true
-	default:
+// admit takes an admission slot for a large body of a user, waiting at most
+// admitWait in all: first for the user's own (one large body per user at a
+// time, so no one takes all the slots), then for one of the shared ones.
+func (h *handler) admit(ctx context.Context, userID string) (release func(), ok bool) {
+	h.usersMu.Lock()
+	u := h.users[userID]
+	if u == nil {
+		u = &userSlot{ch: make(chan struct{}, 1)}
+		h.users[userID] = u
+	}
+	u.refs++
+	h.usersMu.Unlock()
+	unref := func() {
+		h.usersMu.Lock()
+		if u.refs--; u.refs == 0 {
+			delete(h.users, userID)
+		}
+		h.usersMu.Unlock()
 	}
 	t := time.NewTimer(h.admitWait)
 	defer t.Stop()
 	select {
+	case u.ch <- struct{}{}:
+	case <-t.C:
+		unref()
+		return nil, false
+	case <-ctx.Done():
+		unref()
+		return nil, false
+	}
+	select {
 	case h.slots <- struct{}{}:
-		return true
+		return func() { <-h.slots; <-u.ch; unref() }, true
 	case <-t.C:
 	case <-ctx.Done():
 	}
-	return false
+	<-u.ch
+	unref()
+	return nil, false
+}
+
+// userSlot is a user's share of the admission slots (one at a time).
+type userSlot struct {
+	ch   chan struct{} // capacity 1: held while the user holds a slot
+	refs int           // requests of the user waiting for or holding it
+}
+
+// pacedBody moves the connection's read deadline as the body arrives: byte
+// n is due grace + n/rate after start (never after limit), so a body that
+// falls behind is cut off. Once the body is read, the deadline is limit,
+// which net/http's background read of the connection inherits.
+type pacedBody struct {
+	io.ReadCloser
+	rc           *http.ResponseController
+	start, limit time.Time
+	grace        time.Duration
+	rate         float64 // bytes per second
+	n, want      int64   // bytes read; the Content-Length (-1: unknown)
+}
+
+func (p *pacedBody) Read(b []byte) (int, error) {
+	due := p.start.Add(p.grace + time.Duration(float64(p.n)/p.rate*float64(time.Second)))
+	if due.After(p.limit) {
+		due = p.limit
+	}
+	_ = p.rc.SetReadDeadline(due)
+	n, err := p.ReadCloser.Read(b)
+	p.n += int64(n)
+	if err == io.EOF || (p.want >= 0 && p.n >= p.want) {
+		_ = p.rc.SetReadDeadline(p.limit)
+	}
+	return n, err
 }
 
 // bearerToken returns the token of an "Authorization: Bearer <token>"

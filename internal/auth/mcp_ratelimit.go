@@ -13,9 +13,11 @@ import (
 // authorize, a code or refresh token naming a grant at the token endpoint —
 // is charged to that person (ratelimit.Key: per client IP for guests);
 // every other request is charged to its client IP once it is answered, and
-// answered 429 instead when that budget is spent. Requests that identify no
-// one (junk from one address behind a shared proxy) so never exhaust the
-// budget of the people who connect from the same address.
+// answered 429 instead when that budget is spent — except a valid request of
+// a signed-out browser in oidc mode, whose way to the login is never
+// charged. Requests that identify no one (junk from one address behind a
+// shared proxy) so never exhaust the budget of the people who connect from
+// the same address, signed in or not.
 
 // limitWriter applies the limit to one request.
 type limitWriter struct {
@@ -45,6 +47,16 @@ func chargeUser(w http.ResponseWriter, userID string, anonymous bool) bool {
 		l.reject(wait)
 	}
 	return allowed
+}
+
+// exemptLimit lets a valid authorization request of a signed-out browser in
+// oidc mode through uncharged: its answer (the way to the login) is cheap,
+// identifies no one and only leads to the IdP, so junk from the same
+// address never keeps people from signing in.
+func exemptLimit(w http.ResponseWriter) {
+	if l, ok := w.(*limitWriter); ok {
+		l.charged = true
+	}
 }
 
 // WriteHeader charges the client IP for an answer to a request that

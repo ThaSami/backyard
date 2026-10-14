@@ -21,8 +21,8 @@ import (
 )
 
 // The grant store (SPEC §8.4, §10): one record per consent in
-// _system/_mcp_grants/<gid>, plus a rotation marker per issued refresh
-// generation in _system/_mcp_rotations/<gid>.<n>. The grant record is the
+// _system/_mcp_grants/<gid>, plus the rotation markers of the newest two
+// issued refresh generations in _system/_mcp_rotations/<gid>.<n>. The grant record is the
 // single source of truth: every token check reads it, and revocation
 // deletes it.
 
@@ -243,6 +243,11 @@ func (m *MCP) deleteGrant(ctx context.Context, gid string) (bool, error) {
 // calls it with from=0, grace=false; refreshing RT(n) with from=n,
 // grace=true. It returns the outcome and, for ok and grace, the current
 // grant (nil when the grant disappeared concurrently).
+//
+// Only the markers of the newest two generations are kept (O(1) state per
+// grant): a refresh of RT(n) deletes marker n-1 before it creates marker
+// n+1, so a presented generation without its marker is an old one, and a
+// redeemed grant proves a replayed code.
 func (m *MCP) rotate(ctx context.Context, gid string, from int64, grace bool) (string, *grantRecord, error) {
 	now := m.now()
 	g, err := m.loadGrant(ctx, gid)
@@ -252,6 +257,37 @@ func (m *MCP) rotate(ctx context.Context, gid string, from int64, grace bool) (s
 	if g == nil || g.Exp <= now.Unix() || (from >= 1 && g.RedeemedAt == 0) {
 		return rotateMissing, nil, nil
 	}
+	sctx, cancel := storeCtx(ctx)
+	defer cancel()
+	reuse := func() (string, *grantRecord, error) {
+		if _, err := m.docs.Delete(sctx, docstore.SystemSite, grantsCollection, gid); err != nil {
+			return "", nil, err
+		}
+		return rotateReuse, g, nil
+	}
+	hasMarker := func(n int64) (bool, error) {
+		_, err := m.docs.Get(sctx, docstore.SystemSite, rotationsCollection, markerID(gid, n))
+		if errors.Is(err, docstore.ErrNotFound) {
+			return false, nil
+		}
+		return err == nil, err
+	}
+	switch {
+	case from == 0 && g.RedeemedAt > 0:
+		return reuse() // a replayed code
+	case from >= 1:
+		if ok, err := hasMarker(from); err != nil {
+			return "", nil, err
+		} else if !ok {
+			return reuse() // an old generation, compacted away
+		}
+		if from >= 2 {
+			// Compaction comes first: a failure leaves nothing created.
+			if _, err := m.docs.Delete(sctx, docstore.SystemSite, rotationsCollection, markerID(gid, from-1)); err != nil {
+				return "", nil, err
+			}
+		}
+	}
 	// The family's exp is fixed at redemption (created_at + the token TTL
 	// then in force) and never extended; refresh markers carry it as stored,
 	// so a later, lower auth.token_ttl cannot prune them before the grant.
@@ -259,13 +295,23 @@ func (m *MCP) rotate(ctx context.Context, gid string, from int64, grace bool) (s
 	if from == 0 {
 		familyExp = g.CreatedAt + int64(m.family/time.Second)
 	}
-	sctx, cancel := storeCtx(ctx)
-	defer cancel()
 	marker := map[string]any{"gid": gid, "n": from + 1, "at": now.UnixMilli(), "exp": familyExp}
 	_, err = m.docs.Create(sctx, docstore.SystemSite, rotationsCollection, markerID(gid, from+1), marker, g.User.ID)
 	switch {
 	case err == nil:
+		// The checks above read the store before the Create: a request that
+		// read it before later rotations compacted the markers has just
+		// filled a gap (marker from is gone now, or the code was redeemed).
 		if from == 0 {
+			cur, err := m.loadGrant(ctx, gid)
+			switch {
+			case err != nil:
+				return "", nil, err
+			case cur == nil:
+				return rotateOK, nil, nil // revoked concurrently
+			case cur.RedeemedAt > 0:
+				return reuse()
+			}
 			d, err := m.docs.Update(sctx, docstore.SystemSite, grantsCollection, gid,
 				map[string]any{"redeemed_at": now.Unix(), "exp": familyExp}, g.User.ID)
 			if errors.Is(err, docstore.ErrNotFound) {
@@ -277,6 +323,10 @@ func (m *MCP) rotate(ctx context.Context, gid string, from int64, grace bool) (s
 			if g, err = grantFromDoc(d); err != nil {
 				return "", nil, err
 			}
+		} else if ok, err := hasMarker(from); err != nil {
+			return "", nil, err
+		} else if !ok {
+			return reuse()
 		}
 		return rotateOK, g, nil
 	case !errors.Is(err, docstore.ErrConflict):
@@ -288,19 +338,16 @@ func (m *MCP) rotate(ctx context.Context, gid string, from int64, grace bool) (s
 			return "", nil, err
 		}
 		if err == nil && now.UnixMilli()-intValue(md.Data["at"]) <= mcpRefreshGrace.Milliseconds() {
-			_, err := m.docs.Get(sctx, docstore.SystemSite, rotationsCollection, markerID(gid, from+2))
+			next, err := hasMarker(from + 2)
 			switch {
-			case errors.Is(err, docstore.ErrNotFound):
-				return rotateGrace, g, nil
 			case err != nil:
 				return "", nil, err
+			case !next:
+				return rotateGrace, g, nil
 			}
 		}
 	}
-	if _, err := m.docs.Delete(sctx, docstore.SystemSite, grantsCollection, gid); err != nil {
-		return "", nil, err
-	}
-	return rotateReuse, g, nil
+	return reuse()
 }
 
 // markerID is the document id of rotation marker n of a grant.

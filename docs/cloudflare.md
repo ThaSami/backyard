@@ -104,8 +104,9 @@ asked for it), the health checks `/__backyard/healthz` and `/__backyard/readyz`,
 until `MCP_ENABLED` is set). `backyard cloudflare access enable` creates this Bypass application
 (with an API token in `BACKYARD_CF_API_TOKEN`) or prints the dashboard steps, and verifies at
 the edge that all nine paths reach the Worker before it switches the Worker to Access; after an
-upgrade, run it once more so the bypass application gains the connector's paths
-(`backyard cloudflare status` reports them as `access-connector`). The optional
+upgrade, run it once more so the bypass application gains the connector's paths (with the API
+token again, or it names the destinations to add in the dashboard; `backyard cloudflare status`
+reports them as `access-connector`). The optional
 [Terraform module](../deploy/terraform/cloudflare/README.md) creates the same (`bypass_paths`).
 
 **Use Backyard in Claude.** `backyard cloudflare setup --var MCP_ENABLED:true` (Terraform:

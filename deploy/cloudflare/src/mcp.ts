@@ -197,8 +197,11 @@ function parseMessage(body: Uint8Array): Message {
   const idStrings = new Map<object, string>();
   let v: unknown;
   try {
-    // ignoreBOM: a byte order mark is no JSON, as on the Go server.
-    const text = new TextDecoder("utf-8", { fatal: false, ignoreBOM: true }).decode(body);
+    // ignoreBOM: a byte order mark is no JSON, as on the Go server. fatal: a
+    // body that is not UTF-8 is no JSON text either (RFC 8259 §8.1), as on
+    // the Go server (whose decoder would replace each invalid byte, where
+    // TextDecoder replaces each maximal invalid sequence).
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(body);
     v = JSON.parse(text, function (this: unknown, key: string, value: unknown, context?: { source?: string }) {
       if (key === "id" && typeof value === "number" && typeof context?.source === "string") idSources.set(this as object, context.source);
       // Lone surrogate escapes ("\ud800") become U+FFFD, as encoding/json

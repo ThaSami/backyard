@@ -512,7 +512,9 @@ With the [Terraform module](#with-terraform-optional-infrastructure-as-code), se
   the connector, and API tokens are not accepted by it.
 - **Access.** After upgrading, re-run `backyard cloudflare access enable` (or `terraform apply`)
   once, so the bypass application holds all nine paths; `backyard cloudflare status` reports
-  `access-connector` until it does. `/__backyard/auth/authorize` stays behind Access: that login
+  `access-connector` until it does. Updating a bypass application the CLI created needs the
+  admin API token again (`BACKYARD_CF_API_TOKEN`, or paste it when asked); without one, the
+  command names the four destinations to add in the dashboard instead. `/__backyard/auth/authorize` stays behind Access: that login
   is the connector's sign-in, with Okta or any other identity provider of Access.
 - **The URL** is shown on the hub's card "Use Backyard in Claude" (and as `mcp_url` in
   `/__backyard/api/info`). The hub URL must be https: `workers.dev` and custom domains are.

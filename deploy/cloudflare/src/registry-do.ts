@@ -18,6 +18,8 @@ const MCP_REFRESH_GRACE = 60;
 
 /** Most grants listed at once. */
 const MCP_MAX_GRANTS = 200;
+/** Expired grants and rotation markers pruned per consent (each). */
+const MCP_PRUNE_PAGE = 500;
 
 /** A row of mcp_grants. */
 interface GrantRow {
@@ -98,14 +100,15 @@ export class RegistryDO extends DurableObject<Env> {
     // Slots of max_sites held by first deploys between their commit and putSite.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS site_reservations (name TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)`);
     // Claude connector (SPEC §8.4.8): one grant per consent (times in unix
-    // seconds; data holds the other fields as JSON) and one marker per issued
-    // refresh-token generation.
+    // seconds; data holds the other fields as JSON) and the markers of its
+    // newest two issued refresh-token generations.
     this.sql.exec(
       `CREATE TABLE IF NOT EXISTS mcp_grants (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL, code_exp INTEGER NOT NULL, redeemed_at INTEGER, exp INTEGER NOT NULL)`,
     );
     this.sql.exec(`CREATE INDEX IF NOT EXISTS mcp_grants_user ON mcp_grants (user_id)`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS mcp_grants_exp ON mcp_grants (exp)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS mcp_rotations (gid TEXT NOT NULL, n INTEGER NOT NULL, at INTEGER NOT NULL, exp INTEGER NOT NULL, PRIMARY KEY (gid, n))`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS mcp_rotations_exp ON mcp_rotations (exp)`);
   }
 
   /** Sites plus live reservations of names that are not sites yet. */
@@ -313,8 +316,9 @@ export class RegistryDO extends DurableObject<Env> {
       const now = Math.floor(Date.now() / 1000);
       const { id, user_id, created_at, code_exp, redeemed_at, exp, ...rest } = g;
       this.ctx.storage.transactionSync(() => {
-        this.sql.exec("DELETE FROM mcp_grants WHERE exp < ?", now);
-        this.sql.exec("DELETE FROM mcp_rotations WHERE exp < ?", now);
+        // Bounded, over the exp indexes: a backlog is worked off by later consents.
+        this.sql.exec(`DELETE FROM mcp_grants WHERE id IN (SELECT id FROM mcp_grants WHERE exp < ? LIMIT ${MCP_PRUNE_PAGE})`, now);
+        this.sql.exec(`DELETE FROM mcp_rotations WHERE rowid IN (SELECT rowid FROM mcp_rotations WHERE exp < ? LIMIT ${MCP_PRUNE_PAGE})`, now);
         this.sql.exec(
           `INSERT INTO mcp_grants (${GRANT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)`,
           id,
@@ -346,7 +350,9 @@ export class RegistryDO extends DurableObject<Env> {
    * rotate (SPEC §8.4.8), the only state transition of a grant, in one
    * transaction: code redemption calls it with from=0, grace=false (and the
    * grant's family expiry, which becomes its expiry); refreshing generation n
-   * with from=n, grace=true. now is unix seconds.
+   * with from=n, grace=true. now is unix seconds. Only the markers of the
+   * newest two generations are kept: a presented generation without its
+   * marker is an old one, and a redeemed grant proves a replayed code.
    */
   async mcpRotate(gid: string, from: number, now: number, grace: boolean, familyExp: number): Promise<Result<RotateOutcome>> {
     try {
@@ -354,6 +360,13 @@ export class RegistryDO extends DurableObject<Env> {
         const g = this.grantRow(gid);
         if (!g || g.exp <= now) return "missing";
         if (from >= 1 && g.redeemed_at === null) return "missing";
+        const reuse = (): RotateOutcome => {
+          this.dropGrant(gid);
+          return "reuse";
+        };
+        if (from === 0 && g.redeemed_at !== null) return reuse(); // a replayed code
+        if (from >= 1 && this.sql.exec("SELECT 1 FROM mcp_rotations WHERE gid = ? AND n = ?", gid, from).toArray().length === 0) return reuse(); // compacted away
+        if (from >= 2) this.sql.exec("DELETE FROM mcp_rotations WHERE gid = ? AND n = ?", gid, from - 1);
         const created = this.sql.exec("INSERT OR IGNORE INTO mcp_rotations (gid, n, at, exp) VALUES (?, ?, ?, ?)", gid, from + 1, now, familyExp);
         if (created.rowsWritten > 0) {
           if (from === 0) this.sql.exec("UPDATE mcp_grants SET redeemed_at = ?, exp = ? WHERE id = ?", now, familyExp, gid);
@@ -365,8 +378,7 @@ export class RegistryDO extends DurableObject<Env> {
           if (m && now - m.at <= MCP_REFRESH_GRACE && !next) return "grace";
         }
         // A replay of a code, or an old refresh generation: revoke the grant.
-        this.dropGrant(gid);
-        return "reuse";
+        return reuse();
       });
       return ok(outcome);
     } catch (e) {
