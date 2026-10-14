@@ -1,0 +1,20 @@
+{
+  "name": "backyard",
+  "displayName": "Backyard",
+  "version": "0.1.0",
+  "description": "Build, host and share internal web apps on Backyard (a folder of HTML becomes an internal URL with a zero-config backend). Adds the Backyard skill (client API, recipes, deploy guide), the /backyard:new, /backyard:deploy and /backyard:docs commands, and the Backyard MCP server. The MCP server and deploys need the backyard CLI on your PATH.",
+  "author": {
+    "name": "Backyard contributors",
+    "url": "https://github.com/thasami/backyard"
+  },
+  "homepage": "https://github.com/thasami/backyard",
+  "repository": "https://github.com/thasami/backyard",
+  "license": "Apache-2.0",
+  "keywords": ["backyard", "internal-tools", "hosting", "static-sites", "realtime", "deploy", "mcp"],
+  "mcpServers": {
+    "backyard": {
+      "command": "backyard",
+      "args": ["mcp"]
+    }
+  }
+}

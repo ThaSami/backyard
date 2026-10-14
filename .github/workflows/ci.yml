@@ -1,0 +1,519 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GO_VERSION: "1.26"
+  NODE_VERSION: "22"
+  GOLANGCI_LINT_VERSION: v2.14
+  TERRAFORM_VERSION: "1.16.5"
+
+jobs:
+  # Which optional trees exist (job-level `if` cannot use hashFiles).
+  detect:
+    name: Detect components
+    runs-on: ubuntu-latest
+    outputs:
+      cloudflare: ${{ steps.detect.outputs.cloudflare }}
+      conformance: ${{ steps.detect.outputs.conformance }}
+      e2e: ${{ steps.detect.outputs.e2e }}
+      helm: ${{ steps.detect.outputs.helm }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: detect
+        run: |
+          has() { if [ -e "$1" ]; then echo true; else echo false; fi; }
+          {
+            echo "cloudflare=$(has deploy/cloudflare/package.json)"
+            echo "conformance=$(has conformance)"
+            if [ -f e2e/package.json ] || [ -f web/test/e2e.test.mjs ]; then echo "e2e=true"; else echo "e2e=false"; fi
+            echo "helm=$(has deploy/helm/backyard/Chart.yaml)"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  go:
+    name: Go (vet, test -race)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: backyard
+          POSTGRES_PASSWORD: backyard
+          POSTGRES_DB: backyard
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U backyard -d backyard"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      dynamodb:
+        image: amazon/dynamodb-local
+        ports:
+          - 8000:8000
+      azurite:
+        image: mcr.microsoft.com/azure-storage/azurite
+        ports:
+          - 10000:10000
+    env:
+      BACKYARD_TEST_POSTGRES_DSN: postgres://backyard:backyard@127.0.0.1:5432/backyard?sslmode=disable
+      BACKYARD_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+      BACKYARD_TEST_DYNAMODB_ENDPOINT: http://127.0.0.1:8000
+      # Azurite's well-known development account (not a secret).
+      BACKYARD_TEST_AZURITE: DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+      - name: gofmt
+        run: |
+          unformatted="$(git ls-files -z '*.go' | xargs -0 gofmt -l)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files need gofmt (run make fmt):"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go.mod is tidy
+        run: go mod tidy -diff
+      - name: go vet
+        run: go vet ./...
+      - name: Build
+        run: go build ./...
+      - name: Wait for DynamoDB Local and Azurite
+        run: |
+          for url in http://127.0.0.1:8000 http://127.0.0.1:10000/devstoreaccount1?comp=list; do
+            for i in $(seq 1 60); do
+              if curl -s -o /dev/null "$url"; then echo "$url is up"; break; fi
+              if [ "$i" = 60 ]; then echo "::error::$url did not come up"; exit 1; fi
+              sleep 1
+            done
+          done
+      - name: go test -race
+        run: go test -race -count=1 -timeout=30m -covermode=atomic -coverprofile=coverage.out ./...
+      - name: Coverage summary
+        if: always() && hashFiles('coverage.out') != ''
+        run: go tool cover -func=coverage.out | tail -n 1 | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always() && hashFiles('coverage.out') != ''
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+
+  sdk:
+    name: JavaScript SDK and hub
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: SDK build is in sync with web/sdk/src
+        run: node web/sdk/build.mjs --check
+      - name: Install Chromium for the browser tests
+        run: |
+          npm install --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/pw" playwright-core@1.56.1
+          node "$RUNNER_TEMP/pw/node_modules/playwright-core/cli.js" install --with-deps chromium
+          echo "PLAYWRIGHT_CORE=$RUNNER_TEMP/pw/node_modules/playwright-core/index.mjs" >> "$GITHUB_ENV"
+      - name: node --test
+        run: node --test 'web/sdk/test/*.test.mjs' 'web/test/*.test.mjs'
+
+  cloudflare:
+    name: Cloudflare edition
+    needs: detect
+    if: needs.detect.outputs.cloudflare == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: deploy/cloudflare
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+      - name: Bundle like a deploy (scripts/cloudflare-ci.mjs deploy --dry-run)
+        working-directory: .
+        run: node scripts/cloudflare-ci.mjs deploy --dry-run
+
+  conformance-go:
+    name: Conformance (Go server)
+    needs: detect
+    if: needs.detect.outputs.conformance == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      # A warehouse source, so the warehouse checks run instead of the 501 ones.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: backyard
+          POSTGRES_PASSWORD: backyard
+          POSTGRES_DB: backyard
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U backyard -d backyard"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: shellcheck the runners
+        run: shellcheck conformance/*.sh
+      - name: Build
+        run: make build
+      # Host mode as an anonymous guest, then path mode with a static token;
+      # AI aliases are backed by the suite's mock OpenAI-compatible provider.
+      - name: Run the suite against backyard serve --dev (host and path mode)
+        env:
+          BACKYARD_BIN: ${{ github.workspace }}/bin/backyard
+          CONFORMANCE_WAREHOUSE_DSN: postgres://backyard:backyard@127.0.0.1:5432/backyard?sslmode=disable
+        run: conformance/run-go.sh
+
+  conformance-worker:
+    name: Conformance (Cloudflare Worker)
+    needs: detect
+    if: needs.detect.outputs.conformance == 'true' && needs.detect.outputs.cloudflare == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install the Worker
+        working-directory: deploy/cloudflare
+        run: npm ci --no-audit --no-fund
+      # Path mode as an anonymous guest, then host mode with the DEPLOY_TOKEN.
+      - name: Run the suite against wrangler dev --env local (path and host mode)
+        run: conformance/run-worker.sh
+
+  terraform:
+    name: Terraform (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [aws, gcp, azure, cloudflare]
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
+    steps:
+      - uses: actions/checkout@v7
+      - id: module
+        run: |
+          dir="deploy/terraform/${{ matrix.module }}"
+          if ls "$dir"/*.tf >/dev/null 2>&1; then
+            echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$dir does not exist yet: skipping"
+          fi
+      - uses: hashicorp/setup-terraform@v4
+        if: steps.module.outputs.dir != ''
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - uses: actions/cache@v6
+        if: steps.module.outputs.dir != ''
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: terraform-${{ matrix.module }}-${{ hashFiles(format('deploy/terraform/{0}/**/.terraform.lock.hcl', matrix.module), format('deploy/terraform/{0}/**/versions.tf', matrix.module)) }}
+          restore-keys: terraform-${{ matrix.module }}-
+      - name: terraform fmt -check
+        if: steps.module.outputs.dir != ''
+        run: mkdir -p "$TF_PLUGIN_CACHE_DIR" && terraform -chdir="${{ steps.module.outputs.dir }}" fmt -check -recursive -diff
+      - name: terraform init + validate (module)
+        if: steps.module.outputs.dir != ''
+        run: |
+          terraform -chdir="${{ steps.module.outputs.dir }}" init -backend=false -input=false
+          terraform -chdir="${{ steps.module.outputs.dir }}" validate
+      - name: terraform validate (examples)
+        if: steps.module.outputs.dir != ''
+        run: |
+          for ex in "${{ steps.module.outputs.dir }}"/examples/*/; do
+            ls "$ex"*.tf >/dev/null 2>&1 || continue
+            echo "::group::$ex"
+            terraform -chdir="$ex" init -backend=false -input=false
+            terraform -chdir="$ex" validate
+            echo "::endgroup::"
+          done
+      - name: terraform test (mocked providers)
+        if: steps.module.outputs.dir != ''
+        run: |
+          dir="${{ steps.module.outputs.dir }}"
+          if ls "$dir"/tests/*.tftest.hcl >/dev/null 2>&1; then
+            terraform -chdir="$dir" test
+          else
+            echo "no tests in $dir/tests"
+          fi
+      # Every backyard.yaml the module's test scenarios render (and, on AWS,
+      # the Lambda gateway's) must load with internal/config, the strict
+      # loader `backyard serve` uses at startup: a key the server no longer
+      # accepts fails here, not as a container that never becomes ready.
+      - uses: actions/setup-go@v7
+        if: steps.module.outputs.dir != '' && hashFiles(format('deploy/terraform/{0}/configcheck/*_test.go', matrix.module)) != ''
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+      - name: Rendered backyard.yaml loads with the server's config loader (configcheck)
+        if: steps.module.outputs.dir != '' && hashFiles(format('deploy/terraform/{0}/configcheck/*_test.go', matrix.module)) != ''
+        env:
+          BACKYARD_TEST_TERRAFORM: "1"
+        run: go test -count=1 "./${{ steps.module.outputs.dir }}/configcheck/"
+
+  helm:
+    name: Helm chart (helm ${{ matrix.helm }})
+    needs: detect
+    if: needs.detect.outputs.helm == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        helm: [v3.22.0, v4.3.0]
+    env:
+      CHART: deploy/helm/backyard
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+        with:
+          version: ${{ matrix.helm }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+      - name: Install kubeconform
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP" kubeconform
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: helm lint
+        run: |
+          helm lint --strict "$CHART"
+          helm lint --strict "$CHART" -f "$CHART/values-production.yaml"
+      - name: helm template + kubeconform + config schema
+        run: |
+          for values in "" "-f $CHART/values-production.yaml"; do
+            echo "::group::helm template $values"
+            # shellcheck disable=SC2086
+            helm template backyard "$CHART" $values > "$RUNNER_TEMP/rendered.yaml"
+            kubeconform -strict -summary -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+              "$RUNNER_TEMP/rendered.yaml"
+            go run ./scripts/checkconfig -configmap "$RUNNER_TEMP/rendered.yaml"
+            echo "::endgroup::"
+          done
+      # The chart's guards (e.g. auth.mode header must not trust identity
+      # headers from the whole pod network) and its NetworkPolicy.
+      - name: Chart tests (go test ./deploy/helm/...)
+        env:
+          BACKYARD_TEST_HELM: "1"
+        run: go test -count=1 ./deploy/helm/...
+
+  deploy-kits:
+    name: docker-compose, systemd, scripts, workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+      - name: Sample configs match the config schema
+        run: go run ./scripts/checkconfig deploy/docker-compose/backyard.yaml deploy/systemd/backyard.yaml
+      - name: docker compose config
+        run: |
+          # Required values are generated by init-env.sh; any value satisfies the check.
+          (cd deploy/docker-compose && BACKYARD_SECRET=x POSTGRES_PASSWORD=x BACKYARD_DEPLOY_TOKEN_SHA256=x \
+            docker compose --env-file .env.example -f docker-compose.yml config --quiet)
+          docker compose -f deploy/docker-compose/test-services.yml config --quiet
+      - name: systemd-analyze verify
+        run: |
+          # The unit references /usr/local/bin/backyard; verify against a stand-in.
+          sudo install -m 0755 /bin/true /usr/local/bin/backyard
+          systemd-analyze verify deploy/systemd/backyard.service
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: CI tooling tests (scripts/*.test.mjs)
+        run: node --test 'scripts/*.test.mjs'
+      - name: shellcheck
+        run: shellcheck scripts/*.sh deploy/systemd/install.sh deploy/docker-compose/init-env.sh
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12 "$RUNNER_TEMP"
+          "$RUNNER_TEMP/actionlint" -color
+
+  docker:
+    name: Docker image (buildx, no push)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build linux/amd64 + linux/arm64
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          build-args: |
+            VERSION=0.0.0-ci
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build linux/amd64 into the local image store
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: backyard:ci
+          build-args: |
+            VERSION=0.0.0-ci
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha
+      - name: Smoke test
+        run: |
+          docker run --rm backyard:ci version
+          test "$(docker image inspect backyard:ci --format '{{.Config.User}}')" = "65532:65532"
+
+  e2e:
+    name: End-to-end in Chromium (${{ matrix.target }})
+    needs: detect
+    if: needs.detect.outputs.e2e == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # go: the Playwright suite in e2e/ (it starts its own `backyard serve` instances, a fake AI
+        #     upstream and a mock OIDC provider); worker: web/test/e2e.test.mjs against the
+        #     Cloudflare edition under wrangler dev --env local.
+        include:
+          - target: go
+            lockfile: e2e/package-lock.json
+          - target: worker
+            lockfile: deploy/cloudflare/package-lock.json
+    services:
+      # For the dashboard-on-a-real-warehouse test (go target).
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: backyard
+          POSTGRES_PASSWORD: backyard
+          POSTGRES_DB: backyard
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U backyard -d backyard"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        if: matrix.target == 'go'
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ matrix.lockfile }}
+
+      # --- go: the Playwright suite (e2e/README.md) ------------------------------
+      - name: Build backyard
+        if: matrix.target == 'go'
+        run: make build
+      - name: Install the e2e suite and Chromium
+        if: matrix.target == 'go'
+        working-directory: e2e
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+      - name: Test (Playwright)
+        if: matrix.target == 'go'
+        working-directory: e2e
+        env:
+          BACKYARD_BIN: ${{ github.workspace }}/bin/backyard
+          BACKYARD_TEST_POSTGRES_DSN: postgres://backyard:backyard@127.0.0.1:5432/backyard?sslmode=disable
+        run: npm test
+      - name: Test (web/test/e2e.test.mjs against backyard serve --dev)
+        if: matrix.target == 'go'
+        env:
+          BACKYARD_E2E_SERVE: go
+          BACKYARD_E2E_BIN: ${{ github.workspace }}/bin/backyard
+          BACKYARD_TEST_POSTGRES_DSN: postgres://backyard:backyard@127.0.0.1:5432/backyard?sslmode=disable
+          PLAYWRIGHT_CORE: ${{ github.workspace }}/e2e/node_modules/playwright-core/index.mjs
+        run: node --test web/test/e2e.test.mjs
+      - uses: actions/upload-artifact@v7
+        if: failure() && matrix.target == 'go'
+        with:
+          name: e2e-report
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/
+          retention-days: 7
+
+      # --- worker: the hub + SDK browser test against the Cloudflare edition -----
+      - name: Install the Worker
+        if: matrix.target == 'worker'
+        working-directory: deploy/cloudflare
+        run: npm ci --no-audit --no-fund
+      - name: Install Chromium (playwright-core)
+        if: matrix.target == 'worker'
+        run: |
+          npm install --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/pw" playwright-core@1.56.1
+          node "$RUNNER_TEMP/pw/node_modules/playwright-core/cli.js" install --with-deps chromium
+          echo "PLAYWRIGHT_CORE=$RUNNER_TEMP/pw/node_modules/playwright-core/index.mjs" >> "$GITHUB_ENV"
+      - name: Test (web/test/e2e.test.mjs)
+        if: matrix.target == 'worker'
+        run: scripts/with-server.sh worker -- node --test web/test/e2e.test.mjs

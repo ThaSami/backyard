@@ -1,0 +1,130 @@
+# backyard.yaml rendered by Terraform (deploy/terraform/azure). Change the
+# module variables instead of editing this copy. Secrets are never written
+# here: Container Apps injects them as secret environment variables that
+# Backyard expands at startup (OIDC_CLIENT_SECRET, ANTHROPIC_API_KEY,
+# OPENAI_API_KEY) or reads directly (BACKYARD_SECRET for server.secret,
+# DATABASE_URL for database.postgres.dsn).
+server:
+  name: ${jsonencode(display_name)}
+  listen: ":8080"
+  base_domain: ${jsonencode(base_domain)}
+  public_url: ${jsonencode(public_url)}
+  url_mode: ${url_mode}
+  trusted_proxies: ${jsonencode(trusted_proxies)}
+auth:
+  mode: ${auth_mode}
+%{ if length(admins) > 0 ~}
+  admins: ${jsonencode(admins)}
+%{ endif ~}
+%{ if length(admin_groups) > 0 ~}
+  admin_groups: ${jsonencode(admin_groups)}
+%{ endif ~}
+%{ if length(allowed_domains) > 0 ~}
+  allowed_domains: ${jsonencode(allowed_domains)}
+%{ endif ~}
+%{ if length(allowed_groups) > 0 ~}
+  allowed_groups: ${jsonencode(allowed_groups)}
+%{ endif ~}
+%{ if token_ttl != "" ~}
+  token_ttl: ${jsonencode(token_ttl)}
+%{ endif ~}
+%{ if length(static_tokens) > 0 ~}
+  tokens:
+%{ for t in static_tokens ~}
+    - name: ${jsonencode(t.name)}
+      sha256: ${jsonencode(t.sha256)}
+      admin: ${t.admin ? "true" : "false"}
+%{ endfor ~}
+%{ endif ~}
+%{ if auth_mode == "oidc" ~}
+  oidc:
+    issuer: ${jsonencode(oidc.issuer)}
+    client_id: ${jsonencode(oidc.client_id)}
+%{ if oidc.has_secret ~}
+    client_secret: '$${OIDC_CLIENT_SECRET}'
+%{ endif ~}
+%{ if length(oidc.scopes) > 0 ~}
+    scopes: ${jsonencode(oidc.scopes)}
+%{ endif ~}
+%{ if oidc.use_userinfo ~}
+    use_userinfo: true
+%{ endif ~}
+%{ if oidc.device_client_id != "" ~}
+    device_client_id: ${jsonencode(oidc.device_client_id)}
+%{ endif ~}
+%{ if oidc.session_ttl != "" ~}
+    session_ttl: ${jsonencode(oidc.session_ttl)}
+%{ endif ~}
+%{ endif ~}
+storage:
+  type: azure
+  azure:
+    account: ${jsonencode(storage_account)}
+    container: ${jsonencode(storage_container)}
+%{ if storage_prefix != "" ~}
+    prefix: ${jsonencode(storage_prefix)}
+%{ endif ~}
+database:
+  type: postgres
+  postgres:
+    # dsn: from the DATABASE_URL environment variable (Container Apps secret).
+    max_conns: ${postgres_max_conns}
+pubsub:
+  # LISTEN/NOTIFY on the same database (pubsub.postgres.dsn defaults to
+  # database.postgres.dsn).
+  type: postgres
+%{ if allow_anonymous ~}
+deploy:
+  allow_anonymous: true
+%{ endif ~}
+%{ if length(ai_models) > 0 ~}
+ai:
+%{ if ai_default_model != "" ~}
+  default_model: ${jsonencode(ai_default_model)}
+%{ endif ~}
+%{ if ai_default_image != "" ~}
+  default_image_model: ${jsonencode(ai_default_image)}
+%{ endif ~}
+%{ if ai_default_embed != "" ~}
+  default_embedding_model: ${jsonencode(ai_default_embed)}
+%{ endif ~}
+  providers:
+%{ for name, p in ai_providers ~}
+    ${jsonencode(name)}:
+      type: ${p.type}
+%{ if p.endpoint != "" ~}
+      endpoint: ${jsonencode(p.endpoint)}
+%{ endif ~}
+%{ if p.use_azure_ad ~}
+      use_azure_ad: true
+%{ endif ~}
+%{ if p.api_key_env != "" ~}
+      api_key: '$${${p.api_key_env}}'
+%{ endif ~}
+%{ endfor ~}
+  models:
+%{ for alias, m in ai_models ~}
+    ${jsonencode(alias)}:
+      provider: ${jsonencode(m.provider)}
+      model: ${jsonencode(m.model)}
+      kind: ${m.kind}
+%{ if m.description != "" ~}
+      description: ${jsonencode(m.description)}
+%{ endif ~}
+%{ if m.max_tokens > 0 ~}
+      max_tokens: ${m.max_tokens}
+%{ endif ~}
+%{ if m.effort != "" ~}
+      effort: ${m.effort}
+%{ endif ~}
+%{ endfor ~}
+%{ endif ~}
+telemetry:
+  log_level: ${log_level}
+  log_format: json
+%{ if access_log ~}
+  access_log: true
+%{ endif ~}
+%{ if extra_config_yaml != "" ~}
+${extra_config_yaml}
+%{ endif ~}

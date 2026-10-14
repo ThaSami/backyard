@@ -1,0 +1,43 @@
+# Build output
+/bin/
+/dist/
+/backyard
+/backyard-lambda
+*.test
+*.out
+coverage.*
+
+# Local data / dev
+.backyard-data/
+.backyard/
+*.db
+*.db-shm
+*.db-wal
+
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.tfstate.lock.info
+*.auto.tfvars
+terraform.tfvars
+
+# Node / e2e
+node_modules/
+e2e/test-results/
+e2e/playwright-report/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Terraform modules are reusable: consumers pin providers in their own lock files
+deploy/terraform/**/.terraform.lock.hcl

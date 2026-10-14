@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Poll</title>
+  <meta name="description" content="Ask the room a question during an all-hands and watch the answers arrive live.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📊</text></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Audience view (default) -->
+  <main id="audience" class="audience" hidden>
+    <p class="eyebrow">Live poll <span class="live" id="a-live" hidden>● voting open</span></p>
+    <h1 id="a-question">Waiting for the host…</h1>
+    <p class="muted" id="a-hint">The question appears here as soon as the host starts it.</p>
+    <div id="a-options" class="options"></div>
+    <section id="a-results" class="results" hidden></section>
+  </main>
+
+  <!-- Host view (?host) -->
+  <main id="host" class="host" hidden>
+    <section class="panel editor">
+      <h2>New question</h2>
+      <form id="h-form">
+        <label for="h-question">Question</label>
+        <input id="h-question" maxlength="200" required placeholder="What should our next hack week focus on?">
+        <label>Options</label>
+        <div id="h-options"></div>
+        <button type="button" class="link" id="h-add-option">+ Add option</button>
+        <div class="row">
+          <button class="primary" type="submit">Start new round</button>
+        </div>
+      </form>
+      <div class="share">
+        <span class="muted">Audience link</span>
+        <code id="h-link"></code>
+        <button type="button" class="secondary" id="h-copy">Copy</button>
+      </div>
+    </section>
+
+    <section class="panel stage">
+      <div class="stage-head">
+        <span class="eyebrow" id="h-status">No round yet</span>
+        <span class="muted" id="h-people"></span>
+      </div>
+      <h1 id="h-question-live">Start a round to see live results here.</h1>
+      <section id="h-results" class="results"></section>
+      <div class="row" id="h-controls" hidden>
+        <button type="button" class="secondary" id="h-toggle">Close voting</button>
+      </div>
+    </section>
+  </main>
+
+  <p class="toast" id="toast" role="status" hidden></p>
+
+  <script src="/__backyard/backyard.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

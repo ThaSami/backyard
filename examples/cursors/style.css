@@ -1,0 +1,80 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f6f5f1;
+  --surface: #ffffffee;
+  --ink: #1d1c1a;
+  --ink-2: #5f5d58;
+  --line: #e4e2dc;
+  --dot: #0b0b0b1a;
+  --accent: #2266c8;
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #121211;
+    --surface: #1c1c1aee;
+    --ink: #f0efec;
+    --ink-2: #a9a79f;
+    --line: #2e2d2a;
+    --dot: #ffffff1a;
+    --accent: #4b93ea;
+  }
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--ink); }
+button, input { font: inherit; color: inherit; }
+
+.board { position: fixed; inset: 0; cursor: crosshair; touch-action: none;
+         background-image: radial-gradient(var(--dot) 1.2px, transparent 1.2px); background-size: 24px 24px; }
+
+.cursor { position: absolute; left: 0; top: 0; pointer-events: none; transition: transform 90ms linear; will-change: transform; z-index: 2; }
+.cursor svg path { fill: var(--c); stroke: #fff; stroke-width: 1.5; stroke-linejoin: round; }
+.cursor .tag { position: absolute; left: 16px; top: 18px; display: flex; flex-direction: column; width: max-content; max-width: 260px;
+               padding: 2px 9px; border-radius: 10px; background: var(--c); color: #fff; white-space: nowrap; }
+.cursor .who { font-size: 12px; font-weight: 600; }
+.cursor .say { font-size: 14px; white-space: normal; overflow-wrap: anywhere; }
+.cursor:not(.talking) .say { display: none; }
+.cursor.talking .tag { padding: 4px 10px 6px; border-radius: 4px 12px 12px 12px; }
+
+.reaction { position: absolute; font-size: 30px; pointer-events: none; transform: translate(-50%, -50%);
+            animation: float 1.4s ease-out forwards; z-index: 3; }
+@keyframes float {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(.5); }
+  15% { opacity: 1; transform: translate(-50%, -60%) scale(1.15); }
+  100% { opacity: 0; transform: translate(-50%, -260%) scale(1); }
+}
+
+.people { position: fixed; top: 16px; right: 16px; width: 220px; padding: 12px 14px; border: 1px solid var(--line);
+          border-radius: 14px; background: var(--surface); backdrop-filter: blur(8px); z-index: 4; }
+.people-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+.status { color: var(--ink-2); font-size: 12px; }
+.people ul { list-style: none; margin: 0; padding: 0; max-height: 50vh; overflow: auto; }
+.people li { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+.people li span:last-of-type { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.people small { color: var(--ink-2); }
+.dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+
+.toolbar { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); display: flex; align-items: center; gap: 12px;
+           padding: 8px 10px 8px 16px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface);
+           backdrop-filter: blur(8px); z-index: 4; max-width: calc(100% - 32px); }
+.hint { color: var(--ink-2); white-space: nowrap; }
+kbd { font: 12px ui-monospace, monospace; padding: 1px 5px; border: 1px solid var(--line); border-radius: 4px; }
+.emojis { display: flex; gap: 2px; }
+.emojis button { border: 0; background: none; font-size: 20px; padding: 4px 6px; border-radius: 999px; cursor: pointer; }
+.emojis button.active { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+
+.chat { position: fixed; z-index: 5; width: 220px; padding: 6px 10px; border-radius: 4px 12px 12px 12px; border: 2px solid var(--accent);
+        background: var(--surface); outline: none; }
+
+.toasts { position: fixed; left: 16px; bottom: 18px; display: grid; gap: 6px; z-index: 4; }
+.toast { padding: 6px 12px; border-radius: 10px; background: var(--ink); color: var(--bg); animation: in .2s ease-out; }
+@keyframes in { from { opacity: 0; transform: translateY(6px); } }
+
+@media (max-width: 640px) {
+  .people { width: auto; left: 16px; }
+  .hint { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { .cursor { transition: none; } }

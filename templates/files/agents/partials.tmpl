@@ -1,0 +1,104 @@
+{{/* Shared sections of the agent instruction files. Rendered with tmplData. */}}
+
+{{define "intro" -}}
+This folder is the **Backyard** site `{{.Site}}`. Backyard publishes a folder of static files
+(HTML, CSS, JS, images) to an internal URL that only people in the company can open, and gives
+every page a zero-config backend through one script: `backyard.db` (JSON documents with
+realtime queries), `backyard.files` (uploads), `backyard.ai` (LLM chat and streaming, images,
+embeddings), `backyard.warehouse` (read-only SQL), `backyard.socket` (websocket rooms with
+presence) and `backyard.id` (the signed-in user).
+{{- if .Server}}
+
+- Backyard server (hub): {{.Server}}
+- This site once deployed: {{if .SiteURL}}{{.SiteURL}}{{else}}{{if .HostURL}}{{.HostURL}} (host mode) or {{end}}{{.PathURL}} (path mode){{end}}; `backyard deploy` prints the exact URL.
+{{- end}}
+{{- end}}
+
+{{define "rules" -}}
+## Rules
+
+1. **Static files only.** `index.html` is the entry point. No server code (no Node/Python/PHP
+   backends, API routes or cron jobs): use the built-in APIs. A build step is optional; deploy
+   its output folder (`backyard deploy dist`).
+2. **Load the SDK with an absolute path**, before your code:
+   `<script src="/__backyard/backyard.js"></script>`. Reference this site's own files with
+   **relative** paths (`app.js`, `img/logo.png`), never `/app.js`.
+3. **Never put secrets in any file** (API keys, tokens, passwords): everything deployed is
+   readable by every employee. The server holds the AI and warehouse credentials.
+4. **All data is shared by everyone who can open the site**; there are no per-user
+   permissions. Use `_meta.created_by` only for UX such as "mine".
+5. **Identity is built in:** `await backyard.me()`. Never build login forms or ask for names.
+6. **Realtime by default:** render shared data with `collection.watch(render, query)` so every
+   open tab updates live; use rooms for presence, cursors and typing indicators.
+7. **Self-contained and robust:** vendor libraries into this folder instead of using public
+   CDNs; insert user content with `textContent`; handle loading, empty and error states
+   (`unsupported` means AI or the warehouse is not enabled on the server).
+8. **Deploy = overwrite.** `backyard deploy` replaces the whole site `{{.Site}}` (its data
+   survives). Deploy when the user asks for it, and confirm before deploying to another site
+   name.
+{{- end}}
+
+{{define "commands" -}}
+## Commands
+
+```sh
+backyard dev                  # preview at http://{{.Site}}.localhost:4321/ with a local backend (long-running: start it in the background)
+backyard deploy               # publish this folder (overwrites the site; prints its URL)
+backyard deploy --dry-run     # show what would be uploaded and deleted
+backyard sites list [filter]  # existing sites; `backyard pull <site>` downloads one to study or reuse
+```
+
+- Check the running preview with curl: `curl -s -H 'Host: {{.Site}}.localhost:4321' http://127.0.0.1:4321/`.
+  Outside browsers `*.localhost` often does not resolve (Node `fetch`, wget and Python fail in
+  containers and CI), and `http://localhost:4321/` is the dev hub, not this site.
+- The site name is in `.backyard.json`. Never deployed: `CLAUDE.md`, `AGENTS.md`, `.claude/`,
+  `.cursor/`, `.github/`, `node_modules/`, dotfiles (including `.backyard-data/`, the local
+  data of `backyard dev`) and the patterns in `.backyardignore`.
+- If `backyard deploy` says you are not logged in, ask the user to run
+  `backyard login{{if .Server}} --server {{.Server}}{{else}} --server <hub URL>{{end}}` in a terminal (it opens the browser), then retry.
+{{- if not .Server}}
+  No Backyard server yet? `backyard cloudflare setup` (run by the user; it opens a browser) deploys
+  one to their own Cloudflare account on the free plan and logs the CLI in.
+{{- end}}
+- AI and warehouse calls answer `unsupported` under a plain `backyard dev`; they work with
+  `backyard dev --config backyard.yaml` (providers configured) or once deployed.
+{{- end}}
+
+{{define "api" -}}
+## Backyard API cheat sheet
+
+Methods return Promises unless marked sync. Failures throw a `BackyardError` with `err.code`
+(`bad_request`, `unauthenticated`, `forbidden`, `not_found`, `conflict`, `too_large`,
+`rate_limited`, `unsupported`, `upstream_error`, `internal`), `err.status` and `err.message`.
+On `401` the SDK sends the page to the login screen by itself.
+
+{{.CheatSheet}}
+
+Document ids allow only `A-Z a-z 0-9 _ - : .`; derive per-person ids with
+`me.id.replace(/[^A-Za-z0-9_\-:.]/g, "_")`. Query values must have the same JSON type as the
+field (`"3"` never equals `3`) and missing fields never match. There is no atomic increment:
+store one document per vote/like and count them.
+
+### Which API for what
+
+{{.Decision}}
+
+### Limits (server defaults)
+
+{{.Limits}}
+{{- end}}
+
+{{define "more" -}}
+## More documentation
+{{if .Claude}}
+- The Backyard skill in `.claude/skills/backyard/`: `SKILL.md` (overview, patterns,
+  troubleshooting), `references/api.md` (complete API plus the HTTP and websocket protocol),
+  `references/recipes.md` (complete example apps), `references/deploy.md` (CLI, login, CI).
+{{- end}}
+{{- if .Server}}
+- {{.Server}}/docs (rendered docs) and {{.Server}}/llms-full.txt (all docs in one file).
+{{- else}}
+- Your Backyard hub serves `/docs` and `/llms-full.txt` (all docs in one file).
+{{- end}}
+- TypeScript declarations: `/__backyard/backyard.d.ts` on any Backyard site.
+{{- end}}

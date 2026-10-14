@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="description" content="Backyard API reference, recipes and deploy guide." />
+    <title>Docs · Backyard</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/hub.css" />
+    <script src="/docs.js" defer></script>
+  </head>
+  <body id="docs-page">
+    <a class="skip-link" href="#doc">Skip to content</a>
+
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/">
+          <img src="/favicon.svg" alt="" width="28" height="28" />
+          <span class="brand-name" data-server-name>Backyard</span>
+        </a>
+        <nav class="nav" aria-label="Main">
+          <a href="/">Sites</a>
+          <a href="/docs" aria-current="page">Docs</a>
+          <a href="/llms.txt" class="nav-optional">llms.txt</a>
+        </nav>
+      </div>
+    </header>
+
+    <div class="docs">
+      <nav class="docs-nav" aria-label="Documentation">
+        <details id="docs-nav-details" open>
+          <summary>Contents</summary>
+          <h2>Guides</h2>
+          <ul id="doc-list">
+            <li><a href="/docs?doc=api" data-doc="api">API reference</a></li>
+            <li><a href="/docs?doc=recipes" data-doc="recipes">Recipes</a></li>
+            <li><a href="/docs?doc=deploy" data-doc="deploy">Deploying</a></li>
+            <li><a href="/docs?doc=skill" data-doc="skill">Agent skill</a></li>
+          </ul>
+          <h2 id="toc-title">On this page</h2>
+          <ul class="toc" id="toc" aria-labelledby="toc-title"></ul>
+          <h2>For agents</h2>
+          <ul>
+            <li><a href="/llms.txt">/llms.txt</a></li>
+            <li><a href="/llms-full.txt">/llms-full.txt</a></li>
+            <li><a href="/__backyard/backyard.d.ts">backyard.d.ts</a></li>
+          </ul>
+        </details>
+      </nav>
+
+      <main class="markdown" id="doc" tabindex="-1" aria-live="polite">
+        <p class="docs-status">Loading…</p>
+      </main>
+    </div>
+  </body>
+</html>

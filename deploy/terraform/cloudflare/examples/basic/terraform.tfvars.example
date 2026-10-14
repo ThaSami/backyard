@@ -1,0 +1,14 @@
+account_id  = "0123456789abcdef0123456789abcdef"
+zone_name   = "example.com"
+base_domain = "backyard.example.com"
+url_mode    = "path"
+
+# Who may sign in (any of these):
+allowed_email_domains = ["example.com"]
+allowed_emails        = []
+
+# Optional: sign in with Okta and allow Okta groups.
+# okta_account_url    = "https://example.okta.com"
+# okta_client_id      = "0oa..."
+# okta_client_secret  = "..."   # or TF_VAR_okta_client_secret
+# allowed_okta_groups = ["backyard-users"]

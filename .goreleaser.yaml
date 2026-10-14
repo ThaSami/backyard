@@ -1,0 +1,214 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+#
+# Release configuration (GoReleaser v2). Tagging vX.Y.Z runs
+# .github/workflows/release.yml, which publishes:
+#   * backyard_<version>_<os>_<arch>.tar.gz|zip   the CLI/server for linux, darwin, windows (amd64, arm64)
+#   * backyard-lambda_<version>_linux_<arch>.zip  the AWS Lambda deploy gateway ("bootstrap" at the zip root)
+#   * checksums.txt (+ SBOMs)                      used by scripts/install.sh and deploy/systemd/install.sh
+#   * ghcr.io/thasami/backyard:<version>           multi-arch image (linux/amd64, linux/arm64)
+#
+# Try it locally: make release-snapshot (or goreleaser release --snapshot --clean).
+version: 2
+
+project_name: backyard
+
+before:
+  hooks:
+    - go mod download
+
+metadata:
+  mod_timestamp: "{{ .CommitTimestamp }}"
+
+builds:
+  - id: backyard
+    main: ./cmd/backyard
+    binary: backyard
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/thasami/backyard/internal/version.Version={{ .Version }}
+      - -X github.com/thasami/backyard/internal/version.Commit={{ .FullCommit }}
+      - -X github.com/thasami/backyard/internal/version.Date={{ .CommitDate }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+  # AWS Lambda (provided.al2023) deploy gateway, see deploy/terraform/aws.
+  - id: backyard-lambda
+    main: ./cmd/backyard-lambda
+    binary: bootstrap
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    tags:
+      - lambda.norpc
+    ldflags:
+      - -s -w
+      - -X github.com/thasami/backyard/internal/version.Version={{ .Version }}
+      - -X github.com/thasami/backyard/internal/version.Commit={{ .FullCommit }}
+      - -X github.com/thasami/backyard/internal/version.Date={{ .CommitDate }}
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: backyard
+    ids:
+      - backyard
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE*
+      - README*
+      - SECURITY.md
+
+  # Lambda packages contain only "bootstrap" (no LICENSE/README: the zip is
+  # uploaded to Lambda as-is).
+  - id: backyard-lambda
+    ids:
+      - backyard-lambda
+    formats:
+      - zip
+    name_template: "backyard-lambda_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - none*
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+# SPDX SBOMs for every archive (needs syft on the PATH; the release workflow
+# installs it).
+sboms:
+  - id: archives
+    artifacts: archive
+
+dockers_v2:
+  - id: backyard
+    ids:
+      - backyard
+    dockerfile: Dockerfile
+    # The "release" stage only copies the prebuilt binary ($TARGETPLATFORM/backyard).
+    flags:
+      - --target=release
+    images:
+      - ghcr.io/thasami/backyard
+    tags:
+      - "{{ .Version }}"
+      - "{{ if not .Prerelease }}{{ .Major }}.{{ .Minor }}{{ end }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      org.opencontainers.image.title: Backyard
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.created: "{{ .CommitDate }}"
+      org.opencontainers.image.source: https://github.com/thasami/backyard
+      org.opencontainers.image.licenses: Apache-2.0
+    annotations:
+      "index,manifest:org.opencontainers.image.description": "Drop a folder of HTML, get an internal URL - with a zero-config backend for every site."
+      "index,manifest:org.opencontainers.image.version": "{{ .Version }}"
+      "index,manifest:org.opencontainers.image.revision": "{{ .FullCommit }}"
+      "index,manifest:org.opencontainers.image.created": "{{ .CommitDate }}"
+      "index,manifest:org.opencontainers.image.source": https://github.com/thasami/backyard
+      "index,manifest:org.opencontainers.image.licenses": Apache-2.0
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+report_sizes: true
+
+changelog:
+  use: github
+  sort: asc
+  abbrev: 0
+  groups:
+    - title: Breaking changes
+      regexp: '^[[:word:]]+(\([[:word:]/.-]+\))?!:.+$'
+      order: 0
+    - title: Features
+      regexp: '^feat(\([[:word:]/.-]+\))?:.+$'
+      order: 1
+    - title: Security
+      regexp: '^(sec|security)(\([[:word:]/.-]+\))?:.+$'
+      order: 2
+    - title: Bug fixes
+      regexp: '^fix(\([[:word:]/.-]+\))?:.+$'
+      order: 3
+    - title: Performance
+      regexp: '^perf(\([[:word:]/.-]+\))?:.+$'
+      order: 4
+    - title: Dependencies
+      regexp: '^(build|chore)\(deps\):.+$'
+      order: 5
+    - title: Other changes
+      order: 999
+  filters:
+    exclude:
+      - '^docs(\(.*\))?:'
+      - '^test(\(.*\))?:'
+      - '^ci(\(.*\))?:'
+      - '^chore(\([^d].*\))?:'
+      - '^Merge (pull request|branch)'
+
+release:
+  github:
+    owner: thasami
+    name: backyard
+  prerelease: auto
+  name_template: "Backyard {{ .Version }}"
+  footer: |
+    ## Install
+
+    **CLI** (Linux, macOS):
+
+    ```sh
+    curl -fsSL https://raw.githubusercontent.com/thasami/backyard/{{ .Tag }}/scripts/install.sh | sh -s -- --version {{ .Version }}
+    ```
+
+    **Server** — container image `ghcr.io/thasami/backyard:{{ .Version }}`, the Helm chart in
+    `deploy/helm/backyard`, docker-compose in `deploy/docker-compose`, a single VM with
+    `deploy/systemd/install.sh`, Terraform for AWS/GCP/Azure/Cloudflare in `deploy/terraform`, or
+    the Cloudflare free-plan edition with `backyard cloudflare setup`.
+
+    Verify downloads with `sha256sum --ignore-missing -c checksums.txt`.
+
+# Homebrew (optional): create the tap repository and a HOMEBREW_TAP_TOKEN
+# secret, then uncomment.
+#
+# homebrew_casks:
+#   - name: backyard
+#     ids:
+#       - backyard
+#     repository:
+#       owner: thasami
+#       name: homebrew-tap
+#       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+#     homepage: https://github.com/thasami/backyard
+#     description: Drop a folder of HTML, get an internal URL.
+#     license: Apache-2.0
+#     binaries:
+#       - backyard
+#     generate_completions_from_executable:
+#       args:
+#         - completion
+#       shell_parameter_format: cobra

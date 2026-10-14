@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest an improvement to Backyard.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Backyard deliberately has a small, fixed set of capabilities (database + realtime, files,
+        AI, warehouse, websockets, identity) and no custom backends — saying no is a feature.
+        Requests that make the existing pieces easier to deploy, operate or use are very welcome.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the use case, not only the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How could Backyard help? API sketches, config examples and UI ideas are useful.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What do you do today, or what else did you try?
+  - type: checkboxes
+    id: editions
+    attributes:
+      label: Editions
+      description: The Go server and the Cloudflare Workers edition share one public contract (SPEC).
+      options:
+        - label: This should work on the Go server
+        - label: This should work on the Cloudflare Workers edition

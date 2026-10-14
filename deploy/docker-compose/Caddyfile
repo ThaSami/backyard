@@ -1,0 +1,75 @@
+# Caddy in front of Backyard (deploy/docker-compose). It terminates TLS for the
+# hub ({$BACKYARD_DOMAIN}) and every site (*.{$BACKYARD_DOMAIN}) and proxies to
+# backyard:8080, websockets and streaming responses included.
+#
+# BACKYARD_TLS (.env) selects how certificates are obtained, see README.md:
+#   internal   Caddy's own CA (default): localhost, labs, or networks whose
+#              devices trust Caddy's root certificate
+#   on_demand  public ACME (Let's Encrypt / ZeroSSL) certificates issued per
+#              host on its first request; needs public DNS + ports 80/443
+#   files      your own wildcard certificate: ./certs/fullchain.pem + privkey.pem
+#   dns        one ACME wildcard certificate via the DNS-01 challenge; needs a
+#              Caddy image with your DNS provider plugin (see the snippet below)
+{
+	# Extra global options from .env, e.g. CADDY_GLOBAL_OPTIONS="email ops@acme.com"
+	# (ACME account contact for expiry notices).
+	{$CADDY_GLOBAL_OPTIONS}
+
+	# on_demand: ask the endpoint below before issuing a certificate, so only
+	# the hub and single-label subdomains of BACKYARD_DOMAIN get one.
+	on_demand_tls {
+		ask http://127.0.0.1:5555/allowed
+	}
+}
+
+(tls_internal) {
+	tls internal
+}
+
+(tls_on_demand) {
+	tls {
+		on_demand
+	}
+}
+
+(tls_files) {
+	tls /certs/fullchain.pem /certs/privkey.pem
+}
+
+# DNS-01 wildcard certificate. Build Caddy with your provider, e.g.
+#   FROM caddy:2-builder AS builder
+#   RUN xcaddy build --with github.com/caddy-dns/cloudflare
+#   FROM caddy:2
+#   COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+# then set BACKYARD_TLS=dns, pass CLOUDFLARE_API_TOKEN to the caddy service and
+# uncomment (other providers: github.com/caddy-dns/route53, .../googleclouddns, .../azure, ...):
+#
+# (tls_dns) {
+# 	tls {
+# 		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+# 	}
+# }
+
+{$BACKYARD_DOMAIN}, *.{$BACKYARD_DOMAIN} {
+	import tls_{$BACKYARD_TLS:internal}
+
+	encode zstd gzip
+
+	reverse_proxy backyard:8080 {
+		# Stream AI responses (text/event-stream) without buffering.
+		flush_interval -1
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
+
+# On-demand TLS "ask" endpoint (internal only).
+http://:5555 {
+	bind 127.0.0.1
+	@allowed expression `{query.domain} == "{$BACKYARD_DOMAIN}" || ({query.domain}.endsWith(".{$BACKYARD_DOMAIN}") && {query.domain}.matches("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?[.]{$BACKYARD_DOMAIN}$"))`
+	respond @allowed 200
+	respond 403
+}

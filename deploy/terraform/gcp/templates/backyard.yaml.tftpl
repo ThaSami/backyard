@@ -1,0 +1,171 @@
+# backyard.yaml rendered by Terraform (deploy/terraform/gcp) and passed to
+# Cloud Run as BACKYARD_CONFIG_YAML. Change the module variables instead of
+# editing this copy. It contains no secrets: server.secret is read from
+# BACKYARD_SECRET and database.postgres.dsn from DATABASE_URL (Backyard's
+# environment overrides); the remaining environment references are expanded
+# at startup from variables backed by Secret Manager.
+server:
+  name: ${jsonencode(display_name)}
+  base_domain: ${jsonencode(domain)}
+  public_url: ${jsonencode(public_url)}
+  url_mode: ${url_mode}
+%{ if length(trusted_proxies) > 0 ~}
+  trusted_proxies: ${jsonencode(trusted_proxies)}
+%{ endif ~}
+  # Cloud Run sends SIGTERM 10 seconds before it kills an instance.
+  shutdown_timeout: 8s
+auth:
+  mode: ${auth_mode}
+%{ if length(admins) > 0 ~}
+  admins: ${jsonencode(admins)}
+%{ endif ~}
+%{ if length(admin_groups) > 0 ~}
+  admin_groups: ${jsonencode(admin_groups)}
+%{ endif ~}
+%{ if length(allowed_domains) > 0 ~}
+  allowed_domains: ${jsonencode(allowed_domains)}
+%{ endif ~}
+%{ if length(allowed_groups) > 0 ~}
+  allowed_groups: ${jsonencode(allowed_groups)}
+%{ endif ~}
+%{ if length(static_tokens) > 0 ~}
+  tokens:
+%{ for t in static_tokens ~}
+    - name: ${jsonencode(t.name)}
+      sha256: ${jsonencode(t.sha256)}
+      admin: ${t.admin}
+%{ endfor ~}
+%{ endif ~}
+%{ if auth_mode == "iap" ~}
+  iap:
+    audience: ${jsonencode(iap_audience)}
+%{ endif ~}
+%{ if oidc != null ~}
+  oidc:
+    issuer: ${jsonencode(oidc.issuer)}
+    client_id: ${jsonencode(oidc.client_id)}
+%{ if oidc.client_secret ~}
+    client_secret: "${env}OIDC_CLIENT_SECRET}"
+%{ endif ~}
+%{ if length(oidc.scopes) > 0 ~}
+    scopes: ${jsonencode(oidc.scopes)}
+%{ endif ~}
+%{ if oidc.use_userinfo ~}
+    use_userinfo: true
+%{ endif ~}
+%{ if oidc.device_client_id != "" ~}
+    device_client_id: ${jsonencode(oidc.device_client_id)}
+%{ endif ~}
+%{ if length(oidc.api_audiences) > 0 ~}
+    api_audiences: ${jsonencode(oidc.api_audiences)}
+%{ endif ~}
+%{ endif ~}
+storage:
+  type: gcs
+  gcs:
+    bucket: ${jsonencode(bucket)}
+%{ if storage_prefix != "" ~}
+    prefix: ${jsonencode(storage_prefix)}
+%{ endif ~}
+    # Cloud Run credentials have no private key: V4 upload URLs are signed via
+    # the IAM Credentials API as this service account.
+    signer_email: ${jsonencode(signer_email)}
+database:
+  type: postgres
+  postgres:
+    # dsn: from DATABASE_URL
+    max_conns: ${format("%d", database_max_conns)}
+pubsub:
+  # LISTEN/NOTIFY on the same database fans realtime events out across
+  # Cloud Run instances (dsn defaults to database.postgres.dsn).
+  type: postgres
+deploy:
+  methods: ${jsonencode(deploy_methods)}
+  expose_storage: ${expose_storage}
+%{ if length(ai_models) > 0 ~}
+ai:
+%{ if ai_default_model != "" ~}
+  default_model: ${jsonencode(ai_default_model)}
+%{ endif ~}
+  providers:
+%{ for name, p in ai_providers ~}
+    ${jsonencode(name)}:
+      type: ${p.type}
+%{ if p.platform != "" ~}
+      platform: ${p.platform}
+%{ endif ~}
+%{ if p.project_id != "" ~}
+      project_id: ${jsonencode(p.project_id)}
+%{ endif ~}
+%{ if p.location != "" ~}
+      location: ${jsonencode(p.location)}
+%{ endif ~}
+%{ if p.api_key_env != "" ~}
+      api_key: "${env}${p.api_key_env}}"
+%{ endif ~}
+%{ if p.base_url != "" ~}
+      base_url: ${jsonencode(p.base_url)}
+%{ endif ~}
+%{ endfor ~}
+  models:
+%{ for alias, m in ai_models ~}
+    ${jsonencode(alias)}:
+      provider: ${jsonencode(m.provider)}
+      model: ${jsonencode(m.model)}
+      kind: ${m.kind}
+%{ if m.description != "" ~}
+      description: ${jsonencode(m.description)}
+%{ endif ~}
+%{ if m.max_tokens > 0 ~}
+      max_tokens: ${format("%d", m.max_tokens)}
+%{ endif ~}
+%{ if m.effort != "" ~}
+      effort: ${m.effort}
+%{ endif ~}
+%{ endfor ~}
+%{ endif ~}
+%{ if warehouse != null ~}
+warehouse:
+  default_source: bigquery
+  allow_raw_sql: ${warehouse.allow_raw_sql}
+  sources:
+    bigquery:
+      type: bigquery
+      description: ${jsonencode("BigQuery (${warehouse.project_id})")}
+      project_id: ${jsonencode(warehouse.project_id)}
+      location: ${jsonencode(warehouse.location)}
+%{ if warehouse.max_bytes_billed > 0 ~}
+      max_bytes_billed: ${format("%d", warehouse.max_bytes_billed)}
+%{ endif ~}
+%{ if length(warehouse.queries) > 0 ~}
+  queries:
+%{ for qname, q in warehouse.queries ~}
+    ${jsonencode(qname)}:
+      source: bigquery
+      sql: ${jsonencode(q.sql)}
+%{ if q.description != "" ~}
+      description: ${jsonencode(q.description)}
+%{ endif ~}
+%{ if length(q.params) > 0 ~}
+      params: ${jsonencode(q.params)}
+%{ endif ~}
+%{ endfor ~}
+%{ endif ~}
+%{ endif ~}
+%{ if render_files ~}
+files:
+  # Cloud Run rejects HTTP/1 requests larger than 32 MiB.
+  max_upload_bytes: ${format("%d", body_limit)}
+%{ endif ~}
+%{ if render_sites ~}
+sites:
+  # Cloud Run cannot send unchunked HTTP/1 responses larger than 32 MiB, and
+  # gateway uploads (the presign fallback) are requests.
+  max_file_bytes: ${format("%d", body_limit)}
+%{ endif ~}
+telemetry:
+  log_level: ${log_level}
+  log_format: json
+%{ if access_log ~}
+  access_log: true
+%{ endif ~}

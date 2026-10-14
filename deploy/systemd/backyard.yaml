@@ -1,0 +1,87 @@
+# Backyard on a single VM without a cloud bucket: site files and uploads on the
+# local disk (fs storage), documents in an embedded SQLite database, realtime in
+# memory. Everything lives in /var/lib/backyard. Installed to
+# /etc/backyard/backyard.yaml by install.sh (which sets base_domain).
+#
+# Secrets come from /etc/backyard/backyard.env (BACKYARD_SECRET=...,
+# BACKYARD_DEPLOY_TOKEN_SHA256=...); ${VAR} references below are expanded from
+# that environment too.
+# Every option: `backyard config example`. Check edits:
+#   sudo -u backyard sh -c 'set -a; . /etc/backyard/backyard.env; backyard config validate /etc/backyard/backyard.yaml'
+
+server:
+  # Hub at https://backyard.example.com/, sites at https://<site>.backyard.example.com/
+  # (wildcard DNS + TLS on the reverse proxy, see README.md).
+  base_domain: backyard.example.com
+  public_url: https://backyard.example.com
+  # Caddy / nginx on the same machine terminates TLS and proxies here.
+  listen: 127.0.0.1:8080
+  trusted_proxies:
+    - 127.0.0.1
+    - ::1
+
+auth:
+  # "none": no login (private networks, VPN). For SSO use oidc below.
+  mode: none
+  # Static bearer tokens for deploys and CI, stored as the SHA-256 of the token
+  # (`backyard token hash <token>`). install.sh creates the "deploy" token and
+  # prints it once; use it with `backyard login --server <url> --token <token>`.
+  tokens:
+    - name: deploy
+      sha256: ${BACKYARD_DEPLOY_TOKEN_SHA256}
+      admin: true
+  #
+  # Single sign-on (Okta, Entra ID, Google, Keycloak, ...); redirect URL:
+  # https://backyard.example.com/__backyard/auth/callback
+  # mode: oidc
+  # oidc:
+  #   issuer: https://acme.okta.com/oauth2/default
+  #   client_id: 0oa...
+  #   client_secret: "${OIDC_CLIENT_SECRET}"
+  # allowed_domains: [acme.com]
+  # admin_groups: [backyard-admins]
+
+storage:
+  type: fs
+  fs:
+    root: /var/lib/backyard
+
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/backyard/backyard.db
+
+pubsub:
+  # One process: in-memory realtime fan-out.
+  type: memory
+
+deploy:
+  # api: the deploy gateway (CLI, hub drag & drop).
+  # rsync: `backyard deploy --method rsync` over SSH into /var/lib/backyard/sites
+  # as the "backyard" user restricted with rrsync (README.md).
+  methods: [api, rsync]
+  # Quoted: the trailing ":" would otherwise be read as YAML syntax.
+  rsync_target: "backyard@backyard.example.com:"
+
+# AI for backyard.ai (put ANTHROPIC_API_KEY=... in /etc/backyard/backyard.env):
+#
+# ai:
+#   providers:
+#     anthropic:
+#       type: anthropic
+#       api_key: "${ANTHROPIC_API_KEY}"
+#   models:
+#     smart:
+#       provider: anthropic
+#       model: claude-opus-5-5
+#     fast:
+#       provider: anthropic
+#       model: claude-haiku-5-5
+#   default_model: smart
+
+telemetry:
+  # journald keeps the structure of JSON lines; use text for plain reading.
+  log_format: json
+  metrics: true
+  # Prometheus scrape target (local only).
+  metrics_listen: 127.0.0.1:9090

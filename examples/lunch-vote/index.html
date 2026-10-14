@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lunch Vote</title>
+  <meta name="description" content="Where should we eat today? Add places and vote together, live.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍜</text></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div>
+      <p class="eyebrow" id="today">Today</p>
+      <h1>Where should we eat?</h1>
+    </div>
+    <div class="presence" aria-label="People deciding right now">
+      <div class="stack" id="stack"></div>
+      <span class="muted" id="here"></span>
+    </div>
+  </header>
+
+  <main>
+    <section class="leader" id="leader" aria-live="polite" hidden></section>
+
+    <ul class="spots" id="spots"></ul>
+    <p class="empty" id="empty" hidden>No places yet. Add the first one below.</p>
+    <p class="empty" id="loading">Loading places…</p>
+
+    <form class="add" id="add">
+      <select id="emoji" aria-label="Icon"></select>
+      <input id="name" placeholder="Add a place…" maxlength="60" autocomplete="off" required aria-label="Place name">
+      <button type="submit">Add</button>
+    </form>
+    <p class="error" id="error" role="alert" hidden></p>
+  </main>
+
+  <footer class="muted">One vote per person per day · click again to take it back · <span id="who"></span></footer>
+
+  <script src="/__backyard/backyard.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

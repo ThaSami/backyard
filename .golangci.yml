@@ -1,0 +1,200 @@
+# golangci-lint v2 configuration (https://golangci-lint.run/usage/configuration/).
+# Run with `make lint` or `golangci-lint run`.
+version: "2"
+
+run:
+  timeout: 10m
+  tests: true
+  # Use the module's go directive.
+  go: ""
+
+linters:
+  default: none
+  enable:
+    # Correctness and security.
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+    - gosec
+    - bodyclose
+    - errorlint
+    - rowserrcheck
+    - sqlclosecheck
+    - durationcheck
+    - copyloopvar
+    # Low-noise bug finders: []any passed as variadic ...any, Trojan Source
+    # bidi characters, nil error returned after an error check, appends to
+    # slices made with a non-zero length, reassigned package variables of
+    # other packages, contexts re-wrapped inside loops, misspelled //go:
+    # directives, and host:port built with Sprintf (breaks IPv6).
+    - asasalint
+    - bidichk
+    - nilnesserr
+    - makezero
+    - reassign
+    - fatcontext
+    - gocheckcompilerdirectives
+    - nosprintfhostport
+    # Conventions.
+    - revive
+    - misspell
+    - unconvert
+    # Every //nolint names its linter and says why.
+    - nolintlint
+
+  settings:
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      # Unused directives are reported (allow-unused: false).
+
+    govet:
+      enable-all: true
+      disable:
+        # Struct field ordering for memory layout is not worth the churn.
+        - fieldalignment
+        # Shadowing `err` is idiomatic Go.
+        - shadow
+
+    errcheck:
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (net/http.ResponseWriter).Write
+        - io.Copy(*bytes.Buffer)
+        - io.Copy(os.Stdout)
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+
+    gosec:
+      excludes:
+        # Unhandled errors: errcheck covers this with project-specific exclusions.
+        - G104
+        # Integer overflow conversions: noisy for bounded values (ports, sizes).
+        - G115
+        # Subprocesses with variable arguments: the CLI runs rsync / aws /
+        # gcloud / az / npm on purpose (arguments are passed without a shell).
+        - G204
+        # Directory/file permissions: 0755/0644 are intentional for site files
+        # and scaffolded projects shared with other users and tools.
+        - G301
+        - G302
+        - G306
+        # File paths from variables (including the taint-analysis variant): the
+        # CLI and config loader open caller-provided paths, and fs storage
+        # confines access with os.Root.
+        - G304
+        - G703
+        # math/rand is used for jitter and test data only; secrets, tokens and
+        # ids use crypto/rand (reviewed).
+        - G404
+        # Taint analysis for SSRF / open redirects: the AI proxy calls configured
+        # upstreams and every redirect target is validated (SPEC §8.1 "no open
+        # redirects"); the analyzer cannot see those checks.
+        - G704
+        - G710
+      config:
+        global:
+          audit: false
+
+    errorlint:
+      # Wrapping (%w vs %v) is a deliberate choice per call site (errors shown
+      # to API clients must not expose internals); comparisons and type
+      # assertions on errors must use errors.Is / errors.As.
+      errorf: false
+      asserts: true
+      comparison: true
+
+    # misspell: no locale, so both US and UK spellings are accepted and only
+    # real typos are reported.
+
+    revive:
+      # Light rule set: naming and documentation conventions, no style policing.
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: exported
+          arguments:
+            - disableStutteringCheck
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: var-declaration
+        - name: var-naming
+
+    staticcheck:
+      checks:
+        - all
+        # Package comments, dot imports and naming are covered by revive.
+        - -ST1000
+        - -ST1001
+        - -ST1003
+        # Opinionated style checks that staticcheck itself leaves off by
+        # default (receiver names, comment wording, redundant types in
+        # declarations).
+        - -ST1016
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        - -ST1023
+        # Quick-fix suggestions (De Morgan, tagged switch, ...) are style.
+        - -QF*
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - std-error-handling
+    rules:
+      # Tests may use simpler error handling, fixed test credentials,
+      # self-signed certificates and short-lived HTTP responses, and need no
+      # doc comments.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - bodyclose
+          - revive
+      # Shared test helpers (blobtest, servertest, clitest, fakes, ...) are
+      # production-quality code otherwise, but run only against local test
+      # servers.
+      - path: internal/.*/(.*test|testutil|fake.*)/
+        linters:
+          - gosec
+    paths:
+      - node_modules
+      - deploy/terraform
+      - web/sdk/test
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/thasami/backyard
+  exclusions:
+    generated: lax
+    paths:
+      - node_modules
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

@@ -1,0 +1,179 @@
+# backyard.yaml — annotated example configuration.
+#
+# Every value can reference environment variables: ${VAR} or ${VAR:-default}.
+# Print this file with `backyard config example`; check yours with
+# `backyard config validate backyard.yaml`.
+
+server:
+  # Hub lives at https://<base_domain>/, sites at https://<site>.<base_domain>/.
+  # Point a wildcard DNS record (*.backyard.example.com) and certificate at the server.
+  base_domain: ${BACKYARD_BASE_DOMAIN:-backyard.example.com}
+  # public_url: https://backyard.example.com     # default: https://<base_domain>
+  # url_mode: host                                # host (wildcard subdomains) | path (/s/<site>/)
+  # listen: ":8080"                               # default :$PORT or :8080
+  # 32+ random characters: openssl rand -hex 32
+  secret: ${BACKYARD_SECRET}
+  # Load balancers / proxies whose X-Forwarded-* (and identity) headers are trusted.
+  trusted_proxies: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+  name: Backyard
+
+auth:
+  # none | oidc (okta, entra, google, auth0, keycloak) | iap | alb | header
+  mode: oidc
+  admins: ["platform-team@example.com"]
+  admin_groups: ["backyard-admins"]
+  allowed_domains: ["example.com"]
+  # allowed_groups: ["employees"]
+  # token_ttl: 720h                 # lifetime of CLI/API tokens minted by the server
+  # Static bearer tokens for CI (store only the sha256; see `backyard token hash`).
+  # tokens:
+  #   - name: github-actions
+  #     sha256: 3f7c…
+  oidc:
+    # Okta: https://<org>.okta.com/oauth2/default   Entra ID: https://login.microsoftonline.com/<tenant>/v2.0
+    issuer: ${OIDC_ISSUER:-https://example.okta.com/oauth2/default}
+    client_id: ${OIDC_CLIENT_ID:-backyard}
+    client_secret: ${OIDC_CLIENT_SECRET:-change-me}
+    scopes: [openid, profile, email, groups]
+    # session_ttl: 12h
+    # use_userinfo: true
+    # Native/public client used by `backyard login --device` (OAuth device authorization grant).
+    # device_client_id: 0oa-native-client
+  # iap:
+  #   audience: /projects/123456789/global/backendServices/987654321
+  # alb:
+  #   region: us-east-1
+  #   signer_arn: arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/app/backyard/abc
+  # header:
+  #   email_header: X-Forwarded-Email
+  #   name_header: X-Forwarded-User
+  #   groups_header: X-Forwarded-Groups
+
+identity:
+  # Claim names used to build the user profile exposed by backyard.id.me().
+  claims:
+    team: department
+    title: title
+    slack: slack_handle
+  # Optional people directory (CSV with an "email" column, or JSON array).
+  # directory:
+  #   type: csv
+  #   path: /etc/backyard/people.csv
+  #   reload: 1h
+
+storage:
+  # fs (local disk / mounted bucket, rsync target) | s3 | gcs | azure
+  type: fs
+  fs:
+    root: /var/lib/backyard
+  # s3:
+  #   bucket: acme-backyard
+  #   region: us-east-1
+  #   prefix: ""
+  # gcs:
+  #   bucket: acme-backyard
+  # azure:
+  #   account: acmebackyard
+  #   container: backyard
+
+database:
+  # sqlite (single node) | postgres | dynamodb | memory
+  type: sqlite
+  sqlite:
+    path: /var/lib/backyard/backyard.db
+  # postgres:
+  #   dsn: ${DATABASE_URL}
+  # dynamodb:
+  #   table: backyard
+  #   region: us-east-1
+  #   create_table: true
+  # max_doc_bytes: 262144
+  # max_docs_per_site: 100000       # 0 = default; negative = unlimited
+
+pubsub:
+  # memory (single instance) | postgres (LISTEN/NOTIFY) | redis
+  type: memory
+  # redis:
+  #   url: redis://redis:6379/0
+
+ai:
+  default_model: smart
+  providers:
+    anthropic:
+      type: anthropic
+      api_key: ${ANTHROPIC_API_KEY:-}
+    openai:
+      type: openai
+      api_key: ${OPENAI_API_KEY:-}
+    # bedrock:
+    #   type: bedrock
+    #   region: us-east-1
+    # vertex:
+    #   type: gemini
+    #   project_id: my-gcp-project
+    #   location: us-central1
+    # azure:
+    #   type: azure-openai
+    #   endpoint: https://acme.openai.azure.com
+    #   api_key: ${AZURE_OPENAI_API_KEY}
+    # ollama:
+    #   type: ollama
+    #   base_url: http://ollama:11434/v1
+  models:
+    smart:
+      provider: anthropic
+      model: claude-opus-5-5
+      description: Most capable model for complex tasks
+    fast:
+      provider: anthropic
+      model: claude-haiku-5-5
+      description: Fast and inexpensive
+    image:
+      provider: openai
+      model: gpt-image-1
+      kind: image
+    embed:
+      provider: openai
+      model: text-embedding-3-small
+      kind: embedding
+  # max_tokens: 8192
+  # allow_raw_models: false
+
+warehouse:
+  # allow_raw_sql: true
+  # sources:
+  #   default:
+  #     type: bigquery
+  #     project_id: acme-analytics
+  #     max_bytes_billed: 10000000000
+  #   redshift:
+  #     type: postgres
+  #     dsn: ${REDSHIFT_DSN}
+  # queries:
+  #   weekly_active_users:
+  #     sql: SELECT day, users FROM analytics.wau WHERE team = @team ORDER BY day
+  #     params: [team]
+  #     description: Weekly active users for a team
+
+sites:
+  # none: anyone can overwrite any site (Quick philosophy) | owner: first deployer owns it
+  ownership: none
+  # max_site_bytes: 524288000
+  # max_files: 10000
+
+deploy:
+  # Methods advertised to the CLI, in preference order.
+  # methods: [api, rsync]
+  # rsync_target: deploy@backyard.example.com:/var/lib/backyard/sites
+  # gateway_url: https://abc123.lambda-url.us-east-1.on.aws
+
+ratelimit:
+  # Per user and instance. 0 (or unset) = the default; negative = unlimited.
+  ai_per_minute: 20
+  ai_tokens_per_day: 2000000        # input + output tokens per UTC day
+
+telemetry:
+  log_level: info
+  log_format: json
+  metrics: true
+  # metrics_listen: ":9090"

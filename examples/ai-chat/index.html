@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Chat</title>
+  <meta name="description" content="Chat with the company's AI models, with streaming answers and a model picker.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="bar">
+    <div class="title"><span aria-hidden="true">💬</span> AI Chat</div>
+    <div class="controls">
+      <label class="field"><span>Model</span><select id="model" disabled><option>Loading…</option></select></label>
+      <label class="field"><span>Style</span><select id="style"></select></label>
+      <button id="new-chat" class="ghost" title="Start a new conversation">New chat</button>
+    </div>
+  </header>
+
+  <main id="log" class="log" aria-live="polite">
+    <section id="welcome" class="welcome">
+      <h1 id="hello">What can I help with?</h1>
+      <p class="muted">Answers stream in as they are written. Your conversation stays in this browser tab.</p>
+      <div id="suggestions" class="suggestions"></div>
+    </section>
+  </main>
+
+  <p id="banner" class="banner" role="alert" hidden></p>
+
+  <form id="composer" class="composer">
+    <textarea id="input" rows="1" placeholder="Message the AI…  (Enter to send, Shift+Enter for a new line)" aria-label="Message"></textarea>
+    <button id="send" class="send" title="Send" aria-label="Send">↑</button>
+  </form>
+
+  <script src="/__backyard/backyard.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,36 @@
+{
+  "name": "backyard-cloudflare",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Backyard on Cloudflare Workers (free plan): one Worker plus SQLite Durable Objects, Workers AI and optional R2 (SPEC §16).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "sync": "node scripts/sync-assets.mjs",
+    "predev": "npm run sync",
+    "dev": "wrangler dev",
+    "dev:local": "wrangler dev --env local",
+    "pretest": "npm run sync",
+    "test": "vitest run && node --test test/scripts/*.test.mjs",
+    "test:worker": "vitest run",
+    "test:scripts": "node --test test/scripts/*.test.mjs",
+    "pretypecheck": "npm run sync",
+    "typecheck": "tsc --noEmit",
+    "build": "node scripts/sync-assets.mjs --strict && wrangler deploy --dry-run --env= --outdir .wrangler/dist",
+    "predeploy": "node scripts/sync-assets.mjs --strict",
+    "deploy": "wrangler deploy --env=",
+    "deploy:ci": "node scripts/sync-assets.mjs --strict && wrangler deploy --env=",
+    "setup": "node scripts/setup.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.4.0",
+    "@cloudflare/workers-types": "5.20261012.1",
+    "@types/node": "22.20.5",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11",
+    "wrangler": "4.149.0"
+  }
+}

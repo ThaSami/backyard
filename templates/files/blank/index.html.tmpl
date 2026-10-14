@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <meta name="description" content="{{.Title}}, a Backyard site">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌱</text></svg>">
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f5f1; --surface: #ffffff; --ink: #1d1c1a; --ink-2: #5f5d58; --line: #e4e2dc;
+      --accent: #2266c8; --accent-ink: #ffffff; --danger: #bf3434; --radius: 16px;
+      font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #121211; --surface: #1c1c1a; --ink: #f0efec; --ink-2: #a9a79f; --line: #2e2d2a; --accent: #4b93ea;
+              --accent-ink: #0b1b30; --danger: #e5605f; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink); padding: 7vh 16px 4rem; }
+    main { max-width: 640px; margin: 0 auto; }
+    .eyebrow { display: inline-flex; align-items: center; gap: .45rem; font-size: .78rem; font-weight: 600;
+               letter-spacing: .06em; text-transform: uppercase; color: var(--ink-2); }
+    h1 { font-size: clamp(2.1rem, 6vw, 3rem); line-height: 1.05; letter-spacing: -.025em; margin: .6rem 0 .5rem; }
+    h2 { font-size: 1.05rem; margin: 0 0 .25rem; display: flex; align-items: baseline; gap: .5rem; }
+    .lead { color: var(--ink-2); font-size: 1.1rem; margin: 0 0 2rem; }
+    .muted { color: var(--ink-2); font-size: .9rem; margin: 0 0 1rem; }
+    code { font: .88em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: color-mix(in srgb, var(--ink) 7%, transparent);
+           padding: .1em .35em; border-radius: 6px; }
+    .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 1.25rem 1.35rem; margin-bottom: 1rem; }
+    .me { display: flex; align-items: center; gap: .9rem; }
+    .me .muted { margin: 0; }
+    .avatar { width: 44px; height: 44px; border-radius: 50%; flex: none; display: grid; place-items: center; overflow: hidden;
+              background: var(--accent); color: var(--accent-ink); font-weight: 650; object-fit: cover; }
+    .avatar.sm { width: 32px; height: 32px; font-size: .8rem; }
+    .count { font-size: .8rem; font-weight: 500; color: var(--ink-2); }
+    form { display: flex; gap: .5rem; }
+    input { flex: 1; min-width: 0; font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line);
+            border-radius: 10px; padding: .6rem .8rem; }
+    input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+    button { font: inherit; font-weight: 600; border: 0; border-radius: 10px; padding: .6rem 1.1rem; background: var(--accent);
+             color: var(--accent-ink); cursor: pointer; }
+    button:disabled { opacity: .6; cursor: progress; }
+    .notes { list-style: none; margin: 1rem 0 0; padding: 0; }
+    .notes li { display: flex; gap: .75rem; align-items: flex-start; padding: .75rem 0; border-top: 1px solid var(--line);
+                animation: in .25s ease-out; }
+    .notes .body { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+    .notes .who { font-weight: 600; font-size: .9rem; }
+    .notes time { color: var(--ink-2); font-size: .8rem; margin-left: .35rem; }
+    .notes .del { background: none; color: var(--ink-2); padding: .2rem .4rem; font-weight: 400; }
+    .notes .del:hover { color: var(--danger); }
+    .empty, .error { margin: 1rem 0 0; color: var(--ink-2); font-size: .9rem; }
+    .error { color: var(--danger); }
+    .steps ol { margin: .5rem 0 0; padding-left: 1.2rem; }
+    .steps li { margin: .35rem 0; }
+    a { color: var(--accent); }
+    footer { margin-top: 2rem; text-align: center; color: var(--ink-2); font-size: .8rem; }
+    @keyframes in { from { opacity: 0; transform: translateY(-4px); } }
+  </style>
+</head>
+<body>
+  <main>
+    <span class="eyebrow">🌱 Backyard · {{.Site}}</span>
+    <h1>{{.Title}}</h1>
+    <p class="lead">Your new site is ready. Edit <code>index.html</code>, then run <code>backyard deploy</code> to publish.</p>
+
+    <section class="card me" aria-live="polite">
+      <span class="avatar" id="me-avatar" aria-hidden="true"></span>
+      <div>
+        <strong id="me-name">Loading…</strong>
+        <p class="muted" id="me-detail">Asking <code>backyard.me()</code> who you are.</p>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Guestbook <span class="count" id="count"></span></h2>
+      <p class="muted">Notes appear instantly for everyone who has this page open: <code>backyard.db</code> + <code>watch()</code>.</p>
+      <form id="note-form">
+        <input id="note" maxlength="280" placeholder="Say hi to your colleagues…" autocomplete="off" required aria-label="Note">
+        <button id="post">Post</button>
+      </form>
+      <ul class="notes" id="notes"></ul>
+      <p class="empty" id="empty" hidden>No notes yet. Be the first!</p>
+      <p class="error" id="error" hidden></p>
+    </section>
+
+    <section class="card steps">
+      <h2>Next steps</h2>
+      <ol>
+        <li>Preview with a local backend: <code>backyard dev</code></li>
+        <li>Build your idea: ask your coding agent, e.g. “turn this into a lunch poll for my team”.</li>
+        <li>Publish: <code>backyard deploy</code> (it replaces the whole site; data is kept).</li>
+      </ol>
+    </section>
+
+    <footer>Built on Backyard{{if .Server}} · <a href="{{html .Server}}/docs">Docs</a>{{end}}</footer>
+  </main>
+
+  <script src="/__backyard/backyard.js"></script>
+  <script type="module">
+    const $ = (sel) => document.querySelector(sel);
+    const initials = (name) => (name || "?").split(/\s+/).filter(Boolean).map((w) => w[0]).slice(0, 2).join("").toUpperCase();
+    const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+
+    function ago(iso) {
+      const s = (Date.parse(iso) - Date.now()) / 1000;
+      for (const [unit, sec] of [["day", 86400], ["hour", 3600], ["minute", 60]]) {
+        if (Math.abs(s) >= sec) return rtf.format(Math.round(s / sec), unit);
+      }
+      return "just now";
+    }
+
+    function avatar(person, small) {
+      const el = person.avatar_url ? Object.assign(new Image(), { src: person.avatar_url, alt: "" }) : document.createElement("span");
+      el.className = small ? "avatar sm" : "avatar";
+      if (!person.avatar_url) el.textContent = initials(person.name);
+      return el;
+    }
+
+    function showError(err) {
+      $("#error").hidden = false;
+      $("#error").textContent = err?.code === "rate_limited" ? "Slow down a little and try again." : `Something went wrong: ${err?.message ?? err}`;
+    }
+
+    async function start() {
+      const me = await backyard.me();
+      $("#me-avatar").replaceWith(Object.assign(avatar(me), { id: "me-avatar" }));
+      $("#me-name").textContent = `Hi, ${me.anonymous ? me.name : me.name.split(" ")[0]} 👋`;
+      $("#me-detail").textContent = me.anonymous
+        ? "You are browsing as a guest (this server runs without sign-in)."
+        : [me.title, me.team, me.email].filter(Boolean).join(" · ");
+
+      const notes = backyard.db.collection("guestbook");
+      notes.watch((docs) => {
+        $("#count").textContent = docs.length ? `${docs.length}${docs.hasMore ? "+" : ""}` : "";
+        $("#empty").hidden = docs.length > 0;
+        $("#notes").replaceChildren(...docs.map((n) => {
+          const li = document.createElement("li");
+          const body = document.createElement("div");
+          body.className = "body";
+          body.innerHTML = `<span class="who"></span><time></time><div class="text"></div>`;
+          body.querySelector(".who").textContent = n.name;
+          body.querySelector("time").textContent = ago(n._meta.created_at);
+          body.querySelector("time").dateTime = n._meta.created_at;
+          body.querySelector(".text").textContent = n.text;
+          li.append(avatar(n, true), body);
+          if (n._meta.created_by === me.id) {
+            const del = Object.assign(document.createElement("button"), { className: "del", textContent: "✕", title: "Delete" });
+            del.onclick = () => notes.delete(n.id).catch(showError);
+            li.append(del);
+          }
+          return li;
+        }));
+      }, notes.orderBy("_meta.created_at", "desc").limit(20));
+
+      $("#note-form").onsubmit = async (e) => {
+        e.preventDefault();
+        const text = $("#note").value.trim();
+        if (!text) return;
+        $("#post").disabled = true;
+        $("#error").hidden = true;
+        try {
+          await notes.create({ text, name: me.name, avatar_url: me.avatar_url ?? null });
+          $("#note").value = "";
+        } catch (err) {
+          showError(err);
+        } finally {
+          $("#post").disabled = false;
+          $("#note").focus();
+        }
+      };
+    }
+
+    if (!window.backyard) {
+      $("#me-name").textContent = "Backyard is not available here";
+      $("#me-detail").innerHTML = "Open this page with <code>backyard dev</code>, or after <code>backyard deploy</code>.";
+    } else {
+      start().catch((err) => {
+        $("#me-name").textContent = "Could not reach Backyard";
+        $("#me-detail").textContent = err.message;
+      });
+    }
+  </script>
+</body>
+</html>

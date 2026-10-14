@@ -1,0 +1,5 @@
+# Local settings and secrets created by init-env.sh
+.env
+# TLS material for BACKYARD_TLS=files
+certs/*
+!certs/README.md

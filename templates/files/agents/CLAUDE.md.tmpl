@@ -1,0 +1,23 @@
+# {{.Title}}: a Backyard site
+
+{{template "intro" .}}
+
+**Use the Backyard skill** (`.claude/skills/backyard/SKILL.md`) for everything you build here:
+it has the client API, golden rules, patterns and limits. Read
+`.claude/skills/backyard/references/api.md` before using an API in a non-trivial way, and
+`references/recipes.md` for complete example apps (voting, polls, chat, cursors, AI, uploads,
+dashboards, games).
+
+{{template "rules" .}}
+
+{{template "commands" .}}
+
+## Project layout
+
+- {{.IndexFiles}}: the site itself (add pages, scripts, styles and images next to them).
+- `.backyard.json`: the site name (`{{.Site}}`) used by `backyard deploy` and `backyard dev`.
+- `.backyardignore`: extra files to keep out of deploys.
+- `.claude/skills/backyard/`: the Backyard skill (documentation for you; never deployed).
+{{- if .Codex}}
+- `AGENTS.md`: the same guidance for other coding agents.
+{{- end}}

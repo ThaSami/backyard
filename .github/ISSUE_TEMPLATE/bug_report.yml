@@ -1,0 +1,75 @@
+name: Bug report
+description: Something in Backyard does not work as documented.
+labels: [bug, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please do not include secrets, tokens or
+        internal hostnames — redact them. Security issues go to the private advisory form instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: |
+        1. Deploy a site with `backyard deploy ./site`
+        2. Open https://site.backyard.example.com/
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `backyard version` (server and CLI if they differ), or the image tag.
+      placeholder: backyard 0.1.0 (abc1234, 2026-01-01T00:00:00Z) linux/amd64
+    validations:
+      required: true
+  - type: dropdown
+    id: edition
+    attributes:
+      label: Where does it run?
+      multiple: true
+      options:
+        - Local (backyard dev / serve --dev)
+        - docker-compose
+        - Kubernetes (Helm chart)
+        - systemd / single VM
+        - AWS (Terraform)
+        - GCP (Terraform)
+        - Azure (Terraform)
+        - Cloudflare Workers edition
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Static sites / routing
+        - Deploys (CLI, gateway, rsync, bucket sync)
+        - Database / realtime
+        - Files
+        - AI
+        - Warehouse
+        - Websockets / rooms
+        - Authentication / identity
+        - Hub UI / docs
+        - JavaScript SDK
+        - CLI / MCP / agent skill
+        - Packaging / install
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: The relevant parts of backyard.yaml (secrets removed), or the Worker vars.
+      render: yaml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Server logs, CLI output (`--verbose`) or browser console output.
+      render: text

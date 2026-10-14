@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <meta name="description" content="{{.Title}}, a Backyard app">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌱</text></svg>">
+  <!-- Own files use RELATIVE paths (works on host- and path-mode servers). -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span aria-hidden="true">🌱</span> {{.Title}}</div>
+    <div class="status">
+      <span class="pill" id="online" title="People with this page open" hidden></span>
+      <span class="pill offline" id="offline" hidden>Reconnecting…</span>
+      <div class="user" id="user" hidden><span class="avatar" id="user-avatar"></span><span id="user-name"></span></div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="panel">
+      <div class="panel-head">
+        <h1>Items</h1>
+        <div class="filters" role="group" aria-label="Filter">
+          <button class="chip active" data-filter="all" aria-pressed="true">All</button>
+          <button class="chip" data-filter="open" aria-pressed="false">Open</button>
+          <button class="chip" data-filter="mine" aria-pressed="false">Mine</button>
+        </div>
+      </div>
+
+      <form id="add-form" class="add">
+        <input id="add-input" maxlength="200" placeholder="Add an item…" autocomplete="off" required aria-label="New item">
+        <button class="primary">Add</button>
+      </form>
+
+      <ul id="list" class="list" aria-live="polite"></ul>
+      <p id="empty" class="empty" hidden>Nothing here yet. Add the first item above.</p>
+      <p id="loading" class="empty">Loading…</p>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <!-- The Backyard SDK: ABSOLUTE path, loaded before the app. -->
+  <script src="/__backyard/backyard.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,72 @@
+# Backyard server as a hardened systemd service (single VM, no cloud bucket).
+# Installed by deploy/systemd/install.sh to /etc/systemd/system/backyard.service.
+#
+#   /usr/local/bin/backyard          the binary
+#   /etc/backyard/backyard.yaml      configuration (strictly validated)
+#   /etc/backyard/backyard.env       secrets: BACKYARD_SECRET=..., API keys (mode 0640, root:backyard)
+#   /var/lib/backyard                data: sites/, uploads/, _meta/, backyard.db (StateDirectory)
+#
+# Local overrides: systemctl edit backyard
+
+[Unit]
+Description=Backyard - internal sites with a zero-config backend
+Documentation=https://github.com/thasami/backyard/tree/main/deploy/systemd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=backyard
+Group=backyard
+EnvironmentFile=-/etc/backyard/backyard.env
+ExecStart=/usr/local/bin/backyard serve --config /etc/backyard/backyard.yaml
+Restart=on-failure
+RestartSec=2s
+# Slightly longer than server.shutdown_timeout (20s by default).
+TimeoutStopSec=30s
+LimitNOFILE=65536
+
+# /var/lib/backyard, owned by the service user (also the home directory of the
+# "backyard" account that rsync deploys use, see README.md).
+StateDirectory=backyard
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/backyard
+UMask=0027
+
+# Sandboxing. The server only needs its state directory, outbound network
+# access (IdP, AI providers, warehouse) and a listening socket.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+# No capabilities: listen on a port >= 1024 (server.listen, default :8080)
+# behind Caddy or nginx. To bind :80/:443 directly instead, add
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# and remove PrivateUsers=yes (systemctl edit backyard).
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

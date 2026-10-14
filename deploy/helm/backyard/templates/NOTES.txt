@@ -1,0 +1,61 @@
+Backyard {{ include "backyard.imageTag" . }} is installed as "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+{{- $publicURL := include "backyard.publicURL" . }}
+{{- $domain := include "backyard.baseDomain" . }}
+
+Hub:   {{ $publicURL }}/
+{{- if eq (include "backyard.urlMode" .) "host" }}
+Sites: https://<site>.{{ $domain }}/   (needs DNS and TLS for {{ $domain }} and *.{{ $domain }})
+{{- else }}
+Sites: {{ $publicURL }}/s/<site>/
+{{- end }}
+
+{{- if .Values.ingress.enabled }}
+
+Point DNS for the ingress hosts at your ingress controller:
+  kubectl get ingress {{ include "backyard.fullname" . }} -n {{ .Release.Namespace }}
+{{- else }}
+
+No ingress is configured (ingress.enabled=false). To try it locally:
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "backyard.fullname" . }} 8080:{{ .Values.service.port }}
+  curl http://127.0.0.1:8080/__backyard/healthz
+{{- end }}
+
+Log in with the CLI (https://github.com/thasami/backyard/releases):
+  backyard login --server {{ $publicURL }}
+
+{{- if eq (dig "auth" "mode" "none" .Values.config | default "none") "none" }}
+
+WARNING: config.auth.mode is "none": anyone who can reach {{ $publicURL }} can use every
+site and its data. Configure SSO (auth.mode: oidc, see values-production.yaml) or keep the
+service on a private network.
+{{- if and (not (dig "auth" "tokens" list .Values.config)) (not (dig "deploy" "allow_anonymous" false .Values.config)) }}
+
+No deploy token is configured, so nobody can deploy yet. Create one and add its SHA-256:
+  TOKEN="byd_$(openssl rand -hex 24)"; backyard token hash "$TOKEN"
+  config.auth.tokens: [{name: deploy, sha256: <hash>, admin: true}]
+then: backyard login --server {{ $publicURL }} --token "$TOKEN"
+{{- end }}
+{{- end }}
+
+{{- if and (eq (dig "auth" "mode" "none" .Values.config | default "none" | lower) "header") (not (dig "auth" "header" "jwt_header" "" .Values.config)) }}
+
+NOTE: config.auth.mode is "header" without jwt_header: any peer in config.server.trusted_proxies{{ if .Values.networkPolicy.enabled }}
+that networkPolicy.from admits{{ end }} can sign in as anyone by sending {{ dig "auth" "header" "email_header" "the identity headers" .Values.config }}.
+Every route through those peers must set or strip that header.
+{{- end }}
+
+{{- if and (eq (dig "storage" "type" "fs" .Values.config | default "fs") "fs") (not .Values.persistence.enabled) }}
+
+WARNING: persistence is disabled: sites, uploads and the database live in an emptyDir and are
+lost when the pod is rescheduled.
+{{- end }}
+
+{{- if include "backyard.createSecret" . }}
+{{- if not .Values.secret.backyardSecret }}
+
+BACKYARD_SECRET was generated and stored in Secret {{ include "backyard.fullname" . }}; it is
+kept across upgrades. With GitOps tools that render the chart offline, set
+secret.backyardSecret or existingSecret instead, or it changes on every render.
+{{- end }}
+{{- end }}
