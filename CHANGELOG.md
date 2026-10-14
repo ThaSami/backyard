@@ -4,7 +4,7 @@ All notable changes to Backyard are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-10-14
 
 The first public version of Backyard: drop a folder of HTML, get an internal URL with a
 zero-config backend for every site.
@@ -313,4 +313,4 @@ zero-config backend for every site.
 - Further hardening from an adversarial review of both editions: stricter input validation,
   safer defaults and narrower error messages.
 
-[0.1.0]: https://github.com/thasami/backyard/commits/main
+[0.1.0]: https://github.com/thasami/backyard/releases/tag/v0.1.0
