@@ -40,6 +40,11 @@ jobs:
     name: Publish backyard-cloudflare to npm
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # One publish at a time, so each picks its dist-tag knowing the one before
+    # (a run that arrives while another waits replaces the waiting one).
+    concurrency:
+      group: npm-publish-backyard-cloudflare
+      cancel-in-progress: false
     environment:
       name: npm
       url: https://www.npmjs.com/package/backyard-cloudflare
@@ -53,7 +58,7 @@ jobs:
         env:
           PRIVATE: ${{ github.event.repository.private }}
         run: |
-          if ! printf '%s\n' "$TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'; then
+          if ! [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::the tag input is not a release tag vX.Y.Z"
             exit 1
           fi
@@ -101,9 +106,18 @@ jobs:
           case "$version" in
             *-*) tag=next ;;
             *)
-              # A release of an older line (1.4.1 after 1.5.0) must not move
-              # latest back: it gets the dist-tag release-1.4 instead.
-              current="$(npm view backyard-cloudflare dist-tags.latest 2>/dev/null || true)"
+              # A version older than npm's latest (1.4.1 after 1.5.0, or 1.5.0
+              # published after 1.5.1) must not move latest back: it gets the
+              # dist-tag release-1.4 (release-1.5) instead. E404 means the
+              # package is not on npm yet; any other failure stops here.
+              if ! current="$(npm view backyard-cloudflare dist-tags.latest 2>"$RUNNER_TEMP/npm-view.err")"; then
+                if ! grep -q 'code E404' "$RUNNER_TEMP/npm-view.err"; then
+                  cat "$RUNNER_TEMP/npm-view.err" >&2
+                  echo "::error::cannot read npm's latest version of backyard-cloudflare"
+                  exit 1
+                fi
+                current=""
+              fi
               if [ -n "$current" ] && [ "$current" != "$version" ] &&
                 [ "$(printf '%s\n' "$current" "$version" | sort -V | tail -n 1)" = "$current" ]; then
                 tag="release-${version%.*}"

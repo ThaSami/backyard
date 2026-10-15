@@ -276,10 +276,14 @@ When the repository variable `BACKYARD_NPM_PUBLISH` is `true`, the release's `np
 [npm workflow](.github/workflows/npm-publish.yml), which downloads the package from the GitHub
 release, verifies it against `checksums.txt` and publishes exactly those bytes to npm as
 `backyard-cloudflare`, with provenance. The dist-tag is `latest`, `next` for a pre-release tag
-such as `v1.2.0-rc.1`, or `release-X.Y` for a release of an older line (`v1.4.1` after npm's
-`latest` 1.5.0), which leaves `latest` alone. Its job is the only one with an OIDC token
-(`id-token: write`, which the release's `npm` job passes on), and the only one that runs in the
-`npm` environment (Settings → Environments → New environment, named `npm`):
+such as `v1.2.0-rc.1`, or `release-X.Y` for a version older than npm's `latest` (`v1.4.1` after
+1.5.0, or `v1.5.0` published after 1.5.1), which leaves `latest` alone (`npm dist-tag` moves or
+removes such tags). If npm cannot say what its `latest` is, other than for a package it does not
+have yet, the job fails rather than guess. Publishes run one at a time; a run that arrives while
+another one waits replaces the waiting one, which then has to be run again. Its job is the only
+one with an OIDC token (`id-token: write`, which the release's `npm` job passes on), and the
+only one that runs in the `npm` environment (Settings → Environments → New environment, named
+`npm`):
 
 - **`NPM_TOKEN`**: a secret of the `npm` environment, so no other job can read it (a repository
   secret works too). The environment can also require a reviewer's approval before each publish;
@@ -312,9 +316,10 @@ works once a release has published the package), so the canonical repository sho
    manual first publish below, or with a placeholder `backyard-cloudflare@0.0.0` published by
    hand, after which `NPM_TOKEN` can be limited to the package right away (step 3). Registering
    `backyard-cf` as well is optional, against typosquatting. Otherwise, a token limited to
-   selected packages can name only packages that already exist, so the first `NPM_TOKEN` secret is a short-lived granular token (a few days) with read
-   and write access to "All packages"; if the account requires two-factor authentication for
-   publishing, the token also needs "Bypass two-factor authentication". Add it as the `NPM_TOKEN`
+   selected packages can name only packages that already exist, so the first `NPM_TOKEN` secret is a short-lived granular token (a few days) with
+   "Read and write (publish and stage)" access to "All packages" and "Bypass two-factor
+   authentication" checked: npm requires two-factor authentication or such a token for every
+   publish, and CI cannot answer a 2FA prompt (a "stage only" token cannot publish). Add it as the `NPM_TOKEN`
    secret of the `npm` environment, set the repository variable `BACKYARD_NPM_PUBLISH` to `true`
    and tag the release. The job fails if the variable is on and the secret is missing. Check that this
    first `npm publish --provenance` succeeds: provenance compares the package's `repository.url`
@@ -325,9 +330,19 @@ works once a release has published the package), so the canonical repository sho
    `--provenance` (npm generates provenance only in CI); the provenance check then moves to the
    next release.
 3. **Right after that.** Replace `NPM_TOKEN` with a granular token that can publish only
-   `backyard-cloudflare` (selectable now that the package exists) and revoke the bootstrap
-   token. Trusted publishing (OIDC without a token) also needs an existing package, plus a
-   change to the `npm` job (npm 11.5.1 or later, and no `NPM_TOKEN` check), so it is a later step.
+   `backyard-cloudflare` (selectable now that the package exists), again with "Read and write
+   (publish and stage)" and "Bypass two-factor authentication", and revoke the bootstrap token.
+   The package's Publishing access must still allow tokens (not "Require two-factor
+   authentication and disallow tokens").
+4. **Before January 2027.** npm removes publishing directly with a granular access token in
+   January 2027 ([About access tokens](https://docs.npmjs.com/about-access-tokens)), so by then
+   the workflows must use [trusted publishing](https://docs.npmjs.com/trusted-publishers) (OIDC,
+   no token). npm checks the file name of the workflow that was triggered, not of the one that
+   runs `npm publish`, so the package needs two trusted publishers (package Settings → Trusted
+   publishing): `release.yml` for tag releases and `npm-publish.yml` for runs by hand, both with
+   the environment `npm` and with `npm publish` allowed (new trusted publishers allow only staged
+   publishing by default). `npm-publish.yml` then needs npm 11.5.1 or later (and Node.js 22.14.0
+   or later) and no `NPM_TOKEN` check; both workflows already grant `id-token: write`.
 
 Without npm publishing (forks, for example), every GitHub release still carries the package:
 `npx --package https://github.com/thasami/backyard/releases/download/vX.Y.Z/backyard-cloudflare-X.Y.Z.tgz backyard-cloudflare setup`.

@@ -15,8 +15,9 @@ All notable changes to Backyard are documented here. The format follows
 
 ### Changed
 
-- npm publishing keeps `latest` on the newest version: a release of an older line (`v1.4.1`
-  after `latest` 1.5.0) gets the dist-tag `release-1.4` instead of moving `latest` back.
+- npm publishing keeps `latest` on the newest version: a version older than npm's `latest`
+  (`v1.4.1` after 1.5.0) gets the dist-tag `release-1.4` instead of moving `latest` back.
+  Publishes run one at a time, and one fails if npm cannot say what its `latest` is.
 
 ## [0.2.0] - 2026-10-15
 

@@ -19,7 +19,7 @@
 // indented keys under `jobs:`, steps the six-space indented list items.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -70,9 +70,10 @@ function steps(jobText) {
 /** The script of a step's run: (a one-liner or the indented block under `run: |`). */
 function runScript(stepText) {
   const lines = stepText.split("\n");
-  const i = lines.findIndex((l) => /^ {8}run:/.test(l));
+  const key = /^ {6}(?:- | {2})run:\s*/; // `run:` under a step, or as its first key
+  const i = lines.findIndex((l) => key.test(l));
   if (i < 0) return "";
-  const first = lines[i].replace(/^ {8}run:\s*/, "");
+  const first = lines[i].replace(key, "");
   if (!/^[|>]/.test(first)) return first;
   const out = [];
   for (const l of lines.slice(i + 1)) {
@@ -263,68 +264,138 @@ test("npm-publish.yml publishes the release's own package with provenance", () =
   assert.match(npm, /^ {4}environment:\n {6}name: npm$/m, "NPM_TOKEN can be a secret of the npm environment");
   assert.match(npm, /^ {4}permissions:\n {6}contents: read\n {6}id-token: write\b/m);
   assert.doesNotMatch(npm, /contents: write|actions\/checkout|npm pack|make /, "npm gets the release asset, not a rebuild");
+  // Each publish picks its dist-tag after the previous one has landed.
+  assert.match(npm, /^ {4}concurrency:\n {6}group: npm-publish-backyard-cloudflare\n {6}cancel-in-progress: false$/m);
   // The tag reaches the scripts as $TAG, never interpolated into them.
   assert.match(npm, /^ {4}env:\n {6}TAG: \$\{\{ inputs\.tag \}\}$/m);
   assert.doesNotMatch(npm, /GITHUB_REF_NAME#v/, "the tag input names the release, not the ref the run is on");
 
   const list = steps(npm);
   const check = stepIndex(list, "name: Check the tag", "checking the tag");
-  const script = runScript(list[check]);
-  assert.ok(script.includes(`grep -Eqx 'v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?'`), `a release tag only:\n${script}`);
-  assert.ok(script.includes('[ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "$TAG" ]'), "run on another tag, the provenance would name its commit");
   assert.match(list[check], /^ {10}PRIVATE: \$\{\{ github\.event\.repository\.private \}\}$/m);
-  assert.ok(script.includes('[ "$PRIVATE" = true ]'), "a private repository fails before anything is published");
-
   const node = stepIndex(list, "actions/setup-node", "setting up Node");
   assert.match(list[node], /registry-url: "https:\/\/registry\.npmjs\.org"/);
   const download = stepIndex(list, "gh release download", "downloading the release asset");
-  const fetch = runScript(list[download]);
-  assert.ok(fetch.includes('gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft'), "a published release only");
-  assert.ok(fetch.includes('[ "$draft" != false ]'));
-  assert.ok(
-    fetch.includes(`gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'backyard-cloudflare-*.tgz' --pattern checksums.txt --dir pkg`),
-    fetch,
-  );
+  assert.match(list[download], /^ {10}GH_TOKEN: \$\{\{ github\.token \}\}$/m);
   const verify = stepIndex(list, "sha256sum", "verifying the download");
   assert.match(list[verify], /sha256sum --ignore-missing -c checksums\.txt/);
   assert.ok(list[verify].includes('backyard-cloudflare-${TAG#v}\\.tgz$" checksums.txt'), "the package must be listed");
   const publish = stepIndex(list, "npm publish", "publishing");
-  assert.match(list[publish], /NODE_AUTH_TOKEN: \$\{\{ secrets\.NPM_TOKEN \}\}/);
-  assert.ok(runScript(list[publish]).includes('if [ -z "$NODE_AUTH_TOKEN" ]; then'), "a missing token fails the job");
-  assert.ok(list[publish].includes('version="${TAG#v}"'));
-  assert.ok(
-    list[publish].includes('npm publish "./pkg/backyard-cloudflare-${version}.tgz" --provenance --access public --tag "$tag"'),
-    list[publish],
-  );
+  assert.match(list[publish], /^ {10}NODE_AUTH_TOKEN: \$\{\{ secrets\.NPM_TOKEN \}\}$/m);
   assert.ok(check < node && node < download && download < verify && verify < publish, "check → download → verify → publish");
 });
 
-test("npm-publish.yml picks the dist-tag: latest, next for a pre-release, release-X.Y for an older line", () => {
-  const list = steps(job("npm", "npm-publish.yml"));
-  const script = runScript(list[stepIndex(list, "npm publish", "publishing")]);
-  // The script up to npm publish, with a fake npm whose `npm view` prints
-  // npm's current latest (and fails, like E404, when there is none).
-  const choose = script.slice(script.indexOf('version="${TAG#v}"'), script.indexOf("npm publish "));
-  const dir = mkdtempSync(join(tmpdir(), "npm-publish-"));
-  writeFileSync(join(dir, "npm"), '#!/bin/sh\n[ -n "$FAKE_LATEST" ] || exit 1\necho "$FAKE_LATEST"\n', { mode: 0o755 });
-  const distTag = (version, latest) =>
-    execFileSync("bash", ["-ec", `${choose}\nprintf '%s' "$tag"`], {
-      env: { PATH: `${dir}:${process.env.PATH}`, TAG: `v${version}`, FAKE_LATEST: latest },
-      encoding: "utf8",
-    }).replace(/^::notice::.*\n/m, "");
+/**
+ * Runs a step's script with `bash -e`, as GitHub does, in a scratch directory
+ * that is also $RUNNER_TEMP and comes first on PATH with the given fake
+ * commands. Fakes append their calls to "$RUNNER_TEMP/calls".
+ */
+function runStep(stepText, env, fakes = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "workflow-step-"));
   try {
-    assert.equal(distTag("0.2.0", ""), "latest", "a new package");
-    assert.equal(distTag("0.2.0", "0.0.0"), "latest");
-    assert.equal(distTag("1.0.0", "0.2.0"), "latest");
-    assert.equal(distTag("0.10.0", "0.9.3"), "latest", "versions compare numerically");
-    assert.equal(distTag("0.2.0", "0.2.0"), "latest", "a republish is npm's to refuse");
-    assert.equal(distTag("0.1.1", "0.2.0"), "release-0.1", "an older line keeps latest");
-    assert.equal(distTag("0.9.3", "0.10.0"), "release-0.9");
-    assert.equal(distTag("1.2.0-rc.1", "1.1.0"), "next");
-    assert.equal(distTag("0.1.0-rc.1", "0.2.0"), "next");
+    for (const [name, body] of Object.entries(fakes)) {
+      writeFileSync(join(dir, name), `#!/bin/sh\n${body}`, { mode: 0o755 });
+    }
+    const r = spawnSync("bash", ["-e", "-c", runScript(stepText)], {
+      cwd: dir,
+      env: { PATH: `${dir}:${process.env.PATH}`, RUNNER_TEMP: dir, ...env },
+      encoding: "utf8",
+    });
+    const calls = existsSync(join(dir, "calls")) ? readFileSync(join(dir, "calls"), "utf8") : "";
+    return { status: r.status, stderr: r.stderr, calls };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+/** A step of npm-publish.yml's job, by a substring of its text. */
+function npmPublishStep(text) {
+  const list = steps(job("npm", "npm-publish.yml"));
+  return list[stepIndex(list, text, text)];
+}
+
+test("npm-publish.yml refuses a tag that is not a release tag of this run", () => {
+  const check = npmPublishStep("name: Check the tag");
+  const passes = (TAG, env = {}) =>
+    runStep(check, { TAG, GITHUB_REF_TYPE: "branch", GITHUB_REF_NAME: "main", PRIVATE: "false", ...env }).status === 0;
+  assert.ok(passes("v0.2.0"));
+  assert.ok(passes("v1.2.0-rc.1"));
+  assert.ok(passes("v0.2.0", { GITHUB_REF_TYPE: "tag", GITHUB_REF_NAME: "v0.2.0" }), "the release's own run");
+  for (const bad of ["", "0.2.0", "v0.2", "v0.2.0-", " v0.2.0", "v0.2.0 ", "v0.2.0\n", "v0.2.0\nv0.3.0", "--repo=x/y", "v0.2.0;id"]) {
+    assert.ok(!passes(bad), JSON.stringify(bad));
+  }
+  assert.ok(!passes("v0.2.0", { GITHUB_REF_TYPE: "tag", GITHUB_REF_NAME: "v0.1.0" }), "the provenance would name v0.1.0's commit");
+  assert.ok(!passes("v0.2.0", { PRIVATE: "true" }), "npm rejects provenance from a private repository");
+});
+
+test("npm-publish.yml downloads only from a published release", () => {
+  const download = npmPublishStep("gh release download");
+  // `gh release view --json isDraft --jq .isDraft` prints true or false, or
+  // fails when there is no such release.
+  const gh = `printf '%s\\n' "$*" >> "$RUNNER_TEMP/calls"
+case "$1 $2" in
+  "release view") [ "$FAKE_DRAFT" != missing ] || { echo "release not found" >&2; exit 1; }; echo "$FAKE_DRAFT" ;;
+  "release download") ;;
+  *) exit 99 ;;
+esac
+`;
+  const run = (draft) => runStep(download, { TAG: "v0.2.0", GITHUB_REPOSITORY: "ThaSami/backyard", FAKE_DRAFT: draft }, { gh });
+  const published = run("false");
+  assert.equal(published.status, 0, published.stderr);
+  assert.equal(
+    published.calls,
+    "release view v0.2.0 --repo ThaSami/backyard --json isDraft --jq .isDraft\n" +
+      "release download v0.2.0 --repo ThaSami/backyard --pattern backyard-cloudflare-*.tgz --pattern checksums.txt --dir pkg\n",
+  );
+  for (const draft of ["true", "missing", ""]) {
+    const r = run(draft);
+    assert.notEqual(r.status, 0, `isDraft: ${draft}`);
+    assert.doesNotMatch(r.calls, /release download/, `isDraft: ${draft}`);
+  }
+});
+
+test("npm-publish.yml picks the dist-tag: latest, next for a pre-release, release-X.Y below latest", () => {
+  const publish = npmPublishStep("npm publish");
+  // `npm view` answers like npm 10: the version, nothing (no latest tag),
+  // E404 (no such package) or another error.
+  const npm = `case "$*" in
+  "view backyard-cloudflare dist-tags.latest")
+    case "$FAKE_LATEST" in
+      E404) echo "npm error code E404" >&2; exit 1 ;;
+      ETIMEDOUT) echo "npm error code ETIMEDOUT" >&2; exit 1 ;;
+      *) [ -z "$FAKE_LATEST" ] || echo "$FAKE_LATEST" ;;
+    esac ;;
+  "publish "*) printf '%s\\n' "$*" >> "$RUNNER_TEMP/calls" ;;
+  *) echo "unexpected: npm $*" >&2; exit 99 ;;
+esac
+`;
+  const run = (version, latest, token = "npm_x") => runStep(publish, { TAG: `v${version}`, FAKE_LATEST: latest, NODE_AUTH_TOKEN: token }, { npm });
+  const distTag = (version, latest) => {
+    const r = run(version, latest);
+    assert.equal(r.status, 0, r.stderr);
+    const m = /^publish (\S+) --provenance --access public --tag (\S+)\n$/.exec(r.calls);
+    assert.ok(m, r.calls);
+    assert.equal(m[1], `./pkg/backyard-cloudflare-${version}.tgz`);
+    return m[2];
+  };
+  assert.equal(distTag("0.2.0", "E404"), "latest", "a new package");
+  assert.equal(distTag("0.2.0", ""), "latest", "no latest tag yet");
+  assert.equal(distTag("0.2.0", "0.0.0"), "latest");
+  assert.equal(distTag("1.0.0", "0.2.0"), "latest");
+  assert.equal(distTag("0.10.0", "0.9.3"), "latest", "versions compare numerically");
+  assert.equal(distTag("0.2.0", "0.2.0"), "latest", "a republish is npm's to refuse");
+  assert.equal(distTag("0.1.1", "0.2.0"), "release-0.1", "an older line leaves latest alone");
+  assert.equal(distTag("0.9.3", "0.10.0"), "release-0.9");
+  assert.equal(distTag("0.2.0", "0.2.1"), "release-0.2", "so does an older patch of latest's line");
+  assert.equal(distTag("1.2.0-rc.1", "1.1.0"), "next");
+  assert.equal(distTag("0.1.0-rc.1", "0.2.0"), "next");
+
+  const unknown = run("0.1.1", "ETIMEDOUT");
+  assert.notEqual(unknown.status, 0, "without npm's latest, a publish could move it back");
+  assert.equal(unknown.calls, "");
+  const noToken = run("0.2.0", "0.0.0", "");
+  assert.notEqual(noToken.status, 0, "a missing NPM_TOKEN fails the job");
+  assert.equal(noToken.calls, "");
 });
 
 test("only the publishing job runs in the npm environment, whose NPM_TOKEN no other job may read", () => {
@@ -336,15 +407,18 @@ test("only the publishing job runs in the npm environment, whose NPM_TOKEN no ot
   }
 });
 
-test("no workflow interpolates inputs or event data into a script", () => {
-  // Such values reach scripts through env:, where they cannot inject shell code.
+test("no workflow interpolates inputs, env or event data into a script", () => {
+  // Such values reach scripts as environment variables, where they cannot
+  // inject shell code (${{ env.X }} would be pasted into the script text).
+  const interpolated = /\$\{\{(?:(?!\}\})[\s\S])*?\b(inputs|env|github\.event|github\.head_ref)\b/;
   let seen = 0;
-  for (const [file, text] of Object.entries(workflows)) {
+  for (const file of Object.keys(workflows)) {
     for (const name of jobNames(file)) {
       for (const s of steps(job(name, file))) {
         const script = runScript(s);
+        if (/^ {6}(?:- | {2})run:/m.test(s)) assert.ok(script.trim(), `${file}: job ${name}: an empty run:\n${s}`);
         if (script) seen++;
-        assert.doesNotMatch(script, /\$\{\{[^}]*\b(inputs|github\.event|github\.head_ref)\b/, `${file}: job ${name}:\n${script}`);
+        assert.doesNotMatch(script, interpolated, `${file}: job ${name}:\n${script}`);
       }
     }
   }
