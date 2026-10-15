@@ -562,14 +562,15 @@ func TestCloudflareSetupEntryPoints(t *testing.T) {
 // TestCloudflareCIDeployCarriesSetup checks the "Deploying from GitHub
 // Actions" section of deploy/cloudflare/README.md against
 // scripts/cloudflare-ci.mjs. A CI deploy names the Worker, its variables and
-// its R2 bucket from its environment only, and wrangler removes a binding the
-// configuration leaves out, so the section's workflow passes all three and
-// says what to carry over from a Worker that `setup` made: the bucket (or the
-// files stored in R2 fail) and that workers.dev stays on.
+// its R2 bucket and its AI switch from its environment only, and wrangler
+// removes a binding the configuration leaves out, so the section's workflow
+// passes all four and says what to carry over from a Worker that `setup`
+// made: the bucket (or the files stored in R2 fail), AI off, and that
+// workers.dev stays on.
 func TestCloudflareCIDeployCarriesSetup(t *testing.T) {
 	ci := readRepoFile(t, "scripts/cloudflare-ci.mjs")
 	section := markdownSection(t, readRepoFile(t, "deploy/cloudflare/README.md"), "Deploying from GitHub Actions")
-	for _, name := range []string{"BACKYARD_CF_WORKER_NAME", "BACKYARD_CF_VARS", "BACKYARD_CF_R2_BUCKET"} {
+	for _, name := range []string{"BACKYARD_CF_WORKER_NAME", "BACKYARD_CF_VARS", "BACKYARD_CF_R2_BUCKET", "BACKYARD_CF_AI"} {
 		if !strings.Contains(ci, "env."+name) {
 			t.Errorf("scripts/cloudflare-ci.mjs no longer reads %s (update this test and the README)", name)
 		}
@@ -584,6 +585,7 @@ func TestCloudflareCIDeployCarriesSetup(t *testing.T) {
 	for _, want := range []string{
 		"`backyard cloudflare status`", "`r2Bucket`", "set `BACKYARD_CF_R2_BUCKET` to it",
 		"A deploy without it removes the R2 binding", "`workers_dev`", "`setup --no-workers-dev`",
+		"set `BACKYARD_CF_AI` to `false`",
 	} {
 		if !strings.Contains(flat, want) {
 			t.Errorf("deploy/cloudflare/README.md (Deploying from GitHub Actions) lacks %q", want)

@@ -58,6 +58,7 @@ function seedWorker(sb, o = {}) {
       vars: { ...base, ...(o.vars ?? {}) },
       secrets: o.secrets ?? { BACKYARD_SECRET: "s".repeat(64), DEPLOY_TOKEN: "byd_existing-token-0123456789abcdef" },
       r2Bucket: o.r2Bucket,
+      ai: o.ai,
       workersDev: o.workersDev,
     });
     for (const host of o.customDomains ?? []) {
@@ -224,6 +225,129 @@ describe("backyard-cloudflare setup", () => {
     r = await sb.run(["setup"]);
     assert.equal(r.code, 0, r.out);
     assert.deepEqual(deployOf(sb.calls()).config.r2_buckets, [{ binding: "R2", bucket_name: "team-files" }]);
+  });
+
+  it("turns AI off with --no-ai (no Workers AI binding, AI_ENABLED managed), remembers it, and --ai turns it back on", async () => {
+    const sb = await newSandbox();
+    // An account where Workers AI is not allowed: a deploy with the binding fails.
+    const noWorkersAI = { FAKE_AI: "disabled" };
+    let r = await sb.run(["setup", "--no-r2"], noWorkersAI);
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /Workers AI is not available on this account/);
+    assert.deepEqual(deployOf(sb.calls()).config.ai, { binding: "AI", remote: true }, "on by default");
+    r = await sb.run(["setup", "--no-r2", "--no-ai"], noWorkersAI);
+    assert.equal(r.code, 0, r.out);
+    let d = deployOf(sb.calls());
+    assert.equal(d.config.ai, undefined, "no Workers AI binding");
+    assert.equal(d.config.vars.AI_ENABLED, "false");
+    assert.ok(!sb.cf().workers.backyard.bindings.some((b) => b.type === "ai"));
+    assert.equal(sb.state().ai, false);
+    assert.equal(sb.state().vars, undefined, "AI_ENABLED is managed, not a remembered override");
+    assert.match(r.out, /Deploying Worker backyard without AI…/);
+    assert.match(r.out, /AI is off \(--ai turns it on\): the AI endpoints answer 501 unsupported\./);
+    assert.doesNotMatch(r.out, /AI runs on Workers AI/);
+    // Remembered by the next run.
+    r = await sb.run(["setup"], noWorkersAI);
+    assert.equal(r.code, 0, r.out);
+    d = deployOf(sb.calls());
+    assert.equal(d.config.ai, undefined);
+    assert.equal(d.config.vars.AI_ENABLED, "false");
+    // While AI is off, AI_ENABLED is managed: --var for it is refused before anything happens.
+    for (const argv of [
+      ["setup", "--var", "AI_ENABLED:true"],
+      ["setup", "--var", "AI_ENABLED:"],
+      ["setup", "--no-ai", "--var", "AI_ENABLED:false"],
+      ["setup", "--dry-run", "--var", "AI_ENABLED:true"],
+    ]) {
+      r = await sb.run(argv);
+      assert.equal(r.code, 2, `${argv.join(" ")}: ${r.out}`);
+      assert.match(r.out, /AI_ENABLED is managed by `npm run cf -- setup --no-ai` while AI is off \(`npm run cf -- setup --ai` turns AI back on\)/);
+      assert.deepEqual(sb.calls(), [], argv.join(" "));
+    }
+    r = await sb.run(["setup", "--ai", "--no-ai"]);
+    assert.equal(r.code, 2, r.out);
+    assert.match(r.out, /--ai and --no-ai contradict each other/);
+    assert.deepEqual(sb.calls(), []);
+    // --dry-run shows the remembered choice, and what --ai would deploy, changing nothing.
+    const saved = readFileSync(sb.statePath(), "utf8");
+    r = await sb.run(["setup", "--dry-run"]);
+    assert.equal(r.code, 0, r.out);
+    d = sb.calls()[0];
+    assert.equal(d.config.ai, undefined);
+    assert.equal(d.config.vars.AI_ENABLED, "false");
+    assert.match(r.out, /AI_ENABLED=false/);
+    assert.match(r.out, /AI: off \(no Workers AI binding\)/);
+    r = await sb.run(["setup", "--dry-run", "--ai"]);
+    assert.equal(r.code, 0, r.out);
+    d = sb.calls()[0];
+    assert.deepEqual(d.config.ai, { binding: "AI", remote: true });
+    assert.equal(d.config.vars.AI_ENABLED, undefined);
+    assert.match(r.out, /AI: on/);
+    assert.equal(readFileSync(sb.statePath(), "utf8"), saved, "--dry-run writes no state");
+    // --ai: the binding is back and AI_ENABLED is no longer set.
+    r = await sb.run(["setup", "--ai"]);
+    assert.equal(r.code, 0, r.out);
+    d = deployOf(sb.calls());
+    assert.deepEqual(d.config.ai, { binding: "AI", remote: true });
+    assert.equal(d.config.vars.AI_ENABLED, undefined);
+    assert.ok(sb.cf().workers.backyard.bindings.some((b) => b.type === "ai" && b.name === "AI"));
+    assert.equal(sb.state().ai, undefined);
+    assert.match(r.out, /AI runs on Workers AI/);
+    // With AI on, --var AI_ENABLED:false turns only the API off and keeps the binding (remembered).
+    r = await sb.run(["setup", "--var", "AI_ENABLED:false"]);
+    assert.equal(r.code, 0, r.out);
+    d = deployOf(sb.calls());
+    assert.deepEqual(d.config.ai, { binding: "AI", remote: true });
+    assert.equal(d.config.vars.AI_ENABLED, "false");
+    assert.deepEqual(sb.state().vars, { AI_ENABLED: "false" });
+    assert.match(r.out, /AI is off: AI_ENABLED is false \(--var AI_ENABLED: drops it\); the Workers AI binding stays\./);
+    // --no-ai takes AI_ENABLED over: the override is dropped, the variable is managed.
+    r = await sb.run(["setup", "--no-ai"]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /Dropped the AI_ENABLED override: with AI off \(--no-ai\) setup sets AI_ENABLED=false itself\./);
+    d = deployOf(sb.calls());
+    assert.equal(d.config.ai, undefined);
+    assert.equal(d.config.vars.AI_ENABLED, "false");
+    assert.equal(sb.state().vars, undefined);
+    assert.equal(sb.state().ai, false);
+    // --ai then turns AI fully on again: nothing remembered keeps the API off.
+    r = await sb.run(["setup", "--ai"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(deployOf(sb.calls()).config.vars.AI_ENABLED, undefined);
+  });
+
+  it("adopts AI off from a Worker deployed with --no-ai, and keeps AI on for a Worker merely without the binding", async () => {
+    const sb = await newSandbox();
+    seedWorker(sb, { vars: { AI_ENABLED: "false" }, ai: false });
+    let r = await sb.run(["setup", "--no-r2"], { FAKE_AI: "disabled" });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /Adopted the deployed configuration of backyard \(no setup state on this machine\): AI off/);
+    let d = deployOf(sb.calls());
+    assert.equal(d.config.ai, undefined);
+    assert.equal(d.config.vars.AI_ENABLED, "false");
+    assert.equal(sb.state().ai, false);
+    assert.equal(sb.state().vars, undefined, "AI_ENABLED is not copied as an override");
+    // On a machine without state, a --var AI_ENABLED for a Worker adopted as AI off is
+    // refused right after the live read: no workers.dev subdomain, no R2 bucket.
+    forgetState(sb);
+    sb.updateCf((s) => (s.buckets = []));
+    sb.requests();
+    r = await sb.run(["setup", "--var", "AI_ENABLED:true"], { FAKE_AI: "disabled" });
+    assert.equal(r.code, 2, r.out);
+    assert.match(r.out, /AI_ENABLED is managed by `npm run cf -- setup --no-ai` while AI is off \(`npm run cf -- setup --ai` turns AI back on\)/);
+    assert.deepEqual(names(sb.calls()), ["whoami --json", "auth token"]);
+    assert.deepEqual(sb.cf().buckets, [], "no R2 bucket was created");
+    assert.ok(!sb.requests().some((x) => x.path.endsWith("/workers/subdomain")), "the workers.dev subdomain is not touched");
+    assert.doesNotMatch(r.out, /R2 bucket/);
+    // Without the binding but with AI on (another provider's keys): AI stays on, the binding comes back.
+    forgetState(sb);
+    seedWorker(sb, { ai: false });
+    r = await sb.run(["setup", "--no-r2"]);
+    assert.equal(r.code, 0, r.out);
+    assert.doesNotMatch(r.out, /AI off/);
+    d = deployOf(sb.calls());
+    assert.deepEqual(d.config.ai, { binding: "AI", remote: true });
+    assert.equal(sb.state().ai, undefined);
   });
 
   it("exits 4 with the reason when the hub does not become ready, instead of saying it is live", async () => {
@@ -457,6 +581,7 @@ describe("backyard-cloudflare setup", () => {
           d.config.durable_objects.bindings.map((b) => b.name),
           ["SITE", "REGISTRY"],
         );
+        assert.deepEqual(d.config.ai, { binding: "AI", remote: true }, "dist/wrangler.base.json binds Workers AI");
         // Every wrangler call ran in a private temporary directory, gone afterwards.
         const cwds = new Set(c.map((x) => x.cwd));
         assert.equal(cwds.size, 1);
@@ -473,8 +598,15 @@ describe("backyard-cloudflare setup", () => {
       }
       assert.deepEqual(sb.snapshot(), before, "nothing is written into the package");
       // npx sets npm_command=exec: the hints name npx.
-      const r = await sb.run(["setup", "--dry-run"], { npm_command: "exec" });
+      let r = await sb.run(["setup", "--dry-run"], { npm_command: "exec" });
       assert.equal(r.code, 0, r.out);
+      // --no-ai leaves the binding of dist/wrangler.base.json out.
+      sb.calls();
+      r = await sb.run(["setup", "--no-ai"], { FAKE_AI: "disabled" });
+      assert.equal(r.code, 0, `${wrangler}: ${r.out}`);
+      const d = deployOf(sb.calls());
+      assert.equal(d.config.ai, undefined);
+      assert.equal(d.config.vars.AI_ENABLED, "false");
     }
   });
 

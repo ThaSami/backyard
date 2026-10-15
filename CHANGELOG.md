@@ -45,6 +45,18 @@ All notable changes to Backyard are documented here. The format follows
 - `backyard cloudflare status` checks `access-connector`: the connector's paths in the Access
   bypass application (ok when they are there; when they are missing, pending while
   `MCP_ENABLED` is off and failed once it is on).
+- Cloudflare edition: AI can be turned off (it stays on by default). `backyard cloudflare setup
+  --no-ai` (remembered, also by `domain add`/`remove` and `access enable`/`disable`; `--ai`
+  turns it back on) deploys without the Workers AI binding, for accounts where Workers AI is not
+  available, and with the new Worker variable `AI_ENABLED=false`: every `/__backyard/api/ai/*`
+  endpoint then answers `501 unsupported` "AI is not configured on this server" before it reads
+  the request, like the Go server with `ai.enabled: false`. While AI is off `AI_ENABLED` is
+  managed by setup (`--var AI_ENABLED:…` exits 2); with AI on, `--var AI_ENABLED:false` turns
+  only the endpoints off. A machine without state adopts AI off from such a Worker,
+  `status` shows it (`AI:`, `ai` in `--json`), the Terraform module's `ai_enabled` (default
+  `true`) puts `--ai` or `--no-ai` into `setup_args`, and the GitHub Actions deployer
+  (`scripts/cloudflare-ci.mjs`, the **Deploy to Cloudflare** workflow) takes
+  `BACKYARD_CF_AI=false` (repository variable `vars.BACKYARD_CF_AI`) to do the same.
 
 ### Changed
 

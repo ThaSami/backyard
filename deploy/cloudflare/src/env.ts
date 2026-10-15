@@ -31,6 +31,11 @@ export interface Env {
   SERVER_NAME?: string;
   /** Extra reserved site names (comma separated), added to the defaults. */
   RESERVED_SITES?: string;
+  /**
+   * "false" turns AI off: every /__backyard/api/ai/* endpoint answers 501
+   * unsupported, like the Go server's ai.enabled: false (unset = on).
+   */
+  AI_ENABLED?: string;
   AI_MODELS?: string;
   AI_DEFAULT_MODEL?: string;
   AI_DEFAULT_IMAGE_MODEL?: string;

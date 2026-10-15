@@ -72,7 +72,8 @@ const forgetState = (sb) => rmSync(join(sb.root, "config"), { recursive: true, f
 /**
  * A Worker that `setup` and `domain add` left behind: live on workers.dev and
  * on the custom domain HOST (path or host mode), Zero Trust set up on the
- * account (team acme), and this machine's state.
+ * account (team acme), and this machine's state (o.ai false: set up with
+ * --no-ai, o.state: fields over it).
  */
 async function accessSandbox(o = {}) {
   const sb = await newSandbox();
@@ -85,7 +86,8 @@ async function accessSandbox(o = {}) {
       s.routes.push({ id: "route-1", zone_id: "zone-example", pattern: `*.${HOST}/*`, script: "backyard" });
       s.dnsRecords.push({ id: "dns-1", zone_id: "zone-example", zone_name: "example.com", type: "AAAA", name: `*.${HOST}`, content: "100::", proxied: true, ttl: 1, comment: "" });
     }
-    s.workers.backyard = deployedWorker({ vars: { ...base, BASE_DOMAIN: HOST, URL_MODE: mode }, secrets: { BACKYARD_SECRET: "s".repeat(64), DEPLOY_TOKEN: TOKEN } });
+    const aiVars = o.ai === false ? { AI_ENABLED: "false" } : {};
+    s.workers.backyard = deployedWorker({ vars: { ...base, BASE_DOMAIN: HOST, URL_MODE: mode, ...aiVars }, secrets: { BACKYARD_SECRET: "s".repeat(64), DEPLOY_TOKEN: TOKEN }, ai: o.ai });
     s.tokens[ADMIN] = { label: "admin", permissions: [...TOKEN_PRESETS.access] };
     s.tokens[DNS_ONLY] = { label: "dns-only", permissions: [...TOKEN_PRESETS.dns] };
     s.tokens[CI_TOKEN] = { label: "ci", permissions: [...TOKEN_PRESETS.workers] };
@@ -917,6 +919,27 @@ describe("backyard-cloudflare access disable", () => {
     assert.deepEqual(writesOf(sb.requests()), []);
     assert.equal(sb.state().access.appId, ids.appId);
     assert.equal(sb.state().accessCreated, undefined);
+  });
+
+  it("keeps AI off (setup --no-ai) in the deploys of access enable and access disable", async () => {
+    const sb = await accessSandbox({ ai: false, state: { ai: false } });
+    // An account where Workers AI is not allowed: a deploy with the binding would fail.
+    const noWorkersAI = { FAKE_AI: "disabled" };
+    let r = await sb.run(ENABLE, { ...WITH_ADMIN, ...noWorkersAI });
+    assert.equal(r.code, 0, r.out);
+    let d = deployOf(sb.calls());
+    assert.equal(d.config.vars.AUTH_MODE, "access");
+    assert.equal(d.config.ai, undefined);
+    assert.equal(d.config.vars.AI_ENABLED, "false");
+    assert.equal(sb.state().ai, false);
+    r = await sb.run(["access", "disable", "--yes"], noWorkersAI);
+    assert.equal(r.code, 0, r.out);
+    d = deployOf(sb.calls());
+    assert.equal(d.config.vars.AUTH_MODE, "none");
+    assert.equal(d.config.ai, undefined);
+    assert.equal(d.config.vars.AI_ENABLED, "false");
+    assert.equal(sb.state().ai, false);
+    assert.equal(liveVars(sb).AI_ENABLED, "false");
   });
 
   it("cannot delete applications made in the dashboard", async () => {

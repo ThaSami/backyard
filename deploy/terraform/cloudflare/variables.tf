@@ -151,6 +151,14 @@ variable "mcp_enabled" {
   default     = false
 }
 
+# --- AI -----------------------------------------------------------------------
+
+variable "ai_enabled" {
+  description = "Serve AI to sites (Workers AI binding, SPEC §5.4). false: setup_args carry --no-ai, so setup deploys without the Workers AI binding and with AI_ENABLED=false (every AI endpoint answers 501 unsupported), for an account without Workers AI; true carries --ai, which turns AI back on at the next setup."
+  type        = bool
+  default     = true
+}
+
 # --- Optional: create an Okta identity provider --------------------------------
 
 variable "okta_account_url" {

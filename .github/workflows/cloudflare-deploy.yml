@@ -26,6 +26,8 @@ name: Deploy to Cloudflare
 #                                  (every deploy resets variables to wrangler.jsonc plus these,
 #                                  so keep them here rather than in the dashboard)
 #   vars.BACKYARD_CF_R2_BUCKET     optional R2 bucket for files above 5 MiB (created if missing)
+#   vars.BACKYARD_CF_AI            "false" turns AI off (like `setup --no-ai`): no Workers AI
+#                                  binding, for accounts without Workers AI (default: on)
 #   vars.BACKYARD_CF_DEPLOY_ARGS   optional extra `wrangler deploy` arguments
 #   vars.BACKYARD_CF_AUTO_DEPLOY   "true" to deploy on every push to main that changes
 #                                  the Worker, the SDK, the hub or the agent docs
@@ -132,6 +134,7 @@ jobs:
           BACKYARD_CF_WORKER_NAME: ${{ vars.BACKYARD_CF_WORKER_NAME }}
           BACKYARD_CF_VARS: ${{ vars.BACKYARD_CF_VARS }}
           BACKYARD_CF_R2_BUCKET: ${{ vars.BACKYARD_CF_R2_BUCKET }}
+          BACKYARD_CF_AI: ${{ vars.BACKYARD_CF_AI }}
           BACKYARD_CF_DEPLOY_ARGS: ${{ vars.BACKYARD_CF_DEPLOY_ARGS }}
           # Only a manual run can confirm (inputs is empty on push).
           BACKYARD_CF_CONFIRM_AUTH_CHANGE: ${{ inputs.confirm_auth_change && 'true' || '' }}

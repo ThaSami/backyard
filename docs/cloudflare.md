@@ -56,7 +56,7 @@ backyard cloudflare access enable --allow-email-domain acme.com   # company logi
 backyard cloudflare status                                        # read-only live check
 ```
 
-Re-run setup to upgrade: every choice is kept (secrets, the deploy token, R2, the domain,
+Re-run setup to upgrade: every choice is kept (secrets, the deploy token, R2, AI, the domain,
 Access and `--var` overrides). A machine without saved state (a teammate, a new laptop, CI)
 adopts the deployed configuration, and keeps a Worker's existing `DEPLOY_TOKEN` unless you pass
 `--rotate-token` (run it with `DEPLOY_TOKEN=<token>` to remember the token there). A deploy that
@@ -78,6 +78,7 @@ manage Cloudflare as code.
 | Realtime + pub/sub | The site's Durable Object with websocket hibernation (no pub/sub needed) |
 | `auth.mode` | `AUTH_MODE=none` (anonymous cookies; deploys need `DEPLOY_TOKEN` unless `ALLOW_ANONYMOUS_DEPLOY`) or `access` (Cloudflare Access verifying `Cf-Access-Jwt-Assertion`, with Okta, Entra ID, Google… as Access identity providers) |
 | AI providers | Workers AI binding (free daily allowance) behind `smart`, `fast`, `image`, `embed`; optional Anthropic / OpenAI-compatible keys |
+| `ai.enabled: false` | `AI_ENABLED=false` (`setup --no-ai`, which also leaves the Workers AI binding out) |
 | Warehouse | Not available (`501`), unless `WAREHOUSE_URL` proxies to a Go server |
 | Deploy methods | `api` only |
 | Rate limits | Daily caps per user / IP and per platform (`LIMITS`) |
@@ -117,6 +118,13 @@ signs people in with Cloudflare Access, so publishing from Claude needs `AUTH_MO
 carries at most 2 MiB of file content (`LIMITS.mcp_publish_bytes`) and tool calls count against
 `LIMITS.mcp_calls_per_day`; `MCP_CLIENTS` and `MCP_REDIRECT_URIS` change which apps may connect.
 Invalid values turn only the connector off and are listed by `/__backyard/readyz`.
+
+**Turning AI off.** AI is on by default. `backyard cloudflare setup --no-ai` (remembered;
+Terraform: `ai_enabled = false`) deploys without the Workers AI binding, for an account where
+Workers AI is not available, and with `AI_ENABLED=false`: every AI endpoint then answers
+`501 unsupported` ("AI is not configured on this server"), exactly as the Go server does with
+`ai.enabled: false`, so sites degrade the same way on both. `setup --ai` turns it back on. See
+the edition's [README](../deploy/cloudflare/README.md#turning-ai-off).
 
 Within the shared contract, a few edition differences are visible to pages and CLIs (all
 listed in the [specification](spec/SPEC.md#16-cloudflare-edition-free-tier)):

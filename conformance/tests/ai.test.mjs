@@ -3,6 +3,8 @@
 // against the deterministic mock provider (BACKYARD_CONFORMANCE_AI=mock, set
 // by the runners, which back the aliases with conformance/mock/openai.mjs) or
 // when BACKYARD_CONFORMANCE_AI=live (real provider; costs tokens).
+// BACKYARD_CONFORMANCE_AI=off: the server has AI turned off (ai.enabled: false,
+// AI_ENABLED=false) even though aliases are configured, so it must answer 501.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { before, describe, test } from "node:test";
@@ -16,7 +18,8 @@ const client = new Client();
 const skip = !canDeploy(env, client) && "cannot deploy (no BACKYARD_TOKEN, anonymous deploys off)";
 const site = uniqueSite("ai");
 const api = (p) => env.api(site, p);
-const providerMode = (process.env.BACKYARD_CONFORMANCE_AI || "").trim(); // "", "mock" or "live"
+const aiMode = (process.env.BACKYARD_CONFORMANCE_AI || "").trim(); // "", "mock", "live" or "off"
+const providerMode = aiMode === "off" ? "" : aiMode;
 
 /** Parses a text/event-stream body into its data events (ignoring ":" comments). */
 function sseEvents(text) {
@@ -62,10 +65,15 @@ describe("AI", { skip }, () => {
   });
 
   test("with AI disabled every endpoint is 501 unsupported", async (t) => {
+    if (models && aiMode === "off") assert.fail("BACKYARD_CONFORMANCE_AI=off, but GET /ai/models answered 200: AI is not turned off");
     if (models) return t.skip("AI is configured");
-    assertError(await client.post(api("/ai/chat"), { messages: [{ role: "user", content: "hi" }] }), 501, "unsupported");
-    assertError(await client.post(api("/ai/image"), { prompt: "a cat" }), 501, "unsupported");
-    assertError(await client.post(api("/ai/embed"), { input: "x" }), 501, "unsupported");
+    // The same answer on both editions (SPEC §5.4), before the body is read.
+    const off = (e) => assert.deepEqual(e, { code: "unsupported", message: "AI is not configured on this server" });
+    off(assertError(await client.get(api("/ai/models")), 501, "unsupported"));
+    off(assertError(await client.post(api("/ai/chat"), { messages: [{ role: "user", content: "hi" }] }), 501, "unsupported"));
+    off(assertError(await client.post(api("/ai/chat"), "{", { raw: true }), 501, "unsupported", "invalid JSON"));
+    off(assertError(await client.post(api("/ai/image"), { prompt: "a cat" }), 501, "unsupported"));
+    off(assertError(await client.post(api("/ai/embed"), { input: "x" }), 501, "unsupported"));
   });
 
   test("request validation", async (t) => {

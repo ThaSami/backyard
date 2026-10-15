@@ -17,6 +17,7 @@
 //   {"schema": 1, "worker", "accountId", "statePath",
 //    "versions": {"package", "wrangler", "deployed"},
 //    "urls": {"public", "workersDev"}, "r2Bucket", "workersDev",
+//    "ai": {"enabled", "binding"},   (AI_ENABLED as the Worker reads it; the Workers AI binding)
 //    "domain": {…state.domain…} | null, "access": {"team", "aud", "source"} | null,
 //    "checks": [{"name", "status": "ok"|"pending"|"failed", "detail"}]}
 //
@@ -25,7 +26,7 @@
 
 import { accessEdgeFailures } from "./access.mjs";
 import { CfError } from "./lib/cfapi.mjs";
-import { adopt, authModeOf, hostOf, normalizeTeam } from "./lib/live.mjs";
+import { adopt, aiEnabledOf, authModeOf, hostOf, normalizeTeam } from "./lib/live.mjs";
 import { dohResolves, parseAccessRedirect, probe, randomProbeLabel } from "./lib/net.mjs";
 import { CliError, EXIT, bold, dim, green, maskSecret, red, ui, yellow } from "./lib/ui.mjs";
 
@@ -266,6 +267,9 @@ export async function runStatus(opts, ctx) {
     urls: { public: publicUrl, workersDev: workersDevUrl },
     r2Bucket: live?.exists ? live.r2Bucket : view.r2Bucket ?? "",
     workersDev: live?.workersDev ?? (view.workersDev ?? null),
+    ai: live?.exists
+      ? { enabled: aiEnabledOf(live.vars.AI_ENABLED), binding: live.ai }
+      : { enabled: view.ai !== false && aiEnabledOf(vars.AI_ENABLED), binding: view.ai !== false },
     domain,
     access,
     checks: results,
@@ -292,6 +296,17 @@ function printReport(report, o) {
   row("Hub:", report.urls.public || "unknown");
   row("workers.dev:", `${report.workersDev === null ? "unknown" : report.workersDev ? "on" : "off"}${report.urls.workersDev ? ` (${report.urls.workersDev})` : ""}`);
   row("R2:", report.r2Bucket ? `bucket ${report.r2Bucket}` : "none (files in Durable Objects, up to 25 MiB each)");
+  const ai = report.ai;
+  row(
+    "AI:",
+    ai.enabled
+      ? ai.binding
+        ? "on (Workers AI)"
+        : "on, without the Workers AI binding (only Anthropic or OpenAI aliases work)"
+      : ai.binding
+        ? "off (AI_ENABLED=false; the Workers AI binding stays)"
+        : `off (${ctx.invokedAs} setup --ai turns it on)`,
+  );
   const d = report.domain;
   row("Domain:", d ? `${d.host} (${d.mode} mode, ${d.status ?? "unknown"}${d.source ? `, ${d.source}` : ""})` : `none (${ctx.invokedAs} domain add <host>)`);
   const a = report.access;

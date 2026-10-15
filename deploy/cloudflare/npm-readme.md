@@ -40,8 +40,8 @@ npx backyard-cloudflare@latest access enable --allow-email-domain acme.com   # c
 npx backyard-cloudflare@latest status                                     # read-only live check
 ```
 
-To upgrade, re-run `setup`: secrets, the deploy token, R2, the domain, Access and your variables
-are kept. A global install works too: `npm i -g backyard-cloudflare && backyard-cloudflare setup`.
+To upgrade, re-run `setup`: secrets, the deploy token, R2, AI, the domain, Access and your
+variables are kept. A global install works too: `npm i -g backyard-cloudflare && backyard-cloudflare setup`.
 With the Backyard CLI, `backyard cloudflare setup` installs this package (verified against its
 release) and logs the CLI in.
 
@@ -58,7 +58,9 @@ release) and logs the CLI in.
 
 Every command takes `--worker-name <name>` (default `backyard`), `--yes` and `--non-interactive`;
 `backyard-cloudflare <command> --help` lists its options and `--version` prints the package and
-wrangler versions.
+wrangler versions. AI runs on Workers AI by default; on an account without it, `setup --no-ai`
+deploys without the binding (the sites' AI calls then answer `501 unsupported`; `--ai` turns AI
+back on).
 
 Exit codes: `0` done · `1` failed (a re-run resumes) · `2` usage error, or input needed in
 non-interactive mode · `3` refused for safety, nothing was changed · `4` applied, but a check

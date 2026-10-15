@@ -8,8 +8,9 @@
 #
 #   path  path mode (the default) as an anonymous guest, with AI aliases
 #         backed by mock/openai.mjs through the "openai" provider
-#   host  host mode (BASE_DOMAIN=localhost) with the DEPLOY_TOKEN, without AI
-#         (its 501 unsupported answers)
+#   host  host mode (BASE_DOMAIN=localhost) with the DEPLOY_TOKEN, with the same mock
+#         aliases but AI turned off (AI_ENABLED=false: its 501 unsupported answers, as the
+#         Go server's ai.enabled: false)
 #
 #   conformance/run-worker.sh            # both passes
 #   conformance/run-worker.sh path       # one pass (path | host)
@@ -144,11 +145,13 @@ for mode in $modes; do
 			--var AUTH_MODE:none --var ALLOW_ANONYMOUS_DEPLOY:true --var MCP_ENABLED:true \
 			--var "BACKYARD_SECRET:$secret" --var "DEPLOY_TOKEN:$token"
 		if [ "$mode" = "host" ]; then
-			set -- "$@" --var URL_MODE:host --var BASE_DOMAIN:localhost
+			set -- "$@" --var URL_MODE:host --var BASE_DOMAIN:localhost --var AI_ENABLED:false
 		else
 			set -- "$@" --var URL_MODE:path
 		fi
-		if [ -n "$ai_mode" ] && [ "$mode" = "path" ]; then
+		# Both passes get the mock aliases: in host mode they are usable too, so
+		# its 501 answers can only come from AI_ENABLED=false.
+		if [ -n "$ai_mode" ]; then
 			set -- "$@" --var "AI_MODELS:$ai_models" --var "OPENAI_BASE_URL:http://127.0.0.1:$ai_port/v1" --var OPENAI_API_KEY:mock-key
 		fi
 		# $runner is empty or "setsid" (word splitting intended).
@@ -167,8 +170,9 @@ for mode in $modes; do
 	url="http://127.0.0.1:$port"
 	if [ "$mode" = "host" ]; then
 		suite_token="$token"
-		suite_ai=""
-		who="the DEPLOY_TOKEN, without AI"
+		# "off" (with the mock aliases): the suite fails unless AI_ENABLED=false turns AI off.
+		suite_ai="${ai_mode:+off}"
+		who="the DEPLOY_TOKEN, with AI_ENABLED=false"
 		url="http://localhost:$port"
 	fi
 	log "running the suite ($mode mode, as $who)"

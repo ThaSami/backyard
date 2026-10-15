@@ -223,7 +223,7 @@ Worker plus SQLite Durable Objects), creates the secrets (`BACKYARD_SECRET` and 
 also **logs the CLI in** to the new server with the deploy token (skip with `--no-login`).
 Re-run it any time to upgrade: every choice is remembered, and a machine without saved state
 adopts the deployed configuration. Options: `--worker-name <name>`, `--no-r2`,
-`--var KEY:VALUE` (e.g. `--var ADMINS:alice@acme.com`), `--rotate-token`,
+`--no-ai` (no Workers AI, for accounts without it; `--ai` turns it back on), `--var KEY:VALUE` (e.g. `--var ADMINS:alice@acme.com`), `--rotate-token`,
 `--workers-subdomain <name>` (without a terminal), `--dry-run`; `backyard cloudflare setup
 --help` lists them all.
 
@@ -263,7 +263,8 @@ when unset). A CI deploy binds only what the workflow names, so before moving a 
 `setup` made to it, set `vars.BACKYARD_CF_R2_BUCKET` to its R2 bucket (`backyard cloudflare
 status` shows it; without it the files stored in R2 answer `500`) and copy its variables
 (`BASE_DOMAIN`, `URL_MODE`, `AUTH_MODE`, `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`) into
-`vars.BACKYARD_CF_VARS`. Teams that manage Cloudflare as code can use the optional Terraform module in
+`vars.BACKYARD_CF_VARS`; if `setup --no-ai` turned AI off (or the account has no Workers AI), set
+`vars.BACKYARD_CF_AI` to `false`. Teams that manage Cloudflare as code can use the optional Terraform module in
 `deploy/terraform/cloudflare` for the domain and Access instead.
 
 | Topic | Cloudflare edition |
@@ -272,7 +273,7 @@ status` shows it; without it the files stored in R2 answer `500`) and copy its v
 | Who can open sites | `AUTH_MODE=none` (default): **anyone with the link** can open sites and use their APIs; visitors get anonymous guest identities (`me.anonymous === true`); only holders of the `DEPLOY_TOKEN` can deploy (unless `ALLOW_ANONYMOUS_DEPLOY`). `AUTH_MODE=access` (`access enable`): Cloudflare Access (free for up to 50 users; Okta, Entra ID, Google… as identity providers) protects the hub and every site, `backyard login` uses the browser flow, and `/__backyard/api/deploy/*` (plus `/__backyard/api/tokens` for `backyard token create`) must bypass Access. Any other `AUTH_MODE` value makes the Worker answer `503` until it is fixed. |
 | Database & realtime | Per-site Durable Object with SQLite — same query semantics; realtime runs in that object. |
 | Files | Up to 25 MiB per file (95 MiB with the optional R2 bucket); 200 MiB and 2,000 files per site. Files up to 5 MiB live in the Durable Object, bigger ones in R2. |
-| AI | Workers AI (free daily allowance) behind the aliases `smart`, `fast`, `image`, `embed` (configurable with `AI_MODELS`), plus optional Anthropic/OpenAI keys. `max_tokens` is capped at 4096. |
+| AI | Workers AI (free daily allowance) behind the aliases `smart`, `fast`, `image`, `embed` (configurable with `AI_MODELS`), plus optional Anthropic/OpenAI keys. `max_tokens` is capped at 4096. An admin can turn AI off (`setup --no-ai`): every AI call then answers `unsupported`. |
 | Warehouse | Not available (`unsupported`), unless `WAREHOUSE_URL` proxies to a Backyard Go server. |
 | Guardrails | Daily caps per user (per IP when anonymous): 200 AI calls, 30 images, 200 deploys, 500 uploads, 20,000 db writes per site; 500 sites per platform. Hitting a cap answers `rate_limited` until 00:00 UTC. Workers free-plan quotas apply too (100,000 requests/day). Admins tune them with `LIMITS`. |
 

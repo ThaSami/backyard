@@ -193,7 +193,10 @@ Cloudflare AI Gateway in front of any provider: point `base_url` at
 `…/workers-ai/v1`, `…/compat`) and authenticate the gateway with
 `headers: { cf-aig-authorization: "Bearer ${CF_AIG_TOKEN}" }`.
 
-The [Cloudflare edition](cloudflare.md) uses the Workers AI binding natively.
+The [Cloudflare edition](cloudflare.md) uses the Workers AI binding natively. Its counterpart
+of `ai.enabled: false` is `AI_ENABLED=false`, which `backyard cloudflare setup --no-ai` sets
+(and deploys without the binding, for accounts without Workers AI): every AI endpoint then
+answers `501 unsupported`, as on the Go server.
 
 ## Ollama
 

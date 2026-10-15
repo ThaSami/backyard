@@ -27,11 +27,11 @@ const BASE_STATE = { version: 2, accountId: "acc1", url: WD, workersDevUrl: WD, 
 const sandboxes = [];
 let fresh = [];
 
-/** A Worker as setup deployed it (the defaults of wrangler.jsonc plus `vars`). */
-function seedWorker(sb, vars = {}) {
+/** A Worker as setup deployed it (the defaults of wrangler.jsonc plus `vars`; o.ai false: deployed with --no-ai). */
+function seedWorker(sb, vars = {}, o = {}) {
   const base = parseJSONC(readFileSync(join(sb.pkg, "wrangler.jsonc"), "utf8")).vars;
   sb.updateCf((s) => {
-    s.workers.backyard = deployedWorker({ vars: { ...base, ...vars }, secrets: { BACKYARD_SECRET: SECRET, DEPLOY_TOKEN: TOKEN } });
+    s.workers.backyard = deployedWorker({ vars: { ...base, ...vars }, secrets: { BACKYARD_SECRET: SECRET, DEPLOY_TOKEN: TOKEN }, ai: o.ai });
   });
 }
 
@@ -743,6 +743,28 @@ describe("backyard-cloudflare domain remove", () => {
     assert.equal(sb.state().domain, undefined);
     assert.equal(sb.state().url, WD);
     assert.equal(sb.result().command, "domain remove");
+  });
+
+  it("keeps AI off (setup --no-ai) in the deploys of domain add and domain remove", async () => {
+    const sb = await newSandbox({ state: { ai: false } });
+    seedWorker(sb, { AI_ENABLED: "false" }, { ai: false });
+    // An account where Workers AI is not allowed: a deploy with the binding would fail.
+    const noWorkersAI = { FAKE_AI: "disabled" };
+    let r = await sb.run(["domain", "add", "backyard.example.com", "--wait", "0"], noWorkersAI);
+    assert.equal(r.code, 0, r.out);
+    let d = deployOf(sb.calls());
+    assert.equal(d.config.ai, undefined);
+    assert.equal(d.config.vars.AI_ENABLED, "false");
+    assert.equal(d.config.vars.BASE_DOMAIN, "backyard.example.com");
+    assert.equal(sb.state().ai, false);
+    r = await sb.run(["domain", "remove", "--yes"], noWorkersAI);
+    assert.equal(r.code, 0, r.out);
+    d = deployOf(sb.calls());
+    assert.equal(d.config.ai, undefined);
+    assert.equal(d.config.vars.AI_ENABLED, "false");
+    assert.equal(d.config.vars.BASE_DOMAIN, "");
+    assert.equal(sb.state().ai, false);
+    assert.ok(!sb.cf().workers.backyard.bindings.some((b) => b.type === "ai"));
   });
 });
 

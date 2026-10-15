@@ -28,6 +28,8 @@
   // Workers AI: the free plan includes a daily allowance (10k neurons/day). It
   // always runs remotely, so `wrangler dev` needs a Cloudflare login; use
   // `npm run dev:local` (the "local" environment below) to develop offline.
+  // `backyard cloudflare setup --no-ai` (for an account without Workers AI)
+  // deploys without this binding and with AI_ENABLED=false; --ai turns it on again.
   "ai": { "binding": "AI", "remote": true },
 
   // Optional R2 bucket for files above FILE_INLINE_MAX (raises the per-file cap
@@ -63,6 +65,10 @@
     "OWNERSHIP": "none",
     // Name shown in the hub.
     "SERVER_NAME": "Backyard",
+    // "false" turns AI off: every /__backyard/api/ai/* endpoint answers 501 unsupported
+    // and no provider is called (like the Go server's ai.enabled: false). Unset = on.
+    // `setup --no-ai` sets it and leaves the "ai" binding out.
+    // "AI_ENABLED": "false",
     // Model aliases: {"alias": {"provider": "workers-ai"|"anthropic"|"openai",
     // "model": "...", "kind": "chat"|"image"|"embedding", "description": "..."}}.
     // Empty = defaults (smart/fast/image/embed on Workers AI). See README.

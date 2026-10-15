@@ -30,7 +30,7 @@ runs with `BACKYARD_CONFORMANCE_MCP=1`. The connector tests sign in through thei
 | Go, path mode (`/s/<site>/`) | static bearer token | no AI, no warehouse (the `501 unsupported` answers); connector as guests |
 | Go, `oidc` (path mode on `127.0.0.1`, without `--dev`) | the mock IdP's `alice` and `bob` (`mock/idp.mjs` on `CONFORMANCE_IDP_PORT`, default 18480) | only `tests/mcp.test.mjs`: the connector's sign-in through `auth.mode: oidc` |
 | Worker, path mode | anonymous guest | AI (mock provider through the `openai` provider); connector as guests |
-| Worker, host mode (`BASE_DOMAIN=localhost`) | `DEPLOY_TOKEN` | no AI; no warehouse; connector as guests |
+| Worker, host mode (`BASE_DOMAIN=localhost`) | `DEPLOY_TOKEN` | AI turned off (`AI_ENABLED=false`, with the mock aliases configured, so only the switch answers `501`); no warehouse; connector as guests |
 
 Pick passes and pass `node --test` options after `--`:
 
@@ -61,7 +61,7 @@ deploy-dependent tests are skipped.
 | `BACKYARD_URL_MODE` | `host` or `path` (default: `url_mode` of `/__backyard/api/info`) |
 | `BACKYARD_SITE_URL_TEMPLATE` | site URL template, e.g. `https://{site}.apps.acme.dev/` (default: derived from the hub URL and `base_domain`) |
 | `BACKYARD_RESOLVE_IP` | address that site host names resolve to (host mode without wildcard DNS) |
-| `BACKYARD_CONFORMANCE_AI` | `mock`: the AI aliases are backed by `mock/openai.mjs` (exact answers are checked); `live`: call the real provider (costs tokens); empty: no provider calls |
+| `BACKYARD_CONFORMANCE_AI` | `mock`: the AI aliases are backed by `mock/openai.mjs` (exact answers are checked); `live`: call the real provider (costs tokens); `off`: AI is turned off on a server with aliases (`ai.enabled: false`, `AI_ENABLED=false`), so every AI endpoint must answer `501 unsupported`; empty: no provider calls |
 | `BACKYARD_CONFORMANCE_SECRET` | the server's `server.secret` (`BACKYARD_SECRET`): lets the suite sign a Backyard API token of a non-anonymous user (SPEC §8.3) to check that tokens minted with it never outlive it; the runners set it. Without it, `BACKYARD_TOKEN` is used when it is a Backyard API token, else those tests are skipped |
 | `BACKYARD_CONFORMANCE_MCP` | `1`: the Claude connector must be enabled (`mcp_url` in `/__backyard/api/info`), else `tests/mcp.test.mjs` fails; unset: it is skipped when the connector is off. With `1` the suite also expects the default client and redirect allowlists (`mcp.clients`, `mcp.redirect_uris`) |
 | `BACKYARD_CONFORMANCE_IDP` | issuer URL of the mock OpenID Connect provider (`mock/idp.mjs`) of an `auth.mode: oidc` server: the connector tests sign in there with the cookie `idp_session=<user>` |

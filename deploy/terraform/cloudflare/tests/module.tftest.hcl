@@ -122,6 +122,7 @@ run "path_mode_with_access" {
   assert {
     condition = output.setup_args == join(" ", [
       "--worker-name backyard",
+      "--ai",
       "--var ACCESS_AUD:737646a56ab1df6ec9bddc7e5ca84eaf3b0768850f3ffb5d74f1534911fe3893",
       "--var ACCESS_TEAM_DOMAIN:acme.cloudflareaccess.com",
       "--var AUTH_MODE:access",
@@ -245,7 +246,7 @@ run "without_access" {
     error_message = "the Worker runs with AUTH_MODE=none"
   }
   assert {
-    condition     = output.setup_args == "--worker-name backyard --var AUTH_MODE:none --var BASE_DOMAIN:backyard.example.com --var MCP_ENABLED:false --var URL_MODE:path"
+    condition     = output.setup_args == "--worker-name backyard --ai --var AUTH_MODE:none --var BASE_DOMAIN:backyard.example.com --var MCP_ENABLED:false --var URL_MODE:path"
     error_message = "setup_args carry the variables without Access"
   }
 }
@@ -356,5 +357,35 @@ run "mcp_disabled_by_default" {
   assert {
     condition     = output.worker_vars.MCP_ENABLED == "false" && strcontains(output.setup_args, "--var MCP_ENABLED:false")
     error_message = "the connector is opt-in, and mcp_enabled = false turns it off: setup_args always carry MCP_ENABLED (setup keeps variables it is not given)"
+  }
+}
+
+run "ai_enabled_by_default" {
+  command = apply
+
+  assert {
+    condition     = startswith(output.setup_args, "--worker-name backyard --ai --var ") && !strcontains(output.setup_args, "--no-ai")
+    error_message = "AI is on by default: setup_args always carry --ai (setup remembers --no-ai, so leaving the flag out could not turn AI back on)"
+  }
+  assert {
+    condition     = !contains(keys(output.worker_vars), "AI_ENABLED") && !strcontains(output.setup_args, "AI_ENABLED")
+    error_message = "AI_ENABLED is never a --var: setup --ai / --no-ai manage it"
+  }
+}
+
+run "ai_disabled" {
+  command = apply
+
+  variables {
+    ai_enabled = false
+  }
+
+  assert {
+    condition     = startswith(output.setup_args, "--worker-name backyard --no-ai --var ") && !strcontains(output.setup_args, " --ai ")
+    error_message = "ai_enabled = false: setup_args carry --no-ai (no Workers AI binding, AI_ENABLED=false)"
+  }
+  assert {
+    condition     = output.setup_command == "npm run setup -- ${output.setup_args}" && !contains(keys(output.worker_vars), "AI_ENABLED")
+    error_message = "setup_command carries --no-ai too, and worker_vars stays without AI_ENABLED"
   }
 }

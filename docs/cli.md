@@ -280,7 +280,7 @@ See [Cloudflare](cloudflare.md).
 
 | Command | Meaning |
 |---|---|
-| `backyard cloudflare setup` | Deploy or upgrade Backyard on your Cloudflare account (Workers free plan); re-running keeps every choice: secrets, the deploy token, R2, the domain, Access and the `--var` overrides. It logs in with wrangler (in the browser) when needed, asks which account to use when the login reaches several, registers the account's workers.dev subdomain when it has none, creates the R2 bucket when R2 is enabled, sets the secrets and deploys. A machine without saved setup state adopts the deployed configuration first, and a deploy that would turn a live Cloudflare Access off is refused. |
+| `backyard cloudflare setup` | Deploy or upgrade Backyard on your Cloudflare account (Workers free plan); re-running keeps every choice: secrets, the deploy token, R2, AI, the domain, Access and the `--var` overrides. It logs in with wrangler (in the browser) when needed, asks which account to use when the login reaches several, registers the account's workers.dev subdomain when it has none, creates the R2 bucket when R2 is enabled, sets the secrets and deploys. A machine without saved setup state adopts the deployed configuration first, and a deploy that would turn a live Cloudflare Access off is refused. |
 | `backyard cloudflare domain add <host>` | Serve Backyard on your own domain: `<host>` becomes a Workers custom domain (Cloudflare creates its DNS record and certificate) and the hub moves there, with sites at `https://<host>/s/<site>/`. With `--host-mode` sites get their own hosts, `https://<site>.<host>/`: it also adds the route `*.<host>/*` and a proxied wildcard DNS record, created with `BACKYARD_CF_API_TOKEN` (a token with Zone · DNS · Edit) or added by you in the dashboard from the printed values (Backyard detects it). Existing DNS records and other Workers' domains are never replaced without `--replace-dns-record` or `--take-over`. |
 | `backyard cloudflare domain remove` | Remove the custom domain this tool added: back to workers.dev. |
 | `backyard cloudflare access enable` | Turn on company login with Cloudflare Access (needs a custom domain): two self-hosted Access applications, one for people (who may sign in: `--allow-email`, `--allow-email-domain`) and one that lets the machine endpoints the Worker authenticates itself (deploys, token minting, health checks) through. With `BACKYARD_CF_API_TOKEN` (Access: Apps and Policies · Edit and Access: Organizations, Identity Providers, and Groups · Read) Backyard creates them; otherwise it prints the dashboard steps and detects the result (`--team` and `--aud` name applications you already have). Access is verified at the edge before the Worker switches to it. |
@@ -354,6 +354,8 @@ Global options of the engine, for every subcommand:
 | `--r2` | Use an R2 bucket for big files (default when R2 is enabled). |
 | `--no-r2` | Never use R2 (remembered). |
 | `--r2-bucket <name>` | Bucket name (default `<worker>-files`). |
+| `--ai` | Serve AI with the Workers AI binding (default; turns AI back on after `--no-ai`). |
+| `--no-ai` | Turn AI off: no Workers AI binding, AI calls answer `501` (remembered). |
 | `--var <KEY:VALUE>` | Override a Worker variable (remembered; `KEY:` drops it). Repeatable. |
 | `--rotate-token` | Issue a new `DEPLOY_TOKEN`. |
 | `--rotate-secret` | Replace `BACKYARD_SECRET` (revokes every API token). |
@@ -410,6 +412,7 @@ Exit codes (the engine's, kept by this CLI, also after it logged in):
 ```sh
 backyard cloudflare setup
 backyard cloudflare setup --worker-name team --no-r2
+backyard cloudflare setup --no-ai                                      # an account without Workers AI
 backyard cloudflare setup --non-interactive --workers-subdomain acme   # CI
 backyard cloudflare setup --package ./dist-npm/backyard-cloudflare-0.1.0.tgz
 backyard cloudflare domain add backyard.acme.com

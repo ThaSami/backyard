@@ -21,6 +21,7 @@ import {
   deployArgVars,
   effectiveConfig,
   hubURL,
+  parseAISwitch,
   isMissingWorker,
   parseDeployArgs,
   parseJSONC,
@@ -151,6 +152,22 @@ test("effectiveConfig", () => {
   assert.deepEqual(clean.vars, base.vars);
   assert.equal(effectiveConfig(routed, { vars: { A: "2" } }).routes, undefined);
   assert.ok(routed.routes, "input is not modified");
+});
+
+test("parseAISwitch", () => {
+  for (const v of [undefined, "", " ", "true", "TRUE"]) assert.equal(parseAISwitch(v), true, `${JSON.stringify(v)} is on`);
+  for (const v of ["false", " False "]) assert.equal(parseAISwitch(v), false, `${JSON.stringify(v)} is off`);
+  for (const v of ["no", "0", "off", "yes"]) assert.throws(() => parseAISwitch(v), /BACKYARD_CF_AI must be "true" or "false"/);
+});
+
+test("effectiveConfig without AI drops the binding and sets AI_ENABLED", () => {
+  const base = { name: "backyard", ai: { binding: "AI", remote: true }, vars: { URL_MODE: "path" } };
+  assert.equal(effectiveConfig(base, { ai: true }), null, "AI on changes nothing");
+  const got = effectiveConfig(base, { ai: false });
+  assert.equal("ai" in got, false, "no Workers AI binding");
+  assert.deepEqual(got.vars, { URL_MODE: "path", AI_ENABLED: "false" });
+  assert.deepEqual(base.ai, { binding: "AI", remote: true }, "input is not modified");
+  assert.deepEqual(base.vars, { URL_MODE: "path" }, "input vars are not modified");
 });
 
 test("hubURL", async (t) => {
@@ -399,6 +416,32 @@ test("deploy: upgrade keeps existing secrets and applies overrides", async () =>
   assert.deepEqual(cfg.r2_buckets, [{ binding: "R2", bucket_name: "team-files" }]);
   assert.ok(!existsSync(join(f.cf, GENERATED_CONFIG)), "generated config is removed");
   assert.equal(f.summary().includes("Warning"), false);
+});
+
+test("deploy: BACKYARD_CF_AI=false deploys without the Workers AI binding", async () => {
+  const config = `{\n  "name": "backyard",\n  "main": "src/index.ts",\n  "ai": { "binding": "AI", "remote": true },\n  "vars": { "URL_MODE": "path", "AUTH_MODE": "none" },\n}\n`;
+  const off = fixture({ exists: true, secrets: ["BACKYARD_SECRET", "DEPLOY_TOKEN"] }, { config });
+  off.env.BACKYARD_CF_AI = "false";
+  await deploy({ env: off.env, log: quiet });
+  const cfg = parseJSONC(off.state().config);
+  assert.equal("ai" in cfg, false, "the deployed config has no ai binding");
+  assert.equal(cfg.vars.AI_ENABLED, "false");
+
+  const on = fixture({ exists: true, secrets: ["BACKYARD_SECRET", "DEPLOY_TOKEN"] }, { config });
+  await deploy({ env: on.env, log: quiet });
+  const d = on.state().calls.find((c) => c.args[0] === "deploy");
+  assert.ok(!d.args.includes("--config"), "AI on (the default) deploys wrangler.jsonc as is, binding included");
+
+  for (const [key, value] of [["BACKYARD_CF_VARS", '{"AI_ENABLED":"true"}'], ["BACKYARD_CF_DEPLOY_ARGS", "--var AI_ENABLED:true"]]) {
+    const clash = fixture({ exists: true, secrets: ["BACKYARD_SECRET"] }, { config });
+    clash.env.BACKYARD_CF_AI = "false";
+    clash.env[key] = value;
+    await assert.rejects(deploy({ env: clash.env, log: quiet }), /AI_ENABLED is set by BACKYARD_CF_AI=false/, key);
+    assert.deepEqual(clash.state().calls, [], `${key}: refused before wrangler runs`);
+  }
+  const bad = fixture({}, { config });
+  bad.env.BACKYARD_CF_AI = "off";
+  await assert.rejects(deploy({ env: bad.env, log: quiet }), /BACKYARD_CF_AI must be "true" or "false"/);
 });
 
 test("deploy: an existing R2 bucket is fine, other R2 errors fail", async () => {

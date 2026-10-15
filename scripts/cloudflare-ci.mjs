@@ -22,6 +22,10 @@
 //                             "BASE_DOMAIN":"example.com","LIMITS":{"ai_per_day":50}}
 //   BACKYARD_CF_R2_BUCKET     R2 bucket for large files: created if missing and
 //                             bound as R2 (needs R2 enabled on the account)
+//   BACKYARD_CF_AI            "false" turns AI off, like `setup --no-ai`: the deploy
+//                             has no Workers AI binding and AI_ENABLED is "false"
+//                             (then BACKYARD_CF_VARS and BACKYARD_CF_DEPLOY_ARGS may
+//                             not set AI_ENABLED). Empty or "true": AI on (default)
 //   BACKYARD_CF_DEPLOY_ARGS   extra `wrangler deploy` arguments (split on spaces)
 //   BACKYARD_CF_DIR           the Worker project (default: deploy/cloudflare)
 //   BACKYARD_CF_WAIT_SECONDS  how long to wait for /__backyard/readyz (default 60, 0 = skip)
@@ -155,6 +159,17 @@ function parseTrailing(text, i) {
 }
 
 /**
+ * Parses BACKYARD_CF_AI: true (AI on, the default; empty or unset) or false
+ * (no Workers AI binding and AI_ENABLED=false, like `setup --no-ai`).
+ */
+export function parseAISwitch(raw) {
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (v === "" || v === "true") return true;
+  if (v === "false") return false;
+  throw new CIError(`BACKYARD_CF_AI must be "true" or "false", not ${JSON.stringify(String(raw))}`);
+}
+
+/**
  * Parses BACKYARD_CF_VARS: a JSON object of Worker variables. Non-string
  * values (numbers, booleans, objects such as LIMITS) are JSON-encoded, since
  * Worker variables are strings. Secret names are refused: variables are
@@ -238,14 +253,19 @@ export function hasRoutes(config) {
 
 /**
  * Builds the effective wrangler configuration: wrangler.jsonc with variable
- * overrides and the optional R2 binding, and never routes (a deploy must not
+ * overrides and the optional R2 binding, without the Workers AI binding and
+ * with AI_ENABLED=false when ai is false, and never routes (a deploy must not
  * attach or move routes and custom domains). Returns null when nothing changes.
  */
-export function effectiveConfig(config, { vars = {}, bucket = "" } = {}) {
-  if (!Object.keys(vars).length && !bucket && !hasRoutes(config)) return null;
+export function effectiveConfig(config, { vars = {}, bucket = "", ai = true } = {}) {
+  if (!Object.keys(vars).length && !bucket && ai && !hasRoutes(config)) return null;
   const out = { ...config, vars: { ...(config.vars ?? {}), ...vars } };
   delete out.routes;
   delete out.route;
+  if (!ai) {
+    delete out.ai;
+    out.vars.AI_ENABLED = "false";
+  }
   if (bucket) {
     const others = (config.r2_buckets ?? []).filter((b) => b.binding !== "R2");
     out.r2_buckets = [...others, { binding: "R2", bucket_name: bucket }];
@@ -496,10 +516,15 @@ export async function deploy({ env = process.env, dryRun = false, log = console.
   if (!WORKER_NAME_RE.test(worker)) throw new CIError(`invalid Worker name ${JSON.stringify(worker)}`);
   const bucket = (env.BACKYARD_CF_R2_BUCKET || "").trim();
   if (bucket && !BUCKET_RE.test(bucket)) throw new CIError(`invalid R2 bucket name ${JSON.stringify(bucket)}`);
+  const ai = parseAISwitch(env.BACKYARD_CF_AI);
   const vars = parseVars(env.BACKYARD_CF_VARS);
   const extraArgs = parseDeployArgs(env.BACKYARD_CF_DEPLOY_ARGS);
+  // With AI off the switch owns AI_ENABLED, so the binding and the variable never disagree.
+  if (!ai && ("AI_ENABLED" in vars || "AI_ENABLED" in deployArgVars(extraArgs))) {
+    throw new CIError("AI_ENABLED is set by BACKYARD_CF_AI=false; remove it from BACKYARD_CF_VARS and BACKYARD_CF_DEPLOY_ARGS");
+  }
   // What the Worker will run with: wrangler.jsonc < BACKYARD_CF_VARS < --var in BACKYARD_CF_DEPLOY_ARGS.
-  const merged = { ...(config.vars ?? {}), ...vars, ...deployArgVars(extraArgs) };
+  const merged = { ...(config.vars ?? {}), ...vars, ...deployArgVars(extraArgs), ...(ai ? {} : { AI_ENABLED: "false" }) };
   const ci = gha(env, log);
   for (const name of SECRET_NAMES) ci.mask(env[name]);
   // wrangler uses HTTPS_PROXY; the auth guard's API calls and the readiness check only with NODE_USE_ENV_PROXY=1.
@@ -550,7 +575,7 @@ export async function deploy({ env = process.env, dryRun = false, log = console.
     if (hasRoutes(config)) {
       ci.warn("routes in wrangler.jsonc are ignored: routes and custom domains are managed by `backyard cloudflare domain add` (or Terraform), and deploys never change them");
     }
-    const effective = effectiveConfig(config, { vars, bucket });
+    const effective = effectiveConfig(config, { vars, bucket, ai });
     // --env= selects the top-level environment explicitly (wrangler.jsonc also
     // defines "local" for offline development).
     const args = ["deploy", "--name", worker, "--env="];

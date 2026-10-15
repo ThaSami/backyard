@@ -53,12 +53,15 @@ output "worker_vars" {
 locals {
   setup_args = join(" ", concat(
     ["--worker-name", var.worker_name],
+    # Always one of the two: setup remembers --no-ai, so leaving the flag out
+    # could not turn AI back on.
+    [var.ai_enabled ? "--ai" : "--no-ai"],
     [for k, v in local.worker_vars : "--var ${k}:${v}"],
   ))
 }
 
 output "setup_args" {
-  description = "Arguments of setup that redeploy the Worker with these variables (they are remembered for later runs): backyard cloudflare setup <setup_args>, or npx backyard-cloudflare@latest setup <setup_args>."
+  description = "Arguments of setup that redeploy the Worker with these variables and --ai or --no-ai (they are remembered for later runs): backyard cloudflare setup <setup_args>, or npx backyard-cloudflare@latest setup <setup_args>."
   value       = local.setup_args
 }
 

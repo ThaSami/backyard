@@ -29,7 +29,8 @@
 //                            workers_dev is on). An account without a workers.dev subdomain and
 //                            workers_dev on → the "register a workers.dev subdomain" error.
 //                            FAKE_DEPLOY_FAIL=1 fails it; FAKE_DEPLOY_DELAY_MS=<ms> prints "Uploading (fake:
-//                            slow)…" and blocks that long first (Ctrl-C tests).
+//                            slow)…" and blocks that long first (Ctrl-C tests). FAKE_AI=disabled fails a
+//                            config with the Workers AI binding (an account where Workers AI is not allowed).
 //   anything else            exit 2
 
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
@@ -227,6 +228,10 @@ function run() {
       }
       if (env.FAKE_DEPLOY_FAIL) {
         console.error("✘ [ERROR] fake deploy failure");
+        return 1;
+      }
+      if (env.FAKE_AI === "disabled" && config.ai) {
+        console.error("✘ [ERROR] fake: Workers AI is not available on this account (binding AI)");
         return 1;
       }
       if (env.FAKE_DEPLOY_DELAY_MS) {

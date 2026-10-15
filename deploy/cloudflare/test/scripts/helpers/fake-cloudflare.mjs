@@ -182,12 +182,13 @@ export function bindingsOf(config, secrets = {}) {
 
 /**
  * A deployed Worker for state.workers (what another machine left behind).
- * @param {{account?: string, vars?: Record<string, any>, secrets?: Record<string, string>, r2Bucket?: string, workersDev?: boolean, version?: string}} o
+ * @param {{account?: string, vars?: Record<string, any>, secrets?: Record<string, string>, r2Bucket?: string, ai?: boolean, workersDev?: boolean, version?: string}} o
+ *   ai: false leaves the Workers AI binding out (deployed with setup --no-ai)
  */
 export function deployedWorker(o = {}) {
   const config = {
     durable_objects: { bindings: [{ name: "SITE", class_name: "SiteDO" }, { name: "REGISTRY", class_name: "RegistryDO" }] },
-    ai: { binding: "AI" },
+    ...(o.ai === false ? {} : { ai: { binding: "AI" } }),
     r2_buckets: o.r2Bucket ? [{ binding: "R2", bucket_name: o.r2Bucket }] : [],
     vars: o.vars ?? {},
   };

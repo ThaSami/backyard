@@ -53,6 +53,7 @@ bypass application.
 ```sh
 # 1. Deploy the Worker (workers.dev URL, AUTH_MODE=none).
 backyard cloudflare setup               # or, once it is on npm: npx backyard-cloudflare@latest setup
+#   add --no-ai when ai_enabled = false (e.g. no Workers AI on the account)
 
 # 2. Domain + Access.
 cd deploy/terraform/cloudflare/examples/basic
@@ -62,7 +63,7 @@ terraform init && terraform apply
 
 # 3. Point the Worker at the domain and turn on Access verification (remembered by setup).
 terraform output -raw setup_command
-#   npm run setup -- --worker-name backyard --var ACCESS_AUD:… --var ACCESS_TEAM_DOMAIN:acme.cloudflareaccess.com
+#   npm run setup -- --worker-name backyard --ai --var ACCESS_AUD:… --var ACCESS_TEAM_DOMAIN:acme.cloudflareaccess.com
 #                    --var AUTH_MODE:access --var BASE_DOMAIN:backyard.example.com --var MCP_ENABLED:false
 #                    --var URL_MODE:path
 cd ../../../../cloudflare && <run it>          # in a checkout of deploy/cloudflare
@@ -83,7 +84,11 @@ npx backyard-cloudflare@latest setup $(terraform output -raw setup_args)   # the
 They always include `--var MCP_ENABLED:true` or `--var MCP_ENABLED:false`: `mcp_enabled = true`
 turns on the [Claude connector](../../../docs/claude-connector.md) (publishing from Claude with
 the Access sign-in), and setting it back to `false` and running `setup` again turns it off (setup
-keeps the variables it is not given, so the module never leaves this one out).
+keeps the variables it is not given, so the module never leaves this one out). Likewise they
+always include `--ai` or `--no-ai`: `ai_enabled = false` deploys without the Workers AI binding
+and with `AI_ENABLED=false`, so every AI call of the sites answers `501 unsupported` (for an
+account where Workers AI is not available), and setting it back to `true` turns AI on again at
+the next `setup` (setup remembers `--no-ai` until it is given `--ai`).
 
 These variables are then managed by Terraform: `setup` deploys and remembers them, and the
 CLI's `domain add` and `access enable` refuse to take them over (exit 2, with how to drop them
@@ -161,6 +166,7 @@ domains, so they leave the module's alone. Leave `routes` out of `wrangler.jsonc
 | `auto_redirect_to_identity` | auto | Skip the Access login page. Defaults to on when exactly one IdP is allowed. |
 | `bypass_paths` | gateway + token minting + health + the Claude connector's four machine paths (nine paths) | Paths below `/__backyard/` (or one of the two OAuth discovery documents) that skip Access. |
 | `mcp_enabled` | `false` | Turn on the [Claude connector](../../../docs/claude-connector.md): `MCP_ENABLED=true` in `worker_vars` and `setup_args` (`false` otherwise, which turns a connector that was on off at the next `setup`). |
+| `ai_enabled` | `true` | Serve AI to sites: `--ai` in `setup_args`. `false` puts `--no-ai` there instead: no Workers AI binding and `AI_ENABLED=false`, so every AI endpoint answers `501 unsupported` (for an account without Workers AI); back to `true`, the next `setup` turns AI on again. |
 | `okta_account_url`, `okta_client_id`, `okta_client_secret`, `okta_authorization_server_id`, `okta_idp_name` | `""` | Create an Okta identity provider. |
 | `okta_identity_provider_id` | `""` | Existing Okta provider for `allowed_okta_groups`. |
 
@@ -173,7 +179,7 @@ domains, so they leave the module's alone. Leave `routes` out of `wrangler.jsonc
 | `access_team_domain` | `<team>.cloudflareaccess.com`, used as the Worker's `ACCESS_TEAM_DOMAIN`. |
 | `okta_identity_provider_id` | Okta provider id (created or passed in). |
 | `worker_vars` | Map of the Worker variables for this setup. |
-| `setup_args` | The arguments of `setup` that apply them: `--worker-name <worker> --var KEY:VALUE …`, for `backyard cloudflare setup` or `npx backyard-cloudflare setup`. |
+| `setup_args` | The arguments of `setup` that apply them: `--worker-name <worker> --ai\|--no-ai --var KEY:VALUE …`, for `backyard cloudflare setup` or `npx backyard-cloudflare setup`. |
 | `setup_command` | The `npm run setup -- <setup_args>` command that applies them in a checkout. |
 
 ## Tests

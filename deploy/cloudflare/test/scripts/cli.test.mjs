@@ -29,7 +29,7 @@ after(async () => {
 /** The binding content of design §3.8: every command and its flags. */
 const EXPECTED = {
   global: ["worker-name", "yes", "non-interactive", "help"],
-  setup: ["r2", "no-r2", "r2-bucket", "var", "rotate-token", "rotate-secret", "skip-deploy", "workers-subdomain", "workers-dev", "no-workers-dev", "confirm-auth-change", "dry-run"],
+  setup: ["r2", "no-r2", "r2-bucket", "ai", "no-ai", "var", "rotate-token", "rotate-secret", "skip-deploy", "workers-subdomain", "workers-dev", "no-workers-dev", "confirm-auth-change", "dry-run"],
   "domain add": ["host-mode", "zone", "take-over", "replace-dns-record", "wait"],
   "domain remove": [],
   "access enable": ["allow-email", "allow-email-domain", "team", "aud", "wait"],

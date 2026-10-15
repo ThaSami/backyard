@@ -642,3 +642,31 @@ func TestAIChatUploadEndToEnd(t *testing.T) {
 	expectError(t, chat("/assets/x.png"), 400, "bad_request")
 	expectError(t, chat("/__backyard/files/01JAAAAAAAAAAAAAAAAAAAAAAA/x.png"), 400, "bad_request")
 }
+
+// TestAIDisabledAnswers pins what every AI endpoint answers with ai.enabled:
+// false, before the body is read or a limit is charged: the Cloudflare
+// edition's AI_ENABLED=false answers the same (SPEC §16).
+func TestAIDisabledAnswers(t *testing.T) {
+	off := false
+	svc, err := router.New(t.Context(), config.AIConfig{Enabled: &off, Models: map[string]config.ModelConfig{"smart": {Provider: "x", Model: "m"}}}, router.Options{Logger: slog.New(slog.DiscardHandler)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t, func(h *harness, d *Deps) { d.AI = svc })
+	const want = `{"error":{"code":"unsupported","message":"AI is not configured on this server"}}`
+	for _, c := range []struct {
+		method, path string
+		body         any
+	}{
+		{"POST", "/chat", map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hi"}}}},
+		{"POST", "/chat", "{"},
+		{"POST", "/image", map[string]any{"prompt": "a cat"}},
+		{"POST", "/embed", map[string]any{"input": "x"}},
+		{"GET", "/models", nil},
+	} {
+		w := h.api(c.method, aiURL+c.path, c.body)
+		if w.Code != http.StatusNotImplemented || strings.TrimSpace(w.Body.String()) != want {
+			t.Errorf("%s %s: %d %s, want 501 %s", c.method, c.path, w.Code, w.Body.String(), want)
+		}
+	}
+}

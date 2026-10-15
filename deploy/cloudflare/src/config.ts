@@ -154,6 +154,12 @@ export const DEFAULT_MODELS: Record<string, ModelConfig> = {
 };
 
 export interface AIConfig {
+  /**
+   * AI_ENABLED (default true). False: every AI endpoint answers 501
+   * unsupported before anything else (Go's ai.enabled: false), and no
+   * provider or binding is used.
+   */
+  enabled: boolean;
   models: Record<string, ModelConfig>;
   defaultChat: string;
   defaultImage: string;
@@ -237,6 +243,7 @@ const VAR_KEYS = [
   "OWNERSHIP",
   "SERVER_NAME",
   "RESERVED_SITES",
+  "AI_ENABLED",
   "AI_MODELS",
   "AI_DEFAULT_MODEL",
   "AI_DEFAULT_IMAGE_MODEL",
@@ -467,6 +474,7 @@ function parseAI(env: Env, problems: string[]): AIConfig {
   };
   problems.push(...warnings);
   return {
+    enabled: bool(env.AI_ENABLED, true),
     models,
     defaultChat: pick(str(env.AI_DEFAULT_MODEL), "chat", ["default", "smart", "chat", "fast"]),
     defaultImage: pick(str(env.AI_DEFAULT_IMAGE_MODEL), "image", ["image", "images"]),

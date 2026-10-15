@@ -234,6 +234,73 @@ describe("AI API", () => {
   });
 });
 
+describe("AI_ENABLED (SPEC §16: like the Go server's ai.enabled)", () => {
+  const OFF = { error: { code: "unsupported", message: "AI is not configured on this server" } };
+  /** A Workers AI binding that fails the test on any use. */
+  const untouchable = new Proxy({}, {
+    get(_t, prop) {
+      throw new Error(`the AI binding was used (${String(prop)}) while AI_ENABLED=false`);
+    },
+  }) as unknown as Ai;
+  const requests = (site: string): [string, RequestInit][] => [
+    [`/s/${site}/__backyard/api/ai/chat`, { method: "POST", headers: apiHeaders(), body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }) }],
+    [`/s/${site}/__backyard/api/ai/chat`, { method: "POST", headers: apiHeaders(), body: JSON.stringify({ messages: [{ role: "user", content: "hi" }], stream: true }) }],
+    [`/s/${site}/__backyard/api/ai/chat`, { method: "POST", headers: apiHeaders(), body: "{" }],
+    [`/s/${site}/__backyard/api/ai/image`, { method: "POST", headers: apiHeaders(), body: JSON.stringify({ prompt: "a cat", n: 4 }) }],
+    [`/s/${site}/__backyard/api/ai/embed`, { method: "POST", headers: apiHeaders(), body: JSON.stringify({ input: "x" }) }],
+    [`/s/${site}/__backyard/api/ai/models`, {}],
+  ];
+
+  it("answers every AI endpoint like Go with ai.enabled: false, before the body, the caps or any provider", async () => {
+    const site = uniqueSite("aioff");
+    const ip = `198.51.100.${Math.floor(Math.random() * 250)}`;
+    const limits = JSON.stringify({ ai_per_day: 1, ai_platform_per_day: 100000 });
+    const env = { AI: untouchable, AI_ENABLED: "false", ANTHROPIC_API_KEY: "k", OPENAI_API_KEY: "k", LIMITS: limits };
+    for (const [path, init] of requests(site)) {
+      const res = await call(path, { ...init, headers: { ...((init.headers as Record<string, string>) ?? {}), "CF-Connecting-IP": ip } }, env);
+      expect(res.status, `${init.method ?? "GET"} ${path}`).toBe(501);
+      expect(res.headers.get("Content-Type")).toMatch(/^application\/json/);
+      expect(await res.json()).toEqual(OFF);
+    }
+    // Nothing was charged: the day's single AI call is still there once AI is on.
+    const { ai } = mockAI();
+    const body = JSON.stringify({ messages: [{ role: "user", content: "hi" }] });
+    const on = await call(`/s/${site}/__backyard/api/ai/chat`, { method: "POST", headers: { ...apiHeaders(), "CF-Connecting-IP": ip }, body }, { AI: ai, LIMITS: limits });
+    expect(on.status).toBe(200);
+    for (const v of ["0", "no", "off", "FALSE", " false "]) {
+      expect((await call(`/s/${site}/__backyard/api/ai/models`, {}, { AI: untouchable, AI_ENABLED: v })).status, v).toBe(501);
+    }
+  });
+
+  it("changes nothing when unset or true", async () => {
+    const { ai, calls } = mockAI();
+    for (const v of [undefined, "", "true", "1", "yes", "on"]) {
+      const res = await call(`/s/x1/__backyard/api/ai/models`, {}, { AI: ai, AI_ENABLED: v });
+      expect(res.status, String(v)).toBe(200);
+      expect(((await res.json()) as { default: string }).default).toBe("smart");
+    }
+    const site = uniqueSite("aion");
+    const res = await call(
+      `/s/${site}/__backyard/api/ai/chat`,
+      { method: "POST", headers: apiHeaders(), body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }) },
+      { AI: ai, AI_ENABLED: "true" },
+    );
+    expect(res.status).toBe(200);
+    expect(calls.length).toBe(1);
+    // Without the binding and without keys: the existing 501 (no usable alias).
+    for (const [path, init] of requests(site)) {
+      const r = await call(path, init, { AI: undefined, AI_ENABLED: "true" });
+      expect(r.status, path).toBe(501);
+      expect(await r.json()).toEqual(OFF);
+    }
+    // Without the binding, other providers still serve.
+    const models = JSON.stringify({ claude: { provider: "anthropic", model: "claude-opus-5-5", kind: "chat" } });
+    const listed = await call(`/s/x1/__backyard/api/ai/models`, {}, { AI: undefined, AI_ENABLED: "true", AI_MODELS: models, ANTHROPIC_API_KEY: "k" });
+    expect(listed.status).toBe(200);
+    expect(((await listed.json()) as { models: { name: string }[] }).models.map((m) => m.name)).toEqual(["claude"]);
+  });
+});
+
 describe("AI image caps and inline images", () => {
   const ip = () => `198.51.100.${1 + Math.floor(Math.random() * 250)}`;
 

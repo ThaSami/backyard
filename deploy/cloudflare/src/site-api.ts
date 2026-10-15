@@ -527,9 +527,19 @@ async function filesDelete(ctx: RequestContext, _u: User, [id]: string[]): Promi
 
 // --- AI (SPEC §5.4) --------------------------------------------------------------
 
+/** The message of every AI endpoint while AI is off (the Go server's). */
+const AI_OFF = "AI is not configured on this server";
+
+/**
+ * The AI service of a request, or 501 unsupported before anything else (the
+ * body, the caps) when AI is off: AI_ENABLED=false (then no provider is made
+ * and the AI binding is never used, like the Go server's ai.enabled: false),
+ * or no alias has a usable provider (no binding, no keys).
+ */
 function aiService(ctx: RequestContext): AIService {
+  if (!ctx.cfg.ai.enabled) throw unsupported(AI_OFF);
   const ai = new AIService(ctx.cfg, ctx.env);
-  if (!ai.enabled()) throw unsupported("AI is not configured on this server");
+  if (!ai.enabled()) throw unsupported(AI_OFF);
   return ai;
 }
 

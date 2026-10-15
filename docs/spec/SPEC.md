@@ -435,6 +435,12 @@ total) on the Go server and 100 on the Cloudflare edition (more → `400 bad_req
 Clients choose **aliases**, never raw provider model ids, unless `ai.allow_raw_models` is true
 (then `"provider/model-id"` is accepted).
 
+AI off (Go `ai.enabled: false`, or no models; Cloudflare `AI_ENABLED=false`, or no alias with a
+usable provider, §16): every `/ai/*` endpoint, `GET /ai/models` included, answers `501` with
+`{"error": {"code": "unsupported", "message": "AI is not configured on this server"}}` before the
+request body is read or an AI limit (rate limit, token budget, daily cap) is charged, and no
+provider is called.
+
 ### 5.5 Warehouse
 
 `POST /warehouse/query`
@@ -1553,6 +1559,12 @@ backyard version | completion <shell>
 Global flags: `--server`, `--gateway`, `--token`, `--profile`, `--json` (machine-readable
 output), `-v`/`--verbose`.
 
+`backyard cloudflare` handles `--dir`, `--package`, `--no-login`, `--skip-install`, `--profile`
+and `-v` itself and passes every other option to the engine unchanged; the engine's commands
+and flags are listed in `deploy/cloudflare/scripts/lib/commands.json` (§16), e.g. `setup
+--no-r2`, `setup --no-ai` / `--ai` (Workers AI off or on, remembered) and `setup --var
+KEY:VALUE`.
+
 Local CLI config: `$XDG_CONFIG_HOME/backyard/config.json` (`~/.config/backyard/config.json`):
 `{"current": "default", "profiles": {"default": {"server": "…", "gateway": "…", "token": "…",
 "token_expires_at": "…", "method": "auto", "refresh_token": "…", "device": {…}}}}` (mode 0600).
@@ -1916,7 +1928,14 @@ storage are available on free); R2 and paid features are optional.
   models. Embeddings via Workers AI. Smaller per-request limits than the Go server (§5.4): at
   most 4 images per `/ai/image` request and 100 inputs per `/ai/embed` request. Chat images
   follow §5.4 exactly (the site's own uploads are read from the DO or R2; 20 MiB per image,
-  64 MiB per request).
+  64 MiB per request). `AI_ENABLED` (default true; `true/1/yes/on`, empty = true, anything else
+  false) is the counterpart of the Go server's `ai.enabled`: false turns AI off as §5.4 says,
+  for Anthropic and OpenAI aliases too, and the `AI` binding is never used.
+  `backyard cloudflare setup --no-ai` (remembered in the engine's state as `"ai": false`;
+  `--ai` turns AI back on) deploys without the `AI` binding and with `AI_ENABLED=false`, for
+  accounts without Workers AI. The flag wins: while AI is off `AI_ENABLED` is a managed
+  variable (`--var AI_ENABLED:…` is refused, exit 2); with AI on, `--var AI_ENABLED:false`
+  turns only the endpoints off and keeps the binding.
 * **Warehouse:** not available on Cloudflare (`501 unsupported`) unless `WAREHOUSE_URL` points
   to a Backyard Go server's warehouse API (proxy) — optional.
 * **Auth:** `AUTH_MODE` = `none` (anonymous cookie identity; deploys need `DEPLOY_TOKEN` unless
@@ -1976,7 +1995,10 @@ storage are available on free); R2 and paid features are optional.
   checked) and logs the CLI in; `npm run setup` in a checkout of `deploy/cloudflare` builds from
   source. `domain add <host> [--host-mode]` and `access enable` add the custom domain and
   Cloudflare Access; deploys (setup and the CI deployer) never change routes or custom domains,
-  and refuse to turn a live Access off unless confirmed. `/info` (§7.1) reports the build
+  and refuse to turn a live Access off unless confirmed. Every deploy of the engine (`setup`,
+  `domain add`/`remove`, `access enable`/`disable`) keeps the remembered choices, `--no-ai`
+  included. The Terraform module's `ai_enabled` (default true) puts `--ai` or `--no-ai` into its
+  `setup_args`. `/info` (§7.1) reports the build
   version (the release version, `<package version>-dev` for checkout builds). GitHub Actions
   example included.
 

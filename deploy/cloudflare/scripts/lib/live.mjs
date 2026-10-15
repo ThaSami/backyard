@@ -6,8 +6,9 @@
 //   A 404 or code 10007 means the Worker does not exist; any other error
 //   leaves it unknown (exists: null) and the guard refuses to guess.
 // * adopt(state, live, baseVars) fills a fresh state from the live Worker:
-//   R2 bucket, variables that differ from the defaults, the domain
-//   (BASE_DOMAIN) and Cloudflare Access (AUTH_MODE=access).
+//   R2 bucket, AI off (no AI binding and AI_ENABLED false), variables that
+//   differ from the defaults, the domain (BASE_DOMAIN) and Cloudflare Access
+//   (AUTH_MODE=access).
 // * authGuard(live, desiredVars, o) refuses (CliError 3) a deploy that would
 //   turn a live AUTH_MODE=access off, change its team, or replace a Worker
 //   whose AUTH_MODE cannot be read, unless o.allow (setup
@@ -22,6 +23,18 @@ import { CliError, EXIT } from "./ui.mjs";
 export const MANAGED_DOMAIN_KEYS = ["BASE_DOMAIN", "URL_MODE"];
 /** Variables derived from state.access. */
 export const MANAGED_ACCESS_KEYS = ["AUTH_MODE", "ACCESS_TEAM_DOMAIN", "ACCESS_AUD"];
+/** Variables derived from state.ai === false (`setup --no-ai`; never stored in state.vars then). */
+export const MANAGED_AI_KEYS = ["AI_ENABLED"];
+
+/**
+ * Whether an AI_ENABLED value turns AI on, as the Worker reads it (bool() in
+ * src/config.ts with the default true): unset or empty, true, 1, yes or on.
+ * @param {unknown} v
+ */
+export function aiEnabledOf(v) {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "" || s === "true" || s === "1" || s === "yes" || s === "on";
+}
 
 /**
  * Normalizes a Cloudflare Access team like the Worker does: "Acme" →
@@ -58,6 +71,7 @@ export function hostOf(v) {
  * @property {Record<string, string>} vars   plain_text bindings, and json bindings (a JSON string as is, anything else JSON.stringify'd)
  * @property {string[]} secretNames      secret_text bindings
  * @property {string} r2Bucket           the bucket bound as R2 ("" = none)
+ * @property {boolean} ai                Workers AI is bound as AI
  * @property {boolean|null} workersDev   null when unreadable
  * @property {string} authMode           see authModeOf ("" when unknown)
  * @property {string} team               normalized ACCESS_TEAM_DOMAIN ("" = unknown or none)
@@ -68,7 +82,7 @@ export function hostOf(v) {
 
 /** @returns {Live} */
 function emptyLive(exists, error = "") {
-  return { exists, vars: {}, secretNames: [], r2Bucket: "", workersDev: null, authMode: "", team: "", aud: "", source: "", error };
+  return { exists, vars: {}, secretNames: [], r2Bucket: "", ai: false, workersDev: null, authMode: "", team: "", aud: "", source: "", error };
 }
 
 /**
@@ -92,6 +106,7 @@ export async function readLive(o) {
     else if (b.type === "json") live.vars[b.name] = typeof b.json === "string" ? b.json : JSON.stringify(b.json);
     else if (b.type === "secret_text") live.secretNames.push(b.name);
     else if (b.type === "r2_bucket" && b.name === "R2") live.r2Bucket = String(b.bucket_name ?? "");
+    else if (b.type === "ai" && b.name === "AI") live.ai = true;
   }
   live.authMode = authModeOf(live.vars.AUTH_MODE);
   live.team = normalizeTeam(live.vars.ACCESS_TEAM_DOMAIN);
@@ -134,10 +149,11 @@ export async function fillAuthFromInfo(live, urls) {
 
 /**
  * Fills a state without setup history from the live Worker. Managed keys go
- * to state.domain / state.access when they are in use (BASE_DOMAIN set,
- * AUTH_MODE=access); otherwise, like every other variable, they are kept in
- * state.vars when they differ from the defaults, so the next deploy changes
- * nothing. Returns the parts that were adopted (for the one-line summary).
+ * to state.domain / state.access / state.ai when they are in use (BASE_DOMAIN
+ * set, AUTH_MODE=access, no AI binding with AI_ENABLED off); otherwise, like
+ * every other variable, they are kept in state.vars when they differ from the
+ * defaults, so the next deploy changes nothing. Returns the parts that were
+ * adopted (for the one-line summary).
  * @param {Record<string, any>} state
  * @param {Live} live
  * @param {Record<string, unknown>} baseVars  the defaults (wrangler config vars)
@@ -152,9 +168,16 @@ export function adopt(state, live, baseVars = {}) {
     parts.push(`R2 bucket ${live.r2Bucket}`);
   }
   const v = live.vars;
+  // Deployed with --no-ai: no binding and AI_ENABLED off. A Worker without the
+  // binding whose AI is on (other providers) keeps AI on: the next deploy binds it.
+  const aiOff = !live.ai && !aiEnabledOf(v.AI_ENABLED);
+  if (aiOff) {
+    state.ai = false;
+    parts.push("AI off");
+  }
   const host = hostOf(v.BASE_DOMAIN);
   const accessOn = authModeOf(v.AUTH_MODE) === "access";
-  const managedNow = new Set([...(host ? MANAGED_DOMAIN_KEYS : []), ...(accessOn ? MANAGED_ACCESS_KEYS : [])]);
+  const managedNow = new Set([...(host ? MANAGED_DOMAIN_KEYS : []), ...(accessOn ? MANAGED_ACCESS_KEYS : []), ...(aiOff ? MANAGED_AI_KEYS : [])]);
   const vars = { ...(state.vars ?? {}) };
   const copied = [];
   for (const [k, val] of Object.entries(v)) {

@@ -158,7 +158,7 @@ everyone a personal login and API tokens. It's free for up to 50 users.
 
 ## What `setup` does
 
-Re-run it at any time to upgrade: every choice is kept (secrets, the deploy token, R2, the
+Re-run it at any time to upgrade: every choice is kept (secrets, the deploy token, R2, AI, the
 domain, Access and your `--var` overrides). Each run:
 
 1. **Builds or finds the Worker.** From the npm package (or the CLI's release package) it
@@ -176,7 +176,8 @@ domain, Access and your `--var` overrides). Each run:
    (the default comes from the account name), or takes `--workers-subdomain <name>`, checks
    that it is free and registers it. An existing subdomain is used as it is and never renamed.
 5. **Adopts the deployed configuration** when this machine has no saved state for the Worker
-   but the Worker exists (another machine, a teammate, CI): the R2 bucket, the variables that
+   but the Worker exists (another machine, a teammate, CI): the R2 bucket, AI off (a Worker
+   deployed with `--no-ai`: no Workers AI binding and `AI_ENABLED=false`), the variables that
    differ from the defaults, the custom domain (`BASE_DOMAIN`, `URL_MODE`) and Cloudflare Access
    (`AUTH_MODE`, `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`). It prints one line, `Adopted the deployed
    configuration of <worker> (no setup state on this machine): …`, and the deploy keeps them.
@@ -185,10 +186,10 @@ domain, Access and your `--var` overrides). Each run:
    the dashboard; 10 GB are free), it says so and continues without it; the next run tries
    again. `--no-r2` turns this off for good.
 7. **Variables:** `wrangler.jsonc`'s defaults, then your remembered `--var` overrides, then the
-   variables that [`domain add`](#your-own-domain) and
-   [`access enable`](#company-login-cloudflare-access) manage. While they manage them,
-   `--var BASE_DOMAIN:…` (and `URL_MODE`, `AUTH_MODE`, `ACCESS_*`) exits 2 and names the
-   command that changes them.
+   variables that [`domain add`](#your-own-domain),
+   [`access enable`](#company-login-cloudflare-access) and [`setup --no-ai`](#turning-ai-off)
+   manage. While they manage them, `--var BASE_DOMAIN:…` (and `URL_MODE`, `AUTH_MODE`,
+   `ACCESS_*`, `AI_ENABLED`) exits 2 and names the command that changes them.
 8. **Runs the auth guard.** A deploy that would turn a live Cloudflare Access off, switch its
    team or open a Worker that fails closed is refused (exit 3, nothing changed), and so is a
    deploy to an existing Worker whose auth mode cannot be read. The message names the cause and
@@ -210,7 +211,7 @@ domain, Access and your `--var` overrides). Each run:
     `BACKYARD_SECRET`. On the first deploy this creates the Durable Object classes (SQLite
     storage, migration `v1`). The generated wrangler configuration never contains `routes`:
     deploys never change routes or custom domains (`routes` in `wrangler.jsonc` are ignored
-    with a warning).
+    with a warning). It binds Workers AI as `AI`, unless AI is off (`--no-ai`, remembered).
 11. **Waits** for `/__backyard/readyz` and prints the hub URL, the browser link and the
     `backyard login` command, and the next step (`domain add` or `access enable`). The token is
     shown only on an interactive terminal. In CI (`CI=true`) or when the output is redirected,
@@ -564,6 +565,8 @@ Global options, for every command:
 | `--r2` | Use an R2 bucket for big files (default when R2 is enabled). |
 | `--no-r2` | Never use R2 (remembered; files are capped at 25 MiB). |
 | `--r2-bucket <name>` | Bucket name (default `<worker>-files`). |
+| `--ai` | Serve AI with the Workers AI binding (the default). Turns AI back on after `--no-ai`. |
+| `--no-ai` | Turn AI off (remembered): no Workers AI binding, and `AI_ENABLED=false`, so every AI call of the sites answers `501 unsupported`. For accounts where Workers AI is not available. See [Turning AI off](#turning-ai-off). |
 | `--var <KEY:VALUE>` | Override a Worker variable (repeatable, remembered). `--var KEY:` drops an override. Secrets (`BACKYARD_SECRET`, `DEPLOY_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `WAREHOUSE_TOKEN`) are refused (exit 2): they are not variables. |
 | `--rotate-token` | Issue a new `DEPLOY_TOKEN`. The old one stops working. |
 | `--rotate-secret` | Replace `BACKYARD_SECRET`. This revokes every API token and anonymous identity. |
@@ -609,7 +612,7 @@ without state it shows the live configuration.
 
 | Option | Meaning |
 | --- | --- |
-| `--json` | Machine-readable output, alone on stdout: `schema`, `worker`, `accountId`, `statePath`, `versions` (`package`, `wrangler`, `deployed`), `urls` (`public`, `workersDev`), `r2Bucket`, `workersDev`, `domain` and `access` (`null` when there is none; their `source` is `external` when they are set with `--var`, and the Access `source` is `live` when it was read from the Worker) and `checks`. |
+| `--json` | Machine-readable output, alone on stdout: `schema`, `worker`, `accountId`, `statePath`, `versions` (`package`, `wrangler`, `deployed`), `urls` (`public`, `workersDev`), `r2Bucket`, `workersDev`, `ai` (`enabled`: `AI_ENABLED` as the Worker reads it; `binding`: Workers AI is bound), `domain` and `access` (`null` when there is none; their `source` is `external` when they are set with `--var`, and the Access `source` is `live` when it was read from the Worker) and `checks`. |
 
 Its checks, each `ok`, `pending` or `failed` with a detail: `worker`, `workers-dev`, `hub`,
 `custom-domain`, `route`, `dns`, `tls`, `access-redirect`, `access-bypass`,
@@ -675,6 +678,7 @@ fields are kept):
 | `deployToken` | The `DEPLOY_TOKEN`, when this machine knows it. |
 | `workersDevUrl`, `workersDev` | The workers.dev URL and whether the Worker serves there. |
 | `r2`, `r2Bucket` | The R2 choice and bucket. |
+| `ai` | `false` after `setup --no-ai`: deploys leave the Workers AI binding out and set `AI_ENABLED=false`. Absent: AI is on (`--ai` removes it). |
 | `vars` | Your `--var` overrides. |
 | `domain` | Set by `domain add`: `host`, `mode` (`path` or `host`), `zoneId`, `zoneName`, the ids of the custom domain, route and DNS record this tool attached or created, `status` (`active`, `pending-dns`, `pending-certificate`) and `source` (`cli` or `adopted`). |
 | `access` | Set by `access enable`: `team`, `aud`, `source` (`api`, `manual` or `adopted`), the ids of the applications and policies it created, and the `allow` list. |
@@ -826,14 +830,40 @@ can use Workers AI, Anthropic, or any OpenAI-compatible API:
   origin) is read from the site's storage (png, jpeg, gif or webp; 64 MiB per request); other
   absolute URLs are handed to the provider.
 
+### Turning AI off
+
+AI is on by default. To turn it off, for example on an account where Workers AI is not
+available (a deploy with the `AI` binding fails there), run setup with `--no-ai`:
+
+```sh
+backyard cloudflare setup --no-ai     # remembered: later runs, domain add and access enable keep it
+backyard cloudflare setup --ai        # back on
+```
+
+With AI off, deploys leave the Workers AI binding out and set `AI_ENABLED=false`. The Worker
+then answers every AI endpoint (`/ai/chat`, `/ai/image`, `/ai/embed`, `GET /ai/models`) with
+`501 unsupported` and the message `AI is not configured on this server`, before it reads the
+request or counts anything against the caps, exactly like the Go server with
+`ai.enabled: false`. No provider is called, also not Anthropic or OpenAI aliases with their keys
+set. Sites see AI as unavailable: every `backyard.ai` call rejects with the error code
+`unsupported`, which the [skill](../../skills/backyard/SKILL.md) already tells agents to handle
+gracefully. `status` shows `AI: off`.
+
+The flag wins over the variable, so the binding and `AI_ENABLED` never disagree: while AI is
+off, `AI_ENABLED` is managed by `setup` (`--var AI_ENABLED:…` exits 2, and `--no-ai` drops an
+earlier `--var AI_ENABLED` override). With AI on, `--var AI_ENABLED:false` turns only the AI
+endpoints off and keeps the binding (`--var AI_ENABLED:` drops it again). The Terraform module's
+`ai_enabled` variable puts `--ai` or `--no-ai` into its `setup_args`.
+
 ## Configuration reference
 
 Set variables with `backyard cloudflare setup --var KEY:VALUE` (repeatable, remembered;
 `--var KEY:` drops an override) or in `wrangler.jsonc` → `vars` in a checkout. `BASE_DOMAIN`
 and `URL_MODE` belong to `domain add`, `AUTH_MODE`, `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` to
-`access enable`. Every deploy sets all variables, so a change made in the dashboard lasts until
-the next `setup`; and don't deploy with a plain `wrangler deploy`, which would deploy
-`wrangler.jsonc`'s defaults past the auth guard. Secrets go through
+`access enable`, and `AI_ENABLED` to `setup --no-ai` while AI is off. Every deploy sets all
+variables, so a change made in the dashboard lasts until the next `setup`; and don't deploy
+with a plain `wrangler deploy`, which would deploy `wrangler.jsonc`'s defaults past the auth
+guard. Secrets go through
 `npx wrangler secret put NAME --name <worker>`.
 
 | Variable | Default | Meaning |
@@ -853,6 +883,7 @@ the next `setup`; and don't deploy with a plain `wrangler deploy`, which would d
 | `LIMITS` | see above | Guardrails (JSON: a string, or an object). |
 | `FILE_INLINE_MAX` | `5242880` | Files above this size go to R2 when bound (max 25 MiB). |
 | `TOKEN_TTL_HOURS` | `720` | Longest lifetime of an API token. |
+| `AI_ENABLED` | `true` | Anything but `true`, `1`, `yes`, `on` or empty (e.g. `false`) turns AI off: every `/__backyard/api/ai/*` endpoint answers `501 unsupported`, like the Go server with `ai.enabled: false`. `setup --no-ai` sets it and drops the Workers AI binding; see [Turning AI off](#turning-ai-off). |
 | `AI_*`, `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL` | — | See [AI](#ai). |
 | `MCP_ENABLED` | `false` | `true` serves the [Claude connector](#use-backyard-in-claude) at `<hub>/__backyard/mcp` (needs an https hub URL). Unset or false: every connector path answers `404`. |
 | `MCP_CLIENTS` | Claude's two client metadata URLs | Client ID Metadata Document URLs that may connect (comma-separated, compared exactly; only these are fetched). Set but empty (`--var MCP_CLIENTS:,`) turns this off, so apps register automatically; `--var MCP_CLIENTS:` drops the override. |
@@ -887,12 +918,13 @@ With the module, `setup` still deploys the Worker, and the module's outputs hand
 variables:
 
 ```sh
-backyard cloudflare setup                         # 1. deploy the Worker (workers.dev)
+backyard cloudflare setup                         # 1. deploy the Worker (workers.dev); add --no-ai with ai_enabled = false
 # 2. terraform apply in your configuration of the module (see its README)
 backyard cloudflare setup $(terraform output -raw setup_args)   # 3. domain + Access variables
 ```
 
-`setup_args` is the module output `--worker-name <worker> --var KEY:VALUE …`; the module's
+`setup_args` is the module output `--worker-name <worker> --ai|--no-ai --var KEY:VALUE …`
+(`--no-ai` when `ai_enabled = false`); the module's
 `examples/basic` exports it, and your own root configuration re-exports it the same way
 (`output "setup_args" { value = module.backyard.setup_args }`).
 `setup_command` holds the same as an `npm run setup -- …` command for a checkout. Variables set
@@ -937,6 +969,7 @@ jobs:
           BACKYARD_CF_WORKER_NAME: ${{ vars.BACKYARD_CF_WORKER_NAME }}
           BACKYARD_CF_VARS: ${{ vars.BACKYARD_CF_VARS }}
           BACKYARD_CF_R2_BUCKET: ${{ vars.BACKYARD_CF_R2_BUCKET }}
+          BACKYARD_CF_AI: ${{ vars.BACKYARD_CF_AI }}
           # Only a manual run with the box checked lets a deploy past the auth guard.
           BACKYARD_CF_CONFIRM_AUTH_CHANGE: ${{ inputs.confirm_auth_change && 'true' || '' }}
 ```
@@ -953,7 +986,12 @@ The CI deployer is declarative: every deploy sets `wrangler.jsonc`'s variables p
   binding: the files stored in R2 then answer `500` until a deploy binds the bucket again (the
   objects stay in the bucket), and new files are capped at 25 MiB;
 - if `setup` used `--worker-name`, set `BACKYARD_CF_WORKER_NAME` to it (the default is `name`
-  in `wrangler.jsonc`, `backyard`).
+  in `wrangler.jsonc`, `backyard`);
+- if `setup` turned AI off (`--no-ai`: the `AI:` line, `ai` in `--json`), set
+  `BACKYARD_CF_AI` to `false`. The CI deployer then leaves the Workers AI binding out and sets
+  `AI_ENABLED` to `false`, as `setup --no-ai` does (so `BACKYARD_CF_VARS` and
+  `BACKYARD_CF_DEPLOY_ARGS` may not set `AI_ENABLED` then). Empty or `true` keeps AI on: a
+  deploy binds Workers AI from `wrangler.jsonc`, which fails on an account without Workers AI.
 
 CI deploys always serve on `workers.dev` (`workers_dev` in `wrangler.jsonc`), even after
 `setup --no-workers-dev`. The CI deployer runs the same auth guard as `setup`: a deploy that would turn a live
@@ -1071,7 +1109,7 @@ other), `/llms.txt` and `/docs`.
 
 - **Upgrade:** re-run `setup`: `backyard cloudflare setup` with a newer `backyard` release (it
   installs that release's package), `npx backyard-cloudflare@latest setup` (once it is on npm), or
-  `git pull && npm ci && npm run setup` in a checkout. Secrets, the deploy token, R2, the
+  `git pull && npm ci && npm run setup` in a checkout. Secrets, the deploy token, R2, AI, the
   domain, Access and `--var` overrides are kept. Durable Object data survives deploys.
   `backyard cloudflare status` shows the package, wrangler and deployed versions.
 - **Back up a site:** `backyard pull <site> ./backup` downloads its files. To export
@@ -1113,6 +1151,8 @@ other), `/llms.txt` and `/docs`.
 | `401` "Cloudflare Access token" errors in the browser | `ACCESS_AUD` or `ACCESS_TEAM_DOMAIN` don't match the Access application: re-run `access enable` (or with `--team`/`--aud`). |
 | `413` on deploy | A file is above the per-file cap (25 MiB without R2): enable R2 on the account and re-run `setup`. Or a guardrail (`max_sites`, `max_site_bytes`, `max_files`) was hit. |
 | `429` with `Retry-After` | A daily guardrail was hit. Raise it with `LIMITS`, or wait until 00:00 UTC. |
+| The deploy fails on the Workers AI binding (`AI`), e.g. Workers AI is not available on the account | `setup --no-ai`: deploys without the binding, and the sites' AI calls answer `501 unsupported` ([Turning AI off](#turning-ai-off)). |
+| AI calls answer `501` "AI is not configured on this server" | AI is off (`status` shows the `AI:` line): `setup --ai` after `--no-ai`, `setup --var AI_ENABLED:` after `--var AI_ENABLED:false`; or no alias has a usable provider (no Workers AI binding, no API key). |
 | R2 bucket could not be created | Enable R2 once in the dashboard (it's free, but requires opting in), then re-run `setup` (add `--r2` if you turned it off with `--no-r2`). |
 | `setup` asks which account | Your login reaches several accounts. Answer once (it's remembered), or set `CLOUDFLARE_ACCOUNT_ID`. |
 | Anything else | `backyard cloudflare status` checks everything; `npx wrangler tail <worker>` streams the Worker's logs, including configuration problems. |

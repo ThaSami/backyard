@@ -11,7 +11,7 @@ import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { createApi } from "../../scripts/lib/cfapi.mjs";
-import { adopt, authGuard, authModeOf, fillAuthFromInfo, hostOf, normalizeTeam, readLive } from "../../scripts/lib/live.mjs";
+import { adopt, aiEnabledOf, authGuard, authModeOf, fillAuthFromInfo, hostOf, normalizeTeam, readLive } from "../../scripts/lib/live.mjs";
 import { parseJSONC } from "../../scripts/lib/layout.mjs";
 import { CliError } from "../../scripts/lib/ui.mjs";
 import { OAUTH_TOKEN, deployedWorker, startFakeCloudflare } from "./helpers/fake-cloudflare.mjs";
@@ -38,7 +38,7 @@ const refused = (fn, reason) =>
   });
 
 /** A live snapshot. */
-const live = (o = {}) => ({ exists: true, vars: {}, secretNames: [], r2Bucket: "", workersDev: true, authMode: "none", team: "", aud: "", source: "settings", error: "", ...o });
+const live = (o = {}) => ({ exists: true, vars: {}, secretNames: [], r2Bucket: "", ai: true, workersDev: true, authMode: "none", team: "", aud: "", source: "settings", error: "", ...o });
 
 describe("normalizeTeam", () => {
   it("matches the Worker's normalization", () => {
@@ -94,6 +94,7 @@ describe("readLive", () => {
     assert.equal(l.team, "acme.cloudflareaccess.com");
     assert.equal(l.aud, AUD);
     assert.equal(l.r2Bucket, "files");
+    assert.equal(l.ai, true, "the Workers AI binding");
     assert.equal(l.workersDev, false);
     assert.equal(l.vars.LIMITS, '{"ai_per_day":5}');
     assert.equal(l.vars.NAME_JSON, "quoted");
@@ -108,6 +109,11 @@ describe("readLive", () => {
     assert.equal(u.exists, null);
     assert.equal(u.authMode, "");
     assert.match(u.error, /403/);
+    // Deployed with --no-ai: no AI binding.
+    fake.update((s) => (s.workers.backyard = deployedWorker({ vars: { ...BASE_VARS, AI_ENABLED: "false" }, ai: false })));
+    const off = await readLive({ api, accountId: "acc1", worker: "backyard" });
+    assert.equal(off.ai, false);
+    assert.equal(off.vars.AI_ENABLED, "false");
   });
 });
 
@@ -175,6 +181,30 @@ describe("adopt", () => {
     assert.equal(off.vars, undefined);
     // An unreadable workers.dev setting is reported.
     assert.equal(adopt({}, live({ workersDev: null }), BASE_VARS).warnings.length, 1);
+  });
+});
+
+describe("AI on and off", () => {
+  it("reads AI_ENABLED like the Worker's bool() with the default true", () => {
+    for (const v of [undefined, null, "", " ", "true", "1", "yes", "on", " TRUE "]) assert.equal(aiEnabledOf(v), true, JSON.stringify(v));
+    for (const v of ["false", "0", "no", "off", "ture", false, 0]) assert.equal(aiEnabledOf(v), false, JSON.stringify(v));
+  });
+
+  it("adopts AI off only from a Worker without the binding whose AI_ENABLED is off", () => {
+    const off = {};
+    const r = adopt(off, live({ vars: { ...BASE_VARS, AI_ENABLED: "false" }, ai: false }), BASE_VARS);
+    assert.equal(off.ai, false);
+    assert.equal(off.vars, undefined, "AI_ENABLED is managed then, not a variable");
+    assert.deepEqual(r.parts, ["AI off"]);
+    // The binding with AI_ENABLED off (--var AI_ENABLED:false): AI stays on, the variable is kept.
+    const runtimeOff = {};
+    adopt(runtimeOff, live({ vars: { ...BASE_VARS, AI_ENABLED: "false" }, ai: true }), BASE_VARS);
+    assert.equal(runtimeOff.ai, undefined);
+    assert.deepEqual(runtimeOff.vars, { AI_ENABLED: "false" });
+    // No binding, AI on (other providers): AI stays on, so the next deploy binds Workers AI again.
+    const noBinding = {};
+    assert.deepEqual(adopt(noBinding, live({ vars: { ...BASE_VARS }, ai: false }), BASE_VARS).parts, []);
+    assert.equal(noBinding.ai, undefined);
   });
 });
 

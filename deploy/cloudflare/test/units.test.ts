@@ -425,6 +425,19 @@ describe("config", () => {
   });
 });
 
+describe("AI_ENABLED (SPEC §16)", () => {
+  const base = { BACKYARD_SECRET: "x".repeat(32) } as unknown as Env;
+  const cfg = (vars: Record<string, unknown>) => parseConfig({ ...base, ...vars } as unknown as Env);
+
+  it("is on by default and parsed like the other booleans", () => {
+    expect(parseConfig(base).ai.enabled).toBe(true);
+    for (const v of [undefined, "", "true", "1", "yes", "on", " TRUE ", true, 1]) expect(cfg({ AI_ENABLED: v }).ai.enabled, String(v)).toBe(true);
+    // A JSON boolean in wrangler.jsonc or the dashboard arrives parsed.
+    for (const v of ["false", "0", "no", "off", "ture", false, 0]) expect(cfg({ AI_ENABLED: v }).ai.enabled, String(v)).toBe(false);
+    expect(cfg({ AI_ENABLED: "false" }).problems).toEqual([]);
+  });
+});
+
 describe("Claude connector variables (MCP_*, SPEC §16)", () => {
   const base = { BACKYARD_SECRET: "x".repeat(32) } as unknown as Env;
   const cfg = (vars: Record<string, unknown>) => parseConfig({ ...base, ...vars } as unknown as Env);

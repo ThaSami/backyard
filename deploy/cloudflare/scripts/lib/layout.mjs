@@ -15,8 +15,10 @@
 //
 // The effective config never contains `routes`: custom domains and routes are
 // attached by `domain add` with explicit conflict checks, so a deploy (also
-// from CI) never changes them. Variables merge as base config < state.vars <
-// the variables managed by `domain add` / `access enable` (managedVars).
+// from CI) never changes them. With AI off (state.ai === false, `setup
+// --no-ai`) it has no `ai` binding either. Variables merge as base config <
+// state.vars < the variables managed by `domain add` / `access enable` /
+// `setup --no-ai` (managedVars).
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -189,12 +191,15 @@ export function createRunDir() {
 }
 
 /**
- * The variables `domain add` and `access enable` manage, derived from the
- * state at every deploy.
+ * The variables `domain add`, `access enable` and `setup --no-ai` manage,
+ * derived from the state at every deploy. AI off sets AI_ENABLED=false, which
+ * wins over a --var, so the Worker never runs without the AI binding while
+ * its variable says AI is on.
  * @param {Record<string, any>} state
  */
 export function managedVars(state) {
   const m = {};
+  if (state?.ai === false) m.AI_ENABLED = "false";
   if (state?.domain?.host) {
     m.BASE_DOMAIN = state.domain.host;
     m.URL_MODE = state.domain.mode === "host" && state.domain.status === "active" ? "host" : "path";
@@ -218,13 +223,15 @@ export function computeVars(baseVars, state) {
 
 /**
  * The effective wrangler config: the base plus name, vars, the R2 binding and
- * workers_dev, without routes (warned about in a checkout's wrangler.jsonc).
+ * workers_dev, without routes (warned about in a checkout's wrangler.jsonc),
+ * and without the Workers AI binding when o.ai is false.
  * @param {Record<string, any>} base
- * @param {{worker: string, vars: Record<string, any>, bucket?: string, workersDev?: boolean, warnRoutes?: boolean}} o
+ * @param {{worker: string, vars: Record<string, any>, bucket?: string, workersDev?: boolean, ai?: boolean, warnRoutes?: boolean}} o
  */
 export function effectiveConfig(base, o) {
   const config = { ...base, name: o.worker, vars: o.vars, workers_dev: o.workersDev ?? true };
   if (o.bucket) config.r2_buckets = [{ binding: "R2", bucket_name: o.bucket }];
+  if (o.ai === false) delete config.ai;
   if (config.routes !== undefined || config.route !== undefined) {
     if (o.warnRoutes) ui.warn("routes in wrangler.jsonc are ignored; use domain add");
     delete config.routes;
@@ -284,6 +291,7 @@ export function writeConfig(layout, config, runDir) {
  * @property {string} url                    the URL in wrangler's output ("" when none)
  * @property {string} bucket
  * @property {boolean} workersDev
+ * @property {boolean} ai                    whether the Workers AI binding was deployed
  */
 
 /**
@@ -304,6 +312,7 @@ export async function deployWorker(ctx, state, o = {}) {
   const vars = computeVars(ctx.base.vars ?? {}, view);
   const bucket = o.bucket !== undefined ? o.bucket : state.r2Bucket ?? "";
   const workersDev = view.workersDev ?? true;
+  const ai = view.ai !== false;
   const cwd = ctx.cwd();
 
   let listed;
@@ -374,7 +383,7 @@ export async function deployWorker(ctx, state, o = {}) {
       else ui.ok(`Secret ${bold(name)} kept`);
     }
   } else {
-    const config = effectiveConfig(ctx.base, { worker, vars, bucket, workersDev, warnRoutes: ctx.layout.kind === "source" });
+    const config = effectiveConfig(ctx.base, { worker, vars, bucket, workersDev, ai, warnRoutes: ctx.layout.kind === "source" });
     const generated = writeConfig(ctx.layout, config, cwd);
     // Removed in the finally below, or by the command's cleanups on Ctrl-C (which exits at once).
     const removeGenerated = once(() => rmSync(generated, { force: true }));
@@ -392,7 +401,7 @@ export async function deployWorker(ctx, state, o = {}) {
     }
     const overrides = Object.keys(view.vars ?? {}).sort();
     if (overrides.length) ui.note(`Variable overrides: ${overrides.join(", ")}`);
-    ui.log(`\nDeploying Worker ${bold(worker)}${bucket ? ` with R2 bucket ${bold(bucket)}` : ""}…\n`);
+    ui.log(`\nDeploying Worker ${bold(worker)}${bucket ? ` with R2 bucket ${bold(bucket)}` : ""}${ai ? "" : `${bucket ? "," : ""} without AI`}…\n`);
     let r;
     try {
       r = await runWrangler(args, { cwd, quiet: o.quiet });
@@ -418,7 +427,7 @@ export async function deployWorker(ctx, state, o = {}) {
     state.deployToken = token;
     ctx.saveState(state);
   }
-  return { vars, token, secretsSet: Object.keys(secrets).sort(), output, url: findURL(output, worker), bucket, workersDev };
+  return { vars, token, secretsSet: Object.keys(secrets).sort(), output, url: findURL(output, worker), bucket, workersDev, ai };
 }
 
 /**
@@ -432,7 +441,8 @@ export async function deployWorker(ctx, state, o = {}) {
 export async function dryRunDeploy(ctx, state, o = {}) {
   const vars = computeVars(ctx.base.vars ?? {}, state);
   const bucket = o.bucket ?? state.r2Bucket ?? "";
-  const config = effectiveConfig(ctx.base, { worker: ctx.worker, vars, bucket, workersDev: state.workersDev ?? true, warnRoutes: ctx.layout.kind === "source" });
+  const ai = state.ai !== false;
+  const config = effectiveConfig(ctx.base, { worker: ctx.worker, vars, bucket, workersDev: state.workersDev ?? true, ai, warnRoutes: ctx.layout.kind === "source" });
   const cwd = ctx.cwd();
   const outBase = ctx.layout.kind === "packaged" ? cwd : mkdtempSync(join(tmpdir(), "backyard-cf-dry-run-"));
   const generated = writeConfig(ctx.layout, config, cwd);
@@ -453,7 +463,7 @@ export async function dryRunDeploy(ctx, state, o = {}) {
     const v = vars[k];
     ui.log(`  ${k}=${typeof v === "string" ? v : JSON.stringify(v)}`);
   }
-  ui.log(dim(`R2: ${bucket ? `bucket ${bucket}` : "none"} · workers.dev: ${config.workers_dev ? "on" : "off"} · layout: ${ctx.layout.kind}`));
+  ui.log(dim(`R2: ${bucket ? `bucket ${bucket}` : "none"} · AI: ${ai ? "on" : "off (no Workers AI binding)"} · workers.dev: ${config.workers_dev ? "on" : "off"} · layout: ${ctx.layout.kind}`));
   if (r.code !== 0) ui.error("wrangler deploy --dry-run failed (see the output above)");
   return r.code;
 }

@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 // `backyard-cloudflare setup`: deploys (or upgrades) Backyard on your
 // Cloudflare account, free plan included. Safe to re-run: every choice is kept
-// (secrets, the deploy token, R2, the domain, Access, --var overrides), and a
+// (secrets, the deploy token, R2, AI, the domain, Access, --var overrides), and a
 // machine without state adopts the deployed configuration first.
 //
 //   setup                          log in (browser) if needed, register the account's
 //                                  workers.dev subdomain if it has none, deploy, set secrets
 //                                  (and an R2 bucket for big files when R2 is enabled)
 //   setup --no-r2                  never use R2 (files capped at 25 MiB)
+//   setup --no-ai                  turn AI off: no Workers AI binding, AI_ENABLED=false (--ai: on again)
 //   setup --worker-name team       deploy under another Worker name
 //   setup --var LIMITS:'{"ai_per_day":50}'   override a variable (remembered; KEY: drops it)
 //   setup --rotate-token           issue a new DEPLOY_TOKEN
@@ -36,7 +37,7 @@ import { fileURLToPath } from "node:url";
 
 import { GO_CLI_INVOCATION } from "./cli.mjs";
 import { CfError } from "./lib/cfapi.mjs";
-import { MANAGED_ACCESS_KEYS, MANAGED_DOMAIN_KEYS, hostOf } from "./lib/live.mjs";
+import { MANAGED_ACCESS_KEYS, MANAGED_AI_KEYS, MANAGED_DOMAIN_KEYS, aiEnabledOf, hostOf } from "./lib/live.mjs";
 import { probe } from "./lib/net.mjs";
 import { CliError, EXIT, bold, cyan, dim, green, isCI, maskSecret, revealSecrets, ui, yellow } from "./lib/ui.mjs";
 
@@ -105,6 +106,19 @@ function refuseManagedVars(overrides, state, inv) {
     }
     if (state.access && MANAGED_ACCESS_KEYS.includes(k)) {
       throw new CliError(EXIT.USAGE, `${k} is managed by \`${inv} access enable\` (use \`${inv} access disable\`)`);
+    }
+  }
+}
+
+/**
+ * Refuses --var AI_ENABLED while AI is off (`setup --no-ai`, remembered):
+ * AI_ENABLED is managed then ("false", with no AI binding), so the variable
+ * can never say AI is on while the Worker has no binding.
+ */
+function refuseAIVar(overrides, aiOff, inv) {
+  for (const k of MANAGED_AI_KEYS) {
+    if (aiOff && Object.hasOwn(overrides, k)) {
+      throw new CliError(EXIT.USAGE, `${k} is managed by \`${inv} setup --no-ai\` while AI is off (\`${inv} setup --ai\` turns AI back on)`);
     }
   }
 }
@@ -253,6 +267,7 @@ export async function runSetup(opts, ctx) {
   const w = ctx.worker;
   const overrides = parseVarFlags(opts.var, w);
   if (opts.r2 && opts.noR2) throw new CliError(EXIT.USAGE, "--r2 and --no-r2 contradict each other");
+  if (opts.ai && opts.noAi) throw new CliError(EXIT.USAGE, "--ai and --no-ai contradict each other");
   if (opts.noR2 && opts.r2Bucket) throw new CliError(EXIT.USAGE, "--r2-bucket and --no-r2 contradict each other");
   if (opts.workersDev && opts.noWorkersDev) throw new CliError(EXIT.USAGE, "--workers-dev and --no-workers-dev contradict each other");
   if (opts.r2Bucket && !BUCKET_RE.test(opts.r2Bucket)) throw new CliError(EXIT.USAGE, `invalid bucket name ${JSON.stringify(opts.r2Bucket)}`);
@@ -264,18 +279,23 @@ export async function runSetup(opts, ctx) {
   }
   /** @type {boolean | undefined} */
   const r2Choice = opts.noR2 ? false : opts.r2 || opts.r2Bucket ? true : undefined;
+  /** @type {boolean | undefined} */
+  const aiChoice = opts.noAi ? false : opts.ai ? true : undefined;
+  /** Whether AI is off for this run: --no-ai, or remembered and no --ai. */
+  const aiOff = (state) => aiChoice === false || (aiChoice === undefined && state.ai === false);
   const baseVars = ctx.base.vars ?? {};
 
   if (opts.dryRun) {
     await ctx.syncAssets();
     const state = ctx.loadState();
     refuseManagedVars(overrides, state, inv);
+    refuseAIVar(overrides, aiOff(state), inv);
     const vars = { ...(state.vars ?? {}) };
     for (const [k, v] of Object.entries(overrides)) {
       if (v === "") delete vars[k];
       else vars[k] = v;
     }
-    const view = { ...state, vars };
+    const view = { ...state, vars, ai: aiOff(state) ? false : undefined };
     if (opts.workersDev) view.workersDev = true;
     if (opts.noWorkersDev) view.workersDev = false;
     const bucket = r2Choice === false ? "" : opts.r2Bucket || (state.r2 !== false ? state.r2Bucket : "") || (r2Choice ? `${w}-files` : "");
@@ -288,6 +308,7 @@ export async function runSetup(opts, ctx) {
   const state = ctx.loadState();
   const previousUrl = state.url ?? "";
   refuseManagedVars(overrides, state, inv);
+  refuseAIVar(overrides, aiOff(state), inv);
 
   await ctx.login(state);
   const api = await ctx.api();
@@ -295,6 +316,9 @@ export async function runSetup(opts, ctx) {
   // The live Worker: adopted by a machine without state, checked by the guard.
   const live = await ctx.readLive();
   if (ctx.adopt(state, live)) externalizeAdopted(state, overrides, baseVars);
+  // An adopted --no-ai makes AI_ENABLED managed: refuse a --var for it now,
+  // before the workers.dev subdomain or the R2 bucket is touched.
+  refuseAIVar(overrides, aiOff(state), inv);
 
   // The account's workers.dev subdomain (registered when there is none), once
   // the adopted setting and the flags are known: a Worker that does not serve
@@ -335,12 +359,25 @@ export async function runSetup(opts, ctx) {
     state.r2Bucket = undefined;
   }
 
+  // AI is on unless --no-ai (remembered as "ai": false); --ai turns it back
+  // on. While it is off the deploy has no Workers AI binding and AI_ENABLED is
+  // managed ("false", see managedVars), so no override of it is kept (a --var
+  // for it was refused above, right after adoption).
+  state.ai = aiOff(state) ? false : undefined;
+
   // Variable overrides: remembered across runs, an empty value drops one.
   refuseManagedVars(overrides, state, inv);
   const vars = { ...(state.vars ?? {}) };
   for (const [k, v] of Object.entries(overrides)) {
     if (v === "") delete vars[k];
     else vars[k] = v;
+  }
+  if (state.ai === false) {
+    for (const k of MANAGED_AI_KEYS) {
+      if (vars[k] === undefined) continue;
+      delete vars[k];
+      ui.note(`Dropped the ${k} override: with AI off (--no-ai) setup sets ${k}=false itself.`);
+    }
   }
   state.vars = Object.keys(vars).length ? vars : undefined;
   if (opts.noWorkersDev) {
@@ -407,7 +444,9 @@ export async function runSetup(opts, ctx) {
     ui.log(`Then: ${bold("backyard init my-site && cd my-site && backyard deploy")}`);
   }
   if (token) ui.note(`\nThe deploy token is saved in ${saved} (mode 0600).`);
-  ui.note("AI runs on Workers AI (free daily allowance); caps: --var LIMITS:'{\"ai_per_day\":50}'.");
+  if (state.ai === false) ui.note("AI is off (--ai turns it on): the AI endpoints answer 501 unsupported.");
+  else if (!aiEnabledOf(d.vars.AI_ENABLED)) ui.note("AI is off: AI_ENABLED is false (--var AI_ENABLED: drops it); the Workers AI binding stays.");
+  else ui.note("AI runs on Workers AI (free daily allowance); caps: --var LIMITS:'{\"ai_per_day\":50}'.");
   const noR2 = state.r2 === false ? "R2 is off (--r2 turns it on)" : `enable R2 on the account and re-run ${inv} setup for files up to 95 MiB`;
   ui.note(`Files: ${bucket ? `R2 bucket ${bucket} for files above FILE_INLINE_MAX` : `stored in Durable Objects (25 MiB per file); ${noR2}`}.`);
   if (!state.domain) ui.note(`Your own domain: ${inv} domain add <host>`);
