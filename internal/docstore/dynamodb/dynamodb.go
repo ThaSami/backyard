@@ -7,8 +7,9 @@
 //
 //   - documents: pk = "<site>#<collection>", sk = <id>, plus attributes
 //     data (S, the JSON body — preserving JSON types exactly), created_at and
-//     updated_at (N, unix nanoseconds), created_by / updated_by (S) and
-//     version (N).
+//     updated_at (N, unix nanoseconds), created_by / updated_by (S),
+//     version (N) and, when Create or UpdateIf wrote the item, w (S, a random
+//     identity of that write call).
 //   - collection counters: pk = "<site>#__collections", sk = <collection>,
 //     n (N), maintained with atomic ADD on every create and delete. Collections
 //     lists counters with n > 0 and Count sums them. Counters are updated
@@ -33,10 +34,11 @@
 // The SDK sends a write again when its answer is lost (an HTTP 500, which
 // DynamoDB documents as "may have succeeded", a dropped connection), and the
 // condition of that attempt then fails on what the first one stored. Create
-// and UpdateIf compare the item their condition failed on with the one they
-// wrote (version, data, actor and updated_at, a docstore.Now() time no other
-// write of the process repeats) and report their own write as done, not as a
-// conflict.
+// and UpdateIf give the item they write a random identity of the call (w) and
+// compare the item their condition failed on with the one they wrote: when it
+// is the same, w included, they report their own write as done, not as a
+// conflict. Data, actor, version and updated_at alone do not identify a write:
+// another replica can write the same values in the same microsecond.
 //
 // # Queries (limitation)
 //
@@ -56,6 +58,7 @@ package dynamodb
 
 import (
 	"context"
+	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -106,6 +109,9 @@ const (
 	attrUpdatedBy = "updated_by"
 	attrVersion   = "version"
 	attrCount     = "n"
+	// attrWrite holds a random identity of the Create or UpdateIf call that
+	// wrote the item; decodeItem ignores it.
+	attrWrite = "w"
 )
 
 // Store is a DynamoDB-backed document store.
@@ -308,9 +314,10 @@ func conditionFailure(err error) (map[string]types.AttributeValue, bool) {
 }
 
 // sameItem reports whether a stored item holds the attributes of want, an
-// item built by docItem, with the same values. Its updated_at is a docstore.Now()
-// timestamp, which no other write of this process repeats, so with the
-// version, data and actor it identifies one write.
+// item built by docItem, with the same values. want carries the write's own
+// identity (attrWrite, see writeID), which no other write repeats, in this
+// process or another: the same data, actor, version and updated_at can come
+// from another replica's write in the same microsecond.
 func sameItem(item, want map[string]types.AttributeValue) bool {
 	if len(item) == 0 {
 		return false
@@ -332,6 +339,11 @@ func sameItem(item, want map[string]types.AttributeValue) bool {
 	}
 	return true
 }
+
+// writeID returns a random identity for one conditional write call, stored
+// with its item as attrWrite. The SDK sends the same request again, so an
+// attempt it retries finds its own identity in the item an earlier one stored.
+func writeID() types.AttributeValue { return attrS(crand.Text()) }
 
 // apiError is the subset of smithy.APIError used to classify AWS errors.
 type apiError interface {
@@ -372,6 +384,7 @@ func (s *Store) Create(ctx context.Context, site, collection, id string, data ma
 		CreatedAt: now, UpdatedAt: now, CreatedBy: actor, UpdatedBy: actor, Version: 1,
 	}
 	item := docItem(d, raw)
+	item[attrWrite] = writeID()
 	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:           aws.String(s.table),
 		Item:                item,
@@ -383,7 +396,7 @@ func (s *Store) Create(ctx context.Context, site, collection, id string, data ma
 	})
 	if old, failed := conditionFailure(err); failed {
 		// An attempt the SDK sent again fails on the item an earlier one
-		// stored: that one is this write.
+		// stored: that one, its identity included, is this write.
 		if !sameItem(old, item) {
 			return nil, fmt.Errorf("%w: document %q already exists in %s", docstore.ErrConflict, id, collection)
 		}
@@ -597,6 +610,7 @@ func (s *Store) UpdateIf(ctx context.Context, site, collection, id string, rev d
 	next.UpdatedBy = actor
 	next.Version = cur.Version + 1
 	want := docItem(&next, raw)
+	want[attrWrite] = writeID()
 	cond, names, values := unchangedCondition(item)
 	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                           aws.String(s.table),
@@ -620,7 +634,7 @@ func (s *Store) UpdateIf(ctx context.Context, site, collection, id string, rev d
 		}
 	}
 	// An attempt the SDK sent again fails on this write, which an earlier
-	// one applied; anything else is another writer's.
+	// one applied (its identity included); anything else is another writer's.
 	if sameItem(old, want) {
 		return &next, nil
 	}

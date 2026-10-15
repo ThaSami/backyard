@@ -3,6 +3,7 @@ package dynamodb_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awsddb "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/thasami/backyard/internal/config"
 	"github.com/thasami/backyard/internal/docstore"
@@ -457,5 +459,151 @@ func TestRetriedConditionalWrites(t *testing.T) {
 	}
 	if _, err := s.Create(ctx, "site", "c", "taken", map[string]any{"exp": 1}, "alice"); !errors.Is(err, docstore.ErrConflict) {
 		t.Errorf("Create of an existing document = %v; want a conflict", err)
+	}
+}
+
+// twinWrite stores, once armed, the item of the first request for op whose
+// body contains mark through another client before forwarding the request,
+// with every attribute other than the document's own passed through edit.
+// It plays a second replica that wrote the same document in the same
+// microsecond, as the same actor, with the same data.
+type twinWrite struct {
+	op, mark string
+	client   *awsddb.Client
+	table    string
+	edit     func(name string, v types.AttributeValue) (types.AttributeValue, bool)
+	mu       sync.Mutex
+	err      error
+	fired    bool
+}
+
+func (w *twinWrite) arm(mark string, edit func(string, types.AttributeValue) (types.AttributeValue, bool)) {
+	w.mu.Lock()
+	w.mark, w.edit, w.err, w.fired = mark, edit, nil, false
+	w.mu.Unlock()
+}
+
+func (w *twinWrite) RoundTrip(r *http.Request) (*http.Response, error) {
+	if !strings.HasSuffix(r.Header.Get("X-Amz-Target"), "."+w.op) || r.Body == nil {
+		return http.DefaultTransport.RoundTrip(r)
+	}
+	body, err := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	r = r.Clone(r.Context())
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	w.mu.Lock()
+	edit := w.edit
+	if edit == nil || !strings.Contains(string(body), w.mark) {
+		w.mu.Unlock()
+		return http.DefaultTransport.RoundTrip(r)
+	}
+	w.edit, w.fired = nil, true
+	w.mu.Unlock()
+	var in struct{ Item map[string]map[string]string }
+	err = json.Unmarshal(body, &in)
+	twin := map[string]types.AttributeValue{}
+	for name, v := range in.Item {
+		var av types.AttributeValue
+		if s, ok := v["S"]; ok {
+			av = &types.AttributeValueMemberS{Value: s}
+		} else if n, ok := v["N"]; ok {
+			av = &types.AttributeValueMemberN{Value: n}
+		} else {
+			err = errors.Join(err, fmt.Errorf("attribute %s: %v", name, v))
+			continue
+		}
+		switch name {
+		case "pk", "sk", "data", "created_at", "updated_at", "created_by", "updated_by", "version":
+			twin[name] = av
+		default:
+			if av, ok := edit(name, av); ok {
+				twin[name] = av
+			}
+		}
+	}
+	if err == nil {
+		_, err = w.client.PutItem(r.Context(), &awsddb.PutItemInput{TableName: aws.String(w.table), Item: twin})
+	}
+	w.mu.Lock()
+	w.err = err
+	w.mu.Unlock()
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// Two replicas can write the same document in the same microsecond (each
+// keeps docstore.Now() increasing only within its process), as the same
+// actor and with the same data: two takers of a lease, two redemptions of a
+// code. A conditional write that fails on the other one's is a conflict, not
+// a write of its own the SDK sent again, and Create leaves the counter alone.
+func TestConditionalWriteRacedByIdenticalWrite(t *testing.T) {
+	ep := testEndpoint(t)
+	plain := testClient(ep)
+	table := testTable(t, plain)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	other, err := dynamodb.New(ctx, plain, config.DynamoDBConfig{Table: table, CreateTable: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	twin := &twinWrite{op: "PutItem", client: plain, table: table}
+	s, err := dynamodb.New(ctx, awsddb.New(awsddb.Options{
+		Region:       "us-east-1",
+		BaseEndpoint: aws.String(ep),
+		Credentials:  credentials.NewStaticCredentialsProvider("test", "test", ""),
+		HTTPClient:   &http.Client{Transport: twin},
+	}), config.DynamoDBConfig{Table: table})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(string, types.AttributeValue) (types.AttributeValue, bool)
+	}{
+		{"another replica", func(_ string, v types.AttributeValue) (types.AttributeValue, bool) {
+			if s, ok := v.(*types.AttributeValueMemberS); ok {
+				return &types.AttributeValueMemberS{Value: s.Value + "-other"}, true
+			}
+			return &types.AttributeValueMemberN{Value: v.(*types.AttributeValueMemberN).Value + "1"}, true
+		}},
+		{"an older version", func(string, types.AttributeValue) (types.AttributeValue, bool) { return nil, false }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "lease-" + strings.ReplaceAll(tc.name, " ", "-")
+			fired := func(what string) {
+				t.Helper()
+				twin.mu.Lock()
+				defer twin.mu.Unlock()
+				if !twin.fired || twin.err != nil {
+					t.Fatalf("%s: the twin write ran %v: %v", what, twin.fired, twin.err)
+				}
+			}
+			before, err := other.Count(ctx, "site")
+			if err != nil {
+				t.Fatal(err)
+			}
+			twin.arm("attribute_not_exists", tc.edit)
+			_, err = s.Create(ctx, "site", "c", id, map[string]any{"exp": 1}, "alice")
+			fired("Create")
+			if !errors.Is(err, docstore.ErrConflict) {
+				t.Errorf("Create raced by an identical write = %v; want a conflict", err)
+			}
+			if n, err := other.Count(ctx, "site"); err != nil || n != before {
+				t.Errorf("Count after the losing Create = %d, %v; want %d", n, err, before)
+			}
+
+			cur, err := other.Get(ctx, "site", "c", id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			twin.arm("#c0", tc.edit)
+			_, err = s.UpdateIf(ctx, "site", "c", id, cur.Rev(), map[string]any{"exp": 2}, "taker")
+			fired("UpdateIf")
+			if !errors.Is(err, docstore.ErrConflict) {
+				t.Errorf("UpdateIf raced by an identical write = %v; want a conflict", err)
+			}
+		})
 	}
 }

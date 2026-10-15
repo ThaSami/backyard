@@ -16,8 +16,9 @@ import (
 // answered 429 instead when that budget is spent — except a valid request of
 // a signed-out browser in oidc mode, whose way to the login is never
 // charged. Requests that identify no one (junk from one address behind a
-// shared proxy) so never exhaust the budget of the people who connect from
-// the same address, signed in or not.
+// shared proxy) so never exhaust the budget of the signed-in people who
+// connect from the same address, nor block a browser on its way to the
+// login; guests (mode none) are keyed by that address and share its budget.
 
 // limitWriter applies the limit to one request.
 type limitWriter struct {

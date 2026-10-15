@@ -298,6 +298,13 @@ function connectorSuite() {
   // ---------------------------------------------------------------------------
 
   describe("client registration (SPEC §8.4.3)", () => {
+    test("the media type is compared without its parameters, malformed ones too", async () => {
+      for (const ct of ["application/json; charset=utf-8", "Application/JSON; charset", "application/json; a=1; a=2"]) {
+        const r = await oauth.register(P, { redirect_uris: [LOOPBACK] }, { headers: { "Content-Type": ct } });
+        assert.equal(r.status, 201, `Content-Type ${ct}: ${r}`);
+      }
+    });
+
     test("a loopback redirect URI registers a public client (201)", async () => {
       const name = `Conformance ${tag()}`;
       const before = Math.floor(Date.now() / 1000);
@@ -408,6 +415,11 @@ function connectorSuite() {
         ["a 513-byte redirect URI", { raw: JSON.stringify({ redirect_uris: [long] }) }, either],
         ["a client_id over 1024 bytes", { raw: JSON.stringify({ redirect_uris: [1, 2, 3, 4].map((n) => `http://127.0.0.1/${n}${"a".repeat(470)}`) }) }, ["invalid_client_metadata"]],
         ["a UTF-8 BOM before the JSON", { raw: "\ufeff" + JSON.stringify({ redirect_uris: [LOOPBACK] }) }, ["invalid_client_metadata"]],
+        [
+          "a body that is not UTF-8",
+          { raw: Buffer.concat([Buffer.from(`{"redirect_uris":["${LOOPBACK}"],"client_name":"a`), Buffer.from([0xff]), Buffer.from(`b"}`)]) },
+          ["invalid_client_metadata"],
+        ],
       ]) {
         const r = await oauth.register(P, null, opts);
         assert.equal(r.status, 400, `${what}: ${r}`);
@@ -870,6 +882,8 @@ function connectorSuite() {
       assert.equal(accept.json.error.code, "bad_request");
       for (const headers of [
         { "Content-Type": "application/json; charset=utf-8" },
+        { "Content-Type": "Application/JSON; charset" },
+        { "Content-Type": "application/json; a=1; a=2" },
         { Accept: "*/*" },
         { Accept: "application/*" },
         { Accept: "application/json" },

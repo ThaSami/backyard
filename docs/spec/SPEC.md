@@ -886,6 +886,10 @@ consent page and issues its own tokens.
   fragment part; then lowercase the scheme and host, drop `:443` for https and `:80` for http,
   remove exactly one trailing `/` from a non-empty path, and leave percent-encoding as is. The
   result must equal R byte for byte.
+* **Media type:** wherever the connector checks a `Content-Type` (the bodies of §8.4.3–§8.4.7,
+  `/__backyard/mcp`, a client ID metadata document), only its media type counts: the part
+  before the first `;`, trimmed of whitespace and compared case-insensitively. Parameters,
+  malformed ones included (`application/json; charset`), are ignored.
 
 **Enablement.** Opt-in on both editions: Go `mcp.enabled` (default `false`, §12), Worker
 `MCP_ENABLED` (unset = off, §16). While it is off — on the Worker also while the MCP variables
@@ -994,7 +998,7 @@ reason. A success is cached for `max-age` clamped to 60–3600 s (300 s without 
 one fetch. The cache is per process (Go) or per isolate (Worker).
 
 **`POST /__backyard/oauth/register`** (RFC 7591, stateless; no authentication, no
-`X-Backyard`). The body is one JSON object (`Content-Type: application/json`, parameters
+`X-Backyard`). The body is one UTF-8 JSON object (`Content-Type: application/json`, parameters
 allowed, ≤ 16 KiB), else `400 {"error":"invalid_client_metadata","error_description":"…"}`.
 
 * `redirect_uris` is required: 1–4 strings of ≤ 512 bytes, each passing the redirect policy,
@@ -1069,7 +1073,9 @@ decides:
 
 1. Go only: the rate limit (§11), which applies to whichever answer the steps below give: a
    request is charged to the person once step 6 has identified them (per client IP for a
-   guest), any other request to its client IP; a spent budget turns the answer into a `429`
+   guest), any other request to its client IP — except a valid request of a browser without a
+   Backyard session in `oidc` mode (the redirect to the login of step 6, the "sign-in ended"
+   page of the `POST`), which is never charged; a spent budget turns the answer into a `429`
    page "Too many requests" with `Retry-After`.
 2. The raw request URI (path + query) is longer than 2048 bytes, the query cannot be parsed (a
    `;` separator or a malformed `%`-escape), or one of `response_type`, `client_id`,
@@ -1156,14 +1162,16 @@ mode, `""` everywhere else.
 
 **`POST /__backyard/auth/authorize`** (the consent decision):
 
-1. The body must be `application/x-www-form-urlencoded`, ≤ 16 KiB, UTF-8 → else a `400` page.
+1. The body must be `application/x-www-form-urlencoded`, ≤ 16 KiB, UTF-8 and parseable (no
+   `;` separator, no malformed `%`-escape) → else a `400` page "Invalid authorization
+   request".
 2. Go only: the rate limit, as for `GET` (step 4 identifies the person).
 3. Browser signals → `403` page "This approval was not sent from the Backyard page", no
    redirect, when `Sec-Fetch-Site` is present and ≠ `same-origin`; or `Origin` is present and
    neither the hub origin, the request's own origin nor `null`; or `Sec-Fetch-Mode` is present
    and ≠ `navigate`; or `Sec-Fetch-Dest` is present and ≠ `document`.
-4. GET steps 3–6 run again on the form fields, plus the parsing and repeated-field checks of
-   step 2 (the 2048-byte cap applies only to `GET`); redirect errors use **`303`**.
+4. GET steps 3–6 run again on the form fields, plus the repeated-field check of step 2 (the
+   2048-byte cap applies only to `GET`); redirect errors use **`303`**.
    `response_type`, `code_challenge_method` and `resource` are required in the form (a missing
    one fails as in step 5; a missing `resource` → `invalid_request` "resource is required"). Go
    `oidc` without a session → `401` page "Your Backyard sign-in ended" with a link to the login
@@ -1447,8 +1455,9 @@ the user of the grant a code or refresh token names; per client IP for guests) a
 when it identifies no one — except that a valid authorization request of a browser without a
 Backyard session in `oidc` mode (the redirect to the login, or the "sign-in ended" page of the
 consent `POST`) is not charged — so failed requests from one address (all of a proxy's clients
-when `trusted_proxies` cannot resolve them) never lock out the people who connect through it,
-signed in or not. The MCP endpoint is charged to `api_per_minute` keyed by the connection's user
+when `trusted_proxies` cannot resolve them) never lock out the signed-in people who connect
+through it, nor a browser on its way to the login; guests (`auth.mode: none`) share their
+address's budget. The MCP endpoint is charged to `api_per_minute` keyed by the connection's user
 (`429 rate_limited` with `Retry-After`), and `backyard_publish` to `deploys_per_hour` keyed by
 that user (guests included). The Cloudflare edition's daily caps are in §16. Its fixed limits:
 
@@ -1670,9 +1679,9 @@ the §5 envelope unless noted:
 5. Go only: `api_per_minute` keyed by the user (§11) → `429 rate_limited` with `Retry-After`.
 6. A method other than `POST` (`GET`, `DELETE`, `PUT`, `PATCH`, `OPTIONS`, `HEAD`) → `405` with
    `Allow: POST`.
-7. A `Content-Type` whose media type is not `application/json` → `415` (`bad_request`). An
-   `Accept` header that admits none of `application/json`, `application/*` and `*/*` → `400`
-   (`bad_request`); no `Accept` is fine.
+7. A `Content-Type` whose media type (§8.4.1) is not `application/json` → `415`
+   (`bad_request`). An `Accept` header that admits none of `application/json`, `application/*`
+   and `*/*` → `400` (`bad_request`); no `Accept` is fine.
 8. **`MCP-Protocol-Version`.** Absent means `2025-06-18` (§8.4.11). Any value other than
    `2025-11-25` and `2025-06-18` → `400`, `Content-Type: application/json`,
    `{"jsonrpc":"2.0","id":null,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2025-11-25","2025-06-18"],"requested":"<value>"}}}`.
@@ -1685,9 +1694,10 @@ the §5 envelope unless noted:
    must arrive within 10 s + n / 65536 s (an average of 64 KiB/s, never later than the 5 min
    below), else `400 bad_request` (the connection's read deadline moves with the body). A
    smaller body is read under `server.read_timeout`. For every request the write deadline
-   becomes now + 5 min before the body is read, and the read deadline now + 5 min once it is
-   read in full. A body cut off (by the pace or `server.read_timeout`) or too large is answered
-   at once with `Connection: close`; its unread rest is not drained.
+   becomes now + 5 min before the body is read, and once the body is read in full the read
+   deadline becomes that same instant (net/http's background read of the connection then
+   cancels the request at that moment). A body cut off (by the pace or `server.read_timeout`)
+   or too large is answered at once with `Connection: close`; its unread rest is not drained.
 10. **JSON-RPC parsing** (`400`, `id: null`): invalid JSON — a body that is not valid UTF-8
     included — →
     `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}`; a JSON array →
@@ -1948,10 +1958,11 @@ storage are available on free); R2 and paid features are optional.
   is atomic per site: `SiteDO.deployMerge` computes the merged file set, checks the limits and
   switches the manifest in one transaction, so concurrent calls never lose each other's files;
   a call that the site limits refuse (E6, E13, E14) for the site as it is uploads nothing.
-  It is capped at `LIMITS.mcp_publish_bytes` (default 2097152) decoded bytes per call, and every
-  `tools/call` counts against `LIMITS.mcp_calls_per_day` (default 5000 per user; `429` when
-  exhausted). On the Workers Free plan's CPU limit large publish calls (base64 decoding and
-  hashing) may fail; lower `mcp_publish_bytes` there if they do.
+  It is capped at `LIMITS.mcp_publish_bytes` (default 2097152) decoded bytes per call, and
+  `tools/call` requests that name a catalog tool with valid `params` count against
+  `LIMITS.mcp_calls_per_day` (default 5000 per user; `429` when exhausted; §14.1 step 12). On
+  the Workers Free plan's CPU limit large publish calls (base64 decoding and hashing) may fail;
+  lower `mcp_publish_bytes` there if they do.
 * **Guardrails (free tier):** per-user/IP daily caps for AI calls, generated images, deploys,
   uploads and document writes, platform-wide daily AI caps, and a platform-wide site cap
   (reserved atomically, so parallel first deploys cannot exceed it), stored in `RegistryDO`;

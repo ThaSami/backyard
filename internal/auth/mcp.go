@@ -406,3 +406,11 @@ func (m *MCP) RevokeUser(ctx context.Context, userID string, actor *identity.Use
 	}
 	return m.revokeUserGrants(ctx, userID, actor, via)
 }
+
+// MediaType returns the media type of a Content-Type value, lowercased, with
+// its parameters ignored, malformed ones included: the connector's endpoints
+// compare only this, as the Worker does (SPEC §8.4, §14.1).
+func MediaType(contentType string) string {
+	mt, _, _ := strings.Cut(contentType, ";")
+	return strings.ToLower(strings.TrimSpace(mt))
+}

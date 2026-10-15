@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -150,12 +149,12 @@ func (m *MCP) verifyDCRClient(id string) (*mcpClient, bool) {
 // serveRegister implements POST /__backyard/oauth/register (SPEC §8.4.3).
 func (m *MCP) serveRegister(w http.ResponseWriter, r *http.Request) {
 	fail := func(code, desc string) { writeOAuthError(w, http.StatusBadRequest, code, desc) }
-	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+	if MediaType(r.Header.Get("Content-Type")) != "application/json" {
 		fail("invalid_client_metadata", "the request body must be application/json")
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxOAuthBody))
-	if err != nil {
+	if err != nil || !utf8.Valid(body) {
 		fail("invalid_client_metadata", "the request body must be one JSON object of at most 16 KiB")
 		return
 	}
@@ -480,8 +479,7 @@ func (m *MCP) fetchCIMD(ctx context.Context, id string) (*mcpClient, time.Durati
 	if resp.StatusCode != http.StatusOK {
 		return nil, 0, fmt.Errorf("it answered HTTP %d", resp.StatusCode)
 	}
-	mt, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	if err != nil || (mt != "application/json" && !strings.HasSuffix(mt, "+json")) {
+	if mt := MediaType(resp.Header.Get("Content-Type")); mt != "application/json" && !strings.HasSuffix(mt, "+json") {
 		return nil, 0, errors.New("it is not JSON (Content-Type " + strconv.Quote(truncate(resp.Header.Get("Content-Type"), 64)) + ")")
 	}
 	if resp.ContentLength > cimdMaxBytes {

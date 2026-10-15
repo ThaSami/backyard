@@ -574,3 +574,64 @@ func TestMCPCIMDGuardedByDefault(t *testing.T) {
 	}
 	_ = url.Values{}
 }
+
+// A Content-Type is compared by its media type alone, as on the Worker: a
+// malformed parameter (one without a value, one repeated) does not turn a
+// JSON or form body away at any endpoint of the connector, nor a client ID
+// metadata document (SPEC §8.4).
+func TestMCPMediaTypeParameters(t *testing.T) {
+	e := newMCPEnv(t, ModeNone, nil)
+	r := postJSON(OAuthRegisterPath, `{"redirect_uris":["`+loopbackCB+`"]}`)
+	r.Header.Set("Content-Type", "Application/JSON; charset")
+	res := e.do(r)
+	m := jsonBody(t, res)
+	id, _ := m["client_id"].(string)
+	if res.StatusCode != http.StatusCreated || id == "" {
+		t.Fatalf("register with a malformed parameter: %d %v", res.StatusCode, m)
+	}
+
+	f := newFlow(id, loopbackCB)
+	b := newBrowser()
+	form, _ := consentFields(t, e.authorize(b, authzParams(id, loopbackCB, f.challenge, f.state)))
+	form.Set("decision", "allow")
+	r = b.request(http.MethodPost, testIssuer+AuthorizePath, form)
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset")
+	r.Header.Set("Sec-Fetch-Site", "same-origin")
+	code := redirectParams(t, e.do(r), http.StatusSeeOther, loopbackCB).Get("code")
+
+	r = oauthPost(OAuthTokenPath, url.Values{
+		"grant_type": {"authorization_code"}, "code": {code}, "code_verifier": {f.verifier},
+		"client_id": {id}, "redirect_uri": {loopbackCB},
+	})
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded; a=1; a=2")
+	res = e.do(r)
+	m = jsonBody(t, res)
+	rt, _ := m["refresh_token"].(string)
+	if res.StatusCode != http.StatusOK || rt == "" {
+		t.Fatalf("token exchange with a repeated parameter: %d %v", res.StatusCode, m)
+	}
+	r = oauthPost(OAuthRevokePath, url.Values{"token": {rt}, "client_id": {id}})
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset")
+	if res := e.do(r); res.StatusCode != http.StatusOK {
+		t.Errorf("revoke with a malformed parameter: %d %s", res.StatusCode, body(t, res))
+	}
+	if e.grantCount() != 0 {
+		t.Error("the revocation did not revoke the grant")
+	}
+
+	s := newCIMDServer(t)
+	s.set(func(s *cimdServer) { s.ctype = "application/json; charset" })
+	ce, cid := cimdEnv(t, s)
+	_, ch := pkce()
+	consentFields(t, ce.authorize(newBrowser(), authzParams(cid, claudeCB, ch, "s")))
+}
+
+// The registration body is UTF-8 JSON, as every other body of the
+// connector: invalid bytes are refused, not replaced (SPEC §8.4.3).
+func TestMCPRegisterNotUTF8(t *testing.T) {
+	e := newMCPEnv(t, ModeNone, nil)
+	res := e.do(postJSON(OAuthRegisterPath, `{"redirect_uris":["`+loopbackCB+`"],"client_name":"a`+"\xff"+`b"}`))
+	if m := jsonBody(t, res); res.StatusCode != http.StatusBadRequest || m["error"] != "invalid_client_metadata" {
+		t.Errorf("a body that is not UTF-8: %d %v; want 400 invalid_client_metadata", res.StatusCode, m)
+	}
+}

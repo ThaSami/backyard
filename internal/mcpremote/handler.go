@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"mime"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -297,7 +296,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 7. Media types.
-	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+	if auth.MediaType(r.Header.Get("Content-Type")) != "application/json" {
 		writeError(w, http.StatusUnsupportedMediaType, "bad_request", "send the JSON-RPC message as application/json")
 		return
 	}

@@ -192,7 +192,10 @@ func TestMediaTypes(t *testing.T) {
 			t.Errorf("Content-Type %q: %s", ct, w.Body)
 		}
 	}
-	wantResponse(t, e.post(initialize, "Content-Type", "application/json; charset=utf-8"), http.StatusOK, "")
+	// Parameters are ignored, malformed ones too (as on the Worker).
+	for _, ct := range []string{"application/json; charset=utf-8", "Application/JSON; charset", "application/json; a=1; a=2", "application/json;"} {
+		wantResponse(t, e.post(initialize, "Content-Type", ct), http.StatusOK, "")
+	}
 	for _, a := range []string{"", "application/json", "*/*", "application/*", "text/event-stream, application/json;q=0.9"} {
 		if w := e.post(initialize, "Accept", a); w.Code != http.StatusOK {
 			t.Errorf("Accept %q: %d", a, w.Code)

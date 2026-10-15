@@ -10,7 +10,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"mime"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -106,7 +105,7 @@ func (m *MCP) issueAccess(g *grantRecord) (string, int64) {
 // readOAuthForm reads an application/x-www-form-urlencoded body of at most
 // 16 KiB. A parameter sent twice is an error (RFC 6749 §3.1).
 func readOAuthForm(w http.ResponseWriter, r *http.Request) (url.Values, string) {
-	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/x-www-form-urlencoded" {
+	if MediaType(r.Header.Get("Content-Type")) != "application/x-www-form-urlencoded" {
 		return nil, "the request body must be application/x-www-form-urlencoded"
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxOAuthBody))

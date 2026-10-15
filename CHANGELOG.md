@@ -71,7 +71,8 @@ All notable changes to Backyard are documented here. The format follows
 
 - DynamoDB: a create whose answer was lost (an HTTP 500 or a dropped connection, after which
   the AWS SDK sends the write again) no longer fails with `409 conflict` on the document it
-  had just created.
+  had just created. Each such write stores a random identity in a new item attribute `w`, so
+  the same document written by another server in the same microsecond is still a conflict.
 
 ## [0.1.0] - 2026-10-14
 

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"mime"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -193,7 +192,7 @@ func (q *authzRequest) auditRecord() *grantRecord {
 
 // readConsentForm reads the urlencoded, UTF-8 consent form (≤ 16 KiB).
 func readConsentForm(w http.ResponseWriter, r *http.Request) (url.Values, bool) {
-	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/x-www-form-urlencoded" {
+	if MediaType(r.Header.Get("Content-Type")) != "application/x-www-form-urlencoded" {
 		return nil, false
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxOAuthBody))
