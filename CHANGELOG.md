@@ -6,6 +6,8 @@ All notable changes to Backyard are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-15
+
 ### Added
 
 - `auth.allowed_emails`: admit exact (verified) email addresses. An address passes when its
@@ -395,5 +397,6 @@ zero-config backend for every site.
 - Further hardening from an adversarial review of both editions: stricter input validation,
   safer defaults and narrower error messages.
 
-[Unreleased]: https://github.com/thasami/backyard/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/thasami/backyard/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/thasami/backyard/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/thasami/backyard/releases/tag/v0.1.0

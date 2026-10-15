@@ -102,7 +102,7 @@ To use the module from your own configuration:
 
 ```hcl
 module "backyard" {
-  source = "git::https://github.com/thasami/backyard.git//deploy/terraform/aws?ref=v0.1.0"
+  source = "git::https://github.com/thasami/backyard.git//deploy/terraform/aws?ref=v0.2.0"
 
   domain          = "backyard.acme.com"
   route53_zone_id = "Z0123456789ABCDEFGHIJ"

@@ -6,9 +6,9 @@ description: >-
   websockets and identity.
 type: application
 # Chart version (SemVer); bump on every chart change.
-version: 0.1.0
+version: 0.2.0
 # Default image tag (image.tag overrides it).
-appVersion: "0.1.0"
+appVersion: "0.2.0"
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/thasami/backyard
 sources:
