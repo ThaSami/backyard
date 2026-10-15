@@ -6,6 +6,18 @@ All notable changes to Backyard are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Maintainers can publish an existing release's `backyard-cloudflare` package to npm by hand
+  (Actions → Publish to npm, with the release's tag): the release's own asset, checked against
+  its `checksums.txt`, with provenance. The release's npm job runs the same workflow
+  (`.github/workflows/npm-publish.yml`).
+
+### Changed
+
+- npm publishing keeps `latest` on the newest version: a release of an older line (`v1.4.1`
+  after `latest` 1.5.0) gets the dist-tag `release-1.4` instead of moving `latest` back.
+
 ## [0.2.0] - 2026-10-15
 
 ### Added

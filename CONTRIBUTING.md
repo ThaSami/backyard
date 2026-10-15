@@ -272,21 +272,31 @@ To try the packaged Cloudflare flow before a release, run `make cloudflare-pack`
 
 ### npm
 
-When the repository variable `BACKYARD_NPM_PUBLISH` is `true`, the release's `npm` job downloads
-the package from the GitHub release, verifies it against `checksums.txt` and publishes exactly
-those bytes to npm as `backyard-cloudflare`, with provenance (dist-tag `latest`, or `next` for a
-pre-release tag such as `v1.2.0-rc.1`). It is the only job with an OIDC token
-(`id-token: write`), and the only one that runs in the `npm` environment (Settings →
-Environments → New environment, named `npm`):
+When the repository variable `BACKYARD_NPM_PUBLISH` is `true`, the release's `npm` job runs the
+[npm workflow](.github/workflows/npm-publish.yml), which downloads the package from the GitHub
+release, verifies it against `checksums.txt` and publishes exactly those bytes to npm as
+`backyard-cloudflare`, with provenance. The dist-tag is `latest`, `next` for a pre-release tag
+such as `v1.2.0-rc.1`, or `release-X.Y` for a release of an older line (`v1.4.1` after npm's
+`latest` 1.5.0), which leaves `latest` alone. Its job is the only one with an OIDC token
+(`id-token: write`, which the release's `npm` job passes on), and the only one that runs in the
+`npm` environment (Settings → Environments → New environment, named `npm`):
 
 - **`NPM_TOKEN`**: a secret of the `npm` environment, so no other job can read it (a repository
   secret works too). The environment can also require a reviewer's approval before each publish;
-  if you limit its deployment branches and tags, allow the tags `v*`.
+  if you limit its deployment branches and tags, allow the tags `v*` (and the branch you run the
+  npm workflow from by hand, below).
 - **`BACKYARD_NPM_PUBLISH`**: a **repository** variable (Settings → Secrets and variables →
   Actions → Variables → Repository variables), not a variable of the `npm` environment. The
   `npm` job's `if:` and the `goreleaser` job, which names the package in the release notes,
   cannot read environment variables, so a switch set only in the environment leaves the job
   skipped.
+
+To publish a release whose npm job was skipped or failed, run the npm workflow by hand: Actions →
+**Publish to npm** → Run workflow, with the release's tag (`vX.Y.Z`) as input. Under "Use
+workflow from", pick that tag when it contains `npm-publish.yml` (releases after 0.2.0), so the
+provenance names the release's commit; otherwise pick `main`, and the provenance names `main`'s
+commit, while the bytes are still the release's own. GitHub re-runs a skipped job only by
+re-running the whole release, which would build and upload everything again, so do not.
 
 The guides show `npx backyard-cloudflare@latest setup` for people with only Node.js (saying it
 works once a release has published the package), so the canonical repository should publish:
@@ -295,7 +305,7 @@ works once a release has published the package), so the canonical repository sho
    (private repositories are rejected even for public packages). Make the repository public
    before setting `BACKYARD_NPM_PUBLISH` to `true`: while it is private, the `goreleaser` job
    fails before anything is published when the variable is on. If an `npm` job failed for this
-   reason, make the repository public and re-run that job.
+   reason, make the repository public and re-run that job (or run the npm workflow by hand).
 2. **First release (name registration).** The first real release registers `backyard-cloudflare`
    on npm under the maintainer account. The docs name the package, so register it before the
    repository becomes public, where anyone could read the name and publish it first: with the

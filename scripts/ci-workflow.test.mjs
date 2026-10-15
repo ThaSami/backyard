@@ -10,7 +10,8 @@
 // release.yml and .goreleaser.yaml: a read-only job builds and tests the
 // backyard-cloudflare package (no npm code runs where a write token is), the
 // GoReleaser job checks its SHA-256, embeds it in the CLI and attaches it; npm
-// gets the release's own bytes, with provenance (public repositories only).
+// gets the release's own bytes, with provenance (public repositories only),
+// from npm-publish.yml, which the release calls and maintainers can run by hand.
 //
 // cloudflare-deploy.yml: only a manual run can confirm an auth downgrade.
 //
@@ -18,7 +19,9 @@
 // indented keys under `jobs:`, steps the six-space indented list items.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,6 +30,7 @@ const read = (...parts) => readFileSync(join(root, ...parts), "utf8");
 const workflows = {
   "ci.yml": read(".github", "workflows", "ci.yml"),
   "release.yml": read(".github", "workflows", "release.yml"),
+  "npm-publish.yml": read(".github", "workflows", "npm-publish.yml"),
   "cloudflare-deploy.yml": read(".github", "workflows", "cloudflare-deploy.yml"),
 };
 const goreleaser = read(".goreleaser.yaml");
@@ -61,6 +65,21 @@ function job(name, file = "ci.yml") {
 /** The steps of a job, each as its text. */
 function steps(jobText) {
   return jobText.split(/\n(?= {6}- )/).filter((s) => /^ {6}- /.test(s));
+}
+
+/** The script of a step's run: (a one-liner or the indented block under `run: |`). */
+function runScript(stepText) {
+  const lines = stepText.split("\n");
+  const i = lines.findIndex((l) => /^ {8}run:/.test(l));
+  if (i < 0) return "";
+  const first = lines[i].replace(/^ {8}run:\s*/, "");
+  if (!/^[|>]/.test(first)) return first;
+  const out = [];
+  for (const l of lines.slice(i + 1)) {
+    if (l.trim() !== "" && !/^ {10}/.test(l)) break;
+    out.push(l);
+  }
+  return out.join("\n");
 }
 
 /** The index of the only step that matches pred (a RegExp or a substring). */
@@ -189,12 +208,14 @@ test("the GoReleaser job runs no npm code, verifies the package and pins its dig
 });
 
 test("no release job with a write permission runs npm code or keeps checkout credentials", () => {
-  for (const name of jobNames("release.yml")) {
-    const text = job(name, "release.yml");
-    if (!/^ {6}[a-z-]+: write\b/m.test(text)) continue;
-    assert.doesNotMatch(text, /make cloudflare|npm (ci|install|test|run|exec)\b|npx /, `job ${name} has a write permission`);
-    for (const s of steps(text).filter((s) => s.includes("actions/checkout"))) {
-      assert.match(s, /persist-credentials: false/, `job ${name} has a write permission`);
+  for (const file of ["release.yml", "npm-publish.yml"]) {
+    for (const name of jobNames(file)) {
+      const text = job(name, file);
+      if (!/^ {6}[a-z-]+: write\b/m.test(text)) continue;
+      assert.doesNotMatch(text, /make cloudflare|npm (ci|install|test|run|exec)\b|npx /, `${file}: job ${name} has a write permission`);
+      for (const s of steps(text).filter((s) => s.includes("actions/checkout"))) {
+        assert.match(s, /persist-credentials: false/, `${file}: job ${name} has a write permission`);
+      }
     }
   }
 });
@@ -207,35 +228,127 @@ test("with npm publishing on, a private repository fails the release before GoRe
   assert.ok(guard < stepIndex(list, "goreleaser/goreleaser-action", "running GoReleaser"), "before the GitHub release exists");
 });
 
-test("the npm job publishes the release's own package with provenance, only when switched on", () => {
+test("the release's npm job calls npm-publish.yml with the tag, only when switched on", () => {
   const npm = job("npm", "release.yml");
   assert.match(npm, /^ {4}needs: goreleaser$/m);
   assert.match(npm, /^ {4}if: vars\.BACKYARD_NPM_PUBLISH == 'true'$/m);
+  assert.match(npm, /^ {4}uses: \.\/\.github\/workflows\/npm-publish\.yml$/m);
+  assert.match(npm, /^ {4}with:\n {6}tag: \$\{\{ github\.ref_name \}\}$/m);
+  // Only NPM_TOKEN; a secret of that name in the npm environment takes precedence.
+  assert.match(npm, /^ {4}secrets:\n {6}NPM_TOKEN: \$\{\{ secrets\.NPM_TOKEN \}\}$/m);
+  assert.doesNotMatch(npm, /secrets: inherit/);
+  // A called workflow gets at most the permissions of the job that calls it.
+  assert.match(npm, /^ {4}permissions:\n {6}contents: read\n {6}id-token: write\b/m);
+});
+
+test("npm-publish.yml is called by the release or run by hand, with the tag of a release", () => {
+  const wf = workflows["npm-publish.yml"];
+  const on = wf.slice(wf.indexOf("\non:\n"), wf.indexOf("\npermissions:\n"));
+  const call = on.slice(on.indexOf("\n  workflow_call:\n"), on.indexOf("\n  workflow_dispatch:\n"));
+  assert.match(call, /^ {4}inputs:\n {6}tag:\n {8}description: .+\n {8}type: string\n {8}required: true$/m);
+  assert.match(call, /^ {4}secrets:\n {6}NPM_TOKEN:\n {8}required: false$/m, "the release passes NPM_TOKEN");
+  const dispatch = on.slice(on.indexOf("\n  workflow_dispatch:\n"));
+  assert.match(dispatch, /^ {4}inputs:\n {6}tag:\n {8}description: .+\n {8}type: string\n {8}required: true$/m);
+  assert.deepEqual(
+    [...on.matchAll(/^ {2}([a-z_]+):$/gm)].map((m) => m[1]),
+    ["workflow_call", "workflow_dispatch"],
+    "no other trigger",
+  );
+  assert.match(wf, /^permissions:\n {2}contents: read$/m);
+  assert.deepEqual(jobNames("npm-publish.yml"), ["npm"]);
+});
+
+test("npm-publish.yml publishes the release's own package with provenance", () => {
+  const npm = job("npm", "npm-publish.yml");
   assert.match(npm, /^ {4}environment:\n {6}name: npm$/m, "NPM_TOKEN can be a secret of the npm environment");
-  assert.match(npm, /^ {6}id-token: write\b/m);
-  assert.match(npm, /^ {6}contents: read$/m);
+  assert.match(npm, /^ {4}permissions:\n {6}contents: read\n {6}id-token: write\b/m);
   assert.doesNotMatch(npm, /contents: write|actions\/checkout|npm pack|make /, "npm gets the release asset, not a rebuild");
+  // The tag reaches the scripts as $TAG, never interpolated into them.
+  assert.match(npm, /^ {4}env:\n {6}TAG: \$\{\{ inputs\.tag \}\}$/m);
+  assert.doesNotMatch(npm, /GITHUB_REF_NAME#v/, "the tag input names the release, not the ref the run is on");
 
   const list = steps(npm);
+  const check = stepIndex(list, "name: Check the tag", "checking the tag");
+  const script = runScript(list[check]);
+  assert.ok(script.includes(`grep -Eqx 'v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?'`), `a release tag only:\n${script}`);
+  assert.ok(script.includes('[ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "$TAG" ]'), "run on another tag, the provenance would name its commit");
+  assert.match(list[check], /^ {10}PRIVATE: \$\{\{ github\.event\.repository\.private \}\}$/m);
+  assert.ok(script.includes('[ "$PRIVATE" = true ]'), "a private repository fails before anything is published");
+
   const node = stepIndex(list, "actions/setup-node", "setting up Node");
   assert.match(list[node], /registry-url: "https:\/\/registry\.npmjs\.org"/);
   const download = stepIndex(list, "gh release download", "downloading the release asset");
-  assert.match(list[download], /--pattern 'backyard-cloudflare-\*\.tgz' --pattern checksums\.txt --dir pkg/);
+  const fetch = runScript(list[download]);
+  assert.ok(fetch.includes('gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft'), "a published release only");
+  assert.ok(fetch.includes('[ "$draft" != false ]'));
+  assert.ok(
+    fetch.includes(`gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'backyard-cloudflare-*.tgz' --pattern checksums.txt --dir pkg`),
+    fetch,
+  );
   const verify = stepIndex(list, "sha256sum", "verifying the download");
   assert.match(list[verify], /sha256sum --ignore-missing -c checksums\.txt/);
-  assert.ok(list[verify].includes("backyard-cloudflare-${GITHUB_REF_NAME#v}\\.tgz$\" checksums.txt"), "the package must be listed");
+  assert.ok(list[verify].includes('backyard-cloudflare-${TAG#v}\\.tgz$" checksums.txt'), "the package must be listed");
   const publish = stepIndex(list, "npm publish", "publishing");
   assert.match(list[publish], /NODE_AUTH_TOKEN: \$\{\{ secrets\.NPM_TOKEN \}\}/);
-  assert.match(list[publish], /npm publish "\.\/pkg\/backyard-cloudflare-\$\{GITHUB_REF_NAME#v\}\.tgz" --provenance --access public --tag "\$tag"/);
-  assert.match(list[publish], /case "\$GITHUB_REF_NAME" in \*-\*\) tag=next ;; esac/, "pre-releases do not move latest");
-  assert.ok(node < download && download < verify && verify < publish, "download → verify → publish");
+  assert.ok(runScript(list[publish]).includes('if [ -z "$NODE_AUTH_TOKEN" ]; then'), "a missing token fails the job");
+  assert.ok(list[publish].includes('version="${TAG#v}"'));
+  assert.ok(
+    list[publish].includes('npm publish "./pkg/backyard-cloudflare-${version}.tgz" --provenance --access public --tag "$tag"'),
+    list[publish],
+  );
+  assert.ok(check < node && node < download && download < verify && verify < publish, "check → download → verify → publish");
 });
 
-test("only the npm job runs in the npm environment, whose NPM_TOKEN no other job may read", () => {
-  for (const name of jobNames("release.yml")) {
-    if (name === "npm") continue;
-    assert.doesNotMatch(job(name, "release.yml"), /^ {4}environment:/m, `job ${name}`);
+test("npm-publish.yml picks the dist-tag: latest, next for a pre-release, release-X.Y for an older line", () => {
+  const list = steps(job("npm", "npm-publish.yml"));
+  const script = runScript(list[stepIndex(list, "npm publish", "publishing")]);
+  // The script up to npm publish, with a fake npm whose `npm view` prints
+  // npm's current latest (and fails, like E404, when there is none).
+  const choose = script.slice(script.indexOf('version="${TAG#v}"'), script.indexOf("npm publish "));
+  const dir = mkdtempSync(join(tmpdir(), "npm-publish-"));
+  writeFileSync(join(dir, "npm"), '#!/bin/sh\n[ -n "$FAKE_LATEST" ] || exit 1\necho "$FAKE_LATEST"\n', { mode: 0o755 });
+  const distTag = (version, latest) =>
+    execFileSync("bash", ["-ec", `${choose}\nprintf '%s' "$tag"`], {
+      env: { PATH: `${dir}:${process.env.PATH}`, TAG: `v${version}`, FAKE_LATEST: latest },
+      encoding: "utf8",
+    }).replace(/^::notice::.*\n/m, "");
+  try {
+    assert.equal(distTag("0.2.0", ""), "latest", "a new package");
+    assert.equal(distTag("0.2.0", "0.0.0"), "latest");
+    assert.equal(distTag("1.0.0", "0.2.0"), "latest");
+    assert.equal(distTag("0.10.0", "0.9.3"), "latest", "versions compare numerically");
+    assert.equal(distTag("0.2.0", "0.2.0"), "latest", "a republish is npm's to refuse");
+    assert.equal(distTag("0.1.1", "0.2.0"), "release-0.1", "an older line keeps latest");
+    assert.equal(distTag("0.9.3", "0.10.0"), "release-0.9");
+    assert.equal(distTag("1.2.0-rc.1", "1.1.0"), "next");
+    assert.equal(distTag("0.1.0-rc.1", "0.2.0"), "next");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("only the publishing job runs in the npm environment, whose NPM_TOKEN no other job may read", () => {
+  for (const file of Object.keys(workflows)) {
+    for (const name of jobNames(file)) {
+      if (file === "npm-publish.yml" && name === "npm") continue;
+      assert.doesNotMatch(job(name, file), /^ {4}environment:/m, `${file}: job ${name}`);
+    }
+  }
+});
+
+test("no workflow interpolates inputs or event data into a script", () => {
+  // Such values reach scripts through env:, where they cannot inject shell code.
+  let seen = 0;
+  for (const [file, text] of Object.entries(workflows)) {
+    for (const name of jobNames(file)) {
+      for (const s of steps(job(name, file))) {
+        const script = runScript(s);
+        if (script) seen++;
+        assert.doesNotMatch(script, /\$\{\{[^}]*\b(inputs|github\.event|github\.head_ref)\b/, `${file}: job ${name}:\n${script}`);
+      }
+    }
+  }
+  assert.ok(seen > 0, "no run: scripts found");
 });
 
 test("npm publish gets a file path npm cannot mistake for a GitHub repository", () => {
@@ -251,15 +364,20 @@ test("npm publish gets a file path npm cannot mistake for a GitHub repository", 
 });
 
 test("only the npm job can mint an OIDC token", () => {
+  // release.yml's npm job grants it to npm-publish.yml, which it calls.
+  const allowed = new Set(["release.yml/npm", "npm-publish.yml/npm"]);
   for (const file of Object.keys(workflows)) {
     const head = workflows[file].slice(0, workflows[file].indexOf("\njobs:"));
     assert.doesNotMatch(head, /id-token/, `${file}: workflow-level id-token permission`);
     for (const name of jobNames(file)) {
-      if (file === "release.yml" && name === "npm") continue;
+      if (allowed.has(`${file}/${name}`)) continue;
       assert.doesNotMatch(job(name, file), /id-token/, `${file}: job ${name} must not have id-token`);
     }
   }
-  assert.ok(jobNames("release.yml").includes("npm"));
+  for (const id of allowed) {
+    const [file, name] = id.split("/");
+    assert.ok(jobNames(file).includes(name), id);
+  }
 });
 
 test(".goreleaser.yaml embeds the package digest and attaches the package", () => {

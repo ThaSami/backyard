@@ -1,0 +1,115 @@
+name: Publish to npm
+
+# Publishes the backyard-cloudflare package of an existing GitHub release to
+# npm: the release's own asset, checked against its checksums.txt, so npm and
+# the release hold the same bytes. With provenance (which needs a public
+# repository), using the NPM_TOKEN secret of the "npm" environment (or of the
+# repository); the environment can require an approval before each publish.
+#
+# release.yml calls it after GoReleaser when vars.BACKYARD_NPM_PUBLISH is
+# 'true'. Run it by hand (Actions → Publish to npm → Run workflow, with the
+# release's tag) for a release whose publish was skipped or failed. Pick that
+# tag under "Use workflow from" when it contains this file, so the provenance
+# names the release's commit; from a branch, it names the branch's commit.
+# See CONTRIBUTING.md, "Releases".
+
+run-name: Publish ${{ inputs.tag }} to npm
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: The release tag (vX.Y.Z)
+        type: string
+        required: true
+    secrets:
+      NPM_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag of the GitHub release to publish (vX.Y.Z)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  npm:
+    name: Publish backyard-cloudflare to npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/backyard-cloudflare
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check the tag
+        env:
+          PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if ! printf '%s\n' "$TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'; then
+            echo "::error::the tag input is not a release tag vX.Y.Z"
+            exit 1
+          fi
+          # The provenance names the commit this run is on.
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "$TAG" ]; then
+            echo "::error::this run is on the tag $GITHUB_REF_NAME but publishes $TAG; run it on $TAG or on a branch"
+            exit 1
+          fi
+          if [ "$PRIVATE" = true ]; then
+            echo "::error::the repository is private; npm rejects --provenance from private repositories"
+            exit 1
+          fi
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Download the package from the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" || draft=missing
+          if [ "$draft" != false ]; then
+            echo "::error::$TAG is not a published GitHub release of $GITHUB_REPOSITORY"
+            exit 1
+          fi
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'backyard-cloudflare-*.tgz' --pattern checksums.txt --dir pkg
+      - name: Verify
+        run: |
+          cd pkg
+          grep -Eq "^[0-9a-f]{64}  backyard-cloudflare-${TAG#v}\.tgz$" checksums.txt || {
+            echo "::error::checksums.txt does not list backyard-cloudflare-${TAG#v}.tgz"
+            exit 1
+          }
+          sha256sum --ignore-missing -c checksums.txt
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::the NPM_TOKEN secret is not set (in the npm environment or the repository)"
+            exit 1
+          fi
+          version="${TAG#v}"
+          tag=latest
+          case "$version" in
+            *-*) tag=next ;;
+            *)
+              # A release of an older line (1.4.1 after 1.5.0) must not move
+              # latest back: it gets the dist-tag release-1.4 instead.
+              current="$(npm view backyard-cloudflare dist-tags.latest 2>/dev/null || true)"
+              if [ -n "$current" ] && [ "$current" != "$version" ] &&
+                [ "$(printf '%s\n' "$current" "$version" | sort -V | tail -n 1)" = "$current" ]; then
+                tag="release-${version%.*}"
+                echo "::notice::npm's latest is $current, newer than $version: publishing $version with the dist-tag $tag"
+              fi
+              ;;
+          esac
+          # The ./ matters: npm reads "pkg/<name>.tgz" as the GitHub repository pkg/<name>.
+          npm publish "./pkg/backyard-cloudflare-${version}.tgz" --provenance --access public --tag "$tag"
