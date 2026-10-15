@@ -28,7 +28,8 @@
 //   sb.close()        stops the fake and removes the sandbox
 //   sb.runTTY(args, env, {answers: [[/prompt/, "answer\n"], …]})   the same on a pseudo
 //                     terminal (interactive: prompts, the hub link with the token); only
-//                     when ttyAvailable() (Linux with util-linux `script`)
+//                     when ttyAvailable() (Linux with util-linux `script`); an answer may be
+//                     a function, run when its output appears (it returns what to type)
 //
 // run(args, env, {input, script, cwd, nodeArgs, timeoutMs, interrupt}): env entries set to
 // undefined are removed; `script` runs another entry point (e.g. "scripts/setup.mjs");
@@ -317,7 +318,8 @@ export async function createSandbox(o = {}) {
      * Use only when ttyAvailable(). Output lines end in "\r\n".
      * @param {string[]} args
      * @param {Record<string, string | undefined>} [extraEnv]
-     * @param {{answers?: [RegExp, string][], timeoutMs?: number}} [ro]
+     * @param {{answers?: [RegExp, string | (() => string)][], timeoutMs?: number}} [ro]   an answer
+     *   that is a function runs when its pattern matches, and what it returns is typed
      * @returns {Promise<RunResult>}
      */
     runTTY(args, extraEnv = {}, ro = {}) {
@@ -334,7 +336,9 @@ export async function createSandbox(o = {}) {
           out += c;
           for (let m; answers.length && (m = answers[0][0].exec(out.slice(seen))); ) {
             seen += m.index + m[0].length;
-            child.stdin.write(answers.shift()[1]);
+            const a = answers.shift()[1];
+            const text = typeof a === "function" ? a() : a;
+            if (text) child.stdin.write(text);
           }
         };
         child.stdout.on("data", onData);

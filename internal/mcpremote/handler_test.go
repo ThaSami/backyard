@@ -465,6 +465,81 @@ func TestSmallBodyKeepsServerTimeout(t *testing.T) {
 	}
 }
 
+// stallPost sends the headers of a POST with Content-Length n and first at
+// once, then one byte of the rest every interval, and reads the answer.
+func stallPost(t *testing.T, addr string, n int, first string, every time.Duration) (*http.Response, time.Duration, error) {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil, 0, err
+	}
+	t.Cleanup(func() { conn.Close() })
+	start := time.Now()
+	_, _ = fmt.Fprintf(conn, "POST /__backyard/mcp HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", hubHost, aliceToken, n, first)
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go func() {
+		for range n - len(first) {
+			select {
+			case <-stop:
+				return
+			case <-time.After(every):
+			}
+			if _, err := io.WriteString(conn, "a"); err != nil {
+				return
+			}
+		}
+	}()
+	_ = conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+	res, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		return nil, time.Since(start), err
+	}
+	b, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	res.Body = io.NopCloser(bytes.NewReader(b))
+	return res, time.Since(start), nil
+}
+
+// A body cut off by the read timeout (a small one) or the pace (a large
+// one) is answered with 400 at once, and the connection closed: the unread
+// rest is not drained under the 5-minute deadline of a body read in full.
+func TestStalledBodyAnswered(t *testing.T) {
+	e := newTenv(t)
+	e.h.bodyGrace, e.h.minBodyRate = 500*time.Millisecond, 1<<20
+	srv := httptest.NewUnstartedServer(e.h)
+	srv.Config.ReadTimeout = time.Second
+	srv.Start()
+	t.Cleanup(srv.Close)
+	ping := `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":"`
+	for _, tc := range []struct {
+		name   string
+		n      int // Content-Length
+		first  int // bytes sent at once; less than 256 KiB stay unread
+		within time.Duration
+	}{
+		{"small, cut by the read timeout", 100 << 10, 10 << 10, 3 * time.Second},
+		{"large, cut by the pace", 1536 << 10, 1436 << 10, 4 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			first := ping + strings.Repeat("a", tc.first-len(ping))
+			res, d, err := stallPost(t, srv.Listener.Addr().String(), tc.n, first, 500*time.Millisecond)
+			if err != nil {
+				t.Fatalf("no answer after %v: %v", d, err)
+			}
+			b, _ := io.ReadAll(res.Body)
+			if res.StatusCode != http.StatusBadRequest || !strings.Contains(string(b), "could not read the request body") || d > tc.within {
+				t.Fatalf("after %v: %d %s; want 400 within %v", d, res.StatusCode, b, tc.within)
+			}
+			if !res.Close {
+				t.Errorf("the connection is kept (%v)", res.Header)
+			}
+		})
+	}
+	if len(e.h.slots) != 0 || len(e.h.users) != 0 {
+		t.Fatalf("%d slots, %d users still taken", len(e.h.slots), len(e.h.users))
+	}
+}
+
 // deadlineWriter records the deadlines set through http.ResponseController.
 type deadlineWriter struct {
 	*httptest.ResponseRecorder

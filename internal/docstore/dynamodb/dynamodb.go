@@ -27,7 +27,16 @@
 // it back conditioned on the item being unchanged since the read (version,
 // created_at and updated_at, so a delete and re-create in between is noticed
 // too), retrying on conflicts (optimistic concurrency), so concurrent updates
-// never lose keys.
+// never lose keys. UpdateIf and DeleteIf write once, conditioned on the
+// revision read.
+//
+// The SDK sends a write again when its answer is lost (an HTTP 500, which
+// DynamoDB documents as "may have succeeded", a dropped connection), and the
+// condition of that attempt then fails on what the first one stored. Create
+// and UpdateIf compare the item their condition failed on with the one they
+// wrote (version, data, actor and updated_at, a docstore.Now() time no other
+// write of the process repeats) and report their own write as done, not as a
+// conflict.
 //
 // # Queries (limitation)
 //
@@ -282,6 +291,48 @@ func isConditionFailed(err error) bool {
 	return errors.As(err, &ccf)
 }
 
+// conditionFailure reports whether err is a failed condition, and returns
+// the item it was checked against when DynamoDB sent it (a write with
+// ReturnValuesOnConditionCheckFailure ALL_OLD; empty when there is none).
+//
+// The SDK sends a write again when its answer is lost (an HTTP 500, which
+// DynamoDB documents as "may have succeeded", a dropped connection, a
+// timeout). When the first attempt was applied, the condition of the next
+// one fails on that very write; sameItem tells it from another writer's.
+func conditionFailure(err error) (map[string]types.AttributeValue, bool) {
+	var ccf *types.ConditionalCheckFailedException
+	if !errors.As(err, &ccf) {
+		return nil, false
+	}
+	return ccf.Item, true
+}
+
+// sameItem reports whether a stored item holds the attributes of want, an
+// item built by docItem, with the same values. Its updated_at is a docstore.Now()
+// timestamp, which no other write of this process repeats, so with the
+// version, data and actor it identifies one write.
+func sameItem(item, want map[string]types.AttributeValue) bool {
+	if len(item) == 0 {
+		return false
+	}
+	for name, w := range want {
+		switch w := w.(type) {
+		case *types.AttributeValueMemberS:
+			if v, ok := getS(item, name); !ok || v != w.Value {
+				return false
+			}
+		case *types.AttributeValueMemberN:
+			n, err := strconv.ParseInt(w.Value, 10, 64)
+			if v, ok := getN(item, name); err != nil || !ok || v != n {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // apiError is the subset of smithy.APIError used to classify AWS errors.
 type apiError interface {
 	error
@@ -320,16 +371,23 @@ func (s *Store) Create(ctx context.Context, site, collection, id string, data ma
 		Site: site, Collection: collection, ID: id, Data: body,
 		CreatedAt: now, UpdatedAt: now, CreatedBy: actor, UpdatedBy: actor, Version: 1,
 	}
+	item := docItem(d, raw)
 	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:           aws.String(s.table),
-		Item:                docItem(d, raw),
+		Item:                item,
 		ConditionExpression: aws.String("attribute_not_exists(#pk)"),
 		ExpressionAttributeNames: map[string]string{
 			"#pk": attrPK,
 		},
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 	})
-	if isConditionFailed(err) {
-		return nil, fmt.Errorf("%w: document %q already exists in %s", docstore.ErrConflict, id, collection)
+	if old, failed := conditionFailure(err); failed {
+		// An attempt the SDK sent again fails on the item an earlier one
+		// stored: that one is this write.
+		if !sameItem(old, item) {
+			return nil, fmt.Errorf("%w: document %q already exists in %s", docstore.ErrConflict, id, collection)
+		}
+		err = nil
 	}
 	if err != nil {
 		return nil, mapErr("create", err)
@@ -538,23 +596,33 @@ func (s *Store) UpdateIf(ctx context.Context, site, collection, id string, rev d
 	next.UpdatedAt = docstore.Now()
 	next.UpdatedBy = actor
 	next.Version = cur.Version + 1
+	want := docItem(&next, raw)
 	cond, names, values := unchangedCondition(item)
 	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName:                 aws.String(s.table),
-		Item:                      docItem(&next, raw),
-		ConditionExpression:       aws.String(cond),
-		ExpressionAttributeNames:  names,
-		ExpressionAttributeValues: values,
+		TableName:                           aws.String(s.table),
+		Item:                                want,
+		ConditionExpression:                 aws.String(cond),
+		ExpressionAttributeNames:            names,
+		ExpressionAttributeValues:           values,
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 	})
 	if err == nil {
 		return &next, nil
 	}
-	if !isConditionFailed(err) {
+	old, failed := conditionFailure(err)
+	if !failed {
 		return nil, mapErr("update", err)
 	}
-	// Written since the read, or deleted: tell them apart.
-	if _, err := s.getItem(ctx, site, collection, id); err != nil {
-		return nil, err
+	// Deleted since the read (or the item not sent): read it again.
+	if len(old) == 0 {
+		if _, old, err = s.getRawItem(ctx, site, collection, id); err != nil {
+			return nil, err
+		}
+	}
+	// An attempt the SDK sent again fails on this write, which an earlier
+	// one applied; anything else is another writer's.
+	if sameItem(old, want) {
+		return &next, nil
 	}
 	return nil, changed
 }
@@ -595,6 +663,12 @@ func (s *Store) DeleteIf(ctx context.Context, site, collection, id string, rev d
 		},
 	})
 	if isConditionFailed(err) {
+		// At another revision, or gone. Gone after an attempt the SDK sent
+		// again may be this delete, applied by an earlier attempt, or another
+		// writer's (who adjusted the counter): it is reported as not removed
+		// and the counter left alone, so it is never counted twice. A lost
+		// answer can leave the counter one too high, as a crash between the
+		// two calls can (see the package documentation).
 		return false, nil
 	}
 	if err != nil {

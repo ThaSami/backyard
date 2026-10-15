@@ -67,6 +67,12 @@ All notable changes to Backyard are documented here. The format follows
   whether or not the connector is on (Backyard answers `404` there until `mcp.enabled`).
   **Upgrade:** `terraform apply`.
 
+### Fixed
+
+- DynamoDB: a create whose answer was lost (an HTTP 500 or a dropped connection, after which
+  the AWS SDK sends the write again) no longer fails with `409 conflict` on the document it
+  had just created.
+
 ## [0.1.0] - 2026-10-14
 
 The first public version of Backyard: drop a folder of HTML, get an internal URL with a

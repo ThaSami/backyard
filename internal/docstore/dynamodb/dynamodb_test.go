@@ -1,8 +1,11 @@
 package dynamodb_test
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -287,5 +290,172 @@ func TestUpdateAfterDeleteAndRecreate(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// lostAnswer forwards the first armed request for op whose body contains
+// mark, lets DynamoDB apply it, and answers 500 instead, as when the answer
+// to a write is lost (DynamoDB: a 500 on a write "may have succeeded"). The
+// SDK's retryer then sends the same write again.
+type lostAnswer struct {
+	op, mark string
+	mu       sync.Mutex
+	armed    bool
+	fired    bool
+	sent     int // requests for op
+}
+
+func (l *lostAnswer) arm(mark string) {
+	l.mu.Lock()
+	l.mark, l.armed, l.fired, l.sent = mark, true, false, 0
+	l.mu.Unlock()
+}
+
+func (l *lostAnswer) RoundTrip(r *http.Request) (*http.Response, error) {
+	if !strings.HasSuffix(r.Header.Get("X-Amz-Target"), "."+l.op) || r.Body == nil {
+		return http.DefaultTransport.RoundTrip(r)
+	}
+	body, err := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	r = r.Clone(r.Context())
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	l.mu.Lock()
+	l.sent++
+	lose := l.armed && strings.Contains(string(body), l.mark)
+	if lose {
+		l.armed, l.fired = false, true
+	}
+	l.mu.Unlock()
+	res, err := http.DefaultTransport.RoundTrip(r)
+	if err != nil || !lose {
+		return res, err
+	}
+	_, _ = io.Copy(io.Discard, res.Body)
+	_ = res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("the write to lose the answer of failed: HTTP %d", res.StatusCode)
+	}
+	msg := `{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"injected: the write was applied"}`
+	return &http.Response{
+		StatusCode: http.StatusInternalServerError, Status: "500 Internal Server Error",
+		Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Header:        http.Header{"Content-Type": {"application/x-amz-json-1.0"}},
+		Body:          io.NopCloser(strings.NewReader(msg)),
+		ContentLength: int64(len(msg)), Request: r,
+	}, nil
+}
+
+// A conditional write whose answer is lost is sent again by the SDK; that
+// attempt fails its condition on the write the first one applied. Create and
+// UpdateIf report it as theirs (it is), not as a conflict with another
+// writer: a first code redemption must not look like a replay, nor a lease
+// taken over like one taken by someone else.
+func TestRetriedConditionalWrites(t *testing.T) {
+	ep := testEndpoint(t)
+	plain := testClient(ep)
+	table := testTable(t, plain)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	other, err := dynamodb.New(ctx, plain, config.DynamoDBConfig{Table: table, CreateTable: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lose := &lostAnswer{op: "PutItem"}
+	s, err := dynamodb.New(ctx, awsddb.New(awsddb.Options{
+		Region:       "us-east-1",
+		BaseEndpoint: aws.String(ep),
+		Credentials:  credentials.NewStaticCredentialsProvider("test", "test", ""),
+		HTTPClient:   &http.Client{Transport: lose},
+	}), config.DynamoDBConfig{Table: table})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retried := func(what string) {
+		t.Helper()
+		lose.mu.Lock()
+		defer lose.mu.Unlock()
+		if !lose.fired || lose.sent != 2 {
+			t.Fatalf("%s: answer lost %v, %d PutItem requests; want the write sent again once", what, lose.fired, lose.sent)
+		}
+	}
+
+	lose.arm("attribute_not_exists")
+	c, err := s.Create(ctx, "site", "c", "lease", map[string]any{"exp": 1}, "alice")
+	retried("Create")
+	if err != nil {
+		t.Fatalf("Create whose answer was lost: %v", err)
+	}
+	if got, err := other.Get(ctx, "site", "c", "lease"); err != nil || !got.At(c.Rev()) || !got.UpdatedAt.Equal(c.UpdatedAt) || got.CreatedBy != "alice" {
+		t.Fatalf("stored %+v, %v; returned %+v", got, err, c)
+	}
+	if n, err := other.Count(ctx, "site"); err != nil || n != 1 {
+		t.Errorf("Count after the retried Create = %d, %v; want 1", n, err)
+	}
+
+	lose.arm("#c0")
+	u, err := s.UpdateIf(ctx, "site", "c", "lease", c.Rev(), map[string]any{"exp": 2}, "taker")
+	retried("UpdateIf")
+	if err != nil {
+		t.Fatalf("UpdateIf whose answer was lost: %v", err)
+	}
+	stored, err := other.Get(ctx, "site", "c", "lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Version != 2 || u.UpdatedBy != "taker" || !reflect.DeepEqual(u.Data, map[string]any{"exp": 2.0}) ||
+		!stored.At(u.Rev()) || !stored.UpdatedAt.Equal(u.UpdatedAt) || !reflect.DeepEqual(stored.Data, u.Data) {
+		t.Fatalf("returned %+v, stored %+v", u, stored)
+	}
+
+	// A write by someone else is still a conflict, and a document deleted
+	// meanwhile is not found, also when the condition fails on the first attempt.
+	hook := &hookTransport{op: "PutItem"}
+	h, err := dynamodb.New(ctx, awsddb.New(awsddb.Options{
+		Region:       "us-east-1",
+		BaseEndpoint: aws.String(ep),
+		Credentials:  credentials.NewStaticCredentialsProvider("test", "test", ""),
+		HTTPClient:   &http.Client{Transport: hook},
+	}), config.DynamoDBConfig{Table: table})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name      string
+		meanwhile func() error
+		want      error
+	}{
+		{"written", func() error {
+			_, err := other.Update(ctx, "site", "c", "lease", map[string]any{"exp": 3}, "taker")
+			return err
+		}, docstore.ErrConflict},
+		{"same data, same actor", func() error {
+			_, err := other.Update(ctx, "site", "c", "lease", map[string]any{"exp": 4}, "taker")
+			return err
+		}, docstore.ErrConflict},
+		{"deleted", func() error { _, err := other.Delete(ctx, "site", "c", "lease"); return err }, docstore.ErrNotFound},
+	} {
+		cur, err := other.Get(ctx, "site", "c", "lease")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var hookErr error
+		hook.arm(func() { hookErr = tc.meanwhile() })
+		_, err = h.UpdateIf(ctx, "site", "c", "lease", cur.Rev(), map[string]any{"exp": 4}, "taker")
+		if hookErr != nil {
+			t.Fatal(hookErr)
+		}
+		if !errors.Is(err, tc.want) {
+			t.Errorf("%s between the read and the write: UpdateIf = %v; want %v", tc.name, err, tc.want)
+		}
+	}
+	// Create of a document someone else created is still a conflict.
+	if _, err := other.Create(ctx, "site", "c", "taken", map[string]any{"exp": 1}, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(ctx, "site", "c", "taken", map[string]any{"exp": 1}, "alice"); !errors.Is(err, docstore.ErrConflict) {
+		t.Errorf("Create of an existing document = %v; want a conflict", err)
 	}
 }

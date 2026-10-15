@@ -700,6 +700,7 @@ export async function runAccessEnable(opts, ctx) {
   let plan = null;
   let saved = false;
   let upgradeWithoutToken = false;
+  let missing = []; // paths the bypass application this tool made lacks
   const onCreated = () => {
     saved = true;
   };
@@ -728,9 +729,8 @@ export async function runAccessEnable(opts, ctx) {
     let ask = !remembered || allowChanged;
     // So does a bypass application this tool made that lacks paths (one of an
     // earlier version, before the Claude connector's four): found at the edge.
-    // Without a token the verification below still waits for them (added in
-    // the dashboard meanwhile, or just now and not yet at the edge).
-    let missing = [];
+    // Without a token they are named, and the verification below waits for
+    // them (added in the dashboard meanwhile, or just now and not yet at the edge).
     if (!ask && remembered?.source === "api") {
       missing = (await accessEdgeFailures({ host, mode, team: remembered.team, aud: remembered.aud, worker: w })).missing;
       ask = missing.length > 0;
@@ -754,6 +754,20 @@ export async function runAccessEnable(opts, ctx) {
     if (!plan) plan = { ...(await guidedMode(ctx, { host, mode, allow, wait: opts.wait })), source: "manual", ids: {}, applied: [] };
   }
   const { team, aud } = plan;
+  // The dashboard steps of the upgrade without a token, before the wait for them.
+  let waitSec = opts.wait ?? VERIFY_WAIT;
+  if (upgradeWithoutToken) {
+    const app = accessNames(w).bypassApp;
+    ui.log(
+      `\nThe Access application "${app}" lacks paths this version needs. Add these destinations to it in the dashboard ` +
+        `(Zero Trust → Access → Applications → "${app}" → Destinations), or set BACKYARD_CF_API_TOKEN ` +
+        `(an API token with ${ACCESS_TOKEN_PERMISSIONS}; it is never stored) and re-run:\n${missing.map((p) => `  - ${p}`).join("\n")}`,
+    );
+    if (ctx.interactive) {
+      waitSec = opts.wait ?? DISCOVERY_WAIT;
+      ui.log(`Waiting for them at the edge (checking every 5 s for up to ${waitSec} s; Ctrl-C stops)…`);
+    }
+  }
 
   // 4. Edge verification, before anything changes on the Worker.
   ui.log(`\nChecking Cloudflare Access at the edge (team ${team}, AUD ${aud})…`);
@@ -762,7 +776,7 @@ export async function runAccessEnable(opts, ctx) {
     const failures = [...f.certs, ...f.redirect, ...f.wildcard, ...f.bypass, ...f.connector];
     return { done: failures.length === 0, failures, missing: f.missing };
   };
-  const v = await waitFor(verify, { timeoutSec: opts.wait ?? VERIFY_WAIT, intervalSec: 5, onPending: progress("waiting for Cloudflare Access") });
+  const v = await waitFor(verify, { timeoutSec: waitSec, intervalSec: 5, onPending: progress("waiting for Cloudflare Access") });
   if (v.failures.length) {
     if (saved) ctx.writeResult(state, { previousUrl });
     if (upgradeWithoutToken && v.missing.length) {

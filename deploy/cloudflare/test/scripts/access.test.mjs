@@ -298,14 +298,29 @@ describe("backyard-cloudflare access enable (API mode)", () => {
     reset();
     sb.calls();
     sb.requests();
-    // No token and no terminal: still missing once the wait is over, so it
-    // ends pending with the remedy, and nothing is changed.
-    for (const args of [["access", "enable", "--wait", "0"], ENABLE]) {
-      r = await sb.run(args);
+    // The destinations to add, and where, are named before the edge is checked.
+    const namedFirst = (out) => {
+      const at = out.indexOf("Checking Cloudflare Access at the edge");
+      assert.ok(at > 0, out);
+      const before = out.slice(0, at);
+      assert.match(before, new RegExp(`Applications → "${N.bypassApp.replace(/[()]/g, "\\$&")}" → Destinations`), before);
+      for (const p of CONNECTOR_RULES) assert.ok(before.includes(`- ${HOST}${p}`), `names ${HOST}${p} first:\n${out}`);
+    };
+    // No token and no terminal (also a token for Workers only, as in CI):
+    // still missing once the wait is over, so it ends pending with the
+    // remedy, and nothing is changed.
+    sb.allowInEnv = [CI_TOKEN];
+    for (const [args, env] of [
+      [["access", "enable", "--wait", "0"], {}],
+      [ENABLE, {}],
+      [["access", "enable", "--wait", "0"], { CLOUDFLARE_API_TOKEN: CI_TOKEN, CI: "true" }],
+    ]) {
+      r = await sb.run(args, env);
       assert.equal(r.code, 4, r.out);
       assert.match(r.out, /BACKYARD_CF_API_TOKEN/);
       assert.match(r.out, new RegExp(`"${N.bypassApp.replace(/[()]/g, "\\$&")}"`));
       for (const p of CONNECTOR_RULES) assert.ok(r.out.includes(HOST + p), `names ${HOST}${p}:\n${r.out}`);
+      namedFirst(r.out);
       assert.doesNotMatch(r.out, /re-run the same command/);
       assert.deepEqual(writesOf(sb.requests()), []);
       assert.ok(!deployOf(sb.calls()));
@@ -324,6 +339,28 @@ describe("backyard-cloudflare access enable (API mode)", () => {
     assert.deepEqual(w.map((x) => `${x.method} ${x.path}`), [`PUT /accounts/acc1/access/apps/${ids.bypassAppId}`]);
     assert.deepEqual(w[0].body.destinations.map((d) => d.uri), ACCESS_BYPASS_PATHS.map((p) => HOST + p));
     assert.deepEqual(sb.state().access, ids);
+    // The dashboard instead: the steps first, then the wait for dashboard
+    // steps (900 s), which ends once the destinations reach the edge.
+    const full = sb.cf().access.acc1.apps.find((a) => a.id === ids.bypassAppId).destinations;
+    reset();
+    sb.calls();
+    sb.requests();
+    const addInDashboard = () => {
+      sb.updateCf((s) => (s.access.acc1.apps.find((a) => a.id === ids.bypassAppId).destinations = full));
+      return "";
+    };
+    r = await sb.runTTY(["access", "enable"], {}, {
+      answers: [
+        [/How do you want to continue\? \S*\[1-2\]/, "1\r"],
+        [/Checking Cloudflare Access at the edge/, addInDashboard],
+      ],
+    });
+    sb.outputs.push(r.out);
+    assert.equal(r.code, 0, r.out);
+    namedFirst(r.out);
+    assert.match(r.out, /up to 900 s/);
+    assert.deepEqual(writesOf(accessReqs(sb.requests())), []);
+    assert.ok(deployOf(sb.calls()), r.out);
   });
 
   it("waits for destinations added in the dashboard to reach the edge, without a token", async () => {

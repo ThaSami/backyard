@@ -1686,7 +1686,8 @@ the §5 envelope unless noted:
    below), else `400 bad_request` (the connection's read deadline moves with the body). A
    smaller body is read under `server.read_timeout`. For every request the write deadline
    becomes now + 5 min before the body is read, and the read deadline now + 5 min once it is
-   read.
+   read in full. A body cut off (by the pace or `server.read_timeout`) or too large is answered
+   at once with `Connection: close`; its unread rest is not drained.
 10. **JSON-RPC parsing** (`400`, `id: null`): invalid JSON — a body that is not valid UTF-8
     included — →
     `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}`; a JSON array →

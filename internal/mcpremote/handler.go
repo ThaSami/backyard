@@ -348,10 +348,11 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		in = &pacedBody{ReadCloser: r.Body, rc: rc, start: start, limit: limit, grace: h.bodyGrace, rate: h.minBodyRate, want: r.ContentLength}
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, in, h.maxBody))
-	// Once it is read, net/http's background read of the connection
-	// inherits the read deadline: the publish's own.
-	_ = rc.SetReadDeadline(limit)
 	if err != nil {
+		// Cut off (the read timeout or the pace) or too large: answered at
+		// once on a connection that is then closed. The expired deadline
+		// stays, and net/http does not drain the unread rest.
+		hdr.Set("Connection", "close")
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
 			writeError(w, http.StatusRequestEntityTooLarge, "too_large", tooLarge)
@@ -360,6 +361,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "could not read the request body")
 		return
 	}
+	// Once it is read, net/http's background read of the connection
+	// inherits the read deadline: the publish's own.
+	_ = rc.SetReadDeadline(limit)
 	// 10. JSON-RPC parse.
 	msg, rerr := parseMessage(body)
 	if rerr != nil {
