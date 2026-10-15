@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -105,6 +106,9 @@ func New(ctx context.Context, name string, pc config.ProviderConfig, opts Option
 		cfg.HTTPClient = opts.HTTPClient
 	}
 	client := bedrockruntime.NewFromConfig(cfg, func(o *bedrockruntime.Options) {
+		// o.HTTPClient is the resolved client here (with the SDK's
+		// defaults-mode timeouts on its own client).
+		o.HTTPClient = readOnlyBodyClient{next: o.HTTPClient}
 		if pc.BaseURL != "" {
 			o.BaseEndpoint = aws.String(strings.TrimRight(pc.BaseURL, "/"))
 		}
@@ -122,6 +126,28 @@ func New(ctx context.Context, name string, pc config.ProviderConfig, opts Option
 	}
 	return p, nil
 }
+
+// readOnlyBodyClient hides io.WriterTo from request bodies. The SDK closes a
+// request's body as soon as the response arrives, while net/http may still
+// make its last read of it (the check for bytes beyond Content-Length); the
+// SDK's body wrapper answers that read through WriteTo with an io.EOF error,
+// so the transport takes the request as failed and closes the connection,
+// cutting off the response being read (a stream ends early or loses its
+// usage). Through Read, the closed body is a plain end of body.
+type readOnlyBodyClient struct{ next aws.HTTPClient }
+
+func (c readOnlyBodyClient) Do(r *http.Request) (*http.Response, error) {
+	if r.Body != nil && r.Body != http.NoBody {
+		r.Body = readOnlyBody{r.Body}
+	}
+	return c.next.Do(r)
+}
+
+// readOnlyBody is an io.ReadCloser without io.WriterTo.
+type readOnlyBody struct{ rc io.ReadCloser }
+
+func (b readOnlyBody) Read(p []byte) (int, error) { return b.rc.Read(p) }
+func (b readOnlyBody) Close() error               { return b.rc.Close() }
 
 // Name implements ai.Provider.
 func (p *Provider) Name() string { return p.name }

@@ -83,6 +83,11 @@ All notable changes to Backyard are documented here. The format follows
 
 ### Fixed
 
+- AI on Amazon Bedrock: a streamed chat could end early with `502` ("decode event: … use of
+  closed network connection") or lose its token usage. The AWS SDK closes a request's body as
+  soon as the response arrives, and Go's HTTP transport, still making its last read of that
+  body, then dropped the connection the response was streaming over. Requests to Bedrock now
+  pass the transport a body that reads as finished once closed.
 - DynamoDB: a create whose answer was lost (an HTTP 500 or a dropped connection, after which
   the AWS SDK sends the write again) no longer fails with `409 conflict` on the document it
   had just created. Each such write stores a random identity in a new item attribute `w`, so

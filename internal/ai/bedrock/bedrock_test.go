@@ -367,6 +367,83 @@ func TestConverseStream(t *testing.T) {
 	}
 }
 
+// closingWriterTo behaves like the SDK's request body wrapper: once closed,
+// Read and WriteTo report io.EOF.
+type closingWriterTo struct {
+	r      *strings.Reader
+	mu     sync.Mutex
+	closed bool
+}
+
+func (b *closingWriterTo) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return 0, io.EOF
+	}
+	return b.r.Read(p)
+}
+
+func (b *closingWriterTo) WriteTo(w io.Writer) (int64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return 0, io.EOF
+	}
+	return b.r.WriteTo(w)
+}
+
+func (b *closingWriterTo) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed = true
+	return nil
+}
+
+type captureDo struct{ req *http.Request }
+
+func (c *captureDo) Do(r *http.Request) (*http.Response, error) {
+	c.req = r
+	return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+}
+
+// TestReadOnlyBodyClient pins why requests go through readOnlyBodyClient: the
+// SDK closes the request body when the response arrives, and net/http's last
+// read of it (io.Copy to check for bytes beyond Content-Length) must then see
+// a plain end of body, not an io.EOF error that makes the transport drop the
+// connection and the response being read.
+func TestReadOnlyBodyClient(t *testing.T) {
+	raw := &closingWriterTo{r: strings.NewReader("body")}
+	_ = raw.Close()
+	if _, err := io.Copy(io.Discard, raw); !errors.Is(err, io.EOF) {
+		t.Fatalf("precondition: a closed WriterTo body fails io.Copy with io.EOF, got %v", err)
+	}
+
+	body := &closingWriterTo{r: strings.NewReader("body")}
+	next := &captureDo{}
+	req, _ := http.NewRequest(http.MethodPost, "http://bedrock.test/model/m/converse-stream", body)
+	if _, err := (readOnlyBodyClient{next: next}).Do(req); err != nil {
+		t.Fatal(err)
+	}
+	sent := next.req.Body
+	if _, ok := sent.(io.WriterTo); ok {
+		t.Fatal("the transport must not see io.WriterTo on the request body")
+	}
+	if got, err := io.ReadAll(io.LimitReader(sent, 4)); err != nil || string(got) != "body" {
+		t.Fatalf("read %q, %v", got, err)
+	}
+	_ = body.Close() // what the SDK does once the response arrives
+	if n, err := io.Copy(io.Discard, sent); n != 0 || err != nil {
+		t.Fatalf("the length check after close = (%d, %v), want (0, nil)", n, err)
+	}
+
+	noBody, _ := http.NewRequest(http.MethodGet, "http://bedrock.test/", nil)
+	noBody.Body = http.NoBody
+	if _, err := (readOnlyBodyClient{next: next}).Do(noBody); err != nil || next.req.Body != http.NoBody {
+		t.Fatalf("http.NoBody must pass unchanged (%v)", err)
+	}
+}
+
 func TestConverseStreamErrors(t *testing.T) {
 	ctx := context.Background()
 	req := ai.ChatRequest{Model: "m", Messages: []ai.Message{{Role: "user", Content: []ai.Part{{Type: "text", Text: "x"}}}}}
