@@ -3,7 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/thasami/backyard/internal/auth"
+	"github.com/thasami/backyard/internal/config"
 	"github.com/thasami/backyard/internal/sites"
 )
 
@@ -308,5 +311,158 @@ func TestHubPreviewCacheAndStorage(t *testing.T) {
 	w = h.get(previewURL("demo"))
 	if w.Code == http.StatusOK || w.Code == http.StatusNotFound || !bytes.Contains(w.Body.Bytes(), []byte(`"error"`)) {
 		t.Errorf("storage failure = %d %s", w.Code, w.Body.String())
+	}
+}
+
+// The 1 MiB cap (SPEC §7.2) holds when serving, not only when the preview
+// is chosen: bytes stored under the preview path by a deploy that was never
+// committed (uploads replace files in place, SPEC §7.3) or by a direct sync
+// are not served when they exceed it.
+func TestHubPreviewSizeCap(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []option
+	}{
+		{"cached", nil},
+		{"uncached", []option{withConfig(func(c *config.Config) { c.Storage.CacheBytes = -1 })}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, tc.opts...)
+			h.putPreviewSite("demo", "cover.svg", map[string]string{"index.html": "x", "cover.svg": previewSVG})
+			expectStatus(t, h.get(previewURL("demo")), http.StatusOK)
+			key := sites.SiteKey("demo", "cover.svg")
+
+			// At the cap: served.
+			atCap := strings.Repeat("x", sites.MaxPreviewBytes)
+			h.blob.set(key, []byte(atCap), time.Now())
+			h.srv.PurgeSite("demo")
+			for _, q := range []string{"", "?v=1"} {
+				w := h.get(previewURL("demo") + q)
+				expectStatus(t, w, http.StatusOK)
+				if w.Body.Len() != sites.MaxPreviewBytes || w.Header().Get("Content-Length") != strconv.Itoa(sites.MaxPreviewBytes) {
+					t.Fatalf("%q: at the cap = %d bytes, Content-Length %q", q, w.Body.Len(), w.Header().Get("Content-Length"))
+				}
+			}
+
+			// One byte over, while the meta still names the file: the 404.
+			h.blob.set(key, []byte(atCap+"x"), time.Now())
+			h.srv.PurgeSite("demo")
+			for _, q := range []string{"", "?v=1"} {
+				for _, rq := range []req{
+					{url: previewURL("demo") + q},
+					{url: previewURL("demo") + q, hdr: map[string]string{"Range": "bytes=0-3"}},
+					{method: http.MethodHead, url: previewURL("demo") + q},
+				} {
+					w := h.serve(rq)
+					if w.Code != http.StatusNotFound {
+						t.Fatalf("%s %q %v: over the cap = %d, %d bytes", rq.method, q, rq.hdr, w.Code, w.Body.Len())
+					}
+					if rq.method == "" {
+						expectError(t, w, http.StatusNotFound, "not_found")
+					}
+					if w.Header().Get("Content-Security-Policy") != "" || strings.Contains(w.Header().Get("Cache-Control"), "immutable") {
+						t.Errorf("%q: 404 headers = %v", q, w.Header())
+					}
+				}
+			}
+			// The site host still serves the file itself, as it serves any file.
+			if w := h.get("https://demo.backyard.test/cover.svg"); w.Code != http.StatusOK || w.Body.Len() != sites.MaxPreviewBytes+1 {
+				t.Errorf("site host = %d, %d bytes", w.Code, w.Body.Len())
+			}
+		})
+	}
+}
+
+// A versioned preview is cached by browsers for a year, so it must show the
+// bytes of the version it names. It is read from storage, not through the
+// object cache: a redeploy through another instance, or a standalone
+// gateway, does not purge this instance's cache, and even locally the purge
+// runs after the meta is written.
+func TestHubPreviewVersionedReadsStorage(t *testing.T) {
+	a := newHarness(t)
+	shared := a.blob
+	b := newHarness(t, func(h *harness, d *Deps) { h.blob = shared; d.Blob = shared })
+	now := time.Now()
+	a.srv.cache.now = func() time.Time { return now } // A's cache entries do not expire in this test
+
+	ctx := context.Background()
+	key := sites.SiteKey("demo", "preview.svg")
+	oldSVG, newSVG := "<svg>OLD</svg>", "<svg>NEW</svg>"
+	t1 := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	t2 := t1.Add(2 * time.Second)
+	commit := func(updated time.Time) {
+		t.Helper()
+		if err := b.srv.deps.Sites.PutMeta(ctx, &sites.Meta{Name: "demo", Preview: "preview.svg", CreatedAt: t1, UpdatedAt: updated, FileCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// version is what the hub puts in ?v=: the listed updated_at.
+	version := func(h *harness) string {
+		t.Helper()
+		w := h.get("https://backyard.test/__backyard/api/sites")
+		expectStatus(t, w, http.StatusOK)
+		var out struct {
+			Sites []struct {
+				Name      string `json:"name"`
+				UpdatedAt string `json:"updated_at"`
+			} `json:"sites"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range out.Sites {
+			if s.Name == "demo" && s.UpdatedAt != "" {
+				return s.UpdatedAt
+			}
+		}
+		t.Fatalf("demo not listed: %s", w.Body.String())
+		return ""
+	}
+
+	shared.set(key, []byte(oldSVG), t1)
+	commit(t1)
+	v1 := version(a)
+	// A serves the first version; its object cache now holds the file.
+	if w := a.get(previewURL("demo")); w.Body.String() != oldSVG {
+		t.Fatalf("A unversioned = %q", w.Body.String())
+	}
+	w := a.get(previewURL("demo") + "?v=" + url.QueryEscape(v1))
+	expectStatus(t, w, http.StatusOK)
+	oldETag := w.Header().Get("ETag")
+	if w.Body.String() != oldSVG || w.Header().Get("Cache-Control") != previewCacheVersioned {
+		t.Fatalf("A v1 = %q %v", w.Body.String(), w.Header())
+	}
+
+	// Redeploy through B: uploads first, then the meta, then B's own purge.
+	shared.set(key, []byte(newSVG), t2)
+	commit(t2)
+	b.srv.PurgeSite("demo")
+	v2 := version(a)
+	if v2 == v1 {
+		t.Fatalf("version unchanged: %q", v2)
+	}
+	// Premise: A's cache still has the old bytes. The unversioned response
+	// is no-cache and heals within storage.cache_ttl.
+	if w := a.get(previewURL("demo")); w.Body.String() != oldSVG || w.Header().Get("Cache-Control") != previewCacheUnversioned {
+		t.Fatalf("A unversioned after redeploy = %q %v, want the cached old bytes", w.Body.String(), w.Header())
+	}
+	// The new version URL gets the new bytes on every instance.
+	for _, tc := range []struct {
+		name string
+		h    *harness
+	}{{"A", a}, {"B", b}} {
+		u := previewURL("demo") + "?v=" + url.QueryEscape(v2)
+		w := tc.h.get(u)
+		expectStatus(t, w, http.StatusOK)
+		if w.Body.String() != newSVG || w.Header().Get("Cache-Control") != previewCacheVersioned ||
+			w.Header().Get("ETag") == oldETag || w.Header().Get("Content-Security-Policy") != sites.PreviewCSP {
+			t.Errorf("%s v2 = %q %v", tc.name, w.Body.String(), w.Header())
+		}
+		// A browser revalidating with the old ETag gets the new object, not a 304.
+		expectStatus(t, tc.h.get(u, "If-None-Match", oldETag), http.StatusOK)
+		w = tc.h.serve(req{method: http.MethodHead, url: u})
+		if w.Code != http.StatusOK || w.Header().Get("Content-Length") != strconv.Itoa(len(newSVG)) {
+			t.Errorf("%s HEAD v2 = %d %v", tc.name, w.Code, w.Header())
+		}
 	}
 }

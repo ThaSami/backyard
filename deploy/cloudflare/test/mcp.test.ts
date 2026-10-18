@@ -10,6 +10,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resetAccessCaches } from "../src/auth";
 import { KeyLabel, b64url, deriveKey, signValue } from "../src/crypto";
+import { formatMicros } from "../src/db/time";
 import type { Env } from "../src/env";
 import { formatBytes, truncateBytes } from "../src/gateway";
 import { MCP_CATALOG } from "../src/generated/mcp";
@@ -20,7 +21,7 @@ import { TOOLS, decodeBase64, toValidUTF8 } from "../src/mcp-tools";
 import { resetMcpCaches } from "../src/oauth";
 import { fileFolderConflicts, type DeployFile } from "../src/site-do";
 import { registry, siteStub } from "../src/stubs";
-import { DEPLOY_TOKEN, MCP_ENV, ORIGIN, SECRET, call, deploy, mcpConnect, sha256Hex, testEnv, uniqueSite, type MCPConnection } from "./helpers";
+import { DEPLOY_TOKEN, MCP_ENV, ORIGIN, SECRET, call, deploy, mcpConnect, sha256Hex, testEnv, uniqueSite, wrapSiteNamespace, type MCPConnection } from "./helpers";
 
 /** Mode none with anonymous deploys: guests may publish. */
 const PUB: Partial<Env> = { ...MCP_ENV, ALLOW_ANONYMOUS_DEPLOY: "true" };
@@ -961,6 +962,51 @@ describe("the tools (SPEC §14.1)", () => {
       ...Array.from({ length: 5 }, (_, i) => mcp.json("backyard_publish", { site, files: [{ path: `part${i}.js`, content: `// ${i}\n` }] })),
     ]);
     expect((await siteRecord(site)).value).toMatchObject({ file_count: 7, preview: "cover.svg" });
+  });
+
+  it("settles the title, preview and updated_at on the files also when a concurrent publish keeps the file count and size", async () => {
+    const { conn, mcp } = await guest();
+    const site = uniqueSite("settle");
+    const index = (img: string, title: string) => `<title>${title}</title><meta property="og:image" content="${img}">`;
+    await mcp.json("backyard_publish", {
+      site,
+      files: [
+        { path: "index.html", content: index("img/a.svg", "Old") },
+        { path: "app.js", content: "aaaa" },
+        { path: "img/a.svg", content: "<svg>A</svg>" },
+        { path: "img/b.svg", content: "<svg>B</svg>" },
+      ],
+    });
+    expect((await siteRecord(site)).value).toMatchObject({ title: "Old", preview: "img/a.svg" });
+    // Publish A (app.js, same size) merges; before it writes its record, publish B
+    // (index.html of the same size naming img/b.svg) runs to its end. A then writes
+    // its older record over B's, and its settle has to put the site's values back.
+    let latest = null as Record<string, unknown> | null;
+    let merges = 0;
+    const SITE = wrapSiteNamespace({
+      async deployMerge(real, ...args) {
+        const r = await real(...args);
+        if (merges++ === 0) {
+          await new Promise((done) => setTimeout(done, 5)); // B switches at a later millisecond
+          await mcp.json("backyard_publish", { site, files: [{ path: "index.html", content: index("img/b.svg", "New") }] });
+          latest = (await siteRecord(site)).value;
+        }
+        return r;
+      },
+    });
+    await client(conn, { ...PUB, SITE }).json("backyard_publish", { site, files: [{ path: "app.js", content: "bbbb" }] });
+    expect(merges).toBe(1);
+    expect(latest).toMatchObject({ title: "New", preview: "img/b.svg" });
+    const info = unwrap(await siteStub(testEnv(), site).siteInfo());
+    expect(info).toMatchObject({ title: "New", preview: "img/b.svg", fileCount: 4 });
+    expect((await siteRecord(site)).value).toMatchObject({
+      title: "New",
+      preview: "img/b.svg",
+      file_count: 4,
+      bytes: info.bytes,
+      updated_at: formatMicros(info.updatedAt * 1000),
+    });
+    expect(latest!.updated_at).toBe(formatMicros(info.updatedAt * 1000));
   });
 
   it("merges concurrent publishes of one site atomically: no file is lost", async () => {

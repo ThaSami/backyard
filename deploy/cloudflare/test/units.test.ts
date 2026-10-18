@@ -360,6 +360,32 @@ describe("titles (as internal/sites/title.go)", () => {
     expect(extractPage('<meta name="DESCR\u0130PTION" content="x">').description).toBe("");
   });
 
+  it("trims attribute values in linear time, with Go's two sets of white space", () => {
+    // A long run of white space inside a value made the old trimming regexes (/^[S]+|[S]+$/) quadratic: seconds per page.
+    const L = 65400;
+    for (const [what, html, want] of [
+      ["name", `<meta name="x${" ".repeat(L)}x" content="d">`, { title: "", description: "", image: "" }],
+      ["property", `<meta property="x${"\t".repeat(L)}x" content="c">`, { title: "", description: "", image: "" }],
+      ["content", `<meta property="og:image" content="x${" ".repeat(L)}x">`, { title: "", description: "", image: `x${" ".repeat(L)}x` }],
+      ["name with Go's spaces", `<meta name="d${"\u3000\u0085\v".repeat(L / 3)}d">`, { title: "", description: "", image: "" }],
+      ["title cut", `<title>${"a".repeat(254)}${" \u2028".repeat(16000)}b c</title>`, { title: "a".repeat(254) + "\u2026", description: "", image: "" }],
+    ] as const) {
+      const start = performance.now();
+      const page = extractPage(html);
+      const ms = performance.now() - start;
+      expect(page, what).toEqual(want);
+      expect(ms, what).toBeLessThan(50);
+    }
+    // strings.TrimSpace (unicode.IsSpace) for the name, HTML's ASCII white space for the og:image key and content.
+    expect(extractPage(`<meta name="${" ".repeat(L)}description\u3000\v\u00a0" content="d">`).description).toBe("d");
+    expect(extractPage('<meta name="\u1680\u2000\u200a\u2028\u2029\u202f\u205fdescription\t\n\r\f" content="d">').description).toBe("d");
+    expect(extractPage('<meta name="\u200bdescription" content="d">').description).toBe("");
+    expect(extractPage('<meta property=" \t\n\r\fog:image \t\n\r\f" content=" \t\n\r\fa.png \t\n\r\f">').image).toBe("a.png");
+    expect(extractPage('<meta property="\vog:image" content="a.png">').image).toBe("");
+    expect(extractPage('<meta property="og:image\u00a0" content="a.png">').image).toBe("");
+    expect(extractPage('<meta property="og:image" content="&nbsp;a.png\v\u3000 ">').image).toBe("\u00a0a.png\v\u3000");
+  });
+
   it.each([
     ["&amp; &amp &AMP; &ampx &lt3 &notit; &not;", "& & & &x <3 \u00acit; \u00ac"],
     ["&#47; &#x2F; &#X2f; &#47 &#x2F", "/ / / / /"],

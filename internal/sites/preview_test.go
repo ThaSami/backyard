@@ -229,7 +229,7 @@ func TestChoosePreview(t *testing.T) {
 }
 
 func FuzzResolvePreviewRef(f *testing.F) {
-	for _, s := range []string{"a.png", "/a.png", "./a.png", "%2E%2E/a", "https://x/a.png", "//x", `a\b`, "a?b#c", "%"} {
+	for _, s := range []string{"a.png", "/a.png", "./a.png", "%2E%2E/a", "https://x/a.png", "//x", `a\b`, "a?b#c", "%", "a%5Cb.png", "img/%5c..%5Ca.png"} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, ref string) {
@@ -237,8 +237,10 @@ func FuzzResolvePreviewRef(f *testing.F) {
 		if !ok {
 			return
 		}
-		// Whatever is accepted is a well-formed relative site path.
-		if p == "" || p[0] == '/' || strings.ContainsAny(p, "\\") {
+		// Whatever is accepted is a well-formed relative site path. A "\\"
+		// may come from a percent escape ("%5C"): SPEC §7.2 rejects it only
+		// in the raw reference, and no site file can contain one.
+		if p == "" || p[0] == '/' {
 			t.Fatalf("ResolvePreviewRef(%q) = %q", ref, p)
 		}
 		for seg := range strings.SplitSeq(p, "/") {

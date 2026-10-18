@@ -28,7 +28,7 @@ import { contentTypeFor, detectContentType, isActiveContent, normalizeContentTyp
 import { boundaryOf, MultipartError, MultipartReader } from "./multipart";
 import { serveObject, type Servable } from "./object";
 import { sanitizeFileName } from "./paths";
-import { choosePreview, PREVIEW_CACHE_UNVERSIONED, PREVIEW_CACHE_VERSIONED, PREVIEW_CSP, previewType } from "./preview";
+import { choosePreview, MAX_PREVIEW_BYTES, PREVIEW_CACHE_UNVERSIONED, PREVIEW_CACHE_VERSIONED, PREVIEW_CSP, previewType } from "./preview";
 import { extractPage, TITLE_SCAN_BYTES } from "./title";
 
 /** Chunk size of stored bytes (the row limit of DO SQLite is 2 MB). */
@@ -856,11 +856,13 @@ export class SiteDO extends DurableObject<Env> {
    * GET /preview?path=[&versioned] — the preview image for the hub (SPEC §3):
    * typed by the extension of its path, never by the stored type, and
    * sandboxed (PREVIEW_CSP), so that an SVG never runs on the hub's origin.
+   * A file larger than MAX_PREVIEW_BYTES is a 404 too, whatever the record
+   * names (defence in depth: the 1 MiB rule also holds when serving).
    */
   private servePreview(req: Request, path: string, versioned: boolean): Response {
     const type = previewType(path);
     const obj = type ? this.fileObject(path) : null;
-    if (!obj) return new Response(null, { status: 404, headers: { "x-backyard-not-found": "preview" } });
+    if (!obj || obj.size > MAX_PREVIEW_BYTES) return new Response(null, { status: 404, headers: { "x-backyard-not-found": "preview" } });
     obj.contentType = type;
     return serveObject(req, obj, {
       cacheControl: versioned ? PREVIEW_CACHE_VERSIONED : PREVIEW_CACHE_UNVERSIONED,

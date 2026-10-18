@@ -690,7 +690,7 @@ On the hub host (`https://backyard.example.com`):
 |---|---|
 | `GET /__backyard/api/me` | Current user |
 | `GET /__backyard/api/sites` | `{"sites": [SiteMeta]}` — the site directory |
-| `GET /__backyard/api/sites/{site}/preview` | The image `SiteMeta.preview` names (`404 not_found` without one), typed by its extension and sandboxed (`Content-Security-Policy: sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'`); `?v=<anything>` makes it cacheable for a year (`private`), the hub passes the site's last update |
+| `GET /__backyard/api/sites/{site}/preview` | The image `SiteMeta.preview` names (`404 not_found` without one, or when the stored file is over 1 MiB), typed by its extension and sandboxed (`Content-Security-Policy: sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'`); a non-empty `?v=` makes it cacheable for a year (`Cache-Control: private, max-age=31536000, immutable`; without one `private, no-cache`), the hub passes the site's last update |
 | `POST /__backyard/api/tokens` | `{"name"?, "ttl_hours"?}` → `{"token", "expires_at", "name"?}` (personal API token; `ttl_hours` at most the server's token TTL, default 720; needs `X-Backyard: 1`; not for guests or static tokens) |
 | `GET /__backyard/api/info` | Server info: URL mode, auth mode, deploy methods, limits |
 | `/__backyard/api/deploy/…` | Deploy gateway (see [deploy.md](deploy.md)) |

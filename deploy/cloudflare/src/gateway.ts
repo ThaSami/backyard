@@ -38,7 +38,7 @@ import type { CommitResult, DeployFile, MergeOutcome, MergeRefusal, PageInfo } f
 import { fixedLength } from "./site-api";
 import { isOwner, siteMetaJSON } from "./sitemeta";
 import { chargeOrThrow, registry, siteStub, VERSION } from "./stubs";
-import { extractPage, TITLE_SCAN_BYTES } from "./title";
+import { extractPage, TITLE_SCAN_BYTES, type Page } from "./title";
 
 /** How long a deploy id (and its upload URLs) stays valid. */
 const DEPLOY_TTL_SECONDS = 3600;
@@ -427,7 +427,8 @@ async function handleRefresh(ctx: RequestContext, [s]: string[]): Promise<Respon
   const prev = await authorizeSite(ctx, u, site);
   const info = unwrap(await siteStub(ctx.env, site).siteInfo());
   if (info.fileCount === 0 && !prev) throw notFound(`site ${JSON.stringify(site)} not found`);
-  const { title, description, preview } = await sitePage(ctx, site, info);
+  // Strict: a refresh that cannot read index.html fails and keeps the record (as on the Go server).
+  const { title, description, preview } = await sitePage(ctx, site, info, undefined, true);
   const now = formatMicros(Date.now() * 1000);
   const meta: SiteRecord = {
     name: site,
@@ -525,12 +526,17 @@ interface SitePage {
  * Title, description and preview of a site: as the SiteDO found them, or,
  * when its index.html lives in R2, from the head of that file (head when
  * the caller has the bytes, else read from R2) with the SiteDO choosing the
- * preview for its og:image. Best effort, like the Go server's readPage: the
- * files are already switched, so a failure here leaves what the SiteDO found.
+ * preview for its og:image. Best effort for a commit or a publish, like the
+ * Go server's readPage: the files are already switched, so a failed read
+ * leaves what the SiteDO found, and a failed choice of the preview keeps the
+ * title and description read and the SiteDO's preview. strict (a refresh,
+ * which switches nothing, and the settling of a record) throws instead, like
+ * the Go server's Refresh, so that the record is left as it is.
  */
-async function sitePage(ctx: RequestContext, site: string, r: PageInfo, head?: Uint8Array): Promise<SitePage> {
+async function sitePage(ctx: RequestContext, site: string, r: PageInfo, head?: Uint8Array, strict = false): Promise<SitePage> {
   const stored = { title: r.title, description: r.description, preview: r.preview };
   if (!r.titleR2Key) return stored;
+  let page: Page;
   try {
     if (!head) {
       if (!ctx.env.R2) return stored;
@@ -538,13 +544,22 @@ async function sitePage(ctx: RequestContext, site: string, r: PageInfo, head?: U
       if (!obj || !("body" in obj)) return stored;
       head = new Uint8Array(await obj.arrayBuffer());
     }
-    const page = extractPage(head);
-    const preview = page.image ? unwrap(await siteStub(ctx.env, site).previewFor(page.image)) : r.preview;
-    return { title: page.title, description: page.description, preview };
+    page = extractPage(head);
   } catch (e) {
+    if (strict) throw e;
     console.warn(`backyard: reading index.html of ${site} for its title failed: ${(e as Error)?.message ?? e}`);
     return stored;
   }
+  let preview = r.preview;
+  if (page.image) {
+    try {
+      preview = unwrap(await siteStub(ctx.env, site).previewFor(page.image));
+    } catch (e) {
+      if (strict) throw e;
+      console.warn(`backyard: choosing the preview of ${site} failed: ${(e as Error)?.message ?? e}`);
+    }
+  }
+  return { title: page.title, description: page.description, preview };
 }
 
 /**
@@ -934,8 +949,10 @@ export async function publishFiles(ctx: RequestContext, req: PublishRequest): Pr
 /**
  * Keeps the site record in step with the files when another commit switched
  * the site after this publish (concurrent publishes write their records in
- * any order): the record then gets the file count, size, title, description
- * and preview of the site as it is now.
+ * any order): when its file count, size, title, description or preview is
+ * not what the site has now, the record gets those of the site as it is now
+ * and the time of its latest switch (so the hub's preview URL changes too).
+ * They are derived strictly: what cannot be read leaves the record alone.
  */
 async function settleSiteRecord(ctx: RequestContext, site: string, committedAt: number): Promise<void> {
   try {
@@ -943,9 +960,19 @@ async function settleSiteRecord(ctx: RequestContext, site: string, committedAt: 
     if (info.updatedAt === committedAt) return;
     const reg = registry(ctx.env);
     const rec = unwrap(await reg.getSite(site));
-    if (!rec || (rec.file_count === info.fileCount && rec.bytes === info.bytes)) return;
-    const { title, description, preview } = await sitePage(ctx, site, info);
+    if (!rec) return;
+    const { title, description, preview } = await sitePage(ctx, site, info, undefined, true);
+    if (
+      rec.file_count === info.fileCount &&
+      rec.bytes === info.bytes &&
+      (rec.title ?? "") === title &&
+      (rec.description ?? "") === description &&
+      (rec.preview ?? "") === preview
+    ) {
+      return;
+    }
     const next: SiteRecord = { ...rec, file_count: info.fileCount, bytes: info.bytes };
+    if (info.updatedAt) next.updated_at = formatMicros(info.updatedAt * 1000);
     delete next.title;
     delete next.description;
     delete next.preview;

@@ -73,6 +73,23 @@ func (s *Server) loadBlob(ctx context.Context, key string) (*object, error) {
 	return s.blobObject(key, e), nil
 }
 
+// loadBlobFresh is loadBlob without the cache: the result reflects storage
+// at or after the call, for a response that must match what was read
+// before it in the same request. The cache is neither read nor filled.
+func (s *Server) loadBlobFresh(ctx context.Context, key string) (*object, error) {
+	if !blob.ValidKey(key) {
+		return nil, errObjectNotFound
+	}
+	e, err := s.fetchEntry(ctx, key, true)
+	if err != nil {
+		return nil, err
+	}
+	if e.notFound {
+		return nil, errObjectNotFound
+	}
+	return s.blobObject(key, e), nil
+}
+
 // fetchEntry stats key and, for small objects when loadSmall is set, reads
 // its bytes.
 func (s *Server) fetchEntry(ctx context.Context, key string, loadSmall bool) (*cacheEntry, error) {

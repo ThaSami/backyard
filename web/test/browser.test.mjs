@@ -13,6 +13,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { inflateSync } from "node:zlib";
 import { startStub } from "./stubserver.mjs";
 
 let pw = null;
@@ -770,6 +771,52 @@ test("hub on a phone-sized screen has no horizontal scroll", async (t) => {
 /** A preview image as sites ship them (16:9). */
 const PREVIEW_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720"><rect width="1280" height="720" fill="#e0672b"/><rect x="64" y="64" width="640" height="80" rx="12" fill="#fff"/></svg>';
 
+/**
+ * A preview of another shape: a w×h SVG in BODY with a band of BAND across its
+ * top (band units high). sized: false leaves out width and height (a
+ * viewBox-only SVG, as docs/deploying-sites.md suggests).
+ */
+const BAND = [224, 103, 43]; // #e0672b
+const BODY = [43, 103, 224]; // #2b67e0
+const bandedSVG = (w, h, band, sized = true) =>
+  `<svg xmlns="http://www.w3.org/2000/svg"${sized ? ` width="${w}" height="${h}"` : ""} viewBox="0 0 ${w} ${h}"><rect width="${w}" height="${h}" fill="#2b67e0"/><rect width="${w}" height="${band}" fill="#e0672b"/></svg>`;
+
+/** Decodes an 8-bit, non-interlaced RGB or RGBA PNG (a Playwright screenshot) into { width, height, at(x, y) → [r, g, b] }. */
+function decodePNG(buf) {
+  assert.equal(buf.toString("latin1", 1, 4), "PNG");
+  let width = 0;
+  let height = 0;
+  let channels = 0;
+  const idat = [];
+  for (let off = 8; off < buf.length; ) {
+    const len = buf.readUInt32BE(off);
+    const type = buf.toString("latin1", off + 4, off + 8);
+    const data = buf.subarray(off + 8, off + 8 + len);
+    if (type === "IHDR") {
+      [width, height, channels] = [data.readUInt32BE(0), data.readUInt32BE(4), { 2: 3, 6: 4 }[data[9]]];
+      assert.ok(data[8] === 8 && data[12] === 0 && channels, "an 8-bit, non-interlaced RGB(A) PNG");
+    } else if (type === "IDAT") idat.push(data);
+    else if (type === "IEND") break;
+    off += 12 + len;
+  }
+  const raw = inflateSync(Buffer.concat(idat));
+  const stride = width * channels;
+  const px = Buffer.alloc(height * stride);
+  for (let y = 0; y < height; y++) {
+    const filter = raw[y * (stride + 1)];
+    for (let i = 0; i < stride; i++) {
+      const a = i >= channels ? px[y * stride + i - channels] : 0;
+      const b = y > 0 ? px[(y - 1) * stride + i] : 0;
+      const c = i >= channels && y > 0 ? px[(y - 1) * stride + i - channels] : 0;
+      const p = a + b - c;
+      const paeth = Math.abs(p - a) <= Math.abs(p - b) && Math.abs(p - a) <= Math.abs(p - c) ? a : Math.abs(p - b) <= Math.abs(p - c) ? b : c;
+      px[y * stride + i] = raw[y * (stride + 1) + 1 + i] + [0, a, b, (a + b) >> 1, paeth][filter];
+    }
+  }
+  return { width, height, at: (x, y) => [...px.subarray(y * stride + x * channels, y * stride + x * channels + 3)] };
+}
+const sameColor = (rgb, want) => rgb.every((v, i) => Math.abs(v - want[i]) <= 8);
+
 const ago = (hours) => new Date(Date.now() - hours * 3600e3).toISOString();
 
 test("hub: the side cards start collapsed (Sites in the first screen), open by click or keyboard and stay as left", async (t) => {
@@ -914,6 +961,74 @@ test("hub: grid cards show the site's preview image, or a placeholder of the sam
     await context.close();
     await stub.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hub: a preview of any shape covers its 16:9 box from the top (a tall page, a 1200×630 og:image); the card stays one link", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  const stub = await startStub({
+    sites: [
+      { name: "tall", url: "http://x/s/tall/", title: "Tall page", preview: "preview.svg", updated_at: ago(1), owners: [] },
+      { name: "og", url: "http://x/s/og/", title: "Open Graph image", preview: "img/og.svg", updated_at: ago(2), owners: [] },
+      { name: "plain", url: "http://x/s/plain/", title: "Without", updated_at: ago(3), owners: [] },
+    ],
+    // A full-page screenshot's shape (viewBox only) and og:image's usual 1200×630.
+    stored: { "tall/preview.svg": bandedSVG(400, 2000, 100, false), "og/img/og.svg": bandedSVG(1200, 630, 60) },
+  });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  try {
+    const { page, problems } = await open(context, stub.url + "/");
+    await page.waitForSelector('.site[data-site="plain"] .site-preview.none');
+    for (const viewport of [{ width: 1280, height: 800 }, { width: 360, height: 740 }]) {
+      await page.setViewportSize(viewport);
+      for (const name of ["tall", "og"]) {
+        const sel = `.site[data-site="${name}"] .site-preview`;
+        const at = `${name} at ${viewport.width}px`;
+        await page.$eval(sel, (b) => b.scrollIntoView({ block: "center" }));
+        await page.waitForFunction((s) => document.querySelector(s + " img")?.complete && document.querySelector(s + " img").naturalWidth > 0, sel);
+        // The image's box is the preview box (inside its bottom border), whatever the image's own ratio.
+        const g = await page.$eval(sel, (b) => {
+          const r = b.getBoundingClientRect();
+          const i = b.querySelector("img").getBoundingClientRect();
+          return { box: [r.left, r.top, r.width, r.height], img: [i.left, i.top, i.width, i.height], border: parseFloat(getComputedStyle(b).borderBottomWidth) };
+        });
+        assert.ok(Math.abs(g.box[2] / g.box[3] - 16 / 9) < 0.01, `${at}: the box is 16:9 (${g.box[2]}×${g.box[3]})`);
+        assert.equal(g.border, 1);
+        for (const [k, want, got] of [["left", g.box[0], g.img[0]], ["top offset", g.box[1], g.img[1]], ["width", g.box[2], g.img[2]], ["height", g.box[3] - g.border, g.img[3]]]) {
+          assert.ok(Math.abs(want - got) < 0.01, `${at}: img ${k} ${got} ≠ box ${want} (${JSON.stringify(g)})`);
+        }
+        // What shows is the image's top (its band at the top centre), cropped, not letterboxed.
+        const png = decodePNG(await page.locator(sel).screenshot());
+        const cx = Math.floor(png.width / 2);
+        const cy = Math.floor(png.height / 2);
+        const samples = { "top centre": png.at(cx, 2), "bottom centre": png.at(cx, png.height - 4), "left middle": png.at(1, cy), "right middle": png.at(png.width - 2, cy) };
+        const want = { "top centre": BAND, "bottom centre": BODY, "left middle": BODY, "right middle": BODY };
+        for (const [k, rgb] of Object.entries(samples)) assert.ok(sameColor(rgb, want[k]), `${at}: the ${k} pixel is rgb(${rgb}), not rgb(${want[k]})`);
+      }
+      // The placeholder keeps its layout: the icon and the text centred in the box.
+      const ph = await page.$eval('.site[data-site="plain"] .site-preview', (b) => {
+        const r = b.getBoundingClientRect();
+        const i = b.querySelector(".icon").getBoundingClientRect();
+        const s = b.querySelector("span").getBoundingClientRect();
+        return { cx: r.left + r.width / 2, cy: r.top + (r.height - 1) / 2, icon: i.left + i.width / 2, text: s.left + s.width / 2, mid: (i.top + s.bottom) / 2, below: s.top > i.bottom };
+      });
+      for (const k of ["icon", "text"]) assert.ok(Math.abs(ph[k] - ph.cx) < 1, `${viewport.width}px: placeholder ${k} centred (${JSON.stringify(ph)})`);
+      assert.ok(Math.abs(ph.mid - ph.cy) < 1 && ph.below, `${viewport.width}px: placeholder centred vertically (${JSON.stringify(ph)})`);
+      // The whole card, preview included, is still its title link.
+      for (const name of ["tall", "og", "plain"]) {
+        const hit = await page.evaluate((n) => {
+          const card = document.querySelector(`.site[data-site="${n}"]`);
+          card.scrollIntoView({ block: "center" });
+          const r = card.querySelector(".site-preview").getBoundingClientRect();
+          return document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) === card.querySelector(".site-title a");
+        }, name);
+        assert.equal(hit, true, `${name} at ${viewport.width}px: the preview's centre hits the title link`);
+      }
+    }
+    assert.deepEqual(problems, []);
+  } finally {
+    await context.close();
+    await stub.close();
   }
 });
 

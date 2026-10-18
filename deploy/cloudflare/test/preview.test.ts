@@ -15,7 +15,7 @@ import { choosePreview, MAX_PREVIEW_BYTES, PREVIEW_CSP, PREVIEW_NAMES, PREVIEW_T
 import type { SiteRecord } from "../src/registry-do";
 import { registry, siteStub } from "../src/stubs";
 import { decodeBytes, extractPage } from "../src/title";
-import { apiHeaders, call, deploy, DEPLOY_TOKEN, testEnv, tokenHeaders, uniqueSite } from "./helpers";
+import { apiHeaders, call, deploy, DEPLOY_TOKEN, testEnv, tokenHeaders, uniqueSite, wrapSiteNamespace } from "./helpers";
 
 const CSP = "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'";
 const IMMUTABLE = "private, max-age=31536000, immutable";
@@ -333,6 +333,57 @@ describe("SiteMeta.preview on the gateway's write paths (SPEC §7.2)", () => {
     expect(Object.keys(m).indexOf("preview")).toBe(Object.keys(m).indexOf("description") + 1);
     expect((await getJSON(`/__backyard/api/deploy/sites/${site}`)).preview).toBe("img/a.svg");
   });
+
+  it("keeps the title and description read from R2 when choosing the preview fails at a commit", async () => {
+    const site = uniqueSite("prevforerr");
+    const SITE = wrapSiteNamespace({
+      previewFor: async () => {
+        throw new Error("simulated SiteDO error");
+      },
+    });
+    const big = page(og("img/c.svg"), "<p>" + "x".repeat(80_000) + "</p>");
+    const m = (await deploy(site, { "index.html": big, "img/c.svg": svg("c"), "preview.svg": svg("p") }, { envOverrides: { SITE } })).commit.site;
+    // Best effort: the files are switched; the preview is the SiteDO's choice of preview.*.
+    expect(m).toMatchObject({ title: "Preview test", description: "Rules", preview: "preview.svg" });
+    expect(await getJSON(`/__backyard/api/deploy/sites/${site}`)).toMatchObject({ title: "Preview test", description: "Rules", preview: "preview.svg" });
+  });
+
+  it("fails a refresh that cannot read index.html from R2 or choose its preview, and keeps the record (as on the Go server)", async () => {
+    const site = uniqueSite("prevreferr");
+    const big = page(og("img/c.svg"), "<p>" + "x".repeat(80_000) + "</p>");
+    await commitMeta(site, { "index.html": big, "img/c.svg": svg("c"), "preview.svg": svg("p") });
+    expect(unwrap(await siteStub(testEnv(), site).siteInfo()).titleR2Key).not.toBe("");
+    const before = await getJSON(`/__backyard/api/deploy/sites/${site}`);
+    expect(before).toMatchObject({ title: "Preview test", description: "Rules", preview: "img/c.svg" });
+    const refresh = (env: Partial<Env>) => call(`/__backyard/api/deploy/sites/${site}/refresh`, { method: "POST", headers: tokenHeaders(), body: "{}" }, env);
+    const bucket = testEnv().R2!;
+    const R2 = new Proxy(bucket, {
+      get(t, p) {
+        if (p === "get") {
+          return async () => {
+            throw new Error("simulated R2 error");
+          };
+        }
+        const v = Reflect.get(t, p);
+        return typeof v === "function" ? v.bind(t) : v;
+      },
+    });
+    const SITE = wrapSiteNamespace({
+      previewFor: async () => ({ ok: false, error: { status: 500, code: "internal", message: "choosing the preview failed" } }),
+    });
+    for (const [what, env] of [
+      ["R2 read", { R2 }],
+      ["previewFor", { SITE }],
+    ] as const) {
+      const res = await refresh(env);
+      expect(res.status, what).toBe(500);
+      expect((await errorOf(res)).code, what).toBe("internal");
+      expect(await getJSON(`/__backyard/api/deploy/sites/${site}`), what).toEqual(before);
+    }
+    const res = await refresh({});
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ title: "Preview test", description: "Rules", preview: "img/c.svg" });
+  });
 });
 
 describe("GET /__backyard/api/sites/{site}/preview (SPEC §3)", () => {
@@ -452,6 +503,26 @@ describe("GET /__backyard/api/sites/{site}/preview (SPEC §3)", () => {
       expect(res.headers.get("Allow"), method).toBe("GET, HEAD");
       expect((await errorOf(res)).code).toBe("bad_request");
     }
+  });
+
+  it("answers 404 for a file over 1 MiB, whatever the record names", async () => {
+    const site = uniqueSite("prevbig");
+    const m = await commitMeta(site, { "index.html": page(og("big.png")), "big.png": new Uint8Array(MAX + 1), "edge.png": new Uint8Array(MAX) });
+    expect(m).not.toHaveProperty("preview");
+    const rec = ((await registry(testEnv()).getSite(site)) as { ok: true; value: SiteRecord }).value;
+    await registry(testEnv()).putSite({ ...rec, preview: "big.png" });
+    for (const q of ["", "?v=1"]) {
+      const res = await call(previewURL(site, q));
+      expect(res.status, q).toBe(404);
+      expect(await errorOf(res), q).toEqual({ code: "not_found", message: `site "${site}" has no preview` });
+      expect((await call(previewURL(site, q), { method: "HEAD" })).status, q).toBe(404);
+    }
+    // At most 1 MiB is served.
+    await registry(testEnv()).putSite({ ...rec, preview: "edge.png" });
+    const res = await call(previewURL(site, "?v=1"));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("image/png");
+    expect((await res.arrayBuffer()).byteLength).toBe(MAX);
   });
 
   it("is served on the hub host in host mode, and is not a site path there", async () => {

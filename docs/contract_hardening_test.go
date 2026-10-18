@@ -135,14 +135,17 @@ func TestUploadSandboxAllowlistDocumented(t *testing.T) {
 // workerPreview holds the site preview values of the Cloudflare edition
 // (deploy/cloudflare/src/preview.ts).
 type workerPreview struct {
-	names    []string
-	maxBytes int
-	csp      string
-	types    map[string]string
+	names            []string
+	maxBytes         int
+	csp              string
+	types            map[string]string
+	cacheVersioned   string // Cache-Control with a non-empty ?v=
+	cacheUnversioned string // Cache-Control without one
 }
 
-// readWorkerPreview reads PREVIEW_NAMES, MAX_PREVIEW_BYTES, PREVIEW_CSP and
-// PREVIEW_TYPES from deploy/cloudflare/src/preview.ts.
+// readWorkerPreview reads PREVIEW_NAMES, MAX_PREVIEW_BYTES, PREVIEW_CSP,
+// PREVIEW_TYPES, PREVIEW_CACHE_VERSIONED and PREVIEW_CACHE_UNVERSIONED from
+// deploy/cloudflare/src/preview.ts.
 func readWorkerPreview(t *testing.T) workerPreview {
 	t.Helper()
 	const rel = "deploy/cloudflare/src/preview.ts"
@@ -168,8 +171,85 @@ func readWorkerPreview(t *testing.T) workerPreview {
 	for _, kv := range regexp.MustCompile(`"?([a-z0-9]+)"?: "([^"]+)"`).FindAllStringSubmatch(find("PREVIEW_TYPES", `(?s)export const PREVIEW_TYPES\b[^=]*= \{(.*?)\}`)[1], -1) {
 		w.types[kv[1]] = kv[2]
 	}
+	w.cacheVersioned = find("PREVIEW_CACHE_VERSIONED", `export const PREVIEW_CACHE_VERSIONED\b[^=]*= "([^"]*)";`)[1]
+	w.cacheUnversioned = find("PREVIEW_CACHE_UNVERSIONED", `export const PREVIEW_CACHE_UNVERSIONED\b[^=]*= "([^"]*)";`)[1]
 	return w
 }
+
+// goStringConsts returns the values of the named string constants of a Go
+// file below repoRoot and how often the file uses each name besides
+// declaring it.
+func goStringConsts(t *testing.T, rel string, names ...string) (values map[string]string, uses map[string]int) {
+	t.Helper()
+	f := parseGoFile(t, rel)
+	values, uses = map[string]string{}, map[string]int{}
+	declared := map[*ast.Ident]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		decl, ok := n.(*ast.GenDecl)
+		if !ok || decl.Tok != token.CONST {
+			return true
+		}
+		for _, spec := range decl.Specs {
+			vs := spec.(*ast.ValueSpec)
+			for i, id := range vs.Names {
+				if !slices.Contains(names, id.Name) || i >= len(vs.Values) {
+					continue
+				}
+				if s, ok := stringLit(vs.Values[i]); ok {
+					values[id.Name] = s
+					declared[id] = true
+				}
+			}
+		}
+		return false
+	})
+	ast.Inspect(f, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok && !declared[id] && slices.Contains(names, id.Name) {
+			uses[id.Name]++
+		}
+		return true
+	})
+	for _, name := range names {
+		if _, ok := values[name]; !ok {
+			t.Fatalf("string constant %s not found in %s (update this test)", name, rel)
+		}
+	}
+	return values, uses
+}
+
+// tsImportRe matches a TypeScript import statement.
+var tsImportRe = regexp.MustCompile(`(?s)\bimport\s+(?:type\s+)?\{[^}]*\}\s*from\s*"[^"]*";`)
+
+// listItem returns the Markdown list item of text that contains needle: the
+// line that starts the item and its indented continuation lines.
+func listItem(t *testing.T, where, text, needle string) string {
+	t.Helper()
+	lines := strings.Split(text, "\n")
+	at := slices.IndexFunc(lines, func(l string) bool { return strings.Contains(l, needle) })
+	if at < 0 {
+		t.Fatalf("%s no longer says %q (update this test)", where, needle)
+	}
+	itemStart := regexp.MustCompile(`^\s*(?:\d+\.|[-*])\s`)
+	start := at
+	for start > 0 && !itemStart.MatchString(lines[start]) {
+		start--
+	}
+	if !itemStart.MatchString(lines[start]) {
+		t.Fatalf("%s: %q is no longer in a list item (update this test)", where, needle)
+	}
+	end := start + 1
+	for end < len(lines) && strings.TrimSpace(lines[end]) != "" && !itemStart.MatchString(lines[end]) &&
+		strings.TrimLeft(lines[end], " \t") != lines[end] {
+		end++
+	}
+	if end <= at {
+		t.Fatalf("%s: %q is no longer in a list item (update this test)", where, needle)
+	}
+	return strings.Join(lines[start:end], "\n")
+}
+
+// mibRe matches a size in MiB ("1 MiB").
+var mibRe = regexp.MustCompile(`\b\d+(?:\.\d+)? MiB\b`)
 
 // previewNameList returns the names of the longest list of preview file
 // names ("`preview.png`, `preview.jpg`, … or `preview.svg`") in text.
@@ -200,12 +280,16 @@ func between(t *testing.T, where, text, start, end string) string {
 
 // TestSitePreviewContractDocumented checks how site previews are chosen
 // (SPEC §7.2) and served (SPEC §3) against both editions: the preview.* file
-// names in their order, the image types and the Content-Type each is served
-// with, the 1 MiB cap, the Content-Security-Policy and the two Cache-Control
-// values. The Go server (internal/sites/preview.go, internal/server) and the
-// Cloudflare edition (deploy/cloudflare/src/preview.ts) must agree with the
-// specification, and the guides that tell people and agents how to ship a
-// preview must state the same names, cap and policy.
+// names in their order, the og:image extensions, the image types and the
+// Content-Type each is served with, the 1 MiB cap (of both rules, and when
+// serving), the Content-Security-Policy and which of the two Cache-Control
+// values goes with a non-empty ?v=. The Go server (internal/sites/preview.go,
+// internal/server/preview.go) and the Cloudflare edition
+// (deploy/cloudflare/src/preview.ts) must agree with the specification, and
+// their preview handlers must use the Cache-Control constants this test
+// reads. The guides that tell people and agents how to ship a preview must
+// state the same names, extensions, cap and policy, and the guide and the
+// API reference the same Cache-Control values.
 func TestSitePreviewContractDocumented(t *testing.T) {
 	if len(sites.PreviewNames) < 2 || len(sites.PreviewTypes) < 2 || sites.PreviewCSP == "" {
 		t.Fatalf("Go preview contract not found: names %q, types %v, CSP %q", sites.PreviewNames, sites.PreviewTypes, sites.PreviewCSP)
@@ -216,6 +300,20 @@ func TestSitePreviewContractDocumented(t *testing.T) {
 	}
 	limit := strconv.Itoa(mib) + " MiB"
 	exts := slices.Sorted(maps.Keys(sites.PreviewTypes))
+	// checkCap reports a span that states no size in MiB, or another one
+	// than the cap.
+	checkCap := func(where, span string) {
+		t.Helper()
+		figures := mibRe.FindAllString(span, -1)
+		if len(figures) == 0 {
+			t.Errorf("%s does not state the preview cap %s", where, limit)
+		}
+		for _, f := range figures {
+			if f != limit {
+				t.Errorf("%s states the preview cap %s, the code %s", where, f, limit)
+			}
+		}
+	}
 
 	// The editions agree.
 	w := readWorkerPreview(t)
@@ -236,13 +334,31 @@ func TestSitePreviewContractDocumented(t *testing.T) {
 			t.Errorf("the preview file name %s has no preview type", name)
 		}
 	}
+	const goHandler = "internal/server/preview.go"
+	goCache, goUses := goStringConsts(t, goHandler, "previewCacheVersioned", "previewCacheUnversioned")
+	versioned, unversioned := goCache["previewCacheVersioned"], goCache["previewCacheUnversioned"]
+	if w.cacheVersioned != versioned {
+		t.Errorf("preview Cache-Control with ?v=: Go %q, Worker %q", versioned, w.cacheVersioned)
+	}
+	if w.cacheUnversioned != unversioned {
+		t.Errorf("preview Cache-Control without ?v=: Go %q, Worker %q", unversioned, w.cacheUnversioned)
+	}
+	workerServe := tsImportRe.ReplaceAllString(readRepoFile(t, "deploy/cloudflare/src/site-do.ts")+readRepoFile(t, "deploy/cloudflare/src/hub.ts"), "")
+	for goName, tsName := range map[string]string{"previewCacheVersioned": "PREVIEW_CACHE_VERSIONED", "previewCacheUnversioned": "PREVIEW_CACHE_UNVERSIONED"} {
+		if goUses[goName] == 0 {
+			t.Errorf("%s defines %s but does not use it", goHandler, goName)
+		}
+		if !regexp.MustCompile(`\b` + tsName + `\b`).MatchString(workerServe) {
+			t.Errorf("deploy/cloudflare/src (site-do.ts, hub.ts) does not use %s", tsName)
+		}
+	}
 
 	// SPEC §7.2: how a preview is chosen.
 	choose := flatten(specSection(t, "7.2"))
 	if got := previewNameList(choose); !slices.Equal(got, sites.PreviewNames) {
 		t.Errorf("SPEC §7.2 lists the preview files %q, the code %q (in this order)", got, sites.PreviewNames)
 	}
-	documented := codeSpans(between(t, "SPEC §7.2", choose, "its extension (lowercased) is one of", "1 MiB"))
+	documented := codeSpans(between(t, "SPEC §7.2", choose, "its extension (lowercased) is one of", "MiB"))
 	sort.Strings(documented)
 	if !slices.Equal(documented, exts) {
 		t.Errorf("SPEC §7.2 names the og:image extensions %q, the code %q", documented, exts)
@@ -250,6 +366,7 @@ func TestSitePreviewContractDocumented(t *testing.T) {
 	if want := fmt.Sprintf("%s (%d bytes)", limit, sites.MaxPreviewBytes); !strings.Contains(choose, want) {
 		t.Errorf("SPEC §7.2 does not state the preview cap %q", want)
 	}
+	checkCap("SPEC §7.2 (rule 2, preview.*)", between(t, "SPEC §7.2", choose, "**`preview.*`.**", "Otherwise the site has no preview"))
 
 	// SPEC §3: how it is served.
 	serve := flatten(specSection(t, "3"))
@@ -267,31 +384,23 @@ func TestSitePreviewContractDocumented(t *testing.T) {
 	if !maps.Equal(served, sites.PreviewTypes) {
 		t.Errorf("SPEC §3 serves previews as %v, the code as %v", served, sites.PreviewTypes)
 	}
+	previews := between(t, "SPEC §3", serve, "**Preview images.**", "The hub UI requests")
+	checkCap("SPEC §3 (the 404 answers of the preview route)", between(t, "SPEC §3", previews, "`404 not_found`", "`405`"))
 	var cacheControl []string
-	for _, s := range codeSpans(between(t, "SPEC §3", serve, "**Preview images.**", "The hub UI requests")) {
+	for _, s := range codeSpans(previews) {
 		if v, ok := strings.CutPrefix(s, "Cache-Control: "); ok {
 			cacheControl = append(cacheControl, v)
 		}
 	}
-	if len(cacheControl) != 2 {
-		t.Fatalf("SPEC §3 gives %d Cache-Control values for previews, want 2 (with and without ?v=): %q", len(cacheControl), cacheControl)
+	if want := []string{versioned, unversioned}; !slices.Equal(cacheControl, want) {
+		t.Errorf("SPEC §3 gives the preview Cache-Control values %q, the code %q (with a non-empty ?v=, without)", cacheControl, want)
 	}
-	goLits := map[string]bool{}
-	ast.Inspect(parseGoFile(t, "internal/server/preview.go"), func(n ast.Node) bool {
-		if e, ok := n.(ast.Expr); ok {
-			if s, ok := stringLit(e); ok {
-				goLits[s] = true
-			}
-		}
-		return true
-	})
-	worker := readRepoFile(t, "deploy/cloudflare/src/preview.ts") + readRepoFile(t, "deploy/cloudflare/src/hub.ts")
-	for _, v := range cacheControl {
-		if !goLits[v] {
-			t.Errorf("internal/server/preview.go does not send Cache-Control %q (SPEC §3)", v)
-		}
-		if !strings.Contains(worker, strconv.Quote(v)) {
-			t.Errorf("deploy/cloudflare/src (preview.ts, hub.ts) does not send Cache-Control %q (SPEC §3)", v)
+	for _, want := range []string{
+		"`Cache-Control: " + versioned + "` when the request has a non-empty `v`",
+		"otherwise `Cache-Control: " + unversioned + "`",
+	} {
+		if !strings.Contains(previews, want) {
+			t.Errorf("SPEC §3 does not say %q (%s: previewCacheVersioned with a non-empty ?v=, previewCacheUnversioned without)", want, goHandler)
 		}
 	}
 	if !strings.Contains(flatten(specSection(t, "2")), "`/__backyard/api/sites/{site}/preview`") {
@@ -300,31 +409,49 @@ func TestSitePreviewContractDocumented(t *testing.T) {
 
 	// The guides say the same.
 	guide := flatten(markdownSection(t, readRepoFile(t, "docs/deploying-sites.md"), "Site preview"))
-	api := flatten(readRepoFile(t, "skills/backyard/references/api.md"))
+	apiRaw := readRepoFile(t, "skills/backyard/references/api.md")
+	api := flatten(apiRaw)
+	// An extension as a word of its own, not the end of a file name such
+	// as img/cover.png.
+	extWord := func(ext string) *regexp.Regexp {
+		return regexp.MustCompile(`(?:^|[^.\w])` + regexp.QuoteMeta(ext) + `\b`)
+	}
 	for where, text := range map[string]string{"docs/deploying-sites.md (Site preview)": guide, "skills/…/references/api.md": api} {
 		if got := previewNameList(text); !slices.Equal(got, sites.PreviewNames) {
 			t.Errorf("%s lists the preview files %q, the code %q (in this order)", where, got, sites.PreviewNames)
 		}
-		for _, want := range append([]string{limit, sites.PreviewCSP, "/__backyard/api/sites/"}, exts...) {
+		for _, want := range []string{limit, sites.PreviewCSP, "/__backyard/api/sites/", versioned, unversioned} {
 			if !strings.Contains(text, want) {
 				t.Errorf("%s does not mention %q", where, want)
 			}
 		}
-	}
-	for where, text := range map[string]string{
-		"docs/security.md (Uploads and deployed files)": flatten(markdownSection(t, readRepoFile(t, "docs/security.md"), "Uploads and deployed files")),
-		"skills/backyard/SKILL.md":                      flatten(readRepoFile(t, "skills/backyard/SKILL.md")),
-		"templates/files/agents/partials.tmpl":          flatten(readRepoFile(t, "templates/files/agents/partials.tmpl")),
-	} {
-		want := []string{"`preview.svg`", "1280×720", "1 MiB"}
-		if strings.HasPrefix(where, "docs/security.md") {
-			want = []string{sites.PreviewCSP, "/__backyard/api/sites/<site>/preview"}
-		}
-		for _, s := range want {
-			if !strings.Contains(text, s) {
-				t.Errorf("%s does not mention %q", where, s)
+		// The og:image rule: its extensions and its cap.
+		rule := between(t, where, text, "og:image", "MiB") + "MiB"
+		for _, ext := range exts {
+			if !extWord(ext).MatchString(rule) {
+				t.Errorf("%s does not name the og:image extension %s (between \"og:image\" and its cap)", where, ext)
 			}
 		}
+		checkCap(where+" (the og:image rule)", rule)
+	}
+	checkCap("docs/deploying-sites.md (Site preview)", guide)
+	routeRow := between(t, "skills/…/references/api.md", apiRaw, "| `GET /__backyard/api/sites/{site}/preview` |", "\n")
+	if !strings.Contains(routeRow, "non-empty") || !strings.Contains(routeRow, versioned) {
+		t.Errorf("skills/…/references/api.md (the preview route row) does not say that a non-empty ?v= gets Cache-Control %q", versioned)
+	}
+	security := flatten(markdownSection(t, readRepoFile(t, "docs/security.md"), "Uploads and deployed files"))
+	for _, s := range []string{sites.PreviewCSP, "/__backyard/api/sites/<site>/preview"} {
+		if !strings.Contains(security, s) {
+			t.Errorf("docs/security.md (Uploads and deployed files) does not mention %q", s)
+		}
+	}
+	// The agent instructions: the list item that tells agents to ship one.
+	for _, rel := range []string{"skills/backyard/SKILL.md", "templates/files/agents/partials.tmpl"} {
+		item := flatten(listItem(t, rel, readRepoFile(t, rel), "1280×720"))
+		if !strings.Contains(item, "`preview.svg`") {
+			t.Errorf("%s does not mention `preview.svg` next to 1280×720", rel)
+		}
+		checkCap(rel+" (the preview item)", item)
 	}
 }
 

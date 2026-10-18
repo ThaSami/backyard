@@ -50,7 +50,19 @@ func (s *Server) handleSitePreview(w http.ResponseWriter, r *http.Request) {
 		noPreview()
 		return
 	}
-	obj, err := s.loadBlob(ctx, sites.SiteKey(site, m.Preview))
+	// A versioned response is kept for a year, so it is read from storage
+	// after the meta: uploads precede the commit that changed the version,
+	// while the object cache may still hold the previous bytes (another
+	// instance's or a standalone gateway's deploy does not purge it, and a
+	// local purge runs only after the meta is written).
+	key := sites.SiteKey(site, m.Preview)
+	versioned := r.URL.Query().Get("v") != ""
+	var obj *object
+	if versioned {
+		obj, err = s.loadBlobFresh(ctx, key)
+	} else {
+		obj, err = s.loadBlob(ctx, key)
+	}
 	switch {
 	case errors.Is(err, errObjectNotFound):
 		noPreview()
@@ -59,9 +71,17 @@ func (s *Server) handleSitePreview(w http.ResponseWriter, r *http.Request) {
 		s.writeAPIError(w, r, s.storageError(err))
 		return
 	}
+	// The 1 MiB cap holds when serving too: an upload of a deploy that was
+	// never committed, or a direct sync, replaces the file in place (SPEC
+	// §7.3) while the meta still names it. The object holds no open body
+	// (serveObject opens it), so there is nothing to release.
+	if obj.size > sites.MaxPreviewBytes {
+		noPreview()
+		return
+	}
 	obj.contentType = ct
 	cc := previewCacheUnversioned
-	if r.URL.Query().Get("v") != "" {
+	if versioned {
 		cc = previewCacheVersioned
 	}
 	w.Header().Set("Content-Security-Policy", sites.PreviewCSP)

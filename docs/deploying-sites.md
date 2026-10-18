@@ -52,16 +52,21 @@ hidden or missing file, a file over 1 MiB or another format is skipped without a
 rule 2 applies: a page can keep an absolute `og:image` for link previews in chat tools and ship
 a `preview.png` for the hub. A deploy without the file removes the preview. After a direct
 sync the preview follows the refresh that the CLI runs afterwards (files copied into storage
-outside the CLI change it only at the next refresh or deploy).
+outside the CLI change it only at the next refresh or deploy). Sites deployed before a server
+knew about previews have none until their next deploy or publish (a direct-synced site: its
+next sync).
 `backyard dev`'s hub shows the placeholder for the folder it serves; open
-`http://<site>.localhost:4321/preview.svg` to check the image itself.
+`http://<site>.localhost:4321/preview.svg` to check the drawing. That view is not sandboxed: on
+the card, an SVG shows nothing it loads from other files (not even the site's own images) and
+no web fonts.
 
 **Sizes and formats.** Make it 1280×720 (16:9) in one of the formats above; an SVG needs
-`xmlns="http://www.w3.org/2000/svg"` and a `viewBox="0 0 1280 720"`. Cards are about 260 to
-380 pixels wide and the image covers the card's 16:9 box, aligned to its top, so draw the app's
-main screen large and simple: a few big shapes, the headings, little small text. An SVG sketch
-of the main screen is usually a few kilobytes and sharp at any size; the six
-[examples](../examples/) each ship one. A preview must be self-contained: it is served with
+`xmlns="http://www.w3.org/2000/svg"` and a `viewBox="0 0 1280 720"`. Cards are at least 260
+pixels wide (up to about 390 on a desktop, the screen's full width on a phone) and the image
+covers the card's 16:9 box, aligned to its top, so draw the app's main screen large and simple:
+a few big shapes, the headings, little small text. An SVG sketch of the main screen is usually
+a few kilobytes and sharp at any size; the six [examples](../examples/) each ship one. A
+preview must be self-contained: it is served with
 `Content-Security-Policy: sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'`,
 so scripts never run and nothing is loaded from elsewhere — inline `<style>`, `data:` images
 and system fonts work, web fonts, external images and stylesheets do not.

@@ -88,6 +88,33 @@ export async function deploy(
   return { create, commit: (await c.json()) as DeployOutcome["commit"] };
 }
 
+/** A SiteDO RPC method of a stub, as the Worker calls it. */
+export type SiteMethod = (...args: unknown[]) => Promise<unknown>;
+
+/**
+ * The SITE namespace (pass it as SITE in envOverrides) with some RPC methods
+ * of every SiteDO stub replaced: wrap[name] gets the real method and the
+ * arguments of each call. Everything else goes to the real SiteDO.
+ */
+export function wrapSiteNamespace(wrap: Record<string, (real: SiteMethod, ...args: unknown[]) => Promise<unknown>>): Env["SITE"] {
+  const ns = testEnv().SITE;
+  return {
+    idFromName: (name: string) => ns.idFromName(name),
+    idFromString: (id: string) => ns.idFromString(id),
+    get(id: DurableObjectId) {
+      const stub = ns.get(id) as unknown as Record<string, SiteMethod>;
+      return new Proxy(stub, {
+        get(target, p) {
+          if (typeof p !== "string" || p === "then") return Reflect.get(target, p);
+          const real: SiteMethod = (...a) => target[p]!(...a);
+          const w = Object.hasOwn(wrap, p) ? wrap[p]! : null;
+          return w ? (...a: unknown[]) => w(real, ...a) : real;
+        },
+      });
+    },
+  } as unknown as Env["SITE"];
+}
+
 /** Returns the anon cookie pair ("backyard_anon=...") set by a response. */
 export function anonCookie(res: Response): string {
   const sc = res.headers.get("Set-Cookie") ?? "";

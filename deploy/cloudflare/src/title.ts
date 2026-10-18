@@ -188,10 +188,33 @@ export function unescapeHTML(s: string): string {
 /** Go's unicode.IsSpace: JavaScript's \s without U+FEFF, with U+0085. */
 const SPACE = "\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
 const SPACES_RE = new RegExp(`[${SPACE}]+`, "u");
-const TRIM_RE = new RegExp(`^[${SPACE}]+|[${SPACE}]+$`, "gu");
+
+/** Whether c is a character of SPACE (Go's unicode.IsSpace); all of them are in the BMP. */
+const isGoSpace = (c: number) =>
+  (c >= 0x09 && c <= 0x0d) || c === 0x20 || c === 0x85 || c === 0xa0 || c === 0x1680 ||
+  (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000;
+
+/** Whether c is HTML's ASCII whitespace. */
+const isASCIISpace = (c: number) => c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d || c === 0x0c;
+
+/**
+ * s without the leading and trailing characters isSp accepts. An index scan,
+ * linear in the length: a trimming regex (/[…]+$/) backtracks quadratically
+ * on a long run of spaces that is not at the end.
+ */
+function trimBy(s: string, isSp: (c: number) => boolean): string {
+  let a = 0;
+  let b = s.length;
+  while (a < b && isSp(s.charCodeAt(a))) a++;
+  while (b > a && isSp(s.charCodeAt(b - 1))) b--;
+  return s.slice(a, b);
+}
+
+/** Go's strings.TrimSpace. */
+const trimSpace = (s: string) => trimBy(s, isGoSpace);
 
 /** HTML's ASCII whitespace (Go's trimASCIISpace). */
-const trimASCIISpace = (s: string) => s.replace(/^[ \t\n\r\f]+|[ \t\n\r\f]+$/g, "");
+const trimASCIISpace = (s: string) => trimBy(s, isASCIISpace);
 
 function asciiLower(s: string): string {
   return s.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
@@ -277,7 +300,7 @@ function cleanText(s: string, max: number): string {
   let t = unescapeHTML(s.replace(/[\udc80-\udcff]+/gu, "\ufffd"));
   t = t.split(SPACES_RE).filter(Boolean).join(" ");
   const chars = [...t];
-  if (chars.length > max) t = chars.slice(0, max - 1).join("").replace(TRIM_RE, "") + "…";
+  if (chars.length > max) t = trimSpace(chars.slice(0, max - 1).join("")) + "…";
   return t;
 }
 
@@ -324,7 +347,7 @@ export function extractPage(doc: Uint8Array | string): Page {
       if (end < 0) break;
       if (!haveDesc || !haveImage) {
         const attrs = parseAttrs(src.slice(i + 5, end - 1));
-        if (!haveDesc && equalFoldASCII((attrs.get("name") ?? "").replace(TRIM_RE, ""), "description")) {
+        if (!haveDesc && equalFoldASCII(trimSpace(attrs.get("name") ?? ""), "description")) {
           page.description = cleanText(attrs.get("content") ?? "", MAX_DESCRIPTION);
           haveDesc = true;
         }

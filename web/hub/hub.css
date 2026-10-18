@@ -873,8 +873,11 @@ label.check input {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 /* The preview image a site ships (SiteMeta.preview), or a placeholder of the
-   same size; the card's link overlay covers it. */
+   same size; the card's link overlay covers it. The grid centres the
+   placeholder; the image is taken out of it (absolutely positioned) so that it
+   fills the 16:9 box whatever its own ratio, covering it from the top. */
 .site-preview {
+  position: relative;
   flex: none;
   display: grid;
   place-items: center;
@@ -890,6 +893,8 @@ label.check input {
   font-size: 13px;
 }
 .site-preview img {
+  position: absolute;
+  inset: 0;
   display: block;
   width: 100%;
   height: 100%;

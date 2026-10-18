@@ -223,9 +223,9 @@ and behind the gate of the other hub APIs (§2), serve the site file that `SiteM
 in both URL modes and in every auth mode (an identity proxy such as Cloudflare Access in front
 included), without fetching anything from site hosts. The answer is `404 not_found` (§5
 envelope) when the site does not exist (an invalid name included), its SiteMeta has no
-`preview`, the file is no longer stored, or the file's extension is not one of the preview types
-below; other methods get `405` with `Allow` like every API route. A `200` carries the file's
-bytes and:
+`preview`, the file is no longer stored, the file's extension is not one of the preview types
+below, or the stored file is larger than 1 MiB (the cap of §7.2 holds when serving too); other
+methods get `405` with `Allow` like every API route. A `200` carries the file's bytes and:
 
 * `Content-Type` by the extension of the path (lowercased), never the type stored with the file:
   `png` → `image/png`, `jpg` and `jpeg` → `image/jpeg`, `gif` → `image/gif`, `webp` →
@@ -684,14 +684,14 @@ editions; `title`, `description`, `preview`, `created_by`, `updated_by` and `dep
 omitted when empty. `deploy_id` here is a short opaque id of the last deploy (`d_<hex>`), not the
 signed deploy token.
 
-`title`, `description` and `preview` are derived from the site's files every time the SiteMeta is
-written — a deploy commit, a refresh, a `backyard_publish` (§14.1) — from the files the site has
-after that write, so a redeploy without them removes them. `title`, `description` and the
-`og:image` reference below come from one tolerant scan of the first 64 KiB of the root
-`index.html`, which skips comments and the contents of `script`, `style`, `svg`, `template`,
-`textarea`, `noscript` and `math` elements: `title` is the text of the first `<title>` and
-`description` the `content` of the first `<meta name="description">` (both with entities decoded
-and whitespace collapsed).
+`title`, `description` and `preview` are derived from the site's files whenever the site's files
+are written — a deploy commit, a refresh, a `backyard_publish` (§14.1) — from the files the site
+has after that write, so a redeploy without them removes them; an owners update keeps them.
+`title`, `description` and the `og:image` reference below come from one tolerant scan of the
+first 64 KiB of the root `index.html`, which skips comments and the contents of `script`,
+`style`, `svg`, `template`, `textarea`, `noscript` and `math` elements: `title` is the text of
+the first `<title>` and `description` the `content` of the first `<meta name="description">`
+(both with entities decoded and whitespace collapsed).
 
 `preview` is the path, relative to the site root (no leading `/`, e.g. `preview.svg` or
 `img/cover.png`), of an image the site ships for the hub's site cards (§3). It is chosen in this

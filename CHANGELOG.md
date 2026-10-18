@@ -19,7 +19,9 @@ All notable changes to Backyard are documented here. The format follows
   extension, sandboxed by `Content-Security-Policy`, cached per viewer until the next deploy),
   with the credentials of the site list, so previews work in host and path mode and behind
   Cloudflare Access, Okta or any identity proxy. Guide:
-  [Site preview](docs/deploying-sites.md#site-preview).
+  [Site preview](docs/deploying-sites.md#site-preview). **Upgrade:** a preview is chosen when a
+  site's metadata is written, so sites deployed before this version show the placeholder until
+  their next deploy or `backyard_publish` (a direct-synced site: its next sync).
 - The six examples ship a hand-drawn `preview.svg`, and the skill and the agent files of
   `backyard init` tell agents to ship one (1280×720, self-contained, at most 1 MiB).
 - Maintainers can publish an existing release's `backyard-cloudflare` package to npm by hand
@@ -35,6 +37,16 @@ All notable changes to Backyard are documented here. The format follows
 - npm publishing keeps `latest` on the newest version: a version older than npm's `latest`
   (`v1.4.1` after 1.5.0) gets the dist-tag `release-1.4` instead of moving `latest` back.
   Publishes run one at a time, and one fails if npm cannot say what its `latest` is.
+- Cloudflare edition: site titles and descriptions are extracted exactly like the Go server
+  (all HTML named character references, references without `;`, unquoted attribute values
+  containing `/`, invalid UTF-8), so a title like `It&rsquo;s` now shows as `It’s` and
+  `<meta name=description content=https://example.com/a/b>` gives the whole URL. Existing sites
+  get the new title and description at their next deploy, refresh or `backyard_publish`.
+
+### Fixed
+
+- Cloudflare edition: a refresh right after a site's first deploy reported `updated_at` before
+  `created_at`; a deploy commit now records the time the site switched.
 
 ## [0.2.0] - 2026-10-15
 
