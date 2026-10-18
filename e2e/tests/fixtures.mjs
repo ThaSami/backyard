@@ -150,15 +150,24 @@ export async function expectAccessible(page, what) {
   // axe measures the colors on screen: an element still fading in (an
   // entrance animation or a transition) reads as low contrast. Let the finite
   // ones finish; endless ones (a blinking cursor) are left alone.
-  await page.evaluate(() =>
-    Promise.all(
-      document
-        .getAnimations()
-        .filter((a) => a.effect?.getComputedTiming().endTime !== Infinity)
-        .map((a) => a.finished.catch(() => {})),
-    ),
-  );
-  const { violations } = await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"]).analyze();
+  const settle = () =>
+    page.evaluate(() =>
+      Promise.all(
+        document
+          .getAnimations()
+          .filter((a) => a.effect?.getComputedTiming().endTime !== Infinity)
+          .map((a) => a.finished.catch(() => {})),
+      ),
+    );
+  const analyze = async () => {
+    await settle();
+    return (await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"]).analyze()).violations;
+  };
+  // Realtime pages can start a new entrance animation while axe runs (another
+  // test's note arrives): measure once more before reporting. A real
+  // violation is still there the second time.
+  let violations = await analyze();
+  if (violations.length) violations = await analyze();
   const found = violations.flatMap((v) =>
     v.nodes.slice(0, 5).map((n) => `${v.id} (${v.impact}) at ${n.target.join(" ")}: ${n.failureSummary.split("\n").slice(1).join(" ").trim()}`),
   );
