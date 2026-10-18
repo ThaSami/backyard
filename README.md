@@ -24,6 +24,22 @@ no secrets in the page. The free-tier Cloudflare edition is inspired by
 </script>
 ```
 
+## See it in action
+
+<p>
+<a href="https://cdn.jsdelivr.net/gh/thasami/backyard@fa734bf3792a77bac6fcdc7b109df2eb6125cf21/.github/media/backyard-cloudflare-setup.mp4"><img src=".github/media/backyard-cloudflare-setup.jpg" alt="Video: Backyard on Cloudflare, set up end to end (1:37)" width="49%"></a>
+<a href="https://cdn.jsdelivr.net/gh/thasami/backyard@fa734bf3792a77bac6fcdc7b109df2eb6125cf21/.github/media/backyard-claude-connector.mp4"><img src=".github/media/backyard-claude-connector.jpg" alt="Video: publish a websocket app from Claude (2:26)" width="49%"></a>
+</p>
+
+- **Cloudflare's free tier, end to end (1:37).** Install the CLI, deploy Backyard to a Cloudflare
+  account, put the hub on your own domain and publish a site, without Cloudflare Access.
+  [Guide](docs/cloudflare.md)
+- **The Claude connector (2:26).** Turn the connector on, add it to Claude Code, approve Backyard's
+  consent page and ask Claude to publish the [`cursors`](examples/cursors/) example: multiplayer
+  cursors over websocket rooms, live in two browsers. Without Access, Claude publishes as a guest,
+  which needs `ALLOW_ANONYMOUS_DEPLOY`; the recording turns it on for the demo only.
+  [Guide](docs/claude-connector.md)
+
 ## Why
 
 Most internal tools are a page, a list, a button and a bit of AI. They die in the backlog
