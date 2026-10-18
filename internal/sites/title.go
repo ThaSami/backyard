@@ -16,20 +16,34 @@ const (
 // inside them (e.g. in a script string or an inline SVG) is not the page's.
 var rawTextElements = []string{"script", "style", "svg", "template", "textarea", "noscript", "math"}
 
-// ExtractTitle returns the <title> text and <meta name="description"> content
-// of an HTML document (best effort; only the first 64 KiB are considered).
+// Page is what a site's root index.html says about the site (SPEC §7.2).
+type Page struct {
+	Title       string // <title> text
+	Description string // <meta name="description"> content
+	// Image is the og:image reference, entity-decoded and trimmed but not
+	// resolved (ResolvePreviewRef, ChoosePreview).
+	Image string
+}
+
+// ExtractPage returns the <title> text, the <meta name="description">
+// content and the og:image reference of an HTML document (best effort;
+// only the first 64 KiB are considered). The og:image is the content of
+// the first <meta> whose property attribute, or without one its name
+// attribute, is "og:image" (ASCII case-insensitive, trimmed).
 //
 // The scan is tolerant of malformed markup: comments and the contents of
 // script/style/svg/template elements are skipped, entities are decoded and
-// whitespace is collapsed. Results are capped at a sensible length.
-func ExtractTitle(doc []byte) (title, description string) {
+// whitespace is collapsed. Title and description are capped at a sensible
+// length.
+func ExtractPage(doc []byte) Page {
+	var pg Page
 	if len(doc) > TitleScanBytes {
 		doc = doc[:TitleScanBytes]
 	}
 	lower := asciiLower(doc)
-	var haveTitle, haveDesc bool
+	var haveTitle, haveDesc, haveImage bool
 	i := 0
-	for i < len(doc) && !(haveTitle && haveDesc) {
+	for i < len(doc) && !(haveTitle && haveDesc && haveImage) {
 		lt := bytes.IndexByte(lower[i:], '<')
 		if lt < 0 {
 			break
@@ -40,21 +54,21 @@ func ExtractTitle(doc []byte) (title, description string) {
 		case bytes.HasPrefix(rest, []byte("<!--")):
 			end := bytes.Index(rest[4:], []byte("-->"))
 			if end < 0 {
-				return title, description
+				return pg
 			}
 			i += 4 + end + 3
 			continue
 		case tagIs(rest, "title"):
 			start := tagEnd(lower, i)
 			if start < 0 {
-				return title, description
+				return pg
 			}
 			end := bytes.Index(lower[start:], []byte("</title"))
 			if end < 0 {
 				end = len(doc) - start // unterminated: take what we have
 			}
 			if !haveTitle {
-				title = cleanText(doc[start:start+end], maxTitleRunes)
+				pg.Title = cleanText(doc[start:start+end], maxTitleRunes)
 				haveTitle = true
 			}
 			i = start + end
@@ -62,13 +76,21 @@ func ExtractTitle(doc []byte) (title, description string) {
 		case tagIs(rest, "meta"):
 			end := tagEnd(lower, i)
 			if end < 0 {
-				return title, description
+				return pg
 			}
-			if !haveDesc {
+			if !haveDesc || !haveImage {
 				attrs := parseAttrs(doc[i+len("<meta") : end-1])
-				if strings.EqualFold(strings.TrimSpace(attrs["name"]), "description") {
-					description = cleanText([]byte(attrs["content"]), maxDescriptionRunes)
+				if !haveDesc && strings.EqualFold(strings.TrimSpace(attrs["name"]), "description") {
+					pg.Description = cleanText([]byte(attrs["content"]), maxDescriptionRunes)
 					haveDesc = true
+				}
+				key, ok := attrs["property"]
+				if !ok {
+					key = attrs["name"]
+				}
+				if !haveImage && asciiEqualFold(trimASCIISpace(key), "og:image") {
+					pg.Image = trimASCIISpace(html.UnescapeString(attrs["content"]))
+					haveImage = true
 				}
 			}
 			i = end
@@ -79,7 +101,7 @@ func ExtractTitle(doc []byte) (title, description string) {
 			if tagIs(rest, el) {
 				start := tagEnd(lower, i)
 				if start < 0 {
-					return title, description
+					return pg
 				}
 				if (el == "svg" || el == "math") && start >= 2 && lower[start-2] == '/' {
 					i = start // self-closing foreign element
@@ -88,7 +110,7 @@ func ExtractTitle(doc []byte) (title, description string) {
 				}
 				end := bytes.Index(lower[start:], []byte("</"+el))
 				if end < 0 {
-					return title, description
+					return pg
 				}
 				i = start + end + 2 + len(el)
 				skipped = true
@@ -99,7 +121,7 @@ func ExtractTitle(doc []byte) (title, description string) {
 			i++
 		}
 	}
-	return title, description
+	return pg
 }
 
 // tagIs reports whether s (lowercased, starting at '<') opens element name.
@@ -219,6 +241,29 @@ func asciiLower(b []byte) []byte {
 	}
 	return out
 }
+
+// asciiEqualFold reports whether s and t are equal under ASCII case folding.
+func asciiEqualFold(s, t string) bool {
+	if len(s) != len(t) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		a, b := s[i], t[i]
+		if 'A' <= a && a <= 'Z' {
+			a += 'a' - 'A'
+		}
+		if 'A' <= b && b <= 'Z' {
+			b += 'a' - 'A'
+		}
+		if a != b {
+			return false
+		}
+	}
+	return true
+}
+
+// trimASCIISpace removes leading and trailing HTML ASCII whitespace.
+func trimASCIISpace(s string) string { return strings.Trim(s, " \t\n\r\f") }
 
 // isWhitespace reports HTML ASCII whitespace.
 func isWhitespace(c byte) bool {

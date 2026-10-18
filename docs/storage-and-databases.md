@@ -30,7 +30,7 @@ Keys (after an optional per-backend `prefix`):
 | Key | Content |
 |---|---|
 | `sites/<site>/<path>` | site files — exactly what `rsync`, `aws s3 sync`, `gcloud storage rsync` and `az storage blob sync` write |
-| `_meta/sites/<site>.json` | site metadata (title, description, owners, last deploy) |
+| `_meta/sites/<site>.json` | site metadata (title, description, preview image path, owners, last deploy) |
 | `_meta/manifests/<site>.json` | the file list with sizes, SHA-256 digests and ETags (for diffed deploys) |
 | `uploads/<site>/<id>/<name>` | `backyard.files` uploads and generated images |
 

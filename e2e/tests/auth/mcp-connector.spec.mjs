@@ -370,6 +370,8 @@ test("the hub card shows the connector URL and the connection; Disconnect cuts t
   await page.goto("/");
   const card = page.locator("#connector");
   await expect(card).toBeVisible();
+  await expect(card.locator("#connector-copy")).toBeHidden(); // collapsed until opened
+  await card.locator("summary").click();
   await expect(card.locator("#connector-url")).toHaveText(MCP_URL);
   await expect(card.locator("#connector-copy")).toBeVisible();
   await expect(card).toContainText(`claude mcp add --transport http backyard ${MCP_URL}`);

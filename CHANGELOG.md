@@ -8,6 +8,20 @@ All notable changes to Backyard are documented here. The format follows
 
 ### Added
 
+- **Site previews on the hub** (both editions): in the grid view every site card starts with a
+  16:9 image that the site ships itself — the `og:image` of its root `index.html` when that
+  names one of the site's own files (png, jpg, jpeg, gif, webp, avif or svg, at most 1 MiB),
+  else the first of `preview.png`, `preview.jpg`, `preview.jpeg`, `preview.webp`,
+  `preview.avif`, `preview.gif`, `preview.svg` at the site root — or a placeholder of the same
+  size that says "No preview available". SiteMeta has a new optional field `preview`,
+  recomputed at every deploy commit, refresh and `backyard_publish` like the title. The hub
+  loads the image from its own origin, `GET /__backyard/api/sites/{site}/preview` (typed by
+  extension, sandboxed by `Content-Security-Policy`, cached per viewer until the next deploy),
+  with the credentials of the site list, so previews work in host and path mode and behind
+  Cloudflare Access, Okta or any identity proxy. Guide:
+  [Site preview](docs/deploying-sites.md#site-preview).
+- The six examples ship a hand-drawn `preview.svg`, and the skill and the agent files of
+  `backyard init` tell agents to ship one (1280×720, self-contained, at most 1 MiB).
 - Maintainers can publish an existing release's `backyard-cloudflare` package to npm by hand
   (Actions → Publish to npm, with the release's tag): the release's own asset, checked against
   its `checksums.txt`, with provenance. The release's npm job runs the same workflow
@@ -15,6 +29,9 @@ All notable changes to Backyard are documented here. The format follows
 
 ### Changed
 
+- The hub's side cards ("Use Backyard in Claude", "Use the CLI", "For agents") are collapsible
+  and collapsed by default, so the site directory starts on the first screen; the browser
+  remembers which cards you opened.
 - npm publishing keeps `latest` on the newest version: a version older than npm's `latest`
   (`v1.4.1` after 1.5.0) gets the dist-tag `release-1.4` instead of moving `latest` back.
   Publishes run one at a time, and one fails if npm cannot say what its `latest` is.

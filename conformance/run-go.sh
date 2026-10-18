@@ -167,6 +167,10 @@ ratelimit:
   # running in parallel. The suite retries HTTP 429s but cannot retry a
   # websocket handshake.
   api_per_minute: 6000
+  # Guests' deploys share that address's bucket too (the static token's are
+  # one user's), and the suite creates more deploys than the default 60 an
+  # hour (tests/preview.test.mjs alone about 40).
+  deploys_per_hour: 1000
 telemetry:
   log_format: text
 EOF

@@ -34,7 +34,13 @@ for (const colorScheme of ["light", "dark"]) {
       await page.locator("#selection-files summary").click();
       await page.locator("#selection-ignored summary").click();
       await page.locator("#token-box summary").click();
+      // The side cards open, and the site previews (or placeholders) in view.
+      for (const summary of await page.locator(".side details[data-panel] > summary:visible").all()) await summary.click();
+      await expect(page.locator(".side details[data-panel][open]")).not.toHaveCount(0);
       await expectAccessible(page, "hub");
+      await page.locator("#sites-title").scrollIntoViewIfNeeded();
+      await expect(page.locator(".site .site-preview").first()).toBeVisible();
+      await expectAccessible(page, "hub site cards");
       await page.locator('button[aria-label="Delete tmpl-blank"]').click();
       await expect(page.locator("#delete-dialog")).toBeVisible();
       await expectAccessible(page, "hub delete dialog");

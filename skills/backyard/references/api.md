@@ -571,9 +571,14 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "X-Backyard: 1" -H "Content
 | `GET /users/{email}` | `User` \| 404 |
 | `GET /site` | `SiteMeta` of the current site |
 
-`SiteMeta = {name, url, title, description, created_at, created_by, updated_at, updated_by,
-deploy_id, file_count, bytes, owners: []}` — `title`/`description` come from the root
-`index.html`'s `<title>` and `<meta name="description">`.
+`SiteMeta = {name, url, title, description, preview, created_at, created_by, updated_at,
+updated_by, deploy_id, file_count, bytes, owners: []}` — `title`/`description` come from the
+root `index.html`'s `<title>` and `<meta name="description">`; `preview` (omitted when there is
+none) is the site path of the image the hub shows on the site's card: the `og:image` of
+`index.html` when it names one of the site's own files (relative or `/`-rooted; png, jpg, jpeg,
+gif, webp, avif or svg; ≤ 1 MiB), else the first of `preview.png`, `preview.jpg`,
+`preview.jpeg`, `preview.webp`, `preview.avif`, `preview.gif`, `preview.svg` at the site root
+that is at most 1 MiB. All three are recomputed whenever the site is deployed or refreshed.
 
 ### Database
 
@@ -685,6 +690,7 @@ On the hub host (`https://backyard.example.com`):
 |---|---|
 | `GET /__backyard/api/me` | Current user |
 | `GET /__backyard/api/sites` | `{"sites": [SiteMeta]}` — the site directory |
+| `GET /__backyard/api/sites/{site}/preview` | The image `SiteMeta.preview` names (`404 not_found` without one), typed by its extension and sandboxed (`Content-Security-Policy: sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'`); `?v=<anything>` makes it cacheable for a year (`private`), the hub passes the site's last update |
 | `POST /__backyard/api/tokens` | `{"name"?, "ttl_hours"?}` → `{"token", "expires_at", "name"?}` (personal API token; `ttl_hours` at most the server's token TTL, default 720; needs `X-Backyard: 1`; not for guests or static tokens) |
 | `GET /__backyard/api/info` | Server info: URL mode, auth mode, deploy methods, limits |
 | `/__backyard/api/deploy/…` | Deploy gateway (see [deploy.md](deploy.md)) |

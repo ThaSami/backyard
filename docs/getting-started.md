@@ -34,8 +34,9 @@ backyard serve --dev
 there is no login (everyone is an anonymous guest), deploys need no token, and files plus an
 SQLite database live in `./.backyard-data`. Set `PORT=9000` to use another port.
 
-Open <http://localhost:8080/> — the hub lists sites, shows CLI setup and accepts drag-and-drop
-deploys of a folder.
+Open <http://localhost:8080/> — the hub lists sites (each with its preview image, or a "No
+preview available" placeholder), keeps CLI setup and instructions for agents in collapsible
+cards on the side, and accepts drag-and-drop deploys of a folder.
 
 ## 3. Create a site
 
@@ -120,6 +121,10 @@ The dev server allows anonymous deploys, so `login` only stores the server URL. 
 uploads what changed and prints the URL — <http://lunch-vote.localhost:8080/>. Deploying again
 overwrites the site in place (files you deleted locally are removed); the data in its database
 survives. `backyard deploy --dry-run` shows what would change.
+
+The hub lists the site under its `<title>`. Its card shows a placeholder until the site ships a
+preview image: add a `preview.svg` (or `preview.png`, 1280×720) at the root of the folder and
+deploy again — see [Site preview](deploying-sites.md#site-preview).
 
 Useful next commands: `backyard sites list`, `backyard open lunch-vote`,
 `backyard pull lunch-vote` (download a site to study or fork it) and `backyard whoami`.

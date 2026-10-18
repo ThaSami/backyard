@@ -34,11 +34,11 @@ import { mcpEnabled, mcpResource } from "./oauth";
 import { normalizeOwners, validatePath } from "./paths";
 import type { SiteRecord } from "./registry-do";
 import { gatewayURL, siteNameError, siteURL, type RequestContext } from "./router";
-import type { CommitResult, DeployFile, MergeOutcome, MergeRefusal } from "./site-do";
+import type { CommitResult, DeployFile, MergeOutcome, MergeRefusal, PageInfo } from "./site-do";
 import { fixedLength } from "./site-api";
 import { isOwner, siteMetaJSON } from "./sitemeta";
 import { chargeOrThrow, registry, siteStub, VERSION } from "./stubs";
-import { extractTitle, TITLE_SCAN_BYTES } from "./title";
+import { extractPage, TITLE_SCAN_BYTES } from "./title";
 
 /** How long a deploy id (and its upload URLs) stays valid. */
 const DEPLOY_TTL_SECONDS = 3600;
@@ -405,14 +405,14 @@ async function handleCommit(ctx: RequestContext, [s, id]: string[]): Promise<Res
     if (!prev) ctx.waitUntil(reg.releaseSite(site).catch(() => {}));
     throw e;
   }
-  const { title, description } = await siteTitle(ctx, r);
+  const page = await sitePage(ctx, site, r);
   const meta = nextSiteRecord(ctx, u, site, prev, {
-    updatedAt: formatMicros(Date.now() * 1000),
+    // The SiteDO's time of the switch, which a refresh reports too.
+    updatedAt: formatMicros(r.committedAt * 1000),
     deployID: "d_" + dc.nonce,
     fileCount: files.length,
     bytes: total,
-    title,
-    description,
+    ...page,
   });
   unwrap(await reg.putSite(meta));
   dropR2Garbage(ctx, r.r2Garbage);
@@ -427,7 +427,7 @@ async function handleRefresh(ctx: RequestContext, [s]: string[]): Promise<Respon
   const prev = await authorizeSite(ctx, u, site);
   const info = unwrap(await siteStub(ctx.env, site).siteInfo());
   if (info.fileCount === 0 && !prev) throw notFound(`site ${JSON.stringify(site)} not found`);
-  const { title, description } = await siteTitle(ctx, info);
+  const { title, description, preview } = await sitePage(ctx, site, info);
   const now = formatMicros(Date.now() * 1000);
   const meta: SiteRecord = {
     name: site,
@@ -442,6 +442,7 @@ async function handleRefresh(ctx: RequestContext, [s]: string[]): Promise<Respon
   if (prev?.deploy_id) meta.deploy_id = prev.deploy_id;
   if (title) meta.title = title;
   if (description) meta.description = description;
+  if (preview) meta.preview = preview;
   unwrap(await registry(ctx.env).putSite(meta));
   return json(siteMetaJSON(meta, siteURL(ctx, site)));
 }
@@ -513,12 +514,37 @@ async function deleteR2Prefix(bucket: R2Bucket, prefix: string): Promise<void> {
 
 // --- shared by commits, refreshes and connector publishes ------------------------
 
-/** Title and description of a site's index.html: as the SiteDO read them, or from R2. */
-async function siteTitle(ctx: RequestContext, r: { title: string; description: string; titleR2Key: string }): Promise<{ title: string; description: string }> {
-  if (!r.titleR2Key || !ctx.env.R2) return { title: r.title, description: r.description };
-  const obj = await ctx.env.R2.get(r.titleR2Key, { range: { offset: 0, length: TITLE_SCAN_BYTES } });
-  if (obj && "body" in obj) return extractTitle(new Uint8Array(await obj.arrayBuffer()));
-  return { title: r.title, description: r.description };
+/** What a site's files say about it after a write (SPEC §7.2). */
+interface SitePage {
+  title: string;
+  description: string;
+  preview: string;
+}
+
+/**
+ * Title, description and preview of a site: as the SiteDO found them, or,
+ * when its index.html lives in R2, from the head of that file (head when
+ * the caller has the bytes, else read from R2) with the SiteDO choosing the
+ * preview for its og:image. Best effort, like the Go server's readPage: the
+ * files are already switched, so a failure here leaves what the SiteDO found.
+ */
+async function sitePage(ctx: RequestContext, site: string, r: PageInfo, head?: Uint8Array): Promise<SitePage> {
+  const stored = { title: r.title, description: r.description, preview: r.preview };
+  if (!r.titleR2Key) return stored;
+  try {
+    if (!head) {
+      if (!ctx.env.R2) return stored;
+      const obj = await ctx.env.R2.get(r.titleR2Key, { range: { offset: 0, length: TITLE_SCAN_BYTES } });
+      if (!obj || !("body" in obj)) return stored;
+      head = new Uint8Array(await obj.arrayBuffer());
+    }
+    const page = extractPage(head);
+    const preview = page.image ? unwrap(await siteStub(ctx.env, site).previewFor(page.image)) : r.preview;
+    return { title: page.title, description: page.description, preview };
+  } catch (e) {
+    console.warn(`backyard: reading index.html of ${site} for its title failed: ${(e as Error)?.message ?? e}`);
+    return stored;
+  }
 }
 
 /**
@@ -531,7 +557,7 @@ function nextSiteRecord(
   u: User,
   site: string,
   prev: SiteRecord | null,
-  f: { updatedAt: string; deployID: string; fileCount: number; bytes: number; title: string; description: string },
+  f: { updatedAt: string; deployID: string; fileCount: number; bytes: number } & SitePage,
 ): SiteRecord {
   const meta: SiteRecord = {
     name: site,
@@ -546,6 +572,7 @@ function nextSiteRecord(
   };
   if (f.title) meta.title = f.title;
   if (f.description) meta.description = f.description;
+  if (f.preview) meta.preview = f.preview;
   if (ctx.cfg.ownership === "owner" && meta.owners.length === 0 && !u.anonymous) meta.owners = [u.id];
   return meta;
 }
@@ -841,11 +868,9 @@ export async function publishFiles(ctx: RequestContext, req: PublishRequest): Pr
       return { ok: false, error: pubErr("E21", PUBLISH_STORE_FAILED) };
     }
 
-    // Title and description: from the sent index.html, else as the site has it.
-    let page = { title: "", description: "" };
-    const index = bytesOf.get("index.html");
-    if (index) page = extractTitle(index.subarray(0, TITLE_SCAN_BYTES));
-    else if (m.hasIndex) page = await siteTitle(ctx, m);
+    // Title, description and preview of the files the site has now (a sent
+    // index.html is the stored one: its bytes spare the read from R2).
+    const page = await sitePage(ctx, site, m, bytesOf.get("index.html"));
     const deployID = "d_" + randomHex(16);
     // The freshest record: a concurrent first publish may have recorded the site (and its owner) by now.
     const latest = unwrap(await reg.getSite(site)) ?? prev;
@@ -909,8 +934,8 @@ export async function publishFiles(ctx: RequestContext, req: PublishRequest): Pr
 /**
  * Keeps the site record in step with the files when another commit switched
  * the site after this publish (concurrent publishes write their records in
- * any order): the record then gets the file count, size and title of the
- * site as it is now.
+ * any order): the record then gets the file count, size, title, description
+ * and preview of the site as it is now.
  */
 async function settleSiteRecord(ctx: RequestContext, site: string, committedAt: number): Promise<void> {
   try {
@@ -919,12 +944,14 @@ async function settleSiteRecord(ctx: RequestContext, site: string, committedAt: 
     const reg = registry(ctx.env);
     const rec = unwrap(await reg.getSite(site));
     if (!rec || (rec.file_count === info.fileCount && rec.bytes === info.bytes)) return;
-    const { title, description } = await siteTitle(ctx, info);
+    const { title, description, preview } = await sitePage(ctx, site, info);
     const next: SiteRecord = { ...rec, file_count: info.fileCount, bytes: info.bytes };
     delete next.title;
     delete next.description;
+    delete next.preview;
     if (title) next.title = title;
     if (description) next.description = description;
+    if (preview) next.preview = preview;
     unwrap(await reg.putSite(next));
   } catch (e) {
     console.warn(`backyard: mcp: updating the record of ${site} failed: ${(e as Error)?.message ?? e}`);

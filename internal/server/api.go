@@ -58,6 +58,7 @@ func (s *Server) hubRoutes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /me", s.handleMe)
 	mux.HandleFunc("GET /sites", s.handleSites)
+	mux.HandleFunc("GET /sites/{site}/preview", s.handleSitePreview)
 	mux.HandleFunc("POST /tokens", s.handleTokens)
 
 	// The Claude connector's connections (SPEC §8.4.7).

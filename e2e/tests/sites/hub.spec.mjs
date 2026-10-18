@@ -48,6 +48,7 @@ test.describe("hub", () => {
     await expect(page.locator("#logout")).toBeHidden();
     await expect(page.locator("#cmd-login")).toContainText(`--server ${new URL(page.url()).origin}`);
     await expect(page.locator("#footer-version")).toContainText("Backyard v");
+    await page.locator('details[data-panel="agents"] > summary').click(); // the card starts collapsed
     for (const href of ["/llms.txt", "/llms-full.txt", "/__backyard/backyard.d.ts", "/docs"]) {
       await expect(page.locator(`.links a[href="${href}"]`)).toBeVisible();
     }
@@ -101,6 +102,7 @@ test.describe("hub", () => {
     await page.locator('button[aria-label="Copy link to tmpl-blank"]').click();
     await expect(page.locator("#toast")).toHaveText("Copied to clipboard");
     expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(state.sites["tmpl-blank"]);
+    await page.locator('details[data-panel="cli"] > summary').click();
     await page.locator("#cmd-login").locator("xpath=ancestor::div[contains(@class,'cmd')]").locator("button.copy").click();
     expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(await page.locator("#cmd-login").textContent());
   });
@@ -113,6 +115,58 @@ test.describe("hub", () => {
     });
     await page.locator('button[aria-label="Copy link to tmpl-blank"]').click();
     await expect(page.locator("#toast")).toHaveText("Could not copy: select the text and copy it yourself");
+  });
+
+  test("the side cards start collapsed, so the sites are in the first screen; each stays as left", async ({ page }) => {
+    const panels = page.locator(".side details[data-panel]");
+    await expect(panels).toHaveCount(3);
+    for (const d of await panels.all()) await expect(d).not.toHaveAttribute("open", /.*/);
+    await expect(page.locator('details[data-panel="cli"] > summary')).toHaveText(/^\s*Use the CLI\s+Deploy from your terminal or CI\.\s*$/);
+    await expect(page.locator('details[data-panel="agents"] > summary')).toHaveText(/^\s*For agents\s+Docs and tools for coding agents\.\s*$/);
+    await expect(page.locator("#cmd-login")).toBeHidden();
+    await page.setViewportSize({ width: 1280, height: 800 });
+    const heading = await page.locator("#sites-title").boundingBox();
+    expect(heading.y + heading.height, "the Sites heading is in the first screen (1280×800)").toBeLessThanOrEqual(800);
+
+    const cli = page.locator('details[data-panel="cli"] > summary');
+    await cli.click();
+    await expect(page.locator("#cmd-login")).toBeVisible();
+    await page.reload();
+    await expect(page.locator("#cmd-login")).toBeVisible();
+    await expect(page.locator('.links a[href="/llms.txt"]')).toBeHidden();
+    await cli.focus();
+    await page.keyboard.press("Enter");
+    await expect(page.locator("#cmd-login")).toBeHidden();
+    expect(await page.evaluate(() => localStorage.getItem("backyard.hubPanels"))).toBeNull();
+  });
+
+  test("grid cards show the preview each site ships, or the placeholder of the same size", async ({ page, request, state }) => {
+    const { sites } = await (await request.get("/__backyard/api/sites")).json();
+    const ours = sites.filter((s) => Object.hasOwn(state.sites, s.name));
+    for (const name of Object.keys(EXAMPLE_TITLES)) {
+      expect(ours.find((s) => s.name === name)?.preview, `example ${name} ships a preview`).toBeTruthy();
+    }
+    const sizes = new Set();
+    for (const meta of ours) {
+      const box = page.locator(`.site[data-site="${meta.name}"] .site-preview`);
+      await box.scrollIntoViewIfNeeded(); // the images load lazily
+      if (meta.preview) {
+        const img = box.locator("img");
+        await expect(img).toHaveAttribute("src", `/__backyard/api/sites/${meta.name}/preview?v=${encodeURIComponent(meta.updated_at || meta.deploy_id || meta.created_at)}`);
+        await expect.poll(() => img.evaluate((i) => i.complete && i.naturalWidth), { message: `the preview of ${meta.name} loads` }).toBeGreaterThan(0);
+      } else {
+        await expect(box).toHaveText("No preview available");
+        await expect(box.locator("img")).toHaveCount(0);
+      }
+      const { width, height } = await box.boundingBox();
+      expect(Math.abs(width / height - 16 / 9), `16:9 box of ${meta.name}`).toBeLessThan(0.01);
+      sizes.add(`${Math.round(width)}x${Math.round(height)}`);
+    }
+    expect([...sizes], "every box has the same size").toHaveLength(1);
+
+    // The list view shows none.
+    await page.locator("#view-list").click();
+    await expect(page.locator(".site-preview")).toHaveCount(0);
   });
 
   test("a site card links to the live site", async ({ page, state }) => {

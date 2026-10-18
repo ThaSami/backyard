@@ -323,6 +323,33 @@ test("filterSites: search terms across fields, newest first", () => {
   assert.deepEqual(plain(hub.filterSites(sites, "zzz")), []);
 });
 
+test("previewURL: the hub route, versioned by the last change; nothing without SiteMeta.preview", () => {
+  const base = { name: "lunch-vote", preview: "preview.svg" };
+  assert.equal(
+    hub.previewURL({ ...base, updated_at: "2026-10-18T09:30:00.123456Z", deploy_id: "d1", created_at: "2026-01-01T00:00:00Z" }),
+    "/__backyard/api/sites/lunch-vote/preview?v=2026-10-18T09%3A30%3A00.123456Z",
+  );
+  assert.equal(hub.previewURL({ ...base, deploy_id: "01J+X/Y", created_at: "2026-01-01T00:00:00Z" }), "/__backyard/api/sites/lunch-vote/preview?v=01J%2BX%2FY");
+  assert.equal(hub.previewURL({ ...base, created_at: "2026-01-01T00:00:00Z" }), "/__backyard/api/sites/lunch-vote/preview?v=2026-01-01T00%3A00%3A00Z");
+  assert.equal(hub.previewURL(base), "/__backyard/api/sites/lunch-vote/preview", "no version: revalidated");
+  assert.equal(hub.previewURL({ name: "a/b?c", preview: "x.png", updated_at: "1" }), "/__backyard/api/sites/a%2Fb%3Fc/preview?v=1");
+  for (const s of [null, undefined, {}, { name: "x" }, { name: "x", preview: "" }, { name: "x", preview: 1 }, { preview: "preview.png" }, { name: "", preview: "p.png" }]) {
+    assert.equal(hub.previewURL(s), "", JSON.stringify(s));
+  }
+});
+
+test("parsePanels / serializePanels: the open side cards, robust to junk in storage", () => {
+  assert.deepEqual(plain(hub.parsePanels("")), {});
+  assert.deepEqual(plain(hub.parsePanels(null)), {});
+  assert.deepEqual(plain(hub.parsePanels('{"cli":true,"agents":true}')), { cli: true, agents: true });
+  assert.deepEqual(plain(hub.parsePanels('{"cli":true,"agents":false,"connector":"yes","Bad Key":true,"__proto__":true}')), { cli: true });
+  for (const junk of ["{", "[true]", '"cli"', "true", "null", "42"]) assert.deepEqual(plain(hub.parsePanels(junk)), {}, junk);
+  assert.equal(hub.serializePanels({}), "", "none open: the key is removed");
+  assert.equal(hub.serializePanels(null), "");
+  assert.equal(hub.serializePanels({ connector: true, cli: false, agents: true }), '{"agents":true,"connector":true}');
+  assert.deepEqual(plain(hub.parsePanels(hub.serializePanels({ cli: true }))), { cli: true });
+});
+
 // --- file collection --------------------------------------------------------
 
 const file = (text, name = "f") => new File([text], name);

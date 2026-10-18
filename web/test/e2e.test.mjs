@@ -252,9 +252,12 @@ async function useHandedToken(page) {
 const SITE_FILES = {
   "index.html": `<!doctype html><html><head><meta charset="utf-8"><title>E2E site</title>
 <meta name="description" content="Backyard end-to-end test site">
+<meta property="og:image" content="/img/cover.svg?x=1">
 <script src="/__backyard/backyard.js"></script><script src="app.js" defer></script></head>
 <body><h1>e2e</h1></body></html>`,
   "app.js": "window.appLoaded = true;\n",
+  // The preview the hub shows (SiteMeta.preview, from the og:image above).
+  "img/cover.svg": '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720"><rect width="1280" height="720" fill="#23784a"/></svg>\n',
   "sub/page.html": "<!doctype html><title>sub</title><p>sub page</p>",
   ".git/HEAD": "ref: refs/heads/main\n",
   "node_modules/x/index.js": "ignored",
@@ -286,18 +289,25 @@ test("hub deploy + SDK end to end against a real server", { timeout: 180_000 }, 
     await page.setInputFiles("#folder-input", folder);
     await page.waitForFunction(() => !document.getElementById("deploy-btn").disabled, null, { timeout: 30_000 });
     assert.equal(await page.inputValue("#site-name"), name);
-    assert.match(await page.textContent("#selection-summary"), new RegExp("^" + name + " · 3 files · "));
+    assert.match(await page.textContent("#selection-summary"), new RegExp("^" + name + " · 4 files · "));
     await page.click("#deploy-btn");
     await page.waitForSelector("#result:not([hidden]), #deploy-error:not([hidden])", { timeout: 60_000 });
     assert.equal(await page.isHidden("#deploy-error"), true, "deploy failed: " + (await page.textContent("#deploy-error")));
     deployed = true;
     const siteURL = await page.textContent("#result-link");
-    assert.match(await page.textContent("#progress-text"), /^Deployed · 3 uploaded · 0 unchanged/);
+    assert.match(await page.textContent("#progress-text"), /^Deployed · 4 uploaded · 0 unchanged/);
     await page.waitForSelector(`.site[data-site="${name}"]`);
     assert.equal(await page.textContent(`.site[data-site="${name}"] .site-title a`), "E2E site", "title extracted from index.html");
+    // The card shows the site's preview (its og:image), loaded from the hub's own origin.
+    const preview = `.site[data-site="${name}"] .site-preview img`;
+    await page.waitForFunction((sel) => document.querySelector(sel)?.naturalWidth > 0, preview, { timeout: 15_000 });
+    const src = await page.getAttribute(preview, "src");
+    assert.match(src, new RegExp(`^/__backyard/api/sites/${name}/preview\\?v=.+`));
+    const served = await page.evaluate((u) => fetch(u).then((r) => [r.status, r.headers.get("content-type"), r.headers.get("content-security-policy")]), src);
+    assert.deepEqual(served, [200, "image/svg+xml", "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'"]);
     // Re-deploying the same folder uploads nothing.
     await page.click("#deploy-btn");
-    await page.waitForFunction(() => /^Deployed · 0 uploaded · 3 unchanged/.test(document.getElementById("progress-text").textContent), null, { timeout: 60_000 });
+    await page.waitForFunction(() => /^Deployed · 0 uploaded · 4 unchanged/.test(document.getElementById("progress-text").textContent), null, { timeout: 60_000 });
 
     // --- The deployed site with the SDK.
     const a = await open(context, siteURL);

@@ -426,14 +426,17 @@ func (g *Gateway) Publish(ctx context.Context, req PublishRequest) (*PublishResu
 		meta.Bytes += mf.Size
 		hasIndex = hasIndex || mf.Path == sites.IndexFile
 	}
+	var page sites.Page
 	if hasIndex {
 		if i, ok := listed[sites.IndexFile]; ok {
 			data := req.Files[i].Data
-			meta.Title, meta.Description = sites.ExtractTitle(data[:min(len(data), sites.TitleScanBytes)])
+			page = sites.ExtractPage(data[:min(len(data), sites.TitleScanBytes)])
 		} else {
-			meta.Title, meta.Description = g.readTitle(cctx, site)
+			page = g.readPage(cctx, site)
 		}
 	}
+	meta.Title, meta.Description = page.Title, page.Description
+	meta.Preview = sites.ChoosePreview(page.Image, man.Files)
 	if err := g.commitSite(cctx, man, meta); err != nil {
 		return nil, g.publishFailed(ctx, site, "write the site manifest", err)
 	}

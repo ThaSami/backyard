@@ -440,9 +440,12 @@ func (g *Gateway) handleCommit(w http.ResponseWriter, r *http.Request) {
 	meta := g.nextMeta(prev, site, u, g.now().UTC())
 	meta.DeployID = shortDeployID(claims.Nonce)
 	meta.FileCount, meta.Bytes = len(req.Files), total
+	var page sites.Page
 	if listed[sites.IndexFile] {
-		meta.Title, meta.Description = g.readTitle(ctx, site)
+		page = g.readPage(ctx, site)
 	}
+	meta.Title, meta.Description = page.Title, page.Description
+	meta.Preview = sites.ChoosePreview(page.Image, man.Files)
 	if err := g.commitSite(ctx, man, meta); err != nil {
 		writeError(w, r, g.log, internalErr(err))
 		return
@@ -618,20 +621,21 @@ func (g *Gateway) rejectCommit(w http.ResponseWriter, r *http.Request, u *identi
 	writeError(w, r, g.log, errf(http.StatusConflict, CodeConflict, "%d file(s) were not uploaded correctly: %s", len(problems), strings.Join(msgs, ", ")))
 }
 
-// readTitle extracts the title/description of a site's index.html.
-func (g *Gateway) readTitle(ctx context.Context, site string) (string, string) {
+// readPage extracts the title, description and og:image of a site's
+// stored index.html.
+func (g *Gateway) readPage(ctx context.Context, site string) sites.Page {
 	rc, _, err := g.store.GetRange(ctx, sites.SiteKey(site, sites.IndexFile), 0, sites.TitleScanBytes)
 	if err != nil {
 		g.log.WarnContext(ctx, "deploy: read index.html for title", "site", site, "error", err)
-		return "", ""
+		return sites.Page{}
 	}
 	defer rc.Close()
 	b, err := io.ReadAll(io.LimitReader(rc, sites.TitleScanBytes))
 	if err != nil {
 		g.log.WarnContext(ctx, "deploy: read index.html for title", "site", site, "error", err)
-		return "", ""
+		return sites.Page{}
 	}
-	return sites.ExtractTitle(b)
+	return sites.ExtractPage(b)
 }
 
 // ---------------------------------------------------------------------------

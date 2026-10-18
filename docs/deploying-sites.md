@@ -23,6 +23,61 @@ DNS labels — `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$` — and may not be reserve
 (`sites.reserved`, by default `www, api, admin, hub, auth, static, assets, cdn, docs, mail,
 backyard, s`).
 
+## Site preview
+
+The hub's site directory shows every site as a card, and in its grid view each card starts with
+a 16:9 preview image. Backyard takes no screenshots: the preview is an image **the site ships
+itself**, chosen whenever the site's metadata is written — a deploy, the refresh after a direct
+sync, a publish from Claude — just as the hub's title comes from `<title>` and the description
+from `<meta name="description">` of the root `index.html`. The rules, in order
+([SPEC §7.2](spec/SPEC.md#72-sites)):
+
+1. **`og:image`** of the root `index.html`, if it names one of the site's own files: a relative
+   path (`img/cover.png`, `./cover.png`) or a site-root one (`/cover.png`), with the extension
+   `png`, `jpg`, `jpeg`, `gif`, `webp`, `avif` or `svg`, at most 1 MiB. Only the first
+   `og:image` tag in the first 64 KiB of the page counts.
+
+   ```html
+   <meta property="og:image" content="img/cover.png">
+   ```
+
+2. Otherwise the first of these files at the root of the site that exists and is at most
+   1 MiB: `preview.png`, `preview.jpg`, `preview.jpeg`, `preview.webp`, `preview.avif`,
+   `preview.gif`, `preview.svg` (exactly these lowercase names).
+3. Otherwise there is no preview, and the card shows a placeholder of the same size that says
+   "No preview available". So does a card whose image fails to load.
+
+An `og:image` that is an absolute URL (`https://…`, `//…`), leaves the site (`..`), names a
+hidden or missing file, a file over 1 MiB or another format is skipped without a warning, and
+rule 2 applies: a page can keep an absolute `og:image` for link previews in chat tools and ship
+a `preview.png` for the hub. A deploy without the file removes the preview. After a direct
+sync the preview follows the refresh that the CLI runs afterwards (files copied into storage
+outside the CLI change it only at the next refresh or deploy).
+`backyard dev`'s hub shows the placeholder for the folder it serves; open
+`http://<site>.localhost:4321/preview.svg` to check the image itself.
+
+**Sizes and formats.** Make it 1280×720 (16:9) in one of the formats above; an SVG needs
+`xmlns="http://www.w3.org/2000/svg"` and a `viewBox="0 0 1280 720"`. Cards are about 260 to
+380 pixels wide and the image covers the card's 16:9 box, aligned to its top, so draw the app's
+main screen large and simple: a few big shapes, the headings, little small text. An SVG sketch
+of the main screen is usually a few kilobytes and sharp at any size; the six
+[examples](../examples/) each ship one. A preview must be self-contained: it is served with
+`Content-Security-Policy: sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'`,
+so scripts never run and nothing is loaded from elsewhere — inline `<style>`, `data:` images
+and system fonts work, web fonts, external images and stylesheets do not.
+
+**How the hub loads it.** The viewer's browser never fetches the preview from the site's host:
+it loads it from the hub's own origin, `GET /__backyard/api/sites/<site>/preview`, with the same
+credentials as the site list. So previews work in host and path mode and in every auth mode,
+also when Cloudflare Access, Okta or another identity proxy guards every site, and no outside
+service ever has to reach a site. The answer's `Content-Type` comes from the file's
+extension, never from the stored type, with `X-Content-Type-Options: nosniff` and a strong
+`ETag`. The hub requests `…/preview?v=<last update>`, which is cached per viewer
+(`Cache-Control: private, max-age=31536000, immutable`) until the next deploy changes the URL;
+without `v` the answer is `Cache-Control: private, no-cache`. Sites without a preview cause no
+request at all. Everyone who can see the hub's site list can see the previews, so like the
+title, a preview should show nothing the site itself would not.
+
 ## Deploy methods
 
 `--method` (or `method` in `.backyard.json`, or `BACKYARD_DEPLOY_METHOD`) picks how the files
@@ -46,8 +101,8 @@ gateway and removes stored files that the ignore rules exclude (`aws s3 rm`, `gc
 rm`/`gsutil rm`, `az storage blob delete`; rsync does it with `--delete-excluded`, and its
 `P .backyard-tmp-*` rule protects the `fs` store's in-flight files). A failed removal fails the
 deploy; `--dry-run --json` lists the commands as `cleanup`. Then the CLI asks the gateway to
-refresh the site (`POST …/sites/<site>/refresh`), which rebuilds its manifest, title and
-description. Without a reachable gateway and a login, ignored files stay published and the CLI
+refresh the site (`POST …/sites/<site>/refresh`), which rebuilds its manifest, title,
+description and [preview](#site-preview). Without a reachable gateway and a login, ignored files stay published and the CLI
 says so: deploy once with `--method api`. A profile's cached bucket and rsync target are only
 used for that profile's server. Direct methods suit platform teams and CI runners that already
 hold cloud credentials; everyone else uses `api`. The Terraform modules (AWS, Google Cloud,

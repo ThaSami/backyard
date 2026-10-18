@@ -21,14 +21,16 @@ export function sha256(buf) {
 
 /**
  * Builds the deploy file list of {path: content}. Content types are set for
- * well-known extensions and left to the server otherwise.
+ * well-known extensions and left to the server otherwise; contentTypes
+ * ({path: type}) declares others.
  */
-export function fileEntries(files) {
+export function fileEntries(files, contentTypes = {}) {
   return Object.entries(files).map(([path, content]) => {
     const buf = Buffer.isBuffer(content) ? content : Buffer.from(content);
     const e = { path, size: buf.length, sha256: sha256(buf) };
     const ext = path.includes(".") ? path.slice(path.lastIndexOf(".") + 1).toLowerCase() : "";
-    if (TYPES[ext]) e.content_type = TYPES[ext];
+    if (Object.hasOwn(contentTypes, path)) e.content_type = contentTypes[path];
+    else if (TYPES[ext]) e.content_type = TYPES[ext];
     return { entry: e, buf };
   });
 }
@@ -51,10 +53,11 @@ export function commitDeploy(client, env, site, deployID, entries, opts = {}) {
 
 /**
  * Deploys files ({path: string|Buffer}) to site with the full protocol and
- * asserts every step. Returns {plan, commit, entries}.
+ * asserts every step (opts.contentTypes: declared types, as fileEntries).
+ * Returns {plan, commit, entries}.
  */
 export async function deploySite(client, env, site, files, opts = {}) {
-  const list = fileEntries(files);
+  const list = fileEntries(files, opts.contentTypes);
   const entries = list.map((f) => f.entry);
   const plan = await createDeploy(client, env, site, entries, opts);
   assert.equal(plan.status, 200, `create deploy: ${plan}`);

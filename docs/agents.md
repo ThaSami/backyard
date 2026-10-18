@@ -165,7 +165,9 @@ The Cloudflare edition serves the same paths.
 
 1. Read `backyard_docs` (or the skill); restate the idea; pick a site name and check it is free
    (`backyard sites info <name>` / `backyard_list_sites`).
-2. `backyard init <name>`; build the page with relative asset paths and the absolute SDK path.
+2. `backyard init <name>`; build the page with relative asset paths and the absolute SDK path,
+   a `<title>`, a `<meta name="description">` and a `preview.svg` (1280×720) sketching the main
+   screen for the hub's site card ([Site preview](deploying-sites.md#site-preview)).
 3. Preview with `backyard dev --no-open` in the background; fix console errors. Outside a
    browser `*.localhost` often does not resolve, so check the page with the line `backyard dev`
    prints: `curl -s -H 'Host: <site>.localhost:4321' http://127.0.0.1:4321/`

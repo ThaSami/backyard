@@ -40,6 +40,12 @@ export function assertSummary(s, user, what = "user summary") {
   if (user.email) assert.equal(s.email, user.email, `${what}.email`);
 }
 
+/** The SiteMeta keys in the order both editions emit them (SPEC §7.2). */
+export const SITE_META_KEYS = ["name", "url", "title", "description", "preview", "created_at", "created_by", "updated_at", "updated_by", "deploy_id", "file_count", "bytes", "owners"];
+
+/** Extensions a SiteMeta.preview may have (SPEC §7.2). */
+export const PREVIEW_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "avif", "svg"];
+
 /** Asserts a SiteMeta (SPEC §7.2). */
 export function assertSiteMeta(m, { name, url, what = "SiteMeta" } = {}) {
   assert.ok(m && typeof m === "object", `${what}: ${JSON.stringify(m)}`);
@@ -53,10 +59,19 @@ export function assertSiteMeta(m, { name, url, what = "SiteMeta" } = {}) {
   assert.ok(Number.isInteger(m.file_count) && m.file_count >= 0, `${what}.file_count`);
   assert.ok(Number.isInteger(m.bytes) && m.bytes >= 0, `${what}.bytes`);
   assert.ok(Array.isArray(m.owners), `${what}.owners must be an array: ${JSON.stringify(m)}`);
-  for (const k of ["title", "description", "created_by", "updated_by", "deploy_id"]) {
-    if (k in m) assert.equal(typeof m[k], "string", `${what}.${k}`);
+  for (const k of ["title", "description", "preview", "created_by", "updated_by", "deploy_id"]) {
+    if (!(k in m)) continue;
+    assert.equal(typeof m[k], "string", `${what}.${k}`);
+    assert.notEqual(m[k], "", `${what}.${k} is omitted when empty`);
   }
   if (m.deploy_id !== undefined) assert.match(m.deploy_id, /^d_[0-9a-f]+$/, `${what}.deploy_id`);
+  if (m.preview !== undefined) {
+    assert.ok(!m.preview.startsWith("/") && !m.preview.split("/").some((seg) => seg === "" || seg.startsWith(".")), `${what}.preview is a site path: ${m.preview}`);
+    const ext = m.preview.includes(".") ? m.preview.slice(m.preview.lastIndexOf(".") + 1).toLowerCase() : "";
+    assert.ok(PREVIEW_EXTENSIONS.includes(ext), `${what}.preview has an image extension: ${m.preview}`);
+  }
+  const known = Object.keys(m).filter((k) => SITE_META_KEYS.includes(k));
+  assert.deepEqual(known, SITE_META_KEYS.filter((k) => known.includes(k)), `${what}: the keys in the order of SPEC §7.2`);
   return m;
 }
 

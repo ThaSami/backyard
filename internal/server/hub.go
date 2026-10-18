@@ -246,6 +246,9 @@ func (s *Server) handleSites(w http.ResponseWriter, r *http.Request) {
 		if list[i].Owners == nil {
 			list[i].Owners = []string{}
 		}
+		if _, dev := s.devSites[list[i].Name]; dev {
+			list[i].Preview = "" // the dev site is served, and has none
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"sites": list})
 }

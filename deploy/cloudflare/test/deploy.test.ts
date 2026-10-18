@@ -185,9 +185,14 @@ describe("deploy gateway protocol", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ name: site, title: "Meta", file_count: 1, owners: [] });
 
+    const committed = (await (await call(`/__backyard/api/deploy/sites/${site}`, { headers: tokenHeaders() })).json()) as { created_at: string; updated_at: string };
     res = await call(`/__backyard/api/deploy/sites/${site}/refresh`, { method: "POST", headers: tokenHeaders() });
     expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ name: site, title: "Meta", file_count: 1 });
+    const refreshed = (await res.json()) as { created_at: string; updated_at: string };
+    expect(refreshed).toMatchObject({ name: site, title: "Meta", file_count: 1 });
+    // One clock: the commit's record and the refresh both take the SiteDO's time of the switch.
+    expect(refreshed.updated_at).toBe(committed.updated_at);
+    expect(Date.parse(refreshed.updated_at)).toBeGreaterThanOrEqual(Date.parse(refreshed.created_at));
 
     // hub API and site API views
     res = await call(`/__backyard/api/sites`);

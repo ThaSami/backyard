@@ -130,7 +130,7 @@ Hub host:
 
 | Path | Purpose |
 |---|---|
-| `/` | hub UI: site directory/search, drag-and-drop deploy, CLI setup instructions |
+| `/` | hub UI: site directory/search (in the grid view each site card shows the site's preview image, §3, or a placeholder of the same size), drag-and-drop deploy, and side cards with CLI setup instructions, agent instructions and the Claude connector (§8.4.7), collapsible and collapsed by default |
 | `/docs` | API docs (renders `skills/backyard/references/api.md`) |
 | `/docs/skill.md`, `/docs/<ref>.md`, `/docs/references/<ref>.md` | the skill documents as `text/markdown` |
 | `/llms.txt`, `/llms-full.txt` | agent-oriented docs (SKILL.md; SKILL.md + all references) |
@@ -138,6 +138,7 @@ Hub host:
 | `/__backyard/api/info` | server info (§7.1, same as deploy `info`) |
 | `/__backyard/api/me` | current user |
 | `/__backyard/api/sites` | site list (`{sites:[SiteMeta]}`) |
+| `/__backyard/api/sites/{site}/preview` | the site's preview image (`SiteMeta.preview`, §7.2; served as in §3) |
 | `/__backyard/api/tokens` | `POST` mint a personal API token (§8.3) |
 | `/__backyard/api/deploy/...` | embedded deploy gateway (§7) |
 | `/__backyard/api/mcp/grants` | the signed-in user's Claude connector connections; admins: anyone's (§8.4) |
@@ -150,9 +151,12 @@ Hub host:
 | `/__backyard/metrics` | Prometheus, **authenticated** (only if `telemetry.metrics` and no `telemetry.metrics_listen`) |
 
 `/__backyard/healthz` and `/readyz` are served on any host without authentication. Hub pages and
-docs require authentication like sites; the SDK files, `/__backyard/auth/*`,
-`/__backyard/api/info`, the deploy gateway, and the remote MCP endpoint and the OAuth endpoints
-of §8.4 (which authenticate by themselves) do not.
+docs require authentication like sites, and so do the hub APIs (`me`, `sites`,
+`sites/{site}/preview`, `tokens`, `mcp/grants`), which pass the same gate as the site API (§5:
+the same credentials, guests in mode `none`, the CSRF rule, and on the Go server
+`api_per_minute`, §11); the SDK files, `/__backyard/auth/*`, `/__backyard/api/info`, the deploy
+gateway, and the remote MCP endpoint and the OAuth endpoints of §8.4 (which authenticate by
+themselves) do not.
 
 ### 2.1 SDK context resolution
 
@@ -212,6 +216,32 @@ and `audio/*` or `video/*` whose subtype has no `+` suffix. Every other type (HT
 XML including `text/xsl` and every `+xml` type, scripts, unknown or unparsable types)
 additionally gets `Content-Security-Policy: sandbox`, so an uploaded document can never run
 script with the site's origin.
+
+**Preview images.** `GET` and `HEAD` `/__backyard/api/sites/{site}/preview`, on the hub host only
+and behind the gate of the other hub APIs (§2), serve the site file that `SiteMeta.preview` names
+(§7.2). The hub thus loads every preview from its own origin with the viewer's own credentials,
+in both URL modes and in every auth mode (an identity proxy such as Cloudflare Access in front
+included), without fetching anything from site hosts. The answer is `404 not_found` (§5
+envelope) when the site does not exist (an invalid name included), its SiteMeta has no
+`preview`, the file is no longer stored, or the file's extension is not one of the preview types
+below; other methods get `405` with `Allow` like every API route. A `200` carries the file's
+bytes and:
+
+* `Content-Type` by the extension of the path (lowercased), never the type stored with the file:
+  `png` → `image/png`, `jpg` and `jpeg` → `image/jpeg`, `gif` → `image/gif`, `webp` →
+  `image/webp`, `avif` → `image/avif`, `svg` → `image/svg+xml`;
+* `Content-Security-Policy: sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'`,
+  so an SVG on the hub's origin never runs script or loads anything, also when it is opened
+  directly;
+* `X-Content-Type-Options: nosniff`, and no `Content-Disposition`;
+* a strong `ETag` with conditional `GET` (`304`); `HEAD` is supported, Range requests may be;
+* `Cache-Control: private, max-age=31536000, immutable` when the request has a non-empty `v`
+  query parameter, otherwise `Cache-Control: private, no-cache`.
+
+The hub UI requests `/__backyard/api/sites/<name>/preview?v=<updated_at, else deploy_id, else
+created_at>` (URL-encoded) only for sites whose SiteMeta has `preview`, so every deploy changes
+the URL and sites without a preview cause no request. A site without a preview, or whose image
+fails to load, gets a placeholder of the same size that says "No preview available".
 
 A small in-memory LRU cache (`storage.cache_bytes`, `storage.cache_ttl`) fronts blob reads for
 objects ≤ 1 MiB.
@@ -648,10 +678,48 @@ on standalone gateways.
 * `POST G/sites/{site}/owners` `{"add": [emails], "remove": [emails]}` → SiteMeta (ownership mode only)
 * `POST G/sites/{site}/refresh` → rebuild manifest + meta from storage after a direct sync → SiteMeta
 
-`SiteMeta = {name, url, title, description, created_at, created_by, updated_at, updated_by,
-deploy_id, file_count, bytes, owners: []}`. `title` is extracted from `<title>` of the root
-`index.html` at commit/refresh; `description` from `<meta name="description">`. `deploy_id` here
-is a short opaque id of the last deploy (`d_<hex>`), not the signed deploy token.
+`SiteMeta = {name, url, title, description, preview, created_at, created_by, updated_at,
+updated_by, deploy_id, file_count, bytes, owners: []}`, with the keys in this order on both
+editions; `title`, `description`, `preview`, `created_by`, `updated_by` and `deploy_id` are
+omitted when empty. `deploy_id` here is a short opaque id of the last deploy (`d_<hex>`), not the
+signed deploy token.
+
+`title`, `description` and `preview` are derived from the site's files every time the SiteMeta is
+written — a deploy commit, a refresh, a `backyard_publish` (§14.1) — from the files the site has
+after that write, so a redeploy without them removes them. `title`, `description` and the
+`og:image` reference below come from one tolerant scan of the first 64 KiB of the root
+`index.html`, which skips comments and the contents of `script`, `style`, `svg`, `template`,
+`textarea`, `noscript` and `math` elements: `title` is the text of the first `<title>` and
+`description` the `content` of the first `<meta name="description">` (both with entities decoded
+and whitespace collapsed).
+
+`preview` is the path, relative to the site root (no leading `/`, e.g. `preview.svg` or
+`img/cover.png`), of an image the site ships for the hub's site cards (§3). It is chosen in this
+order:
+
+1. **`og:image`.** The first `<meta>` tag of that scan whose `property` attribute — or, when the
+   tag has no `property` attribute, its `name` attribute — equals `og:image` (ASCII
+   case-insensitive, leading and trailing ASCII whitespace removed) gives the reference: its
+   `content` attribute, entities decoded and leading and trailing ASCII whitespace (space, tab, LF,
+   FF, CR) removed. Later `og:image` tags are ignored. The reference becomes a site path in these
+   steps, and any failed check means it names none:
+   1. it is not empty, at most 1024 bytes long, has no URL scheme (it does not match
+      `^[A-Za-z][A-Za-z0-9+.-]*:`), does not start with `//` and contains no `\`;
+   2. it is cut at the first `?` or `#`;
+   3. one leading `/` (site-root relative) is removed, then every leading `./`;
+   4. every `%XX` escape is decoded (a `%` not followed by two hex digits fails);
+   5. the result is not empty, is valid UTF-8, contains no control character (U+0000–U+001F,
+      U+007F), and none of its `/`-separated segments is empty, `.`, `..` or starts with `.`.
+
+   The site path is the preview when it is a file of the site, its extension (lowercased) is one
+   of `png`, `jpg`, `jpeg`, `gif`, `webp`, `avif`, `svg`, and it is at most 1 MiB (1048576 bytes).
+2. **`preview.*`.** Otherwise the first of the root files `preview.png`, `preview.jpg`,
+   `preview.jpeg`, `preview.webp`, `preview.avif`, `preview.gif`, `preview.svg` (exactly these
+   lowercase names, in this order) that exists and is at most 1 MiB.
+3. Otherwise the site has no preview.
+
+An `og:image` that fails a check falls through to rule 2 without an error or a warning, so an
+absolute `og:image` URL for link unfurls and a `preview.*` file for the hub can coexist.
 
 ### 7.3 Deploy (diffed, rsync semantics)
 
@@ -1287,9 +1355,10 @@ not accepted there, and it answers `404` while the connector is disabled.
 * Guests (mode `none`) see and revoke their own grants. A static token acts as `token:<name>`,
   which owns no grants; an admin static token may use `?user=`.
 
-The hub UI shows a "Use Backyard in Claude" card while `info.mcp_url` exists: the URL with a copy
-button, the setup steps, the caller's connections with a "Disconnect" button each, and for
-admins a form that disconnects one person.
+The hub UI shows a "Use Backyard in Claude" card while `info.mcp_url` exists, a collapsible card
+like the hub's other side cards (collapsed by default, §2): expanded, it holds the URL with a copy
+button, the setup steps, the caller's connections with a "Disconnect" button each, and for admins
+a form that disconnects one person.
 
 #### 8.4.8 Tokens, grants and rotation
 
@@ -1765,7 +1834,8 @@ URLs or the server secret.
   `LIMITS.mcp_publish_bytes`.
 * `backyard_list_sites` (`query`: case-insensitive substring of name, title or description) →
   `{"sites":[{"name","url","title"?,"description"?,"updated_at"?,"updated_by"?,"file_count","bytes","owners"?}],"total":<matches>,"truncated":<bool>}`,
-  most recently updated first, then by name; `owners` only with ownership `owner`.
+  most recently updated first, then by name; `owners` only with ownership `owner`; no other keys
+  (no `preview`).
 * `backyard_site_files` → `{"site","url","files":[{"path","size"}],"total","truncated"}`, what
   is served, sorted by path.
 * `backyard_read_site_file` checks, in order: the site exists (E22), the path is valid (E8), the
@@ -1812,9 +1882,9 @@ makes the site exactly the given files. The steps, normative on both editions:
    than `max_files` files or more than `max_site_bytes` bytes → E13; a path that is both a file
    and a folder of another → E14. A file whose content is unchanged is not written again.
    Kept files keep their manifest entries (Go adopts objects stored out of band, as a refresh
-   does). The manifest and SiteMeta (`updated_by`, `deploy_id`, title and description from
-   `index.html`, owners on first publish) are written before anything is deleted; the Worker
-   switches the file list in one transaction (`deployMerge`, §16).
+   does). The manifest and SiteMeta (`updated_by`, `deploy_id`, title, description and preview
+   from the resulting files as §7.2 says, owners on first publish) are written before anything is
+   deleted; the Worker switches the file list in one transaction (`deployMerge`, §16).
 10. Audit `deploy.commit` with `via=mcp`, `client` and `grant` (§15); metrics
     `deploys_total{method="mcp"}`.
 

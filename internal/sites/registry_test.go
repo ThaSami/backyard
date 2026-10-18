@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -414,6 +415,72 @@ func TestRefreshOwnershipNone(t *testing.T) {
 	}
 	if len(m.Owners) != 0 {
 		t.Errorf("owners in ownership=none: %v", m.Owners)
+	}
+}
+
+func TestRefreshPreview(t *testing.T) {
+	ctx := context.Background()
+	store := sitestest.NewMemStore()
+	reg := sites.NewRegistry(store, testConfig(t, "none"))
+	refresh := func(want string) {
+		t.Helper()
+		m, err := reg.Refresh(ctx, "demo", "a@x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.Preview != want {
+			t.Errorf("Refresh preview = %q, want %q", m.Preview, want)
+		}
+		stored, err := reg.GetMeta(ctx, "demo")
+		if err != nil || stored.Preview != want {
+			t.Errorf("stored preview = %+v, %v; want %q", stored, err, want)
+		}
+	}
+
+	// The og:image of index.html, after title and description.
+	put(t, store, "sites/demo/index.html", `<title>T</title><meta name="description" content="D"><meta property="og:image" content="/img/cover.png?v=1">`)
+	put(t, store, "sites/demo/img/cover.png", "png")
+	put(t, store, "sites/demo/preview.svg", "<svg/>")
+	refresh("img/cover.png")
+
+	// An unusable og:image falls through to preview.*.
+	if err := store.Delete(ctx, "sites/demo/img/cover.png"); err != nil {
+		t.Fatal(err)
+	}
+	refresh("preview.svg")
+	put(t, store, "sites/demo/preview.svg", strings.Repeat("x", sites.MaxPreviewBytes+1))
+	refresh("")
+	put(t, store, "sites/demo/preview.jpg", strings.Repeat("x", sites.MaxPreviewBytes))
+	refresh("preview.jpg")
+
+	// Without index.html the fallback still applies; without it either, a
+	// refresh removes the preview.
+	if err := store.Delete(ctx, "sites/demo/index.html"); err != nil {
+		t.Fatal(err)
+	}
+	refresh("preview.jpg")
+	if err := store.Delete(ctx, "sites/demo/preview.jpg"); err != nil {
+		t.Fatal(err)
+	}
+	refresh("")
+	if m, err := reg.GetMeta(ctx, "demo"); err != nil || m.Preview != "" {
+		t.Errorf("meta after removal = %+v, %v", m, err)
+	}
+}
+
+func TestMetaPreviewJSON(t *testing.T) {
+	// "preview" follows "description" and is omitted when empty.
+	m := sites.Meta{Name: "a", Title: "T", Description: "D", Preview: "preview.svg", Owners: []string{}}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"description":"D","preview":"preview.svg","created_at"`) {
+		t.Errorf("Meta JSON = %s", b)
+	}
+	m.Preview = ""
+	if b, _ := json.Marshal(m); strings.Contains(string(b), "preview") {
+		t.Errorf("empty preview encoded: %s", b)
 	}
 }
 

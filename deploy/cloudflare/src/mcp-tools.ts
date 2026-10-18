@@ -17,6 +17,7 @@ import { validatePath } from "./paths";
 import type { SiteRecord } from "./registry-do";
 import { siteURL, type RequestContext } from "./router";
 import { registry, siteStub } from "./stubs";
+import { utf8SeqLen } from "./title";
 
 /** One tools/call: the request, the re-gated user and the connection. */
 export interface ToolCall {
@@ -223,21 +224,6 @@ async function toolReadSiteFile(c: ToolCall, a: Record<string, unknown>): Promis
 }
 
 const fatalUTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-
-/** The length of the valid UTF-8 sequence at b[i], or 0 when it is invalid there. */
-function utf8SeqLen(b: Uint8Array, i: number): number {
-  const c = b[i]!;
-  if (c < 0x80) return 1;
-  const cont = (j: number, lo = 0x80, hi = 0xbf) => i + j < b.length && b[i + j]! >= lo && b[i + j]! <= hi;
-  if (c >= 0xc2 && c <= 0xdf) return cont(1) ? 2 : 0;
-  if (c === 0xe0) return cont(1, 0xa0) && cont(2) ? 3 : 0;
-  if ((c >= 0xe1 && c <= 0xec) || c === 0xee || c === 0xef) return cont(1) && cont(2) ? 3 : 0;
-  if (c === 0xed) return cont(1, 0x80, 0x9f) && cont(2) ? 3 : 0;
-  if (c === 0xf0) return cont(1, 0x90) && cont(2) && cont(3) ? 4 : 0;
-  if (c >= 0xf1 && c <= 0xf3) return cont(1) && cont(2) && cont(3) ? 4 : 0;
-  if (c === 0xf4) return cont(1, 0x80, 0x8f) && cont(2) && cont(3) ? 4 : 0;
-  return 0;
-}
 
 /** Text of bytes with each run of invalid UTF-8 replaced by one U+FFFD (Go's strings.ToValidUTF8). */
 export function toValidUTF8(b: Uint8Array): string {

@@ -1039,6 +1039,7 @@ function connectorSuite() {
     const site = uniqueSite("mcp");
     const site2 = uniqueSite("mcp2");
     const site3 = uniqueSite("mcp3");
+    const sitePreview = uniqueSite("mcpprev");
     const index = `<!doctype html><html><head><title>MCP ${site}</title><meta name="description" content="from the connector"></head><body>héllo ${site}</body></html>\n`;
     const png = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d2a5b20000000049454e44ae426082", "hex");
     const files = () => [
@@ -1056,7 +1057,7 @@ function connectorSuite() {
 
     after(async () => {
       const cleaner = new Client();
-      for (const s of [site, site2, site3]) await deleteSiteQuietly(cleaner, env, s);
+      for (const s of [site, site2, site3, sitePreview]) await deleteSiteQuietly(cleaner, env, s);
     });
 
     /** GET of a site file with the person's browser. */
@@ -1228,6 +1229,49 @@ function connectorSuite() {
       assert.equal(res.created, true);
       assert.ok(res.warnings.includes(`No index.html at the site root: ${env.canonicalSiteURL(site2)} answers 404 until one is published.`), JSON.stringify(res.warnings));
       assert.ok(res.warnings.includes('photo.png was sent as text but looks binary; binary files need "encoding": "base64".'), JSON.stringify(res.warnings));
+    });
+
+    test("backyard_publish derives SiteMeta.preview like a deploy (SPEC §7.2)", async (t) => {
+      if (signInSkip) return t.skip(signInSkip);
+      const shot = `<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720"><rect width="1280" height="720" fill="#0f766e"/></svg>\n`;
+      const page = (head) => `<!doctype html><html><head><title>Preview ${sitePreview}</title>${head}</head><body>preview</body></html>\n`;
+      /** The site's SiteMeta from the hub's site list, with the person's browser. */
+      const meta = async () => {
+        const r = await browser.request(`${P}/__backyard/api/sites`);
+        assert.equal(r.status, 200, `the hub's site list: ${r}`);
+        const m = r.json.sites.find((x) => x.name === sitePreview);
+        assert.ok(m, `${sitePreview} is listed`);
+        return m;
+      };
+      const previewURL = `${P}/__backyard/api/sites/${sitePreview}/preview`;
+
+      await mcp.callJSON("backyard_publish", {
+        site: sitePreview,
+        files: [
+          { path: "index.html", content: page('<meta property="og:image" content="./img/shot.svg?v=1">') },
+          { path: "img/shot.svg", content: shot },
+          { path: "preview.png", content: png.toString("base64"), encoding: "base64" },
+        ],
+      });
+      assert.equal((await meta()).preview, "img/shot.svg", "the og:image");
+      const img = await browser.request(`${previewURL}?v=1`);
+      assert.equal(img.status, 200, `the preview route: ${img}`);
+      assert.equal(img.header("content-type"), "image/svg+xml");
+      assert.deepEqual(img.body, Buffer.from(shot), "the preview's bytes");
+      const listed = (await mcp.callJSON("backyard_list_sites", { query: sitePreview })).sites.find((x) => x.name === sitePreview);
+      assert.ok(listed && !("preview" in listed), `backyard_list_sites has no preview: ${JSON.stringify(listed)}`);
+
+      // A merge that leaves index.html alone still reads its og:image: its file is gone, so preview.png.
+      await mcp.callJSON("backyard_publish", { site: sitePreview, files: [], delete: ["img/shot.svg"] });
+      assert.equal((await meta()).preview, "preview.png", "falls back to preview.png");
+      const fallback = await browser.request(previewURL);
+      assert.equal(fallback.status, 200, `${fallback}`);
+      assert.equal(fallback.header("content-type"), "image/png");
+      assert.deepEqual(fallback.body, png);
+
+      await mcp.callJSON("backyard_publish", { site: sitePreview, files: [{ path: "index.html", content: page("") }], replace: true });
+      assert.ok(!("preview" in (await meta())), "a publish without a preview removes it");
+      assert.equal((await browser.request(previewURL)).status, 404, "the route answers 404");
     });
 
     test("invalid publishes are refused and change nothing", async (t) => {

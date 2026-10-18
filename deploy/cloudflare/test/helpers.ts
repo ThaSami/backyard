@@ -56,8 +56,12 @@ export interface DeployOutcome {
   commit: { site: Record<string, unknown>; url: string; deleted: number };
 }
 
-/** Runs the full gateway protocol (create → PUT uploads → commit). */
-export async function deploy(site: string, files: SiteFiles, opts: { token?: string; envOverrides?: Partial<Env> } = {}): Promise<DeployOutcome> {
+/** Runs the full gateway protocol (create → PUT uploads → commit); contentTypes declares types ({path: type}). */
+export async function deploy(
+  site: string,
+  files: SiteFiles,
+  opts: { token?: string; envOverrides?: Partial<Env>; contentTypes?: Record<string, string> } = {},
+): Promise<DeployOutcome> {
   const token = opts.token ?? DEPLOY_TOKEN;
   const entries = await Promise.all(
     Object.entries(files).map(async ([path, content]) => {
@@ -65,7 +69,8 @@ export async function deploy(site: string, files: SiteFiles, opts: { token?: str
       return { path, bytes, size: bytes.length, sha256: await sha256Hex(bytes) };
     }),
   );
-  const list = entries.map(({ path, size, sha256 }) => ({ path, size, sha256 }));
+  const types = opts.contentTypes ?? {};
+  const list = entries.map(({ path, size, sha256 }) => (Object.hasOwn(types, path) ? { path, size, sha256, content_type: types[path] } : { path, size, sha256 }));
   const res = await call(`/__backyard/api/deploy/sites/${site}/deploys`, { method: "POST", headers: tokenHeaders(token), body: JSON.stringify({ files: list }) }, opts.envOverrides);
   if (res.status !== 200) throw new Error(`create deploy: ${res.status} ${await res.text()}`);
   const create = (await res.json()) as DeployOutcome["create"];

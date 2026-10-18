@@ -24,11 +24,13 @@ const (
 	// maxManifestBytes caps the size of a manifest read from storage
 	// (10 000 files of ~1 KiB paths fit comfortably).
 	maxManifestBytes = 64 << 20
-	// TitleScanBytes is how much of an index.html is inspected for its title.
+	// TitleScanBytes is how much of an index.html is inspected for its
+	// title, description and og:image.
 	TitleScanBytes = 64 << 10
 	// ioParallelism bounds concurrent storage calls made by one registry call.
 	ioParallelism = 8
-	// IndexFile is the site-relative path whose <title> describes the site.
+	// IndexFile is the site-relative path whose <title> describes the site
+	// (ExtractPage).
 	IndexFile = "index.html"
 )
 
@@ -374,9 +376,12 @@ func (r *Registry) Refresh(ctx context.Context, name, actor string) (*Meta, erro
 	}
 	m.UpdatedAt, m.UpdatedBy = now, actor
 	m.FileCount, m.Bytes = len(man.Files), total
+	var page Page
 	if head != nil {
-		m.Title, m.Description = ExtractTitle(head)
+		page = ExtractPage(head)
 	}
+	m.Title, m.Description = page.Title, page.Description
+	m.Preview = ChoosePreview(page.Image, man.Files)
 
 	if err := r.PutManifest(ctx, man); err != nil {
 		return nil, err

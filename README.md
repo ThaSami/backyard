@@ -47,8 +47,10 @@ security review. Backyard removes all of that:
 - **Client SDK** (`/__backyard/backyard.js`): `backyard.db` (JSON documents, queries, change
   feeds, live queries), `backyard.files`, `backyard.ai` (chat, streaming, images, embeddings),
   `backyard.warehouse` (read-only SQL), `backyard.socket` (rooms with presence), `backyard.id`.
-- **Hub**: a searchable directory of every site, drag-and-drop deploys, CLI setup, API docs at
-  `/docs` and `/llms.txt` for agents.
+- **Hub**: a searchable directory of every site with a preview image the site ships
+  ([`preview.svg` or `og:image`](docs/deploying-sites.md#site-preview), loaded through the hub
+  so it works behind Access or Okta), drag-and-drop deploys, collapsible CLI and agent setup
+  cards, API docs at `/docs` and `/llms.txt` for agents.
 - **Sign-in**: Okta / any OIDC provider, Google IAP, AWS ALB, trusted proxy headers (oauth2-proxy,
   Pomerium, Azure Easy Auth, Cloudflare Access), or none for labs; API tokens, static CI tokens
   and the OAuth device flow for CLIs.

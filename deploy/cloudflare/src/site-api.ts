@@ -51,7 +51,7 @@ const SSE_HEARTBEAT_MS = 15_000;
 /** Request headers forwarded to the site object for static/upload serving. */
 const FORWARD_HEADERS = ["Range", "If-Range", "If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since"];
 
-function forwardInit(ctx: RequestContext): RequestInit {
+export function forwardInit(ctx: RequestContext): RequestInit {
   const h = new Headers();
   for (const k of FORWARD_HEADERS) {
     const v = ctx.req.headers.get(k);
@@ -141,7 +141,7 @@ async function serveStatic(ctx: RequestContext): Promise<Response> {
 }
 
 /** Converts an object response of the site (inline or R2-backed) for the client. */
-async function finishObject(ctx: RequestContext, res: Response): Promise<Response> {
+export async function finishObject(ctx: RequestContext, res: Response): Promise<Response> {
   if (res.status >= 400 && !res.headers.get("ETag") && (res.headers.get("Content-Type") ?? "").includes("application/json")) {
     const body = (await res.json()) as { error?: { code?: string; message?: string } };
     throw new HttpError(res.status, (body.error?.code as HttpError["code"]) ?? "internal", body.error?.message ?? "error");

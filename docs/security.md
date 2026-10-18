@@ -172,6 +172,13 @@ bodies are bounded too (queries and most bodies 1 MiB, AI chat 32 MiB). See
   `Content-Security-Policy: sandbox`, so an uploaded document can never run script as the
   site. Both editions use the same allowlist ([SPEC §3](spec/SPEC.md#3-static-serving)).
   Deployed site files are served as-is, because pages are the product.
+- A site's **preview image** is the one exception: the hub serves that site file from its own
+  origin (`/__backyard/api/sites/<site>/preview`, behind the same sign-in as the site list),
+  typed by its extension alone (PNG, JPEG, GIF, WebP, AVIF or SVG) and always with
+  `Content-Security-Policy: sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'`,
+  so an SVG preview can neither run script on the hub's origin nor load anything, also when
+  opened directly ([Site preview](deploying-sites.md#site-preview)). Everyone who can list the
+  sites can see every site's preview.
 - Deploy paths are validated (relative, no `..`, no leading `/`, nothing under `__backyard/`,
   no `.git` segment in any letter case); `/__backyard/` can never be shadowed by a site file,
   and repository metadata can neither be deployed nor read back through the gateway.

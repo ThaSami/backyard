@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720" fill="#1d1c1a">
+  <!-- File Drop: the drop zone and the live gallery, drawn by hand for the hub's site card. -->
+  <style>
+    text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .muted { fill: #5f5d58; }
+    .chip { fill: #fff; stroke: #e4e2dc; stroke-width: 1.25; }
+    .chip-text { font-size: 16.9px; text-anchor: middle; }
+    .card { fill: #fff; stroke: #e4e2dc; stroke-width: 1.25; }
+    .name { font-size: 18.75px; font-weight: 600; }
+    .meta { font-size: 15px; fill: #5f5d58; }
+    .bin { fill: none; stroke: #8b8984; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  </style>
+  <defs>
+    <clipPath id="t1"><rect x="40" y="410" width="287" height="287" rx="17.5"/></clipPath>
+    <clipPath id="t2"><rect x="344" y="410" width="287" height="287" rx="17.5"/></clipPath>
+    <clipPath id="t3"><rect x="648" y="410" width="287" height="287" rx="17.5"/></clipPath>
+    <clipPath id="t4"><rect x="952" y="410" width="287" height="287" rx="17.5"/></clipPath>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8fbfe6"/><stop offset="1" stop-color="#d8ebf5"/>
+    </linearGradient>
+    <linearGradient id="stage" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1e2a3a"/><stop offset="1" stop-color="#2f3f57"/>
+    </linearGradient>
+    <path id="bin" d="M0 3h14M5 3V1h4v2M2 3l1 11h8l1-11M5.5 6v5M8.5 6v5"/>
+  </defs>
+
+  <rect width="1280" height="720" fill="#f6f5f1"/>
+
+  <!-- header -->
+  <text x="38" y="88" font-size="45" font-weight="700" letter-spacing="-.9">File Drop</text>
+  <text x="40" y="122" class="muted" font-size="18.75">Share screenshots, decks and docs with everyone who has this link.</text>
+  <text x="1240" y="122" class="muted" font-size="18.75" text-anchor="end">6 files · 19.2 MB</text>
+
+  <!-- drop zone -->
+  <rect x="41.25" y="147.25" width="1197.5" height="177.5" rx="22" fill="#fff" stroke="#e4e2dc" stroke-width="2.5" stroke-dasharray="8 6"/>
+  <circle cx="640" cy="212" r="27.5" fill="#2266c8" fill-opacity=".14"/>
+  <path d="M640 226v-24M629 212l11-12 11 12" fill="none" stroke="#2266c8" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="640" y="268" font-size="18.75" text-anchor="middle"><tspan font-weight="700">Drop files here</tspan>, paste, or <tspan text-decoration="underline">browse</tspan></text>
+  <text x="640" y="296" class="muted" font-size="16" text-anchor="middle">Images, videos, decks, docs: any file up to the server's upload limit</text>
+
+  <!-- filters and search -->
+  <rect x="40" y="356" width="54" height="37" rx="18.5" fill="#1d1c1a"/>
+  <text x="67" y="380" class="chip-text" fill="#f6f5f1">All</text>
+  <rect x="101" y="356" width="84" height="37" rx="18.5" class="chip"/>
+  <text x="143" y="380" class="chip-text">Images</text>
+  <rect x="192" y="356" width="72" height="37" rx="18.5" class="chip"/>
+  <text x="228" y="380" class="chip-text">Video</text>
+  <rect x="271" y="356" width="114" height="37" rx="18.5" class="chip"/>
+  <text x="328" y="380" class="chip-text">Documents</text>
+  <rect x="392" y="356" width="74" height="37" rx="18.5" class="chip"/>
+  <text x="429" y="380" class="chip-text">Other</text>
+  <rect x="890" y="353" width="350" height="43" rx="12.5" class="chip"/>
+  <text x="906" y="381" font-size="18.75" fill="#8b8984">Search by name…</text>
+
+  <!-- gallery -->
+  <rect x="40" y="410" width="287" height="287" rx="17.5" class="card"/>
+  <g clip-path="url(#t1)">
+    <rect x="40" y="410" width="287" height="215" fill="url(#sky)"/>
+    <circle cx="262" cy="458" r="20" fill="#ffd166"/>
+    <path d="M40 560l60-62 42 38 58-70 72 70 55-36v125H40z" fill="#6f957b"/>
+    <path d="M40 585l78-40 64 30 70-34 75 30v54H40z" fill="#4f7560"/>
+    <rect x="40" y="603" width="287" height="22" fill="#7fb0cf"/>
+  </g>
+  <text x="54" y="658" class="name">team-offsite.jpg</text>
+  <text x="54" y="682" class="meta">2.4 MB · Maya Chen · 6/12/2026</text>
+  <use href="#bin" class="bin" transform="translate(299 655)"/>
+
+  <rect x="344" y="410" width="287" height="287" rx="17.5" class="card"/>
+  <g clip-path="url(#t2)">
+    <rect x="344" y="410" width="287" height="215" fill="#ecebe6"/>
+    <path d="M466 489h30l14 14v40h-44z" fill="#fff" stroke="#8fa3b8" stroke-width="2" stroke-linejoin="round"/>
+    <path d="M496 489v14h14" fill="#dfe6ee" stroke="#8fa3b8" stroke-width="2" stroke-linejoin="round"/>
+    <path d="M474 512h28M474 520h28M474 528h28M474 536h18" stroke="#9fb1c4" stroke-width="2"/>
+  </g>
+  <text x="358" y="658" class="name">q3-roadmap.pdf</text>
+  <text x="358" y="682" class="meta">1.1 MB · Jonas Berg · 6/12/2026</text>
+  <use href="#bin" class="bin" transform="translate(603 655)"/>
+
+  <rect x="648" y="410" width="287" height="287" rx="17.5" class="card"/>
+  <g clip-path="url(#t3)">
+    <rect x="648" y="410" width="287" height="215" fill="#fafaf8"/>
+    <rect x="648" y="410" width="287" height="26" fill="#eceae4"/>
+    <circle cx="663" cy="423" r="4" fill="#e5534b"/><circle cx="676" cy="423" r="4" fill="#f2b33d"/><circle cx="689" cy="423" r="4" fill="#38a169"/>
+    <rect x="666" y="452" width="76" height="40" rx="6" fill="#fff" stroke="#e1e0d9"/>
+    <rect x="752" y="452" width="76" height="40" rx="6" fill="#fff" stroke="#e1e0d9"/>
+    <rect x="838" y="452" width="80" height="40" rx="6" fill="#fff" stroke="#e1e0d9"/>
+    <rect x="674" y="460" width="34" height="5" rx="2.5" fill="#c3c2b7"/><rect x="674" y="472" width="48" height="11" rx="3" fill="#52514e"/>
+    <rect x="760" y="460" width="34" height="5" rx="2.5" fill="#c3c2b7"/><rect x="760" y="472" width="40" height="11" rx="3" fill="#52514e"/>
+    <rect x="846" y="460" width="34" height="5" rx="2.5" fill="#c3c2b7"/><rect x="846" y="472" width="44" height="11" rx="3" fill="#52514e"/>
+    <rect x="666" y="502" width="252" height="110" rx="6" fill="#fff" stroke="#e1e0d9"/>
+    <path d="M678 590l26-18 24 8 26-30 26 14 24-22 26 10 28-24 22 6" fill="none" stroke="#2a78d6" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="M678 600l26-4 24 2 26-6 26 3 24-5 26 2 28-4 22 1" fill="none" stroke="#eb6834" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+  </g>
+  <text x="662" y="658" class="name">dashboard.png</text>
+  <text x="662" y="682" class="meta">310 KB · Priya Nair · 6/11/2026</text>
+  <use href="#bin" class="bin" transform="translate(907 655)"/>
+
+  <rect x="952" y="410" width="287" height="287" rx="17.5" class="card"/>
+  <g clip-path="url(#t4)">
+    <rect x="952" y="410" width="287" height="215" fill="url(#stage)"/>
+    <rect x="1004" y="452" width="183" height="104" rx="6" fill="#f6f5f1"/>
+    <rect x="1020" y="472" width="112" height="14" rx="4" fill="#2266c8"/>
+    <rect x="1020" y="496" width="150" height="8" rx="4" fill="#c3c2b7"/>
+    <rect x="1020" y="512" width="128" height="8" rx="4" fill="#c3c2b7"/>
+    <rect x="1020" y="528" width="96" height="8" rx="4" fill="#c3c2b7"/>
+    <rect x="952" y="586" width="287" height="39" fill="#121821" fill-opacity=".55"/>
+    <circle cx="1095" cy="602" r="7" fill="#e8c7a0"/>
+    <path d="M1082 625c0-10 6-15 13-15s13 5 13 15z" fill="#4c6a92"/>
+  </g>
+  <text x="966" y="658" class="name">launch-demo.mp4</text>
+  <text x="966" y="682" class="meta">14.6 MB · Sam Ortiz · 6/11/2026</text>
+  <use href="#bin" class="bin" transform="translate(1211 655)"/>
+</svg>

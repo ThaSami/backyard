@@ -13,6 +13,7 @@ import { KeyLabel, b64url, deriveKey, signValue } from "../src/crypto";
 import type { Env } from "../src/env";
 import { formatBytes, truncateBytes } from "../src/gateway";
 import { MCP_CATALOG } from "../src/generated/mcp";
+import { unwrap } from "../src/http";
 import { issueAPIToken } from "../src/jwt";
 import { SCHEMA_KEYWORDS, validateSchema } from "../src/mcp";
 import { TOOLS, decodeBase64, toValidUTF8 } from "../src/mcp-tools";
@@ -918,6 +919,48 @@ describe("the tools (SPEC §14.1)", () => {
     expect(await mcp.error("backyard_publish", { site, files: [{ path: "huge.txt", content: huge + "!" }, { path: "index.html", content: big }] })).toMatch(/per call/);
     // Unchanged R2 content is not stored again.
     expect(await mcp.json("backyard_publish", { site, files: [{ path: "huge.txt", content: huge }] })).toMatchObject({ uploaded: 0, unchanged: 1 });
+  });
+
+  it("derives the preview like the title, from the files the site has after each publish (SPEC §7.2)", async () => {
+    const { mcp } = await guest();
+    const site = uniqueSite("pubprev");
+    const index = '<!doctype html><title>P</title><meta property="og:image" content="./img/cover.svg?v=1">';
+    await mcp.json("backyard_publish", { site, files: [{ path: "index.html", content: index }] });
+    expect((await siteRecord(site)).value).not.toHaveProperty("preview");
+    // A merge adds the file the kept index.html names.
+    await mcp.json("backyard_publish", { site, files: [{ path: "img/cover.svg", content: "<svg/>" }] });
+    expect((await siteRecord(site)).value).toMatchObject({ preview: "img/cover.svg" });
+    const res = await call(`/__backyard/api/sites/${site}/preview`, {}, PUB);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("image/svg+xml");
+    expect(await res.text()).toBe("<svg/>");
+    // Deleting it falls back to preview.*; replacing the site without one removes it.
+    await mcp.json("backyard_publish", { site, files: [{ path: "preview.svg", content: "<svg></svg>" }], delete: ["img/cover.svg"] });
+    expect((await siteRecord(site)).value).toMatchObject({ preview: "preview.svg" });
+    await mcp.json("backyard_publish", { site, files: [{ path: "index.html", content: index }], replace: true });
+    expect((await siteRecord(site)).value).not.toHaveProperty("preview");
+    // index.html in R2 (FILE_INLINE_MAX): from the sent bytes, then read back from R2 by a later merge.
+    const big = index + "<p>" + "b".repeat(100_000) + "</p>";
+    await mcp.json("backyard_publish", { site, files: [{ path: "index.html", content: big }, { path: "img/cover.svg", content: "<svg/>" }] });
+    expect((await siteRecord(site)).value).toMatchObject({ title: "P", preview: "img/cover.svg" });
+    expect(unwrap(await siteStub(testEnv(), site).siteInfo()).titleR2Key).not.toBe("");
+    await mcp.json("backyard_publish", { site, files: [{ path: "preview.png", content: "png" }] });
+    expect((await siteRecord(site)).value).toMatchObject({ title: "P", preview: "img/cover.svg", file_count: 3 });
+    // backyard_list_sites keeps its own fields.
+    const list = await mcp.json("backyard_list_sites", { query: site });
+    expect(list.sites[0].name).toBe(site);
+    expect(list.sites[0]).not.toHaveProperty("preview");
+  });
+
+  it("keeps the preview in step with concurrent publishes (the record settles on the files)", async () => {
+    const { mcp } = await guest();
+    const site = uniqueSite("raceprev");
+    await mcp.json("backyard_publish", { site, files: [{ path: "index.html", content: '<meta property="og:image" content="cover.svg">' }] });
+    await Promise.all([
+      mcp.json("backyard_publish", { site, files: [{ path: "cover.svg", content: "<svg/>" }] }),
+      ...Array.from({ length: 5 }, (_, i) => mcp.json("backyard_publish", { site, files: [{ path: `part${i}.js`, content: `// ${i}\n` }] })),
+    ]);
+    expect((await siteRecord(site)).value).toMatchObject({ file_count: 7, preview: "cover.svg" });
   });
 
   it("merges concurrent publishes of one site atomically: no file is lost", async () => {

@@ -6,6 +6,7 @@ export interface SiteMeta {
   url: string;
   title?: string;
   description?: string;
+  preview?: string;
   created_at: string;
   created_by?: string;
   updated_at: string;
@@ -21,6 +22,7 @@ export function siteMetaJSON(r: SiteRecord, url: string): SiteMeta {
   const m: SiteMeta = { name: r.name, url } as SiteMeta;
   if (r.title) m.title = r.title;
   if (r.description) m.description = r.description;
+  if (r.preview) m.preview = r.preview;
   m.created_at = r.created_at;
   if (r.created_by) m.created_by = r.created_by;
   m.updated_at = r.updated_at;

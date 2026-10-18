@@ -1,9 +1,10 @@
 /**
  * Hub host requests (SPEC §2): the hub UI, /docs, /llms.txt, the hub API
- * (/me, /sites, /tokens, /info, /mcp/grants), the deploy gateway, the auth
- * endpoints (/__backyard/auth/cli browser → CLI token handoff, login, logout,
- * authorize) and the Claude connector's machine paths (/__backyard/mcp,
- * /__backyard/oauth/*, the OAuth discovery documents; SPEC §8.4, §14.1).
+ * (/me, /sites, /sites/{site}/preview, /tokens, /info, /mcp/grants), the
+ * deploy gateway, the auth endpoints (/__backyard/auth/cli browser → CLI
+ * token handoff, login, logout, authorize) and the Claude connector's machine
+ * paths (/__backyard/mcp, /__backyard/oauth/*, the OAuth discovery documents;
+ * SPEC §8.4, §14.1).
  */
 import { hubDirExists, serveHubFile, serveSDK, serveText } from "./assets";
 import { ANON_COOKIE, authenticate, cookieString, isCookieConflict } from "./auth";
@@ -31,10 +32,11 @@ import {
   serveOAuthMetadata,
 } from "./oauth";
 import { authErrorPage, cliConfirmPage, formActionSource, tokenPage } from "./pages";
-import { redirect, siteURL, type RequestContext } from "./router";
-import { apiGate, dispatch } from "./site-api";
+import { previewType } from "./preview";
+import { redirect, siteNameError, siteURL, type RequestContext } from "./router";
+import { apiGate, dispatch, finishObject, forwardInit } from "./site-api";
 import { siteMetaJSON } from "./sitemeta";
-import { registry } from "./stubs";
+import { registry, siteStub } from "./stubs";
 
 /** Dispatches a request for the hub (ctx.kind === "hub"). */
 export async function serveHub(ctx: RequestContext): Promise<Response> {
@@ -68,6 +70,7 @@ export async function serveHub(ctx: RequestContext): Promise<Response> {
 const HUB_ROUTES = [
   { method: "GET", re: /^\/me$/, h: async (_c: RequestContext, u: User) => json(cleanUser(u)) },
   { method: "GET", re: /^\/sites$/, h: listSites },
+  { method: "GET", re: /^\/sites\/([^/]+)\/preview$/, h: sitePreview },
   { method: "POST", re: /^\/tokens$/, h: mintToken },
   // The Claude connector's connections (SPEC §8.4.7).
   { method: "GET", re: /^\/mcp\/grants$/, h: listMcpGrants },
@@ -78,6 +81,46 @@ const HUB_ROUTES = [
 async function listSites(ctx: RequestContext): Promise<Response> {
   const list = unwrap(await registry(ctx.env).listSites());
   return json({ sites: list.map((r) => siteMetaJSON(r, siteURL(ctx, r.name))) });
+}
+
+/**
+ * GET /__backyard/api/sites/{site}/preview: the image SiteMeta.preview names
+ * (SPEC §3, §7.2), from the hub's own origin, so that it loads with the
+ * credentials of the site list in both URL modes and every auth mode. The
+ * SiteDO serves the file typed by its extension and sandboxed (PREVIEW_CSP);
+ * an R2-backed one is streamed here. A non-empty v makes it immutable.
+ */
+async function sitePreview(ctx: RequestContext, _u: User, [site = ""]: string[]): Promise<Response> {
+  const none = () => notFound(`site ${JSON.stringify(truncate(site, 100))} has no preview`);
+  // A name that cannot be a site wakes no Durable Object.
+  if (siteNameError(site, null)) throw none();
+  const rec = unwrap(await registry(ctx.env).getSite(site));
+  if (!rec?.preview || !previewType(rec.preview)) throw none();
+  const qs = new URLSearchParams({ path: rec.preview });
+  if (hasVersion(ctx.url.search)) qs.set("versioned", "1");
+  const res = await siteStub(ctx.env, site).fetch(`https://site/preview?${qs}`, forwardInit(ctx));
+  if (res.headers.get("x-backyard-not-found")) throw none();
+  return finishObject(ctx, res);
+}
+
+/**
+ * Whether a raw query has a non-empty v parameter as Go's
+ * URL.Query().Get("v") reads it: pairs with a ";" or a malformed escape do
+ * not count, and the first well-formed v decides.
+ */
+function hasVersion(search: string): boolean {
+  for (const pair of search.replace(/^\?/, "").split("&")) {
+    if (pair === "" || pair.includes(";") || /%(?![0-9A-Fa-f]{2})/.test(pair)) continue;
+    const eq = pair.indexOf("=");
+    let key: string;
+    try {
+      key = decodeURIComponent((eq < 0 ? pair : pair.slice(0, eq)).replace(/\+/g, " "));
+    } catch {
+      continue; // invalid UTF-8: not "v"
+    }
+    if (key === "v") return eq >= 0 && eq < pair.length - 1;
+  }
+  return false;
 }
 
 /** Groups that grant admin rights: kept first when a token must drop groups to fit. */

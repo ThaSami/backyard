@@ -2,19 +2,22 @@ package docs
 
 // Contract checks for the statements the specification and the guides make
 // about the hardened behaviour of both editions: which uploads are served
-// without a sandbox, the warehouse and realtime size limits, the direct-sync
-// commands, the ignore rules no configuration can override, the login state
-// cookie, the Cloudflare edition's query page budget, its Access bypass list,
-// the commands and flags of its engine (backyard-cloudflare), what the entry
-// points promise about `backyard cloudflare setup` and what a CI deploy must
-// carry over from it.
+// without a sandbox, how site previews are chosen and served, the warehouse
+// and realtime size limits, the direct-sync commands, the ignore rules no
+// configuration can override, the login state cookie, the Cloudflare
+// edition's query page budget, its Access bypass list, the commands and flags
+// of its engine (backyard-cloudflare), what the entry points promise about
+// `backyard cloudflare setup` and what a CI deploy must carry over from it.
 
 import (
 	"encoding/json"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -26,6 +29,7 @@ import (
 	"github.com/thasami/backyard/internal/auth"
 	"github.com/thasami/backyard/internal/deploy"
 	"github.com/thasami/backyard/internal/pubsub"
+	"github.com/thasami/backyard/internal/sites"
 	"github.com/thasami/backyard/internal/warehouse"
 )
 
@@ -124,6 +128,202 @@ func TestUploadSandboxAllowlistDocumented(t *testing.T) {
 	for _, s := range []string{"`text/xsl`", "`+xml`", "`Content-Security-Policy: sandbox`"} {
 		if !strings.Contains(spec, s) {
 			t.Errorf("SPEC §3 does not mention %s", s)
+		}
+	}
+}
+
+// workerPreview holds the site preview values of the Cloudflare edition
+// (deploy/cloudflare/src/preview.ts).
+type workerPreview struct {
+	names    []string
+	maxBytes int
+	csp      string
+	types    map[string]string
+}
+
+// readWorkerPreview reads PREVIEW_NAMES, MAX_PREVIEW_BYTES, PREVIEW_CSP and
+// PREVIEW_TYPES from deploy/cloudflare/src/preview.ts.
+func readWorkerPreview(t *testing.T) workerPreview {
+	t.Helper()
+	const rel = "deploy/cloudflare/src/preview.ts"
+	src := readRepoFile(t, rel)
+	find := func(name, re string) []string {
+		t.Helper()
+		m := regexp.MustCompile(re).FindStringSubmatch(src)
+		if m == nil {
+			t.Fatalf("%s not found in %s (update this test)", name, rel)
+		}
+		return m
+	}
+	var w workerPreview
+	w.names = quotedStrings(find("PREVIEW_NAMES", `(?s)export const PREVIEW_NAMES\b[^=]*= \[(.*?)\]`)[1])
+	m := find("MAX_PREVIEW_BYTES", `export const MAX_PREVIEW_BYTES\b[^=]*= (\d+)(?: << (\d+))?;`)
+	w.maxBytes, _ = strconv.Atoi(m[1])
+	if m[2] != "" {
+		shift, _ := strconv.Atoi(m[2])
+		w.maxBytes <<= shift
+	}
+	w.csp = find("PREVIEW_CSP", `export const PREVIEW_CSP\b[^=]*= "([^"]*)";`)[1]
+	w.types = map[string]string{}
+	for _, kv := range regexp.MustCompile(`"?([a-z0-9]+)"?: "([^"]+)"`).FindAllStringSubmatch(find("PREVIEW_TYPES", `(?s)export const PREVIEW_TYPES\b[^=]*= \{(.*?)\}`)[1], -1) {
+		w.types[kv[1]] = kv[2]
+	}
+	return w
+}
+
+// previewNameList returns the names of the longest list of preview file
+// names ("`preview.png`, `preview.jpg`, … or `preview.svg`") in text.
+func previewNameList(text string) []string {
+	longest := ""
+	for _, m := range regexp.MustCompile("`preview\\.[a-z]+`(?:,? (?:or |and )?`preview\\.[a-z]+`)+").FindAllString(text, -1) {
+		if len(m) > len(longest) {
+			longest = m
+		}
+	}
+	return codeSpans(longest)
+}
+
+// between returns the part of text from the first start to the next end
+// after it.
+func between(t *testing.T, where, text, start, end string) string {
+	t.Helper()
+	i := strings.Index(text, start)
+	if i < 0 {
+		t.Fatalf("%s no longer says %q (update this test)", where, start)
+	}
+	j := strings.Index(text[i:], end)
+	if j < 0 {
+		t.Fatalf("%s: %q is no longer followed by %q (update this test)", where, start, end)
+	}
+	return text[i : i+j]
+}
+
+// TestSitePreviewContractDocumented checks how site previews are chosen
+// (SPEC §7.2) and served (SPEC §3) against both editions: the preview.* file
+// names in their order, the image types and the Content-Type each is served
+// with, the 1 MiB cap, the Content-Security-Policy and the two Cache-Control
+// values. The Go server (internal/sites/preview.go, internal/server) and the
+// Cloudflare edition (deploy/cloudflare/src/preview.ts) must agree with the
+// specification, and the guides that tell people and agents how to ship a
+// preview must state the same names, cap and policy.
+func TestSitePreviewContractDocumented(t *testing.T) {
+	if len(sites.PreviewNames) < 2 || len(sites.PreviewTypes) < 2 || sites.PreviewCSP == "" {
+		t.Fatalf("Go preview contract not found: names %q, types %v, CSP %q", sites.PreviewNames, sites.PreviewTypes, sites.PreviewCSP)
+	}
+	mib := sites.MaxPreviewBytes >> 20
+	if mib<<20 != sites.MaxPreviewBytes {
+		t.Fatalf("MaxPreviewBytes %d is not a whole number of MiB", sites.MaxPreviewBytes)
+	}
+	limit := strconv.Itoa(mib) + " MiB"
+	exts := slices.Sorted(maps.Keys(sites.PreviewTypes))
+
+	// The editions agree.
+	w := readWorkerPreview(t)
+	if !slices.Equal(w.names, sites.PreviewNames) {
+		t.Errorf("preview file names: Go %q, Worker %q", sites.PreviewNames, w.names)
+	}
+	if w.maxBytes != sites.MaxPreviewBytes {
+		t.Errorf("largest preview: Go %d bytes, Worker %d", sites.MaxPreviewBytes, w.maxBytes)
+	}
+	if w.csp != sites.PreviewCSP {
+		t.Errorf("preview Content-Security-Policy: Go %q, Worker %q", sites.PreviewCSP, w.csp)
+	}
+	if !maps.Equal(w.types, sites.PreviewTypes) {
+		t.Errorf("preview types: Go %v, Worker %v", sites.PreviewTypes, w.types)
+	}
+	for _, name := range sites.PreviewNames {
+		if ext := strings.TrimPrefix(path.Ext(name), "."); sites.PreviewTypes[ext] == "" {
+			t.Errorf("the preview file name %s has no preview type", name)
+		}
+	}
+
+	// SPEC §7.2: how a preview is chosen.
+	choose := flatten(specSection(t, "7.2"))
+	if got := previewNameList(choose); !slices.Equal(got, sites.PreviewNames) {
+		t.Errorf("SPEC §7.2 lists the preview files %q, the code %q (in this order)", got, sites.PreviewNames)
+	}
+	documented := codeSpans(between(t, "SPEC §7.2", choose, "its extension (lowercased) is one of", "1 MiB"))
+	sort.Strings(documented)
+	if !slices.Equal(documented, exts) {
+		t.Errorf("SPEC §7.2 names the og:image extensions %q, the code %q", documented, exts)
+	}
+	if want := fmt.Sprintf("%s (%d bytes)", limit, sites.MaxPreviewBytes); !strings.Contains(choose, want) {
+		t.Errorf("SPEC §7.2 does not state the preview cap %q", want)
+	}
+
+	// SPEC §3: how it is served.
+	serve := flatten(specSection(t, "3"))
+	if want := "`Content-Security-Policy: " + sites.PreviewCSP + "`"; !strings.Contains(serve, want) {
+		t.Errorf("SPEC §3 does not give the preview policy %s", want)
+	}
+	served := map[string]string{}
+	for _, m := range regexp.MustCompile("`([a-z0-9]+)`(?: and `([a-z0-9]+)`)? → `([a-z]+/[a-z0-9.+-]+)`").FindAllStringSubmatch(
+		between(t, "SPEC §3", serve, "`Content-Type` by the extension", "Content-Security-Policy"), -1) {
+		served[m[1]] = m[3]
+		if m[2] != "" {
+			served[m[2]] = m[3]
+		}
+	}
+	if !maps.Equal(served, sites.PreviewTypes) {
+		t.Errorf("SPEC §3 serves previews as %v, the code as %v", served, sites.PreviewTypes)
+	}
+	var cacheControl []string
+	for _, s := range codeSpans(between(t, "SPEC §3", serve, "**Preview images.**", "The hub UI requests")) {
+		if v, ok := strings.CutPrefix(s, "Cache-Control: "); ok {
+			cacheControl = append(cacheControl, v)
+		}
+	}
+	if len(cacheControl) != 2 {
+		t.Fatalf("SPEC §3 gives %d Cache-Control values for previews, want 2 (with and without ?v=): %q", len(cacheControl), cacheControl)
+	}
+	goLits := map[string]bool{}
+	ast.Inspect(parseGoFile(t, "internal/server/preview.go"), func(n ast.Node) bool {
+		if e, ok := n.(ast.Expr); ok {
+			if s, ok := stringLit(e); ok {
+				goLits[s] = true
+			}
+		}
+		return true
+	})
+	worker := readRepoFile(t, "deploy/cloudflare/src/preview.ts") + readRepoFile(t, "deploy/cloudflare/src/hub.ts")
+	for _, v := range cacheControl {
+		if !goLits[v] {
+			t.Errorf("internal/server/preview.go does not send Cache-Control %q (SPEC §3)", v)
+		}
+		if !strings.Contains(worker, strconv.Quote(v)) {
+			t.Errorf("deploy/cloudflare/src (preview.ts, hub.ts) does not send Cache-Control %q (SPEC §3)", v)
+		}
+	}
+	if !strings.Contains(flatten(specSection(t, "2")), "`/__backyard/api/sites/{site}/preview`") {
+		t.Error("SPEC §2 does not list the hub route /__backyard/api/sites/{site}/preview")
+	}
+
+	// The guides say the same.
+	guide := flatten(markdownSection(t, readRepoFile(t, "docs/deploying-sites.md"), "Site preview"))
+	api := flatten(readRepoFile(t, "skills/backyard/references/api.md"))
+	for where, text := range map[string]string{"docs/deploying-sites.md (Site preview)": guide, "skills/…/references/api.md": api} {
+		if got := previewNameList(text); !slices.Equal(got, sites.PreviewNames) {
+			t.Errorf("%s lists the preview files %q, the code %q (in this order)", where, got, sites.PreviewNames)
+		}
+		for _, want := range append([]string{limit, sites.PreviewCSP, "/__backyard/api/sites/"}, exts...) {
+			if !strings.Contains(text, want) {
+				t.Errorf("%s does not mention %q", where, want)
+			}
+		}
+	}
+	for where, text := range map[string]string{
+		"docs/security.md (Uploads and deployed files)": flatten(markdownSection(t, readRepoFile(t, "docs/security.md"), "Uploads and deployed files")),
+		"skills/backyard/SKILL.md":                      flatten(readRepoFile(t, "skills/backyard/SKILL.md")),
+		"templates/files/agents/partials.tmpl":          flatten(readRepoFile(t, "templates/files/agents/partials.tmpl")),
+	} {
+		want := []string{"`preview.svg`", "1280×720", "1 MiB"}
+		if strings.HasPrefix(where, "docs/security.md") {
+			want = []string{sites.PreviewCSP, "/__backyard/api/sites/<site>/preview"}
+		}
+		for _, s := range want {
+			if !strings.Contains(text, s) {
+				t.Errorf("%s does not mention %q", where, s)
+			}
 		}
 	}
 }

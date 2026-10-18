@@ -14,9 +14,10 @@ backend through one script tag — `backyard.db` (JSON documents + realtime), `b
 by the company identity provider before the page loads. There is nothing else: no server code,
 no cron, no config files — saying no is a feature.
 
-The hub (`https://backyard.example.com`) lists every site and serves these docs. Throughout these
-docs, `https://backyard.example.com` stands for the company's Backyard server; `backyard whoami`
-(or the project's `CLAUDE.md` / `AGENTS.md`) shows its real URL — use that one with people.
+The hub (`https://backyard.example.com`) lists every site as a card (title, description and a
+preview image the site ships) and serves these docs. Throughout these docs,
+`https://backyard.example.com` stands for the company's Backyard server; `backyard whoami` (or
+the project's `CLAUDE.md` / `AGENTS.md`) shows its real URL — use that one with people.
 
 ## Golden rules
 
@@ -49,6 +50,13 @@ docs, `https://backyard.example.com` stands for the company's Backyard server; `
 9. **Self-contained pages.** Vanilla HTML/CSS/JS works best. Vendor libraries into the folder
    instead of loading them from public CDNs (corporate networks may block them). Handle loading,
    empty and error states, and make it look good on laptop and phone.
+10. **Ship a preview for the hub.** Every site gets a `<title>`, a `<meta name="description">`
+    and a **`preview.svg`** next to `index.html`: a 1280×720 sketch of the app's main screen in
+    its own colors (`viewBox="0 0 1280 720"`, big shapes and headings, system fonts, no
+    scripts, no external images or fonts, ≤ 1 MiB). The hub shows it on the site's card;
+    without one the card says "No preview available". A `preview.png` works too, or
+    `<meta property="og:image" content="img/cover.png">` naming one of the site's own files
+    (png, jpg/jpeg, gif, webp, avif or svg, ≤ 1 MiB).
 
 ## Quickstart
 
@@ -91,7 +99,8 @@ backyard deploy               # publishes the folder and prints the URL
 1. Restate the idea in one line; pick a site name; check it is free with
    `backyard sites info <name>` ("not found" = free) or `backyard_list_sites`.
 2. `backyard init <name>` (or create the folder with `index.html` + `.backyard.json`).
-3. Build the page(s) following the rules above; keep data models simple (see Patterns).
+3. Build the page(s) following the rules above; keep data models simple (see Patterns). Draw
+   `preview.svg` once the main screen exists.
 4. Preview with `backyard dev` when possible; fix console errors.
 5. `backyard deploy` from the folder; give the user the printed URL. Redeploy after changes.
 
@@ -103,8 +112,8 @@ backyard deploy               # publishes the folder and prints the URL
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Lunch Vote</title>                         <!-- shown in the hub directory -->
-  <meta name="description" content="Vote where the team eats today">
+  <title>Lunch Vote</title>                         <!-- the hub's site card shows the title, -->
+  <meta name="description" content="Vote where the team eats today">  <!-- the description -->
   <link rel="stylesheet" href="style.css">           <!-- relative! -->
 </head>
 <body>
@@ -113,6 +122,17 @@ backyard deploy               # publishes the folder and prints the URL
   <script src="app.js"></script>
 </body>
 </html>
+```
+
+`preview.svg` (the card's image; served sandboxed, so it must be self-contained):
+
+```xml
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720">
+  <rect width="1280" height="720" fill="#f6f5f1"/>
+  <text x="130" y="134" font-family="system-ui, sans-serif" font-size="60" font-weight="700" fill="#1d1c1a">Where should we eat?</text>
+  <rect x="130" y="180" width="1020" height="92" rx="21" fill="#fff" stroke="#2266c8" stroke-width="3"/>
+  <!-- … the rest of the main screen as simple shapes and short labels -->
+</svg>
 ```
 
 ## API cheat sheet

@@ -11,7 +11,7 @@ normative reference for every URL, wire format and default.
 | [Getting started](getting-started.md) | Install, run a local server, build and deploy a first site |
 | [Client API](client-api.md) | `backyard.db`, `files`, `ai`, `warehouse`, `socket`, `id` at a glance |
 | [Realtime](realtime.md) | Live queries, change feeds, rooms and presence, the websocket protocol |
-| [Deploying sites](deploying-sites.md) | Deploy methods, `.backyardignore`, ownership, CI, the Lambda gateway |
+| [Deploying sites](deploying-sites.md) | Site previews on the hub, deploy methods, `.backyardignore`, ownership, CI, the Lambda gateway |
 | [CLI reference](cli.md) | Every `backyard` command and flag |
 | [Agents](agents.md) | Claude skill, Claude Code plugin, MCP server, init templates, `/llms.txt` |
 | [Claude connector](claude-connector.md) | Publish from Claude with the company sign-in: turning on the remote MCP connector, adding it in Claude, proxies, limits, disconnecting |

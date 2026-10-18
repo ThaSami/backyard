@@ -145,112 +145,136 @@
         </section>
 
         <div class="side">
-          <section class="card connector" id="connector" aria-labelledby="connector-title" hidden>
-            <h2 id="connector-title">Use Backyard in Claude</h2>
-            <p class="muted">
-              Add Backyard to Claude as a connector: Claude can then publish and update sites for you. You sign in with
-              your usual account and approve the connection once.
-            </p>
-            <span class="label">Connector URL</span>
-            <div class="cmd">
-              <pre><code id="connector-url"></code></pre>
-              <button type="button" class="icon-btn copy" id="connector-copy" aria-label="Copy the connector URL" title="Copy">
-                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9h10v10H9z" /><path d="M5 15V5h10" /></svg>
-              </button>
-            </div>
-            <ol class="steps">
-              <li>
-                <span class="step-title">Claude on the web, desktop or phone</span>
-                <p class="step-text">
-                  Customize → Connectors → Add custom connector. Name it Backyard, paste the URL, then Connect and sign in.
+          <section class="card panel connector" id="connector" aria-labelledby="connector-title" hidden>
+            <details data-panel="connector">
+              <summary>
+                <h2 id="connector-title">Use Backyard in Claude</h2>
+                <span class="panel-hint">Let Claude publish sites for you.</span>
+                <svg class="icon chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+              </summary>
+              <div class="panel-body">
+                <p class="muted">
+                  Add Backyard to Claude as a connector: Claude can then publish and update sites for you. You sign in with
+                  your usual account and approve the connection once.
                 </p>
-              </li>
-              <li>
-                <span class="step-title">For a whole Team or Enterprise</span>
-                <p class="step-text">
-                  Organization owners add it once under Organization settings → Connectors → Add → Custom → Web; then
-                  everyone just clicks Connect.
+                <span class="label">Connector URL</span>
+                <div class="cmd">
+                  <pre><code id="connector-url"></code></pre>
+                  <button type="button" class="icon-btn copy" id="connector-copy" aria-label="Copy the connector URL" title="Copy">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9h10v10H9z" /><path d="M5 15V5h10" /></svg>
+                  </button>
+                </div>
+                <ol class="steps">
+                  <li>
+                    <span class="step-title">Claude on the web, desktop or phone</span>
+                    <p class="step-text">
+                      Customize → Connectors → Add custom connector. Name it Backyard, paste the URL, then Connect and sign in.
+                    </p>
+                  </li>
+                  <li>
+                    <span class="step-title">For a whole Team or Enterprise</span>
+                    <p class="step-text">
+                      Organization owners add it once under Organization settings → Connectors → Add → Custom → Web; then
+                      everyone just clicks Connect.
+                    </p>
+                  </li>
+                  <li>
+                    <span class="step-title">Claude Code</span>
+                    <div class="cmd"><pre><code id="connector-cmd">claude mcp add --transport http backyard</code></pre></div>
+                    <p class="step-text">Then run <code>/mcp</code> in Claude Code and choose Authenticate.</p>
+                  </li>
+                </ol>
+
+                <h3 id="connector-grants-title" tabindex="-1">Your connections</h3>
+                <ul class="grant-list" id="connector-grants" aria-labelledby="connector-grants-title" aria-busy="true"></ul>
+                <p class="hint" id="connector-grants-empty" hidden>
+                  No connections yet. Each app you connect shows up here, and you can disconnect it at any time.
                 </p>
-              </li>
-              <li>
-                <span class="step-title">Claude Code</span>
-                <div class="cmd"><pre><code id="connector-cmd">claude mcp add --transport http backyard</code></pre></div>
-                <p class="step-text">Then run <code>/mcp</code> in Claude Code and choose Authenticate.</p>
-              </li>
-            </ol>
+                <p class="hint" id="connector-status" role="status" aria-live="polite"></p>
 
-            <h3 id="connector-grants-title" tabindex="-1">Your connections</h3>
-            <ul class="grant-list" id="connector-grants" aria-labelledby="connector-grants-title" aria-busy="true"></ul>
-            <p class="hint" id="connector-grants-empty" hidden>
-              No connections yet. Each app you connect shows up here, and you can disconnect it at any time.
-            </p>
-            <p class="hint" id="connector-status" role="status" aria-live="polite"></p>
-
-            <form class="connector-admin" id="connector-revoke-user" novalidate hidden>
-              <h3 id="connector-admin-title">Disconnect a person</h3>
-              <p class="hint">
-                Admins: end all Claude connections of one person, for example when they leave. They can connect again
-                for as long as they can still sign in.
-              </p>
-              <label for="connector-user">Email or user ID</label>
-              <div class="token-row">
-                <input
-                  type="text"
-                  id="connector-user"
-                  name="user"
-                  placeholder="alice@acme.com"
-                  autocomplete="off"
-                  autocapitalize="off"
-                  spellcheck="false"
-                  aria-describedby="connector-user-status"
-                />
-                <button type="submit" class="btn danger" id="connector-user-submit">Disconnect</button>
+                <form class="connector-admin" id="connector-revoke-user" novalidate hidden>
+                  <h3 id="connector-admin-title">Disconnect a person</h3>
+                  <p class="hint">
+                    Admins: end all Claude connections of one person, for example when they leave. They can connect again
+                    for as long as they can still sign in.
+                  </p>
+                  <label for="connector-user">Email or user ID</label>
+                  <div class="token-row">
+                    <input
+                      type="text"
+                      id="connector-user"
+                      name="user"
+                      placeholder="alice@acme.com"
+                      autocomplete="off"
+                      autocapitalize="off"
+                      spellcheck="false"
+                      aria-describedby="connector-user-status"
+                    />
+                    <button type="submit" class="btn danger" id="connector-user-submit">Disconnect</button>
+                  </div>
+                  <p class="hint" id="connector-user-status" role="status" aria-live="polite"></p>
+                </form>
               </div>
-              <p class="hint" id="connector-user-status" role="status" aria-live="polite"></p>
-            </form>
+            </details>
           </section>
 
-          <section class="card" aria-labelledby="cli-title">
-            <h2 id="cli-title">Use the CLI</h2>
-            <p class="muted">Deploy from your terminal or CI with diffed uploads.</p>
-            <ol class="steps">
-              <li>
-                <span class="step-title">Install</span>
-                <div class="cmd"><pre><code id="cmd-install">curl -fsSL https://raw.githubusercontent.com/thasami/backyard/main/scripts/install.sh | sh</code></pre></div>
-                <p class="hint">Or with Go: <code id="cmd-install-go">go install github.com/thasami/backyard/cmd/backyard@latest</code></p>
-              </li>
-              <li>
-                <span class="step-title">Sign in</span>
-                <div class="cmd"><pre><code id="cmd-login">backyard login</code></pre></div>
-                <p class="hint" id="login-note"></p>
-              </li>
-              <li>
-                <span class="step-title">Create &amp; deploy a site</span>
-                <div class="cmd"><pre><code id="cmd-deploy">backyard init my-site &amp;&amp; cd my-site &amp;&amp; backyard deploy</code></pre></div>
-              </li>
-            </ol>
-            <p class="muted small">
-              Prebuilt binaries:
-              <a href="https://github.com/thasami/backyard/releases" rel="noopener">GitHub releases</a>.
-            </p>
+          <section class="card panel" aria-labelledby="cli-title">
+            <details data-panel="cli">
+              <summary>
+                <h2 id="cli-title">Use the CLI</h2>
+                <span class="panel-hint">Deploy from your terminal or CI.</span>
+                <svg class="icon chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+              </summary>
+              <div class="panel-body">
+                <p class="muted">Deploy from your terminal or CI with diffed uploads.</p>
+                <ol class="steps">
+                  <li>
+                    <span class="step-title">Install</span>
+                    <div class="cmd"><pre><code id="cmd-install">curl -fsSL https://raw.githubusercontent.com/thasami/backyard/main/scripts/install.sh | sh</code></pre></div>
+                    <p class="hint">Or with Go: <code id="cmd-install-go">go install github.com/thasami/backyard/cmd/backyard@latest</code></p>
+                  </li>
+                  <li>
+                    <span class="step-title">Sign in</span>
+                    <div class="cmd"><pre><code id="cmd-login">backyard login</code></pre></div>
+                    <p class="hint" id="login-note"></p>
+                  </li>
+                  <li>
+                    <span class="step-title">Create &amp; deploy a site</span>
+                    <div class="cmd"><pre><code id="cmd-deploy">backyard init my-site &amp;&amp; cd my-site &amp;&amp; backyard deploy</code></pre></div>
+                  </li>
+                </ol>
+                <p class="muted small">
+                  Prebuilt binaries:
+                  <a href="https://github.com/thasami/backyard/releases" rel="noopener">GitHub releases</a>.
+                </p>
+              </div>
+            </details>
           </section>
 
-          <section class="card" aria-labelledby="agents-title">
-            <h2 id="agents-title">For agents</h2>
-            <p class="muted">
-              Coding agents can build and ship sites end to end. Point them at the docs, or install the Claude skill and
-              MCP server.
-            </p>
-            <div class="links">
-              <a class="btn small" href="/llms.txt">/llms.txt</a>
-              <a class="btn small" href="/llms-full.txt">/llms-full.txt</a>
-              <a class="btn small" href="/__backyard/backyard.d.ts">SDK typings</a>
-              <a class="btn small" href="/docs">API docs</a>
-            </div>
-            <span class="label">Install the Claude skill</span>
-            <div class="cmd"><pre><code id="cmd-skill">backyard skill install --global</code></pre></div>
-            <span class="label">Add the MCP server (Claude Code)</span>
-            <div class="cmd"><pre><code id="cmd-mcp">claude mcp add backyard -- backyard mcp</code></pre></div>
+          <section class="card panel" aria-labelledby="agents-title">
+            <details data-panel="agents">
+              <summary>
+                <h2 id="agents-title">For agents</h2>
+                <span class="panel-hint">Docs and tools for coding agents.</span>
+                <svg class="icon chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+              </summary>
+              <div class="panel-body">
+                <p class="muted">
+                  Coding agents can build and ship sites end to end. Point them at the docs, or install the Claude skill and
+                  MCP server.
+                </p>
+                <div class="links">
+                  <a class="btn small" href="/llms.txt">/llms.txt</a>
+                  <a class="btn small" href="/llms-full.txt">/llms-full.txt</a>
+                  <a class="btn small" href="/__backyard/backyard.d.ts">SDK typings</a>
+                  <a class="btn small" href="/docs">API docs</a>
+                </div>
+                <span class="label">Install the Claude skill</span>
+                <div class="cmd"><pre><code id="cmd-skill">backyard skill install --global</code></pre></div>
+                <span class="label">Add the MCP server (Claude Code)</span>
+                <div class="cmd"><pre><code id="cmd-mcp">claude mcp add backyard -- backyard mcp</code></pre></div>
+              </div>
+            </details>
           </section>
         </div>
       </div>
@@ -277,9 +301,9 @@
         </div>
         <p class="visually-hidden" id="search-status" aria-live="polite"></p>
         <ul class="site-list skeleton" id="site-list" aria-busy="true">
-          <li class="site"></li>
-          <li class="site"></li>
-          <li class="site"></li>
+          <li class="site"><div class="site-preview" aria-hidden="true"></div></li>
+          <li class="site"><div class="site-preview" aria-hidden="true"></div></li>
+          <li class="site"><div class="site-preview" aria-hidden="true"></div></li>
         </ul>
         <div class="empty" id="sites-empty" hidden></div>
       </section>

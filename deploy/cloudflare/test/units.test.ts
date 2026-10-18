@@ -29,7 +29,7 @@ import { checkPreconditions, parseRange, serveObject, type Servable } from "../s
 import { sanitizeFileName, validatePath } from "../src/paths";
 import { cleanPath, siteNameError } from "../src/router";
 import { compareMembers, contentDisposition, secondsToMidnight } from "../src/site-do";
-import { extractTitle } from "../src/title";
+import { extractPage, unescapeHTML } from "../src/title";
 
 describe("paths and names", () => {
   it.each([
@@ -302,7 +302,7 @@ describe("upload sandboxing (an allowlist of passive types, like Go's activeCont
   ])("serves %j as is", (ct) => expect(isActiveContent(ct)).toBe(false));
 });
 
-describe("titles", () => {
+describe("titles (as internal/sites/title.go)", () => {
   it.each([
     ["<title>Hello</title>", "Hello", ""],
     ["<TITLE>  A &amp;\n B </TITLE>", "A & B", ""],
@@ -315,7 +315,62 @@ describe("titles", () => {
     ["<meta name=Description content=unquoted>", "", "unquoted"],
     ["<title>&constructor; &toString; &amp;</title>", "&constructor; &toString; &", ""],
     ['<meta constructor="x" name="description" content="d">', "", "d"],
-  ])("extractTitle(%j)", (html, title, description) => expect(extractTitle(html)).toEqual({ title, description }));
+    // The cases of TestExtractTitle.
+    ["", "", ""],
+    ['<HTML><HEAD><TITLE>Shout</TITLE><META NAME="Description" CONTENT="Loud"></HEAD>', "Shout", "Loud"],
+    ["<title>Tom &amp; Jerry &#8212; &lt;3 &quot;x&quot;</title>", 'Tom & Jerry \u2014 <3 "x"', ""],
+    ["<title>\n   Multi\n\tline   title \n</title>", "Multi line title", ""],
+    [`<title id="t" data-x='>'>Attr</title>`, "Attr", ""],
+    [`<meta content='Single &amp; quoted' name='description' />`, "", "Single & quoted"],
+    ["<meta name=description content=https://example.com/a/b>", "", "https://example.com/a/b"],
+    ['<meta name="description" content="Closed"/>', "", "Closed"],
+    ['<meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="description" content="Real">', "", "Real"],
+    ["<title>One</title><title>Two</title><meta name=description content=a><meta name=description content=b>", "One", "a"],
+    ["<svg/><title>After svg</title>", "After svg", ""],
+    ["<!-- <title>x</title>", "", ""],
+    ["<title></title><meta name=description content=''>", "", ""],
+  ])("extractPage(%j)", (html, title, description) => expect(extractPage(html)).toEqual({ title, description, image: "" }));
+
+  it("reads the bytes as Go does: invalid UTF-8 becomes one U+FFFD per run, also at the 64 KiB cut", () => {
+    const enc = (s: string) => new TextEncoder().encode(s);
+    const join = (...parts: (string | number[])[]) => new Uint8Array(parts.flatMap((p) => (typeof p === "string" ? [...enc(p)] : p)));
+    expect(extractPage(join("<title>bad", [0xff], "byte</title>")).title).toBe("bad\ufffdbyte");
+    expect(extractPage(join("<title>a", [0xff, 0xfe], "b", [0xc3], "c", [0xe2, 0x82], "</title>")).title).toBe("a\ufffdb\ufffdc\ufffd");
+    // A character cut by the 64 KiB limit is an invalid byte there.
+    const cut = join("<title>", " ".repeat(64 * 1024 - 8), "\u00e9\u00e9</title>");
+    expect(extractPage(cut).title).toBe("\ufffd");
+    expect(extractPage(" ".repeat(64 * 1024) + "<title>Too late</title>").title).toBe("");
+  });
+
+  it("collapses Go's white space (with U+0085, without U+FEFF) and caps the length", () => {
+    expect(extractPage("<title>a\u0085b\u3000c\ufeffd</title>").title).toBe("a b c\ufeffd");
+    const long = extractPage(`<title>${"a".repeat(5000)}</title><meta name=description content=${"b".repeat(5000)}>`);
+    expect([...long.title]).toHaveLength(256);
+    expect(long.title.endsWith("a\u2026")).toBe(true);
+    expect([...long.description]).toHaveLength(1024);
+    // U+FEFF is no white space: the cut keeps it.
+    expect(extractPage(`<title>${"a".repeat(254)}\ufeffb c</title>`).title).toBe("a".repeat(254) + "\ufeff\u2026");
+    expect(extractPage(`<title>${"\u00e9".repeat(300)}</title>`).title).toBe("\u00e9".repeat(255) + "\u2026");
+  });
+
+  it("matches the description like strings.EqualFold(strings.TrimSpace(name))", () => {
+    expect(extractPage('<meta name="de\u017fcription" content="long s">').description).toBe("long s");
+    expect(extractPage('<meta name=" description\u0085" content="x">').description).toBe("x");
+    expect(extractPage('<meta name="description\ufeff" content="x">').description).toBe("");
+    expect(extractPage('<meta name="DESCR\u0130PTION" content="x">').description).toBe("");
+  });
+
+  it.each([
+    ["&amp; &amp &AMP; &ampx &lt3 &notit; &not;", "& & & &x <3 \u00acit; \u00ac"],
+    ["&#47; &#x2F; &#X2f; &#47 &#x2F", "/ / / / /"],
+    ["&#128; &#x9F; &#150;", "\u20ac \u0178 \u2013"],
+    ["&#0; &#xD800; &#x110000; &#99999999999; &#x;", "\ufffd \ufffd \ufffd \ufffd \ufffd"],
+    ["&#; &# &#x &#xg; &; & x &", "&#; &# &#x &#xg; &; & x &"],
+    ["&eacute;&Eacute&rsquo;&hellip;&euro;&sol;&period;&lowbar;&nbsp;&apos;", "\u00e9\u00c9\u2019\u2026\u20ac/._\u00a0'"],
+    ["&lang;&rang;&constructor;&hasOwnProperty;&__proto__;", "\u27e8\u27e9&constructor;&hasOwnProperty;&__proto__;"],
+    // HTML 5 names, two code points, and the two Go leaves out.
+    ["&check; &Ascr; &NotEqualTilde; &fjlig; &nLt; &notinva; &notinvax &ThickSpace;", "\u2713 \u{1d49c} \u2242\u0338 fj &nLt; \u2209 \u00acinvax \u205f\u200a"],
+  ])("unescapeHTML(%j) as Go's html.UnescapeString", (s, want) => expect(unescapeHTML(s)).toBe(want));
 });
 
 describe("config", () => {

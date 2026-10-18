@@ -1,6 +1,7 @@
 /*
- * Backyard hub UI: site directory, drag-and-drop deploys, CLI and agent setup,
- * and the "Use Backyard in Claude" card of the Claude connector.
+ * Backyard hub UI: site directory (with the previews sites ship), drag-and-drop
+ * deploys, and the collapsible side cards: CLI and agent setup and the "Use
+ * Backyard in Claude" card of the Claude connector.
  * No frameworks, no dependencies. Works with the Go server and the Cloudflare
  * Worker edition (same /__backyard/api endpoints, SPEC §2, §7).
  *
@@ -15,6 +16,7 @@
   const TOKEN_KEY = "backyard.deployToken";
   const REMEMBER_KEY = "backyard.rememberToken";
   const VIEW_KEY = "backyard.hubView";
+  const PANELS_KEY = "backyard.hubPanels";
   const OIDC_MODES = ["oidc", "okta", "entra", "azuread", "google", "auth0", "keycloak"];
   const SITE_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
   const DEFAULT_RESERVED = ["www", "api", "admin", "hub", "auth", "static", "assets", "cdn", "docs", "mail", "backyard", "s"];
@@ -1067,6 +1069,46 @@
     return u;
   }
 
+  /**
+   * The URL of a site's preview image on the hub's own origin (GET
+   * /__backyard/api/sites/{site}/preview, SPEC §2, §7.2), versioned by the
+   * site's last change so that a cached image is never stale; "" when the
+   * SiteMeta has no preview (nothing is requested then).
+   */
+  function previewURL(s) {
+    if (!s || typeof s.name !== "string" || !s.name || typeof s.preview !== "string" || !s.preview) return "";
+    const v = s.updated_at || s.deploy_id || s.created_at || "";
+    return API + "/sites/" + encodeURIComponent(s.name) + "/preview" + (v ? "?v=" + encodeURIComponent(v) : "");
+  }
+
+  const PANEL_RE = /^[a-z][a-z0-9-]{0,31}$/;
+
+  /** Which collapsible hub cards are open, from the stored JSON ({"cli": true, …}); junk reads as none. */
+  function parsePanels(raw) {
+    const open = {};
+    let v = null;
+    try {
+      v = JSON.parse(String(raw || ""));
+    } catch (_) {
+      v = null;
+    }
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      for (const k of Object.keys(v)) if (PANEL_RE.test(k) && v[k] === true) open[k] = true;
+    }
+    return open;
+  }
+
+  /** The stored form of parsePanels' object: only open cards; "" when none is open. */
+  function serializePanels(open) {
+    const names = Object.keys(open || {})
+      .filter((k) => PANEL_RE.test(k) && open[k] === true)
+      .sort();
+    if (!names.length) return "";
+    const out = {};
+    for (const k of names) out[k] = true;
+    return JSON.stringify(out);
+  }
+
   /** Filters and sorts sites for the directory (newest first). */
   function filterSites(sites, query) {
     const q = String(query || "")
@@ -1206,6 +1248,9 @@
     uploadErrorDetail,
     createUploader,
     deleteSite,
+    previewURL,
+    parsePanels,
+    serializePanels,
     filterSites,
     connectorSetup,
     formatDate,
@@ -1284,6 +1329,7 @@
   }
   const ICON_COPY = ["M9 9h10v10H9z", "M5 15V5h10"];
   const ICON_TRASH = ["M4 7h16", "M10 11v6M14 11v6", "M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12", "M9 7V4h6v3"];
+  const ICON_IMAGE = ["M5 4h14a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z", "m4 16 5-5 4 4 2-2 5 5", "M15.5 8.5h.01"];
 
   let toastTimer = null;
   function toast(msg) {
@@ -1396,6 +1442,24 @@
     $("cmd-deploy").textContent = cmds.deploy;
     $("cmd-skill").textContent = cmds.skill;
     $("cmd-mcp").textContent = cmds.mcp;
+  }
+
+  /**
+   * The collapsible side cards (<details data-panel>) start collapsed, so
+   * the site directory is in the first screen; each one's open state is
+   * remembered in this browser.
+   */
+  function wirePanels() {
+    const open = parsePanels(load(PANELS_KEY));
+    for (const d of document.querySelectorAll("details[data-panel]")) {
+      d.open = open[d.dataset.panel] === true;
+      d.addEventListener("toggle", () => {
+        const now = parsePanels(load(PANELS_KEY)); // another tab may have changed others
+        if (d.open) now[d.dataset.panel] = true;
+        else delete now[d.dataset.panel];
+        store(PANELS_KEY, serializePanels(now));
+      });
+    }
   }
 
   function addCopyButtons(root) {
@@ -1706,6 +1770,45 @@
     return owners.length === 0 || owners.indexOf(me.id) >= 0 || (!!me.email && owners.indexOf(me.email) >= 0);
   }
 
+  /**
+   * Preview boxes by site name and image URL, kept across re-renders (every
+   * search keystroke re-renders the list): an image is not reloaded and does
+   * not flicker, and one that failed is not requested again.
+   */
+  const previewBoxes = new Map();
+
+  function noPreview(box) {
+    box.classList.add("none");
+    box.append(icon(ICON_IMAGE), el("span", { text: "No preview available" }));
+  }
+
+  /** The 16:9 box at the top of a grid card: the site's preview image, or the placeholder (also when the image fails to load). */
+  function previewBox(s) {
+    const src = previewURL(s);
+    const key = s.name + "\n" + src;
+    let box = previewBoxes.get(key);
+    if (box) return box;
+    // Decorative: the card's title link names the site.
+    box = el("div", { class: "site-preview", "aria-hidden": "true" });
+    if (src) {
+      // loading before src: an eager load would start as soon as src is set.
+      const img = el("img", { alt: "", loading: "lazy", decoding: "async", width: 320, height: 180, src });
+      img.addEventListener(
+        "error",
+        () => {
+          img.remove(); // an expired session, a deleted file …
+          noPreview(box);
+        },
+        { once: true },
+      );
+      box.append(img);
+    } else {
+      noPreview(box);
+    }
+    previewBoxes.set(key, box);
+    return box;
+  }
+
   function siteItem(s) {
     const url = safeHref(s.url || siteURLFor(state.info, s.name, location.origin));
     const title = s.title || s.name;
@@ -1727,6 +1830,7 @@
     return el(
       "li",
       { class: "site" + (state.fresh === s.name ? " fresh" : ""), "data-site": s.name },
+      state.view === "list" ? null : previewBox(s), // list rows stay compact
       el("h3", { class: "site-title" }, el("a", { href: url, text: title })),
       el("span", { class: "site-name", text: s.name }),
       url !== "#" ? el("span", { class: "site-url", title: url, text: url.replace(/^https?:\/\//i, "").replace(/\/$/, "") }) : null,
@@ -1743,6 +1847,9 @@
     list.removeAttribute("aria-busy");
     list.classList.toggle("as-list", state.view === "list");
     const shown = filterSites(state.sites, state.query);
+    // Forget the boxes of deleted sites and of previous deploys.
+    const current = new Set(state.sites.map((s) => s.name + "\n" + previewURL(s)));
+    for (const key of previewBoxes.keys()) if (!current.has(key)) previewBoxes.delete(key);
     list.textContent = "";
     for (const s of shown) list.append(siteItem(s));
     const total = state.sites.length;
@@ -2161,6 +2268,8 @@
     state.view = load(VIEW_KEY) === "list" ? "list" : "grid";
     $("view-grid").setAttribute("aria-pressed", String(state.view === "grid"));
     $("view-list").setAttribute("aria-pressed", String(state.view === "list"));
+    $("site-list").classList.toggle("as-list", state.view === "list"); // the placeholders, too
+    wirePanels();
     wire();
     renderCLI();
     updateDeployButton();

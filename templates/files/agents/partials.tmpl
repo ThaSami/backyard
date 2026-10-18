@@ -36,6 +36,10 @@ presence) and `backyard.id` (the signed-in user).
 8. **Deploy = overwrite.** `backyard deploy` replaces the whole site `{{.Site}}` (its data
    survives). Deploy when the user asks for it, and confirm before deploying to another site
    name.
+9. **Ship a preview for the hub.** Keep the `<title>` and `<meta name="description">` of
+   `index.html` accurate, and add a `preview.svg` next to it: a 1280×720 sketch of the app's
+   main screen in its own colors (`viewBox="0 0 1280 720"`, system fonts, no scripts or
+   external files, at most 1 MiB). The hub shows it on the site's card.
 {{- end}}
 
 {{define "commands" -}}

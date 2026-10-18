@@ -17,6 +17,12 @@ const MAX_MESSAGE = 4096;
 
 const TYPES = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml" };
 
+/** Site previews (SiteMeta.preview, SPEC §7.2): the same values as internal/sites/preview.go. */
+const PREVIEW_NAMES = ["preview.png", "preview.jpg", "preview.jpeg", "preview.webp", "preview.avif", "preview.gif", "preview.svg"];
+const MAX_PREVIEW_BYTES = 1 << 20;
+const PREVIEW_CSP = "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'";
+const PREVIEW_TYPES = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", avif: "image/avif", svg: "image/svg+xml" };
+
 const DOCS = {
   api: "# Backyard API\n\nUse `backyard.db`.\n\n## Database\n\nSee [recipes](recipes.md#live-lists).\n\n### collection(name)\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n## Files\n\n```js\nawait backyard.files.upload(file)\n```\n",
   recipes: "# Recipes\n\n## Live lists\n\nUse `watch`.\n",
@@ -121,6 +127,10 @@ function wsAccept(req, socket, handlers) {
  * answers (SPEC §8.4.7); mcp.grants seeds the connections (Grant objects,
  * user.id is the owner). Without it the grants API answers 404, as the
  * servers do with the connector off.
+ * stored: {"<site>/<path>": string | Buffer} seeds deployed files, e.g. the
+ * image a site in opts.sites names as its preview ("preview": "preview.svg";
+ * GET /__backyard/api/sites/{site}/preview serves it, 404 when it is missing).
+ * A deploy sets SiteMeta.preview to the first PREVIEW_NAMES file it holds.
  * Returns { url, state, close() }.
  */
 export async function startStub(opts = {}) {
@@ -130,7 +140,7 @@ export async function startStub(opts = {}) {
     sites: opts.sites ? opts.sites.slice() : [],
     deploys: [],
     uploads: new Map(), // upload token → { site, deploy, path, size, sha256, bytes }
-    stored: new Map(), // "site/path" → Buffer
+    stored: new Map(Object.entries(opts.stored || {}).map(([k, v]) => [k, Buffer.from(v)])), // "site/path" → Buffer
     conns: new Set(),
     rooms: new Map(), // room → Map(cid → member)
     files: [], // FileInfo, newest first
@@ -316,6 +326,28 @@ export async function startStub(opts = {}) {
     }
     if (path === "/me") return json(res, 200, user);
     if (path === "/sites") return json(res, 200, { sites: state.sites });
+    // A site's preview image (SPEC §2, §7.2): from the hub's origin, typed by its extension, sandboxed.
+    if ((m = /^\/sites\/([a-z0-9-]+)\/preview$/.exec(path))) {
+      if (method !== "GET" && method !== "HEAD") return apiError(res, 405, "bad_request", "method not allowed");
+      const meta = state.sites.find((s) => s.name === m[1]);
+      const ext = meta && meta.preview ? meta.preview.slice(meta.preview.lastIndexOf(".") + 1).toLowerCase() : "";
+      const bytes = meta && meta.preview ? state.stored.get(m[1] + "/" + meta.preview) : undefined;
+      if (!bytes || !Object.hasOwn(PREVIEW_TYPES, ext)) return apiError(res, 404, "not_found", `site "${m[1]}" has no preview`);
+      const etag = '"' + createHash("sha256").update(bytes).digest("hex") + '"';
+      const headers = {
+        "Content-Type": PREVIEW_TYPES[ext],
+        "Content-Security-Policy": PREVIEW_CSP,
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": new URL(req.url, base).searchParams.get("v") ? "private, max-age=31536000, immutable" : "private, no-cache",
+        ETag: etag,
+      };
+      if (req.headers["if-none-match"] === etag) {
+        res.writeHead(304, headers);
+        return res.end();
+      }
+      res.writeHead(200, { ...headers, "Content-Length": bytes.length });
+      return res.end(method === "HEAD" ? undefined : bytes);
+    }
     // GET G/me (SPEC §7.2): a bearer token takes priority over the visitor's identity.
     if (path === "/deploy/me" && method === "GET") {
       if (!req.headers.authorization) {
@@ -371,7 +403,9 @@ export async function startStub(opts = {}) {
       for (const f of jsonBody().files) if (!state.stored.has(m[1] + "/" + f.path)) return apiError(res, 400, "bad_request", "missing " + f.path);
       dep.committed = true;
       const actor = tokenUser(req.headers.authorization) || user;
-      const meta = { name: m[1], url: base + "/s/" + m[1] + "/", title: m[1], created_at: now(), updated_at: now(), updated_by: actor.id, file_count: dep.files.length, bytes: 0, owners: [] };
+      // SiteMeta.preview: only the fallback names (the stub reads no og:image).
+      const preview = PREVIEW_NAMES.find((n) => dep.files.some((f) => f.path === n && f.size <= MAX_PREVIEW_BYTES));
+      const meta = { name: m[1], url: base + "/s/" + m[1] + "/", title: m[1], ...(preview ? { preview } : {}), created_at: now(), updated_at: now(), updated_by: actor.id, file_count: dep.files.length, bytes: 0, owners: [] };
       state.sites = state.sites.filter((s) => s.name !== m[1]).concat([meta]);
       return json(res, 200, { site: meta, url: meta.url, deleted: 0 });
     }

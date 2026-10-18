@@ -583,6 +583,10 @@ test("hub: the Claude connector card shows the URL, the setup steps and the conn
     // A deploy token in use must not be sent to the grants API (it owns no connections).
     await context.addInitScript(() => localStorage.setItem("backyard.deployToken", "t0k"));
     const { page, problems } = await open(context, stub.url + "/");
+    // The card starts collapsed: its title and summary only.
+    await page.waitForSelector("#connector");
+    assert.equal(await page.isVisible("#connector-copy"), false);
+    await page.click("#connector summary");
     await page.waitForSelector("#connector-grants li");
     const url = stub.url + "/__backyard/mcp";
     assert.equal(await page.isVisible("#connector"), true);
@@ -636,7 +640,7 @@ test("hub: the Claude connector card shows the URL, the setup steps and the conn
     assert.equal(await page.isHidden("#connector-grants"), true);
     assert.equal(await page.evaluate(() => document.activeElement.id), "connector-grants-title");
 
-    // A failure keeps the connection and says why.
+    // A failure keeps the connection and says why (the card stays open across the reload).
     stub.state.grants.push(mine);
     await page.reload();
     await page.waitForSelector("#connector-grants li");
@@ -669,6 +673,7 @@ test("hub: only admins get the form to disconnect a person; it asks first and re
   try {
     await context.addCookies([{ name: "user", value: "admin@acme.com", url: stub.url }]);
     const { page, problems } = await open(context, stub.url + "/");
+    await page.click("#connector summary");
     await page.waitForSelector("#connector-grants li");
     assert.equal(await page.isVisible("#user-admin"), true);
     assert.equal(await page.isVisible("#connector-revoke-user"), true);
@@ -727,23 +732,219 @@ test("hub: only admins get the form to disconnect a person; it asks first and re
 test("hub on a phone-sized screen has no horizontal scroll", async (t) => {
   if (!browser) return t.skip(skipReason);
   const stub = await startStub({
-    sites: [{ name: "a-very-long-site-name-that-should-wrap-nicely", url: "http://x/", updated_at: new Date().toISOString(), owners: [] }],
+    sites: [
+      { name: "a-very-long-site-name-that-should-wrap-nicely", url: "http://x/", updated_at: new Date().toISOString(), owners: [] },
+      { name: "pic", url: "http://x/s/pic/", title: "With a preview", preview: "preview.svg", updated_at: new Date().toISOString(), owners: [] },
+    ],
+    stored: { "pic/preview.svg": PREVIEW_SVG },
     mcp: { grants: [grant("a0000000000000000000000000000001", "admin@acme.com", { client_name: "A-connection-name-without-any-spaces-that-must-wrap" })] },
   });
   const context = await browser.newContext({ viewport: { width: 360, height: 740 } });
   await context.addCookies([{ name: "user", value: "admin@acme.com", url: stub.url }]);
+  const overflow = (page) => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   try {
     for (const path of ["/", "/docs"]) {
       const { page, problems } = await open(context, stub.url + path);
       await page.waitForLoadState("networkidle");
-      const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
-      assert.ok(overflow <= 0, `${path} overflows horizontally by ${overflow}px`);
+      assert.ok((await overflow(page)) <= 0, `${path} overflows horizontally by ${await overflow(page)}px`);
       if (path === "/") {
         assert.equal(await page.isHidden("#banner"), true, "no error banner");
+        await page.waitForFunction(() => document.querySelector(".site-preview img")?.naturalWidth > 0);
+        const boxes = await page.$$eval(".site-preview", (els) => els.map((e) => Math.round(e.getBoundingClientRect().right)));
+        assert.equal(boxes.length, 2);
+        for (const right of boxes) assert.ok(right <= 360, "the preview boxes fit: " + boxes);
+        // Every side card opened, with the connector's admin form.
+        for (const summary of await page.$$(".side details > summary")) await summary.click();
         assert.equal(await page.isVisible("#connector-revoke-user"), true, "the connector card with its admin form");
+        assert.equal(await page.isVisible("#cmd-mcp"), true);
+        assert.ok((await overflow(page)) <= 0, `/ with the side cards open overflows horizontally by ${await overflow(page)}px`);
       }
       assert.deepEqual(problems, []);
     }
+  } finally {
+    await context.close();
+    await stub.close();
+  }
+});
+
+/** A preview image as sites ship them (16:9). */
+const PREVIEW_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720"><rect width="1280" height="720" fill="#e0672b"/><rect x="64" y="64" width="640" height="80" rx="12" fill="#fff"/></svg>';
+
+const ago = (hours) => new Date(Date.now() - hours * 3600e3).toISOString();
+
+test("hub: the side cards start collapsed (Sites in the first screen), open by click or keyboard and stay as left", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  const sites = ["one", "two", "three", "four", "five", "six"].map((name, i) => ({ name, url: `http://x/s/${name}/`, title: name, updated_at: ago(i + 1), owners: [] }));
+  const stub = await startStub({ sites, mcp: { grants: [grant("a0000000000000000000000000000001", "alice@acme.com")] } });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const stored = (page) => page.evaluate(() => localStorage.getItem("backyard.hubPanels"));
+  const opened = (page) => page.$$eval("details[data-panel]", (ds) => ds.filter((d) => d.open).map((d) => d.dataset.panel));
+  try {
+    const { page, problems } = await open(context, stub.url + "/");
+    await page.waitForSelector("#connector");
+    await page.waitForSelector(".site");
+    assert.deepEqual(await opened(page), []);
+    assert.deepEqual(
+      await page.$$eval(".side details > summary", (ss) => ss.map((s) => s.innerText.replace(/\s+/g, " ").trim())),
+      ["Use Backyard in Claude Let Claude publish sites for you.", "Use the CLI Deploy from your terminal or CI.", "For agents Docs and tools for coding agents."],
+    );
+    for (const sel of ["#connector-url", "#connector-copy", "#cmd-login", ".links a"]) assert.equal(await page.isVisible(sel), false, sel + " is collapsed");
+    const sitesTitle = await page.$eval("#sites-title", (h) => h.getBoundingClientRect().bottom);
+    assert.ok(sitesTitle <= 800, `the Sites heading is in the first screen (bottom at ${sitesTitle}px)`);
+    assert.equal(await stored(page), null);
+
+    // A click opens one; its summary line gives way to the full introduction.
+    await page.click('details[data-panel="cli"] > summary');
+    assert.equal(await page.isVisible("#cmd-login"), true);
+    assert.equal(await page.isHidden('details[data-panel="cli"] .panel-hint'), true);
+    assert.equal(await stored(page), '{"cli":true}');
+    // The keyboard too (Enter and Space on the focused summary).
+    await page.focus('details[data-panel="agents"] > summary');
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(() => localStorage.getItem("backyard.hubPanels") === '{"agents":true,"cli":true}');
+    assert.equal(await page.isVisible('.links a[href="/llms.txt"]'), true);
+
+    // Remembered per card.
+    await page.reload();
+    await page.waitForSelector("#cmd-login");
+    assert.deepEqual(await opened(page), ["cli", "agents"]);
+    assert.equal(await page.isVisible("#connector-copy"), false);
+    await page.click('details[data-panel="cli"] > summary');
+    await page.waitForFunction(() => localStorage.getItem("backyard.hubPanels") === '{"agents":true}');
+    await page.focus('details[data-panel="agents"] > summary');
+    await page.keyboard.press(" ");
+    await page.waitForFunction(() => localStorage.getItem("backyard.hubPanels") === null);
+    assert.deepEqual(await opened(page), []);
+
+    // Junk in storage reads as "all collapsed".
+    await page.evaluate(() => localStorage.setItem("backyard.hubPanels", "{not json"));
+    await page.reload();
+    await page.waitForSelector(".site");
+    assert.deepEqual(await opened(page), []);
+    assert.deepEqual(problems, []);
+  } finally {
+    await context.close();
+    await stub.close();
+  }
+});
+
+test("hub: grid cards show the site's preview image, or a placeholder of the same size (also when the image fails)", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  const stub = await startStub({
+    sites: [
+      { name: "pic", url: "http://x/s/pic/", title: "With a preview", preview: "img/cover.svg", updated_at: "2026-10-18T09:30:00.123456Z", owners: [] },
+      { name: "plain", url: "http://x/s/plain/", title: "Without", description: "No image here.", updated_at: "2026-10-17T09:30:00Z", owners: [] },
+      { name: "gone", url: "http://x/s/gone/", title: "Missing file", preview: "preview.png", updated_at: "2026-10-16T09:30:00Z", owners: [] },
+    ],
+    stored: { "pic/img/cover.svg": PREVIEW_SVG },
+  });
+  const { dir, site } = makeSiteDir({ "index.html": "<!doctype html><title>N</title>new", "preview.svg": PREVIEW_SVG });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const previewGets = (name) => stub.state.requests.filter((q) => q.path === `/sites/${name}/preview`);
+  const box = (page, name) => page.$eval(`.site[data-site="${name}"] .site-preview`, (b) => JSON.parse(JSON.stringify(b.getBoundingClientRect())));
+  try {
+    // The placeholders while the list loads have the same box.
+    let release;
+    const held = new Promise((r) => (release = r));
+    const page = await context.newPage();
+    const problems = [];
+    page.on("pageerror", (e) => problems.push("pageerror: " + e.message));
+    page.on("console", (m) => m.type() === "error" && !/status of 404\b/.test(m.text()) && problems.push("console: " + m.text()));
+    await page.route("**/__backyard/api/sites", async (r) => {
+      await held;
+      await r.continue();
+    });
+    await page.goto(stub.url + "/");
+    await page.waitForSelector("#site-list.skeleton .site-preview");
+    const skeleton = await page.$eval("#site-list .site-preview", (b) => JSON.parse(JSON.stringify(b.getBoundingClientRect())));
+    release();
+    await page.waitForSelector('.site[data-site="pic"]');
+
+    // With SiteMeta.preview: the image from the hub's own origin, versioned by updated_at.
+    const img = '.site[data-site="pic"] .site-preview img';
+    await page.waitForFunction((sel) => document.querySelector(sel)?.complete && document.querySelector(sel).naturalWidth > 0, img);
+    assert.deepEqual(
+      await page.$eval(img, (i) => ["src", "alt", "loading", "decoding", "width", "height"].map((a) => i.getAttribute(a))),
+      ["/__backyard/api/sites/pic/preview?v=2026-10-18T09%3A30%3A00.123456Z", "", "lazy", "async", "320", "180"],
+    );
+    assert.equal(await page.getAttribute('.site[data-site="pic"] .site-preview', "aria-hidden"), "true", "decorative");
+    // Without one: the placeholder, and no request at all.
+    assert.equal(await page.textContent('.site[data-site="plain"] .site-preview'), "No preview available");
+    assert.equal(await page.$('.site[data-site="plain"] .site-preview img'), null);
+    assert.equal(previewGets("plain").length, 0);
+    // A preview that fails to load (404 here; an expired session elsewhere) becomes the placeholder.
+    await page.waitForSelector('.site[data-site="gone"] .site-preview.none');
+    assert.equal(await page.textContent('.site[data-site="gone"] .site-preview'), "No preview available");
+    assert.equal(await page.$('.site[data-site="gone"] .site-preview img'), null);
+
+    // Every box has the same 16:9 size, as the loading placeholders had.
+    const [a, b, c] = [await box(page, "pic"), await box(page, "plain"), await box(page, "gone")];
+    for (const other of [b, c, skeleton]) assert.deepEqual([other.width, other.height], [a.width, a.height]);
+    assert.deepEqual([skeleton.x, skeleton.y], [a.x, a.y], "nothing moves when the list arrives");
+    assert.ok(Math.abs(a.width / a.height - 16 / 9) < 0.01, `16:9: ${a.width}×${a.height}`);
+    assert.ok(a.width > 250, "full card width");
+
+    // The whole card, preview included, is the link; the actions stay clickable.
+    const hit = await page.evaluate(() => {
+      document.querySelector('.site[data-site="pic"]').scrollIntoView({ block: "center" });
+      const r = document.querySelector('.site[data-site="pic"] .site-preview').getBoundingClientRect();
+      const at = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+      const copy = document.querySelector('button[aria-label="Copy link to pic"]').getBoundingClientRect();
+      return [at.closest("a")?.getAttribute("href"), document.elementFromPoint(copy.x + copy.width / 2, copy.y + copy.height / 2).closest("button")?.getAttribute("aria-label")];
+    });
+    assert.deepEqual(hit, ["http://x/s/pic/", "Copy link to pic"]);
+
+    // Searching re-renders the cards without loading the images again.
+    await page.fill("#search", "pic");
+    await page.fill("#search", "");
+    await page.waitForSelector('.site[data-site="gone"] .site-preview.none');
+    assert.equal(previewGets("pic").length, 1);
+    assert.equal(previewGets("gone").length, 1, "a failed preview is not asked for again");
+
+    // A deploy with a preview.svg shows it at once.
+    await page.setInputFiles("#folder-input", site);
+    await page.waitForFunction(() => !document.getElementById("deploy-btn").disabled);
+    await page.click("#deploy-btn");
+    await page.waitForSelector('.site[data-site="guest-site"].fresh');
+    const fresh = '.site[data-site="guest-site"] .site-preview img';
+    await page.waitForFunction((sel) => document.querySelector(sel)?.naturalWidth > 0, fresh);
+    assert.match(await page.getAttribute(fresh, "src"), /^\/__backyard\/api\/sites\/guest-site\/preview\?v=\d{4}-/);
+    assert.deepEqual(problems, []);
+  } finally {
+    await context.close();
+    await stub.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hub: the list view shows no previews and requests none", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  const stub = await startStub({
+    sites: [
+      { name: "pic", url: "http://x/s/pic/", title: "With a preview", preview: "preview.svg", updated_at: ago(1), owners: [] },
+      { name: "plain", url: "http://x/s/plain/", title: "Without", updated_at: ago(2), owners: [] },
+    ],
+    stored: { "pic/preview.svg": PREVIEW_SVG },
+  });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const previewGets = () => stub.state.requests.filter((q) => /^\/sites\/[^/]+\/preview$/.test(q.path));
+  try {
+    await context.addInitScript(() => localStorage.setItem("backyard.hubView", "list"));
+    const { page, problems } = await open(context, stub.url + "/");
+    await page.waitForSelector(".site");
+    await page.waitForLoadState("networkidle");
+    assert.equal(await page.getAttribute("#site-list", "class"), "site-list as-list");
+    assert.equal(await page.$$eval(".site-preview", (els) => els.length), 0);
+    assert.equal(previewGets().length, 0);
+    const rows = await page.$$eval(".site", (els) => els.map((e) => Math.round(e.getBoundingClientRect().height)));
+    for (const h of rows) assert.ok(h < 60, "compact rows: " + rows);
+
+    await page.click("#view-grid");
+    await page.waitForFunction(() => document.querySelector(".site-preview img")?.naturalWidth > 0);
+    assert.equal(await page.$$eval(".site-preview", (els) => els.length), 2);
+    await page.click("#view-list");
+    assert.equal(await page.$$eval(".site-preview", (els) => els.length), 0);
+    assert.deepEqual(problems, []);
   } finally {
     await context.close();
     await stub.close();

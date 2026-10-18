@@ -28,7 +28,8 @@ import { contentTypeFor, detectContentType, isActiveContent, normalizeContentTyp
 import { boundaryOf, MultipartError, MultipartReader } from "./multipart";
 import { serveObject, type Servable } from "./object";
 import { sanitizeFileName } from "./paths";
-import { extractTitle, TITLE_SCAN_BYTES } from "./title";
+import { choosePreview, PREVIEW_CACHE_UNVERSIONED, PREVIEW_CACHE_VERSIONED, PREVIEW_CSP, previewType } from "./preview";
+import { extractPage, TITLE_SCAN_BYTES } from "./title";
 
 /** Chunk size of stored bytes (the row limit of DO SQLite is 2 MB). */
 export const CHUNK_SIZE = 1_536 * 1024;
@@ -84,15 +85,26 @@ export interface UploadRow {
   r2_key: string;
 }
 
+/**
+ * What the site's files say about it after a write (SPEC §7.2): title,
+ * description and preview, as this object can tell them.
+ */
+export interface PageInfo {
+  title: string;
+  description: string;
+  /** The preview; with titleR2Key, only the preview.* fallback (the og:image is in R2). */
+  preview: string;
+  /** index.html lives in R2: the Worker reads its title, description and og:image from this key. */
+  titleR2Key: string;
+}
+
 /** Result of a commit. */
-export interface CommitResult {
+export interface CommitResult extends PageInfo {
   deleted: number;
   fileCount: number;
   bytes: number;
-  title: string;
-  description: string;
-  /** index.html lives in R2: the Worker reads its title from this key. */
-  titleR2Key: string;
+  /** Unix milliseconds of the switch (the manifest's updated_at). */
+  committedAt: number;
   /** R2 objects no longer referenced (the Worker deletes them). */
   r2Garbage: string[];
 }
@@ -118,8 +130,6 @@ export type MergeOutcome =
       missingDeletes: string[];
       /** index.html is part of the site afterwards. */
       hasIndex: boolean;
-      /** Unix milliseconds of the switch (the manifest's updated_at). */
-      committedAt: number;
     })
   /** Contents of listed files are not stored (any more): the caller stores them again. */
   | { ok: false; error: "missing"; paths: string[] }
@@ -340,6 +350,8 @@ export class SiteDO extends DurableObject<Env> {
           return this.serveUpload(req, url.searchParams.get("id") ?? "");
         case "/raw":
           return this.serveRaw(req, url.searchParams.get("path") ?? "");
+        case "/preview":
+          return this.servePreview(req, url.searchParams.get("path") ?? "", url.searchParams.has("versioned"));
         case "/blob":
           return await this.putBlob(req, url);
         case "/upload":
@@ -840,6 +852,22 @@ export class SiteDO extends DurableObject<Env> {
     });
   }
 
+  /**
+   * GET /preview?path=[&versioned] — the preview image for the hub (SPEC §3):
+   * typed by the extension of its path, never by the stored type, and
+   * sandboxed (PREVIEW_CSP), so that an SVG never runs on the hub's origin.
+   */
+  private servePreview(req: Request, path: string, versioned: boolean): Response {
+    const type = previewType(path);
+    const obj = type ? this.fileObject(path) : null;
+    if (!obj) return new Response(null, { status: 404, headers: { "x-backyard-not-found": "preview" } });
+    obj.contentType = type;
+    return serveObject(req, obj, {
+      cacheControl: versioned ? PREVIEW_CACHE_VERSIONED : PREVIEW_CACHE_UNVERSIONED,
+      headers: { "Content-Security-Policy": PREVIEW_CSP },
+    });
+  }
+
   // --- deploys (SPEC §7.3) -----------------------------------------------
 
   /** Paths whose current content already has the given sha256 and size. */
@@ -915,7 +943,7 @@ export class SiteDO extends DurableObject<Env> {
         r2Garbage = this.collectGarbage(now, released);
       });
       const stats = this.stats();
-      return ok({ deleted, fileCount: stats.fileCount, bytes: stats.bytes, ...this.titleInfo(), r2Garbage });
+      return ok({ deleted, fileCount: stats.fileCount, bytes: stats.bytes, committedAt: now, ...this.pageInfo(), r2Garbage });
     } catch (e) {
       return failure(e, "committing the deploy");
     }
@@ -1038,7 +1066,7 @@ export class SiteDO extends DurableObject<Env> {
             committedAt: now,
             fileCount: stats.fileCount,
             bytes: stats.bytes,
-            ...this.titleInfo(),
+            ...this.pageInfo(),
             r2Garbage,
           };
         }),
@@ -1072,21 +1100,41 @@ export class SiteDO extends DurableObject<Env> {
     return { fileCount: r.n, bytes: r.b };
   }
 
-  private titleInfo(): { title: string; description: string; titleR2Key: string } {
+  /**
+   * Title, description and preview of the current manifest, from the head of
+   * index.html. When index.html lives in R2 the Worker reads its head
+   * (titleR2Key) and asks previewFor with its og:image; preview is then what
+   * the preview.* files give.
+   */
+  private pageInfo(): PageInfo {
     const row = this.sql.exec("SELECT sha256 FROM files WHERE path = 'index.html'").toArray()[0] as { sha256: string } | undefined;
-    if (!row) return { title: "", description: "", titleR2Key: "" };
-    const b = this.blob("s:" + row.sha256);
-    if (!b) return { title: "", description: "", titleR2Key: "" };
-    if (b.storage === "r2") return { title: "", description: "", titleR2Key: b.r2_key };
-    return { ...extractTitle(this.headOfBlob(b.key, TITLE_SCAN_BYTES)), titleR2Key: "" };
+    const b = row ? this.blob("s:" + row.sha256) : undefined;
+    if (b?.storage === "r2") return { title: "", description: "", preview: this.preview(""), titleR2Key: b.r2_key };
+    const page = b ? extractPage(this.headOfBlob(b.key, TITLE_SCAN_BYTES)) : { title: "", description: "", image: "" };
+    return { title: page.title, description: page.description, preview: this.preview(page.image), titleR2Key: "" };
   }
 
-  /** File count, bytes, title and description of the current manifest (refresh). */
-  async siteInfo(): Promise<Result<{ fileCount: number; bytes: number; title: string; description: string; titleR2Key: string; updatedAt: number }>> {
+  /** The preview of the current manifest for an og:image reference (SPEC §7.2). */
+  private preview(ogImage: string): string {
+    if (!this.ready) return "";
+    return choosePreview(ogImage, (p) => (this.sql.exec("SELECT size FROM files WHERE path = ?", p).toArray()[0] as { size: number } | undefined)?.size);
+  }
+
+  /** The preview of the current manifest for the og:image of an index.html the Worker read from R2. */
+  async previewFor(ogImage: string): Promise<Result<string>> {
     try {
-      if (!this.ready) return ok({ fileCount: 0, bytes: 0, title: "", description: "", titleR2Key: "", updatedAt: 0 });
+      return ok(this.preview(ogImage));
+    } catch (e) {
+      return failure(e, "choosing the preview");
+    }
+  }
+
+  /** File count, bytes, title, description and preview of the current manifest (refresh). */
+  async siteInfo(): Promise<Result<PageInfo & { fileCount: number; bytes: number; updatedAt: number }>> {
+    try {
+      if (!this.ready) return ok({ fileCount: 0, bytes: 0, title: "", description: "", preview: "", titleR2Key: "", updatedAt: 0 });
       const updated = this.sql.exec("SELECT v FROM meta WHERE k = 'updated_at'").toArray()[0] as { v: string } | undefined;
-      return ok({ ...this.stats(), ...this.titleInfo(), updatedAt: updated ? Number(updated.v) : 0 });
+      return ok({ ...this.stats(), ...this.pageInfo(), updatedAt: updated ? Number(updated.v) : 0 });
     } catch (e) {
       return failure(e, "reading the site");
     }

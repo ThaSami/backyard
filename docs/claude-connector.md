@@ -30,8 +30,9 @@ https://<hub>/__backyard/mcp
 for example `https://backyard.acme.com/__backyard/mcp` — the hub's public URL
 (`server.public_url`; on the Cloudflare edition `PUBLIC_URL`, else `https://<BASE_DOMAIN>`)
 plus `/__backyard/mcp`, without a trailing slash. Once the connector is on, the hub shows a card
-**Use Backyard in Claude** with this URL, a copy button and the setup steps, and
-`GET /__backyard/api/info` reports it as `mcp_url`. Use the hub's own address: a site host, or
+**Use Backyard in Claude** next to its other side cards — collapsed, like them, until you open
+it — with this URL, a copy button and the setup steps, and `GET /__backyard/api/info` reports
+it as `mcp_url`. Use the hub's own address: a site host, or
 another name of the hub, answers `404` there.
 
 ## Before you turn it on

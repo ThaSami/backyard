@@ -3,7 +3,9 @@
 Six complete Backyard sites. Each folder is deployable as-is: plain HTML, CSS and JavaScript,
 no build step, no external CDNs, light and dark mode. They use only the documented client API
 (`/__backyard/backyard.js`, see `skills/backyard/references/api.md`), so they run unchanged on
-the Go server and on the Cloudflare edition.
+the Go server and on the Cloudflare edition. Each also ships a `preview.svg`: a hand-drawn,
+self-contained 1280×720 sketch of its main screen that the hub shows on the site's card (see
+[Site preview](../docs/deploying-sites.md#site-preview)).
 
 | Example | What it shows | APIs |
 |---|---|---|

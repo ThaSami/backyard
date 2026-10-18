@@ -45,6 +45,8 @@ export interface SiteRecord {
   name: string;
   title?: string;
   description?: string;
+  /** Site path of the preview image (SPEC §7.2, preview.ts). */
+  preview?: string;
   created_at: string;
   created_by?: string;
   updated_at: string;

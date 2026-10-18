@@ -77,9 +77,9 @@ access log. Then:
    `/__backyard/mcp` (the connector's MCP endpoint, which accepts only its own access tokens),
    `/__backyard/oauth/*` (its token, registration and revocation endpoints),
    `/__backyard/api/info`, `/__backyard/api/deploy/*` (gateway), `/__backyard/metrics`,
-   `/__backyard/api/*` (hub API: `me`, `sites`, `tokens`, `mcp/grants`), else the hub UI,
-   `/docs` and `/llms*.txt`. The connector's paths answer `404` while `mcp.enabled` is false
-   (SPEC §8.4).
+   `/__backyard/api/*` (hub API: `me`, `sites`, `sites/{site}/preview`, `tokens`,
+   `mcp/grants`), else the hub UI, `/docs` and `/llms*.txt`. The connector's paths answer
+   `404` while `mcp.enabled` is false (SPEC §8.4).
 
 **A page load:** the browser asks for `https://lunch-vote.backyard.acme.com/` → the
 authenticator resolves the user (session cookie, proxy assertion, header or bearer token) or
@@ -115,12 +115,15 @@ to the loopback URL → the CLI stores it.
 | Key | Content |
 |---|---|
 | `sites/<site>/<path>` | Site files |
-| `_meta/sites/<site>.json` | `SiteMeta`: title, description, created/updated by and at, last deploy id, file count, bytes, owners |
+| `_meta/sites/<site>.json` | `SiteMeta`: title, description, preview (the path of the site's own preview image), created/updated by and at, last deploy id, file count, bytes, owners |
 | `_meta/manifests/<site>.json` | `{site, updated_at, files: [{path, size, sha256, etag}]}` |
 | `uploads/<site>/<id>/<name>` | Uploaded files and generated images |
 
 The hub's site list is `_meta/sites/*` plus first-level prefixes under `sites/` (sites
-deployed by a plain rsync appear too).
+deployed by a plain rsync appear too, without a title or preview until a refresh). A site's
+preview is one of its own files, chosen when its `SiteMeta` is written; the hub serves it from
+its own origin at `/__backyard/api/sites/<site>/preview`, so it loads with the same credentials
+as the site list ([Site preview](deploying-sites.md#site-preview)).
 
 **Document store** — documents are addressed by `(site, collection, id)`:
 

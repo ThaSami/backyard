@@ -56,6 +56,7 @@ type Meta struct {
 	URL         string    `json:"url"`
 	Title       string    `json:"title,omitempty"`
 	Description string    `json:"description,omitempty"`
+	Preview     string    `json:"preview,omitempty"` // site path of the preview image (preview.go)
 	CreatedAt   time.Time `json:"created_at"`
 	CreatedBy   string    `json:"created_by,omitempty"`
 	UpdatedAt   time.Time `json:"updated_at"`

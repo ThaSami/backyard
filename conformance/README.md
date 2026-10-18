@@ -109,7 +109,8 @@ Tests detect capabilities instead of checking the edition:
   Every client of the suite comes from `127.0.0.1` and the Go server limits
   guests (and the Claude connector's OAuth requests that identify no one) per IP, so `run-go.sh`
   raises `ratelimit.api_per_minute` for the host and path passes: a websocket
-  handshake cannot be retried.
+  handshake cannot be retried. It raises `ratelimit.deploys_per_hour` too: the
+  suite creates more deploys than the default 60 an hour.
 * **Dot segments** — `//` in a path is redirected (or `400` for writes) by both
   editions. `/./` and `/../` are resolved by the Cloudflare runtime before the
   Worker runs, so the request is served as the cleaned path; the Go server
