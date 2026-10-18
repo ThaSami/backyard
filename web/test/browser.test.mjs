@@ -844,7 +844,8 @@ test("hub: the side cards start collapsed (Sites in the first screen), open by c
     await page.click('details[data-panel="cli"] > summary');
     assert.equal(await page.isVisible("#cmd-login"), true);
     assert.equal(await page.isHidden('details[data-panel="cli"] .panel-hint'), true);
-    assert.equal(await stored(page), '{"cli":true}');
+    // <details> fires "toggle" as a task after the click, so the state is saved a moment later.
+    await page.waitForFunction(() => localStorage.getItem("backyard.hubPanels") === '{"cli":true}');
     // The keyboard too (Enter and Space on the focused summary).
     await page.focus('details[data-panel="agents"] > summary');
     await page.keyboard.press("Enter");
