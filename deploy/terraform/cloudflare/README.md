@@ -96,7 +96,7 @@ with `--var KEY:`).
 
 ```hcl
 module "backyard" {
-  source = "git::https://github.com/thasami/backyard.git//deploy/terraform/cloudflare?ref=v0.2.0"
+  source = "git::https://github.com/thasami/backyard.git//deploy/terraform/cloudflare?ref=v0.3.0"
 
   account_id  = "0123456789abcdef0123456789abcdef"
   zone_name   = "example.com"

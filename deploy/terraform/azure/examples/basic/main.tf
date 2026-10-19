@@ -1,6 +1,6 @@
 # Basic Backyard deployment on Azure using the module in ../.. (copy this
 # directory and change `source` to a pinned Git reference, e.g.
-# "git::https://github.com/thasami/backyard.git//deploy/terraform/azure?ref=v0.2.0").
+# "git::https://github.com/thasami/backyard.git//deploy/terraform/azure?ref=v0.3.0").
 #
 #   az login                              # an account that can create resources,
 #                                         # role assignments and an Entra ID app

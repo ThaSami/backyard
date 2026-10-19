@@ -125,7 +125,7 @@ with `domain = null` Backyard runs on the container app's own
 
 ```hcl
 module "backyard" {
-  source = "git::https://github.com/thasami/backyard.git//deploy/terraform/azure?ref=v0.2.0"
+  source = "git::https://github.com/thasami/backyard.git//deploy/terraform/azure?ref=v0.3.0"
 
   location      = "westeurope"
   domain        = "backyard.acme.com"

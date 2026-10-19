@@ -1,6 +1,6 @@
 # Backyard on Cloudflare: custom domain + Cloudflare Access, using the module
 # in ../.. (copy this directory and change `source` to a pinned Git reference,
-# e.g. "git::https://github.com/thasami/backyard.git//deploy/terraform/cloudflare?ref=v0.2.0").
+# e.g. "git::https://github.com/thasami/backyard.git//deploy/terraform/cloudflare?ref=v0.3.0").
 #
 # Optional: `backyard cloudflare domain add` / `access enable` do the same
 # without Terraform (use one or the other for a Worker). Node.js 22+.
