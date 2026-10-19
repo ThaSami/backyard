@@ -78,7 +78,7 @@ claude mcp add backyard -- backyard mcp
 | `backyard_docs` | `topic?` (`skill`, the default, `api`, `recipes` or `deploy`) | Returns the documentation as markdown. Agents call it first. |
 | `backyard_init` | `dir`, `site`, `agents?` | Scaffolds a site (`index.html`, `.backyard.json`, agent files, skill). Never overwrites. |
 | `backyard_deploy` | `dir?`, `site?`, `message?`, `dry_run?`, `overwrite?` | Publishes a folder and returns the URL, the folder it published (`dir`) and counts. Without `dir` it publishes the current project like `backyard deploy` (the folder `.backyard.json` names, else the working directory). The same ignore rules apply: `.git/` and the project files are never uploaded. Refuses to replace a site someone else deployed last unless `overwrite` is true — which agents must only set after asking the user. |
-| `backyard_list_sites` | `query?` | Sites with title, description, URL and last deploy — to find existing tools and free names. |
+| `backyard_list_sites` | `query?` | The sites you can see, with title, description, URL and last deploy — to find existing tools. That is every site unless the server lists each site only to its owners and admins ([owners-only site listing](deploying-sites.md#owners-only-site-listing)); then a name it does not list may still be taken (`backyard_site_files` finds any site by name). |
 | `backyard_site_files` | `site` | A site's deployed files (path, size; at most 2,000 listed). |
 | `backyard_read_site_file` | `site`, `path` | One text file of a site (≤ 256 KiB) — to study or reuse another site's code. Binary file types (images, fonts, archives, media…) are refused without being downloaded, and so is a file whose content is not text. |
 | `backyard_whoami` | — | The logged-in user, server and profile. |
@@ -119,7 +119,7 @@ proxies, limits and disconnecting: [Claude connector](claude-connector.md).
 |---|---|---|
 | `backyard_docs` | `topic?` (`skill`, the default, `api`, `recipes` or `deploy`) | Returns the documentation as Markdown, like the stdio tool. |
 | `backyard_whoami` | — | The account the connection acts as, whether it may publish, the hub URL, the site URL pattern and the publishing limits. |
-| `backyard_list_sites` | `query?` | Sites, most recently updated first (at most 200): name, URL, title, description, last publisher, size, owners. |
+| `backyard_list_sites` | `query?` | The sites the person can see (every site, unless the server lists each site only to its owners and admins), most recently updated first (at most 200): name, URL, title, description, last publisher, size, owners. |
 | `backyard_site_files` | `site` | A site's files with their sizes (at most 2,000). |
 | `backyard_read_site_file` | `site`, `path` | One text file of a site (≤ 128 KiB). Binary files are refused; the text is untrusted data. |
 | `backyard_publish` | `site`, `files` (each `path`, `content`, `encoding?` — `utf-8` or `base64` — and `content_type?`), `delete?`, `replace?`, `overwrite?` | Writes the files and returns the site's URL. Merges by default (the site's other files stay); `delete` removes paths and `replace: true` makes the site exactly the given files. A site someone else published last needs `overwrite`, which Claude sets only after asking. One call carries at most 4 MiB of file content (Cloudflare: 2 MiB); bigger sites go over several calls, big media through the hub or the CLI. |
@@ -164,7 +164,9 @@ The Cloudflare edition serves the same paths.
 ## A typical agent session
 
 1. Read `backyard_docs` (or the skill); restate the idea; pick a site name and check it is free
-   (`backyard sites info <name>` / `backyard_list_sites`).
+   with `backyard sites info <name>` ("not found" = free; the MCP tool `backyard_site_files`
+   finds any site by name too). `backyard_list_sites` shows only the sites you can see, on some
+   servers just your own.
 2. `backyard init <name>`; build the page with relative asset paths and the absolute SDK path,
    a `<title>`, a `<meta name="description">` and a `preview.svg` (1280×720) sketching the main
    screen for the hub's site card ([Site preview](deploying-sites.md#site-preview)).

@@ -1051,5 +1051,6 @@ window.kit = {
   other's databases.
 - Deploys overwrite the library in place: version breaking changes (`kit.v2.js`) so existing
   sites keep working.
-- Find reusable code with `backyard sites list`, then `backyard pull <site>` (or the MCP tools
-  `backyard_site_files` / `backyard_read_site_file`).
+- Find reusable code with `backyard sites list` (the sites you can see; on some servers only
+  your own), then `backyard pull <site>` (or the MCP tools `backyard_site_files` /
+  `backyard_read_site_file`), which work for any site by name.

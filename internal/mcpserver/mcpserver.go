@@ -156,9 +156,11 @@ another site name).`,
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:  "backyard_list_sites",
 		Title: "List Backyard sites",
-		Description: `List the sites on the user's Backyard server (name, title, description, URL, last deploy),
-optionally filtered by a case-insensitive query matched against name, title and description.
-Use it to find existing tools and to pick a site name that is not taken.`,
+		Description: `List the sites on the user's Backyard server that the user can see (name, title,
+description, URL, last deploy), optionally filtered by a case-insensitive query matched against
+name, title and description. Use it to find existing tools. That is every site unless the server
+lists each site only to its owners and admins; then a name it does not list may still be taken
+(backyard_site_files finds any site by name).`,
 		Annotations: readOnly,
 	}, safe(s, s.listSites))
 

@@ -39,7 +39,9 @@ you prefer to remain anonymous.
   sign in.
 - Keep AI provider keys, database credentials and warehouse credentials server-side only.
 - Use read-only credentials for warehouse sources.
-- Enable `sites.ownership: owner` if teams must not overwrite each other's sites.
+- Enable `sites.ownership: owner` if teams must not overwrite each other's sites, and
+  `sites.listing: owners` if people should see only their own sites in the directories (it
+  hides sites; everyone who may open sites can still open them by URL).
 - Turn on the Claude connector (`mcp.enabled`, off by default) only with a sign-in, keep
   `/__backyard/auth/authorize` behind your identity proxy, and keep `mcp.clients` and
   `mcp.redirect_uris` at their exact defaults unless you add a client you trust

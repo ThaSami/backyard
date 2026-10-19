@@ -554,6 +554,13 @@ func TestSitesCommands(t *testing.T) {
 	if out != "" || !strings.Contains(h.err.String(), "No sites yet") {
 		t.Fatalf("empty list: %q %q", out, h.err.String())
 	}
+	// A server that lists each site only to its owners says so.
+	g.Info.SiteListing = "owners"
+	h.err.Reset()
+	out = h.mustRun("sites", "list")
+	if out != "" || !strings.Contains(h.err.String(), "You don't own any sites yet: this server lists each site only to its owners and admins") {
+		t.Fatalf("empty owners list: %q %q", out, h.err.String())
+	}
 }
 
 func TestOpen(t *testing.T) {

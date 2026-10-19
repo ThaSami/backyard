@@ -227,8 +227,8 @@ Open a site (or, without a name, the hub) in the browser.
 
 | Command | Meaning |
 |---|---|
-| `backyard sites list [filter]` (alias `ls`) | List sites; `filter` matches name, title or description. |
-| `backyard sites info <site>` | Show a site's details (title, owners, last deploy, size). |
+| `backyard sites list [filter]` (alias `ls`) | List the sites you can see — every site, unless the server lists each site only to its owners and admins (`sites.listing: owners`, see [owners-only site listing](deploying-sites.md#owners-only-site-listing)); `filter` matches name, title or description. |
+| `backyard sites info <site>` | Show a site's details (title, owners, last deploy, size). Finds any site by name, listed to you or not: "not found" means the name is free. |
 | `backyard sites delete <site>` (alias `rm`) | Delete a site and its files. `-y`/`--yes` skips the confirmation. Admins, or owners in ownership mode. |
 
 ### `backyard token`
@@ -356,6 +356,7 @@ Global options of the engine, for every subcommand:
 | `--r2-bucket <name>` | Bucket name (default `<worker>-files`). |
 | `--ai` | Serve AI with the Workers AI binding (default; turns AI back on after `--no-ai`). |
 | `--no-ai` | Turn AI off: no Workers AI binding, AI calls answer `501` (remembered). |
+| `--site-listing <all\|owners>` | List every site (`all`, the default), or each site only to its owners and admins (`owners`; remembered). |
 | `--var <KEY:VALUE>` | Override a Worker variable (remembered; `KEY:` drops it). Repeatable. |
 | `--rotate-token` | Issue a new `DEPLOY_TOKEN`. |
 | `--rotate-secret` | Replace `BACKYARD_SECRET` (revokes every API token). |
@@ -413,6 +414,7 @@ Exit codes (the engine's, kept by this CLI, also after it logged in):
 backyard cloudflare setup
 backyard cloudflare setup --worker-name team --no-r2
 backyard cloudflare setup --no-ai                                      # an account without Workers AI
+backyard cloudflare setup --site-listing owners                        # people see only their own sites
 backyard cloudflare setup --non-interactive --workers-subdomain acme   # CI
 backyard cloudflare setup --package ./dist-npm/backyard-cloudflare-0.3.0.tgz
 backyard cloudflare domain add backyard.acme.com

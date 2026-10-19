@@ -11,9 +11,13 @@
 #   oidc  `backyard serve`, auth.mode oidc against the mock OpenID Connect
 #         provider (mock/idp.mjs), path mode on 127.0.0.1; runs only
 #         tests/mcp.test.mjs, signed in as the IdP's alice and bob
+#   listing `backyard serve --dev`, path mode with sites.listing: owners (so
+#         sites.ownership defaults to owner) and an admin in auth.admins; runs
+#         only tests/listing.test.mjs, with API tokens the suite signs for its
+#         people and the static token, an admin here
 #
-#   conformance/run-go.sh               # all three passes
-#   conformance/run-go.sh host          # one pass (host | path | oidc)
+#   conformance/run-go.sh               # all four passes
+#   conformance/run-go.sh host          # one pass (host | path | oidc | listing)
 #   conformance/run-go.sh path -- --test-name-pattern=files   # extra node --test args
 #
 # Environment:
@@ -37,19 +41,21 @@ warehouse_dsn="${CONFORMANCE_WAREHOUSE_DSN-${BACKYARD_TEST_POSTGRES_DSN:-}}"
 modes=""
 while [ $# -gt 0 ]; do
 	case "$1" in
-	host | path | oidc) modes="$modes $1" ;;
+	host | path | oidc | listing) modes="$modes $1" ;;
 	--)
 		shift
 		break
 		;;
 	*)
-		echo "usage: $0 [host|path|oidc]... [-- node --test args]" >&2
+		echo "usage: $0 [host|path|oidc|listing]... [-- node --test args]" >&2
 		exit 2
 		;;
 	esac
 	shift
 done
-[ -n "$modes" ] || modes="host path oidc"
+[ -n "$modes" ] || modes="host path oidc listing"
+# The admin of the listing pass (auth.admins); the suite signs an API token for it.
+listing_admin="listing-admin@conformance.test"
 
 log() { printf '>> %s\n' "$*" >&2; }
 fail() {
@@ -136,9 +142,17 @@ if [ "$ai_port" != "off" ]; then
 	ai_mode="mock"
 fi
 
-# write_config MODE TOKEN_SHA256 DATA_DIR FEATURES SECRET: prints the server
-# configuration; FEATURES "full" adds AI and the warehouse.
+# write_config URL_MODE TOKEN_SHA256 DATA_DIR FEATURES SECRET [LISTING]: prints
+# the server configuration; FEATURES "full" adds AI and the warehouse; LISTING
+# "owners" adds sites.listing: owners, the listing pass's admin and admin
+# rights for the static token.
 write_config() {
+	admins="[]"
+	token_admin="false"
+	if [ "${6:-}" = "owners" ]; then
+		admins="[\"$listing_admin\"]"
+		token_admin="true"
+	fi
 	cat <<EOF
 server:
   listen: "127.0.0.1:$port"
@@ -154,9 +168,11 @@ database:
     path: "$3/backyard.db"
 auth:
   mode: none
+  admins: $admins
   tokens:
     - name: conformance
       sha256: "$2"
+      admin: $token_admin
 deploy:
   allow_anonymous: true
 mcp:
@@ -174,6 +190,13 @@ ratelimit:
 telemetry:
   log_format: text
 EOF
+	if [ "${6:-}" = "owners" ]; then
+		cat <<EOF
+sites:
+  # No sites.ownership: owner is its default with this listing.
+  listing: owners
+EOF
+	fi
 	[ "$4" = "full" ] || return 0
 	if [ -n "$ai_mode" ]; then
 		cat <<EOF
@@ -278,9 +301,18 @@ for mode in $modes; do
 		write_oidc_config "$data" "$secret" "$idp_secret" >"$data/backyard.yaml"
 		dev=""
 	else
+		url_mode="$mode"
 		features="full"
-		[ "$mode" = "path" ] && features="none"
-		write_config "$mode" "$(sha256_hex "$token")" "$data" "$features" "$secret" >"$data/backyard.yaml"
+		listing=""
+		case "$mode" in
+		path) features="none" ;;
+		listing)
+			url_mode="path"
+			features="none"
+			listing="owners"
+			;;
+		esac
+		write_config "$url_mode" "$(sha256_hex "$token")" "$data" "$features" "$secret" "$listing" >"$data/backyard.yaml"
 	fi
 	log "starting backyard serve $dev ($mode mode) on 127.0.0.1:$port"
 	(
@@ -300,12 +332,21 @@ for mode in $modes; do
 	suite_ai="$ai_mode"
 	suite_url="http://localhost:$port"
 	suite_idp=""
+	suite_listing="all"
+	suite_admin=""
 	tests="tests/*.test.mjs"
 	who="an anonymous guest"
 	if [ "$mode" = "path" ]; then
 		suite_token="$token"
 		suite_ai=""
 		who="the static token, without AI and warehouse"
+	elif [ "$mode" = "listing" ]; then
+		suite_token="$token"
+		suite_ai=""
+		suite_listing="owners"
+		suite_admin="$listing_admin"
+		tests="tests/listing.test.mjs"
+		who="API tokens of the suite's people and the static token (an admin), only the site listing"
 	elif [ "$mode" = "oidc" ]; then
 		suite_ai=""
 		suite_url="http://127.0.0.1:$port"
@@ -320,6 +361,7 @@ for mode in $modes; do
 		BACKYARD_URL="$suite_url" BACKYARD_TOKEN="$suite_token" BACKYARD_CONFORMANCE_AI="$suite_ai" \
 			BACKYARD_CONFORMANCE_SECRET="$secret" BACKYARD_CONFORMANCE_MCP=1 \
 			BACKYARD_CONFORMANCE_IDP="$suite_idp" BACKYARD_CONFORMANCE_IDP_USERS=alice,bob \
+			BACKYARD_CONFORMANCE_LISTING="$suite_listing" BACKYARD_CONFORMANCE_ADMIN="$suite_admin" \
 			node --test --test-reporter=spec "$@" "$tests"
 	)
 	rc=$?

@@ -189,6 +189,12 @@ export interface Config {
   admins: string[];
   adminGroups: string[];
   ownership: "none" | "owner";
+  /**
+   * SITE_LISTING (SPEC §7.2 "Listing"): "all" lists every site; "owners" lists
+   * a site only to whom listedTo (sitemeta.ts) admits, and implies ownership
+   * "owner".
+   */
+  siteListing: "all" | "owners";
   serverName: string;
   reserved: string[];
   limits: Limits;
@@ -202,9 +208,12 @@ export interface Config {
   /**
    * A misconfiguration that makes the Worker answer every request except the
    * health checks with 503 (fail closed), "" when there is none: an
-   * AUTH_MODE other than "none" or "access". The Go server refuses to start
-   * then; serving without authentication instead would make public a Worker
-   * meant to sit behind Cloudflare Access (workers.dev is not behind Access).
+   * AUTH_MODE other than "none" or "access" (serving without authentication
+   * instead would make public a Worker meant to sit behind Cloudflare Access;
+   * workers.dev is not behind Access), a SITE_LISTING other than "all" or
+   * "owners", or SITE_LISTING=owners with an OWNERSHIP other than "owner"
+   * (listing every site instead would show what was meant to be hidden). The
+   * Go server refuses to start then. Several are joined with "; ".
    */
   fatal: string;
   /** Configuration problems (logged once per isolate: npx wrangler tail). */
@@ -241,6 +250,7 @@ const VAR_KEYS = [
   "ADMINS",
   "ADMIN_GROUPS",
   "OWNERSHIP",
+  "SITE_LISTING",
   "SERVER_NAME",
   "RESERVED_SITES",
   "AI_ENABLED",
@@ -276,8 +286,9 @@ const LIST_VARS = new Set<string>(["MCP_CLIENTS", "MCP_REDIRECT_URIS"]);
  * parsed value: numbers and booleans are taken as their text, objects in
  * LIMITS and AI_MODELS as their JSON, arrays of strings in MCP_CLIENTS and
  * MCP_REDIRECT_URIS as a comma-separated list. Any other value is reported
- * and ignored (in AUTH_MODE it makes the configuration fatal; in the MCP
- * lists it turns the Claude connector off).
+ * and ignored (in AUTH_MODE and SITE_LISTING, and in OWNERSHIP alongside
+ * SITE_LISTING=owners, it makes the configuration fatal; in the MCP lists it
+ * turns the Claude connector off).
  */
 function stringVars(env: Env, problems: string[], invalid: Set<string>): Env {
   const out: Record<string, unknown> = { ...env };
@@ -355,7 +366,7 @@ export function parseConfig(rawEnv: Env): Config {
   if (invalid.has("AUTH_MODE") || (am && am !== "access" && am !== "none")) {
     fatal = 'AUTH_MODE must be "none" or "access"';
     problems.push(
-      `${fatal} (got ${invalid.has("AUTH_MODE") ? "a value that is not a string" : JSON.stringify(am.slice(0, 64))}); every request but the health checks is refused with 503 until it is fixed`,
+      `${fatal} (got ${invalid.has("AUTH_MODE") ? "a value that is not a string" : JSON.stringify(am.slice(0, 64))}); ${FAIL_CLOSED}`,
     );
   }
   const accessTeam = normalizeTeam(str(env.ACCESS_TEAM_DOMAIN));
@@ -390,7 +401,7 @@ export function parseConfig(rawEnv: Env): Config {
   if (!secret) problems.push("BACKYARD_SECRET is not set (re-run setup: backyard cloudflare setup or npx backyard-cloudflare setup; or npx wrangler secret put BACKYARD_SECRET, at least 32 characters)");
   else if (secret.length < 32) problems.push("BACKYARD_SECRET must be at least 32 characters");
 
-  const ownership = str(env.OWNERSHIP).toLowerCase() === "owner" ? "owner" : "none";
+  const { siteListing, ownership } = parseListing(env, invalid, problems, (f) => (fatal = fatal ? `${fatal}; ${f}` : f));
   const reserved = [...DEFAULT_RESERVED, ...list(env.RESERVED_SITES).map((s) => s.toLowerCase())];
 
   return {
@@ -405,6 +416,7 @@ export function parseConfig(rawEnv: Env): Config {
     admins: list(env.ADMINS).map((s) => s.toLowerCase()),
     adminGroups: list(env.ADMIN_GROUPS).map((s) => s.toLowerCase()),
     ownership,
+    siteListing,
     serverName: str(env.SERVER_NAME) || "Backyard",
     reserved,
     limits,
@@ -578,6 +590,44 @@ export function mcpRedirectURIHost(e: string): string {
   const u = splitURL(e);
   if (!u || u.scheme !== "https" || u.authority.includes("@")) return "";
   return authorityHost(u.authority);
+}
+
+/** How a fatal problem is reported: the problem line names the remedy. */
+const FAIL_CLOSED = "every request but the health checks is refused with 503 until it is fixed";
+
+/**
+ * Parses SITE_LISTING and OWNERSHIP (SPEC §7.2 "Listing", §16), like the Go
+ * server's sites.listing and sites.ownership. SITE_LISTING (trimmed,
+ * case-insensitive) unset, empty or "all" lists every site, and OWNERSHIP
+ * "owner" means ownership owner, anything else none (as before the option).
+ * "owners" implies ownership: OWNERSHIP unset, empty or "owner" means owner.
+ * Fails closed (fail) for any other SITE_LISTING, and for any other
+ * OWNERSHIP alongside "owners": listing every site, or owners-only listing
+ * without recorded owners, is not what was asked for.
+ */
+function parseListing(
+  env: Env,
+  invalid: Set<string>,
+  problems: string[],
+  fail: (fatal: string) => void,
+): { siteListing: "all" | "owners"; ownership: "none" | "owner" } {
+  const sl = str(env.SITE_LISTING).toLowerCase();
+  const own = str(env.OWNERSHIP).toLowerCase();
+  if (invalid.has("SITE_LISTING") || (sl !== "" && sl !== "all" && sl !== "owners")) {
+    const f = 'SITE_LISTING must be "all" or "owners"';
+    fail(f);
+    problems.push(`${f} (got ${invalid.has("SITE_LISTING") ? "a value that is not a string" : JSON.stringify(sl.slice(0, 64))}); ${FAIL_CLOSED}`);
+    // Never all (the configuration is fatal anyway).
+    return { siteListing: "owners", ownership: "owner" };
+  }
+  if (sl !== "owners") return { siteListing: "all", ownership: own === "owner" ? "owner" : "none" };
+  if (invalid.has("OWNERSHIP") || (own !== "" && own !== "owner")) {
+    const f = "SITE_LISTING=owners requires OWNERSHIP=owner (its default with this option)";
+    fail(f);
+    const got = invalid.has("OWNERSHIP") ? "a value that is not a string" : JSON.stringify(own.slice(0, 64));
+    problems.push(`${f} (got OWNERSHIP=${got}; leave OWNERSHIP unset or set it to owner); ${FAIL_CLOSED}`);
+  }
+  return { siteListing: "owners", ownership: "owner" };
 }
 
 /** Parses MCP_ENABLED, MCP_CLIENTS and MCP_REDIRECT_URIS (SPEC §16). */

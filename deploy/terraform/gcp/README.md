@@ -230,6 +230,22 @@ source IPs. Deploys still need a token (`static_tokens`).
   `extra_config_yaml` replaces the module's, so set those limits there as well;
   the module warns otherwise. The deploy itself uploads straight to the bucket
   through signed URLs.
+- **Owners-only site listing.** To show each person only the sites they own in the
+  hub, `backyard sites list` and `backyard_list_sites` (admins see every site),
+  add `listing: owners` in a `sites` section of `extra_config_yaml`; it implies
+  `ownership: owner` ([owners-only site listing](../../docs/deploying-sites.md#owners-only-site-listing)).
+  The section replaces the module's, so repeat the Cloud Run cap:
+
+  ```hcl
+  extra_config_yaml = <<-EOT
+    sites:
+      listing: owners
+      max_file_bytes: 32505856   # 31 MiB, the module's cap for Cloud Run
+  EOT
+  ```
+
+  Servers older than the option refuse the key (the new revision never becomes
+  ready), so set it with an `image` of a release that has it.
 - **Database.** By default the module creates Cloud SQL `db-custom-1-3840` (1 vCPU,
   3.75 GB, zonal), with daily backups, point-in-time recovery, connector-only
   access and deletion protection. Every Cloud Run instance opens up to

@@ -102,10 +102,11 @@ func NewGateway(t testing.TB) *Gateway {
 	g.URL = g.Server.URL
 	g.Info = deploy.Info{
 		Name: "Backyard", Version: "test", PublicURL: g.URL, BaseDomain: "127.0.0.1", URLMode: "path",
-		GatewayURL: g.URL + GatewayPath,
-		Auth:       deploy.AuthInfo{Mode: "oidc", CLILoginURL: g.URL + "/__backyard/auth/cli"},
-		Methods:    []string{"api"},
-		Limits:     deploy.Limits{MaxSiteBytes: 500 << 20, MaxFiles: 10000, MaxFileBytes: 100 << 20},
+		GatewayURL:  g.URL + GatewayPath,
+		Auth:        deploy.AuthInfo{Mode: "oidc", CLILoginURL: g.URL + "/__backyard/auth/cli"},
+		Methods:     []string{"api"},
+		Limits:      deploy.Limits{MaxSiteBytes: 500 << 20, MaxFiles: 10000, MaxFileBytes: 100 << 20},
+		SiteListing: "all",
 	}
 	return g
 }

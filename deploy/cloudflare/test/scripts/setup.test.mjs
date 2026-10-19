@@ -350,6 +350,141 @@ describe("backyard-cloudflare setup", () => {
     assert.equal(sb.state().ai, undefined);
   });
 
+  it("lists sites only to their owners with --site-listing owners (SITE_LISTING managed), remembers it, and --site-listing all lists every site again", async () => {
+    const sb = await newSandbox();
+    let r = await sb.run(["setup", "--no-r2", "--site-listing", "owners"]);
+    assert.equal(r.code, 0, r.out);
+    let d = deployOf(sb.calls());
+    assert.equal(d.config.vars.SITE_LISTING, "owners");
+    assert.equal(d.config.vars.OWNERSHIP, undefined, "the Worker implies OWNERSHIP=owner with SITE_LISTING=owners");
+    assert.equal(sb.cf().workers.backyard.bindings.find((b) => b.name === "SITE_LISTING")?.text, "owners");
+    assert.equal(sb.state().siteListing, "owners");
+    assert.equal(sb.state().vars, undefined, "SITE_LISTING is managed, not a remembered override");
+    assert.match(r.out, /Site listing: owners only \(--site-listing all lists every site\)\. Without company login visitors are anonymous guests and see no sites\./);
+    // Remembered by the next run.
+    r = await sb.run(["setup", "--no-r2"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(deployOf(sb.calls()).config.vars.SITE_LISTING, "owners");
+    assert.match(r.out, /Site listing: owners only/);
+    // A --var that contradicts the listing, an OWNERSHIP other than owner, or a bad flag value is refused before anything happens.
+    for (const [argv, re] of [
+      [["setup", "--var", "SITE_LISTING:all"], /SITE_LISTING is managed by `npm run cf -- setup --site-listing`: the site listing is owners \(`npm run cf -- setup --site-listing all` changes it\)/],
+      [["setup", "--var", "SITE_LISTING:"], /SITE_LISTING is managed by `npm run cf -- setup --site-listing`: the site listing is owners \(`npm run cf -- setup --site-listing all` changes it\)/],
+      [["setup", "--site-listing", "all", "--var", "SITE_LISTING:owners"], /SITE_LISTING is managed by `npm run cf -- setup --site-listing`: the site listing is all \(`npm run cf -- setup --site-listing owners` changes it\)/],
+      [["setup", "--dry-run", "--var", "SITE_LISTING:mine"], /SITE_LISTING is managed by `npm run cf -- setup --site-listing`: the site listing is owners \(`npm run cf -- setup --site-listing all` changes it\)/],
+      [["setup", "--var", "OWNERSHIP:none"], /--var OWNERSHIP:none contradicts the owners-only site listing, which needs OWNERSHIP=owner \(its default with --site-listing owners; owners are recorded only then\): leave OWNERSHIP out, or pass --var OWNERSHIP:owner/],
+      [["setup", "--dry-run", "--var", "OWNERSHIP:none"], /--var OWNERSHIP:none contradicts the owners-only site listing/],
+      [["setup", "--site-listing", "mine"], /--site-listing must be all or owners \(got "mine"\)/],
+      [["setup", "--site-listing", "Owners"], /--site-listing must be all or owners \(got "Owners"\)/],
+      [["setup", "--site-listing"], /--site-listing needs a value/],
+    ]) {
+      r = await sb.run(argv);
+      assert.equal(r.code, 2, `${argv.join(" ")}: ${r.out}`);
+      assert.match(r.out, re, argv.join(" "));
+      assert.deepEqual(sb.calls(), [], argv.join(" "));
+    }
+    // A --var that agrees is not kept: the flag sets the variable. OWNERSHIP:owner is a plain override.
+    r = await sb.run(["setup", "--no-r2", "--var", "SITE_LISTING:owners", "--var", "OWNERSHIP:owner"]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /Dropped the SITE_LISTING override: setup --site-listing sets SITE_LISTING itself \(the site listing is owners\)\./);
+    d = deployOf(sb.calls());
+    assert.equal(d.config.vars.SITE_LISTING, "owners");
+    assert.equal(d.config.vars.OWNERSHIP, "owner");
+    assert.deepEqual(sb.state().vars, { OWNERSHIP: "owner" });
+    // --dry-run shows the remembered choice, and what --site-listing all would deploy, changing nothing.
+    const saved = readFileSync(sb.statePath(), "utf8");
+    r = await sb.run(["setup", "--dry-run"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(sb.calls()[0].config.vars.SITE_LISTING, "owners");
+    assert.match(r.out, /^ {2}SITE_LISTING=owners$/m);
+    assert.match(r.out, /site listing: owners only/);
+    r = await sb.run(["setup", "--dry-run", "--site-listing", "all"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(sb.calls()[0].config.vars.SITE_LISTING, undefined);
+    assert.match(r.out, /site listing: every site/);
+    assert.equal(readFileSync(sb.statePath(), "utf8"), saved, "--dry-run writes no state");
+    // --site-listing all: SITE_LISTING is no longer set, and OWNERSHIP is a plain variable again.
+    r = await sb.run(["setup", "--no-r2", "--site-listing", "all", "--var", "OWNERSHIP:none"]);
+    assert.equal(r.code, 0, r.out);
+    d = deployOf(sb.calls());
+    assert.equal(d.config.vars.SITE_LISTING, undefined);
+    assert.equal(d.config.vars.OWNERSHIP, "none");
+    assert.equal(sb.state().siteListing, undefined);
+    assert.deepEqual(sb.state().vars, { OWNERSHIP: "none" });
+    assert.doesNotMatch(r.out, /Site listing:/);
+    // Back to owners: the remembered OWNERSHIP:none is refused until it is dropped.
+    r = await sb.run(["setup", "--site-listing", "owners"]);
+    assert.equal(r.code, 2, r.out);
+    assert.match(r.out, /the remembered --var OWNERSHIP:none contradicts the owners-only site listing, which needs OWNERSHIP=owner .*: drop it with --var OWNERSHIP:/);
+    assert.deepEqual(sb.calls(), []);
+    r = await sb.run(["setup", "--no-r2", "--site-listing", "owners", "--var", "OWNERSHIP:"]);
+    assert.equal(r.code, 0, r.out);
+    d = deployOf(sb.calls());
+    assert.equal(d.config.vars.SITE_LISTING, "owners");
+    assert.equal(d.config.vars.OWNERSHIP, undefined);
+    assert.equal(sb.state().vars, undefined);
+    assert.equal(sb.state().siteListing, "owners");
+    // An OWNERSHIP written into the base configuration needs an override.
+    const config = join(sb.pkg, "wrangler.jsonc");
+    writeFileSync(config, readFileSync(config, "utf8").replace(/"vars": \{/, '"vars": {\n    "OWNERSHIP": "none",'));
+    r = await sb.run(["setup", "--no-r2"]);
+    assert.equal(r.code, 2, r.out);
+    assert.match(r.out, /the base configuration \(wrangler\.jsonc\) sets OWNERSHIP=none, which contradicts the owners-only site listing.*: pass --var OWNERSHIP:owner/);
+    assert.deepEqual(sb.calls(), []);
+    r = await sb.run(["setup", "--no-r2", "--var", "OWNERSHIP:owner"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(deployOf(sb.calls()).config.vars.OWNERSHIP, "owner");
+  });
+
+  it("adopts owners-only listing from the live Worker, and an older release's OWNERSHIP default is no override", async () => {
+    const sb = await newSandbox();
+    seedWorker(sb, { vars: { SITE_LISTING: "owners", ADMINS: "alice@example.com" } });
+    let r = await sb.run(["setup", "--no-r2"]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /Adopted the deployed configuration of backyard \(no setup state on this machine\): owners-only site listing; variables ADMINS/);
+    let d = deployOf(sb.calls());
+    assert.equal(d.config.vars.SITE_LISTING, "owners");
+    assert.equal(sb.state().siteListing, "owners");
+    assert.deepEqual(sb.state().vars, { ADMINS: "alice@example.com" }, "SITE_LISTING is not copied as an override");
+    // On a machine without state, an OWNERSHIP that contradicts the adopted listing is
+    // refused right after the live read: no workers.dev subdomain, no R2 bucket.
+    forgetState(sb);
+    sb.updateCf((s) => (s.buckets = []));
+    sb.requests();
+    r = await sb.run(["setup", "--var", "OWNERSHIP:none"]);
+    assert.equal(r.code, 2, r.out);
+    assert.match(r.out, /--var OWNERSHIP:none contradicts the owners-only site listing/);
+    assert.deepEqual(names(sb.calls()), ["whoami --json", "auth token"]);
+    assert.deepEqual(sb.cf().buckets, [], "no R2 bucket was created");
+    assert.ok(!sb.requests().some((x) => x.path.endsWith("/workers/subdomain")), "the workers.dev subdomain is not touched");
+    // A Worker an earlier release deployed (OWNERSHIP "none" written out): adopting it keeps
+    // nothing, so --site-listing owners works right away.
+    forgetState(sb);
+    seedWorker(sb, { vars: { OWNERSHIP: "none" } });
+    r = await sb.run(["setup", "--no-r2", "--site-listing", "owners"]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /Adopted the deployed configuration of backyard \(no setup state on this machine\): the defaults \(nothing to keep\)/);
+    d = deployOf(sb.calls());
+    assert.equal(d.config.vars.SITE_LISTING, "owners");
+    assert.equal(d.config.vars.OWNERSHIP, undefined);
+    assert.equal(sb.state().vars, undefined);
+    // An invalid live value (the Worker fails closed) is adopted as owners-only, never as every site.
+    forgetState(sb);
+    seedWorker(sb, { vars: { SITE_LISTING: "mine" } });
+    r = await sb.run(["setup", "--no-r2"]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /SITE_LISTING="mine" is neither all nor owners \(the Worker refuses every request\): adopted as --site-listing owners/);
+    assert.equal(deployOf(sb.calls()).config.vars.SITE_LISTING, "owners");
+    // A SITE_LISTING override an earlier version remembered becomes the choice, and is dropped.
+    sb.writeState("backyard", { ...sb.state(), siteListing: undefined, vars: { SITE_LISTING: "owners" } });
+    r = await sb.run(["setup", "--no-r2"]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /Dropped the SITE_LISTING override: setup --site-listing sets SITE_LISTING itself \(the site listing is owners\)\./);
+    assert.equal(deployOf(sb.calls()).config.vars.SITE_LISTING, "owners");
+    assert.equal(sb.state().siteListing, "owners");
+    assert.equal(sb.state().vars, undefined);
+  });
+
   it("exits 4 with the reason when the hub does not become ready, instead of saying it is live", async () => {
     const sb = await newSandbox();
     const fast = { FAKE_FAST_SLEEP: "1", BACKYARD_CF_RESULT_FILE: sb.resultPath };

@@ -6,9 +6,9 @@
 //   A 404 or code 10007 means the Worker does not exist; any other error
 //   leaves it unknown (exists: null) and the guard refuses to guess.
 // * adopt(state, live, baseVars) fills a fresh state from the live Worker:
-//   R2 bucket, AI off (no AI binding and AI_ENABLED false), variables that
-//   differ from the defaults, the domain (BASE_DOMAIN) and Cloudflare Access
-//   (AUTH_MODE=access).
+//   R2 bucket, AI off (no AI binding and AI_ENABLED false), owners-only site
+//   listing (SITE_LISTING=owners), variables that differ from the defaults,
+//   the domain (BASE_DOMAIN) and Cloudflare Access (AUTH_MODE=access).
 // * authGuard(live, desiredVars, o) refuses (CliError 3) a deploy that would
 //   turn a live AUTH_MODE=access off, change its team, or replace a Worker
 //   whose AUTH_MODE cannot be read, unless o.allow (setup
@@ -25,6 +25,16 @@ export const MANAGED_DOMAIN_KEYS = ["BASE_DOMAIN", "URL_MODE"];
 export const MANAGED_ACCESS_KEYS = ["AUTH_MODE", "ACCESS_TEAM_DOMAIN", "ACCESS_AUD"];
 /** Variables derived from state.ai === false (`setup --no-ai`; never stored in state.vars then). */
 export const MANAGED_AI_KEYS = ["AI_ENABLED"];
+/** Variables derived from state.siteListing (`setup --site-listing`; never stored in state.vars). */
+export const MANAGED_LISTING_KEYS = ["SITE_LISTING"];
+
+/**
+ * Defaults that the wrangler.jsonc of earlier releases wrote out and that are
+ * now left unset, with the same meaning: a live value equal to one of them is
+ * not an override. (OWNERSHIP "none" until 0.3.0; unset now means none, or
+ * owner with SITE_LISTING=owners.)
+ */
+const LEGACY_DEFAULTS = { OWNERSHIP: "none" };
 
 /**
  * Whether an AI_ENABLED value turns AI on, as the Worker reads it (bool() in
@@ -34,6 +44,18 @@ export const MANAGED_AI_KEYS = ["AI_ENABLED"];
 export function aiEnabledOf(v) {
   const s = String(v ?? "").trim().toLowerCase();
   return s === "" || s === "true" || s === "1" || s === "yes" || s === "on";
+}
+
+/**
+ * A SITE_LISTING as the Worker reads it (trimmed, case-insensitive): "all"
+ * (also when unset or empty), "owners", or null for any other value (the
+ * Worker then refuses every request but the health checks).
+ * @param {unknown} v
+ * @returns {"all" | "owners" | null}
+ */
+export function siteListingOf(v) {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "" || s === "all" ? "all" : s === "owners" ? "owners" : null;
 }
 
 /**
@@ -152,8 +174,10 @@ export async function fillAuthFromInfo(live, urls) {
  * to state.domain / state.access / state.ai when they are in use (BASE_DOMAIN
  * set, AUTH_MODE=access, no AI binding with AI_ENABLED off); otherwise, like
  * every other variable, they are kept in state.vars when they differ from the
- * defaults, so the next deploy changes nothing. Returns the parts that were
- * adopted (for the one-line summary).
+ * defaults, so the next deploy changes nothing. SITE_LISTING always goes to
+ * state.siteListing ("owners", also for an invalid value, which the Worker
+ * never reads as all). Returns the parts that were adopted (for the one-line
+ * summary).
  * @param {Record<string, any>} state
  * @param {Live} live
  * @param {Record<string, unknown>} baseVars  the defaults (wrangler config vars)
@@ -175,14 +199,29 @@ export function adopt(state, live, baseVars = {}) {
     state.ai = false;
     parts.push("AI off");
   }
+  // Deployed with --site-listing owners (or SITE_LISTING=owners set otherwise).
+  const listing = siteListingOf(v.SITE_LISTING);
+  if (listing !== "all") {
+    state.siteListing = "owners";
+    parts.push("owners-only site listing");
+    if (listing === null) {
+      warnings.push(`SITE_LISTING=${JSON.stringify(v.SITE_LISTING)} is neither all nor owners (the Worker refuses every request): adopted as --site-listing owners`);
+    }
+  }
   const host = hostOf(v.BASE_DOMAIN);
   const accessOn = authModeOf(v.AUTH_MODE) === "access";
-  const managedNow = new Set([...(host ? MANAGED_DOMAIN_KEYS : []), ...(accessOn ? MANAGED_ACCESS_KEYS : []), ...(aiOff ? MANAGED_AI_KEYS : [])]);
+  const managedNow = new Set([
+    ...(host ? MANAGED_DOMAIN_KEYS : []),
+    ...(accessOn ? MANAGED_ACCESS_KEYS : []),
+    ...(aiOff ? MANAGED_AI_KEYS : []),
+    ...MANAGED_LISTING_KEYS,
+  ]);
   const vars = { ...(state.vars ?? {}) };
   const copied = [];
   for (const [k, val] of Object.entries(v)) {
     if (managedNow.has(k)) continue;
     const def = baseVars[k] === undefined || baseVars[k] === null ? "" : typeof baseVars[k] === "string" ? baseVars[k] : JSON.stringify(baseVars[k]);
+    if (def === "" && Object.hasOwn(LEGACY_DEFAULTS, k) && val === LEGACY_DEFAULTS[k]) continue;
     if (val !== def) {
       vars[k] = val;
       copied.push(k);

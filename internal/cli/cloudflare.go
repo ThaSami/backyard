@@ -754,6 +754,7 @@ var cfCommands = []cfCommand{
 		{Name: "r2-bucket", Value: "name", Help: "bucket name (default <worker>-files)"},
 		{Name: "ai", Help: "serve AI with the Workers AI binding (default; turns AI back on after --no-ai)"},
 		{Name: "no-ai", Help: "turn AI off: no Workers AI binding, AI calls answer 501 (remembered)"},
+		{Name: "site-listing", Value: "all|owners", Help: "list every site (all, default), or each site only to its owners and admins (owners; remembered)"},
 		{Name: "var", Value: "KEY:VALUE", Repeatable: true, Help: "override a Worker variable (remembered; KEY: drops it)"},
 		{Name: "rotate-token", Help: "issue a new DEPLOY_TOKEN"},
 		{Name: "rotate-secret", Help: "replace BACKYARD_SECRET (revokes every API token)"},
@@ -805,7 +806,8 @@ func cloudflareSubcommands() []cfSubcommand {
 			name: "setup", use: "setup [options]", engine: []string{"setup"},
 			short: "Deploy or upgrade Backyard on your Cloudflare account (Workers free plan)",
 			intro: `Deploy or upgrade Backyard on your Cloudflare account (Workers free plan); re-running keeps
-every choice: secrets, the deploy token, R2, AI, the domain, Access and the --var overrides.
+every choice: secrets, the deploy token, R2, AI, the site listing, the domain, Access and the
+--var overrides.
 
 It logs in with wrangler (in the browser) when needed, asks which account to use when the
 login reaches several, registers the account's workers.dev subdomain when it has none,
@@ -816,6 +818,7 @@ its deploy token (unless --no-login).`,
 			example: `  backyard cloudflare setup
   backyard cloudflare setup --worker-name team --no-r2
   backyard cloudflare setup --no-ai                                      # an account without Workers AI
+  backyard cloudflare setup --site-listing owners                        # people see only their own sites
   backyard cloudflare setup --var ADMINS:alice@acme.com
   backyard cloudflare setup --non-interactive --workers-subdomain acme   # CI
   backyard cloudflare setup --package ./dist-npm/backyard-cloudflare-0.1.0.tgz

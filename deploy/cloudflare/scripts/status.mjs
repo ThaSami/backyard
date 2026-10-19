@@ -18,6 +18,8 @@
 //    "versions": {"package", "wrangler", "deployed"},
 //    "urls": {"public", "workersDev"}, "r2Bucket", "workersDev",
 //    "ai": {"enabled", "binding"},   (AI_ENABLED as the Worker reads it; the Workers AI binding)
+//    "siteListing": "all"|"owners"|"invalid",   (SITE_LISTING as the Worker reads it; invalid:
+//                                    the Worker refuses every request)
 //    "domain": {…state.domain…} | null, "access": {"team", "aud", "source"} | null,
 //    "checks": [{"name", "status": "ok"|"pending"|"failed", "detail"}]}
 //
@@ -26,7 +28,7 @@
 
 import { accessEdgeFailures } from "./access.mjs";
 import { CfError } from "./lib/cfapi.mjs";
-import { adopt, aiEnabledOf, authModeOf, hostOf, normalizeTeam } from "./lib/live.mjs";
+import { adopt, aiEnabledOf, authModeOf, hostOf, normalizeTeam, siteListingOf } from "./lib/live.mjs";
 import { dohResolves, parseAccessRedirect, probe, randomProbeLabel } from "./lib/net.mjs";
 import { CliError, EXIT, bold, dim, green, maskSecret, red, ui, yellow } from "./lib/ui.mjs";
 
@@ -270,6 +272,7 @@ export async function runStatus(opts, ctx) {
     ai: live?.exists
       ? { enabled: aiEnabledOf(live.vars.AI_ENABLED), binding: live.ai }
       : { enabled: view.ai !== false && aiEnabledOf(vars.AI_ENABLED), binding: view.ai !== false },
+    siteListing: (live?.exists ? siteListingOf(live.vars.SITE_LISTING) : view.siteListing === "owners" ? "owners" : siteListingOf(vars.SITE_LISTING)) ?? "invalid",
     domain,
     access,
     checks: results,
@@ -306,6 +309,14 @@ function printReport(report, o) {
       : ai.binding
         ? "off (AI_ENABLED=false; the Workers AI binding stays)"
         : `off (${ctx.invokedAs} setup --ai turns it on)`,
+  );
+  row(
+    "Site listing:",
+    report.siteListing === "owners"
+      ? `owners only: each site is listed to its owners and admins (${ctx.invokedAs} setup --site-listing all lists every site)`
+      : report.siteListing === "all"
+        ? "every site"
+        : `SITE_LISTING is neither all nor owners: the Worker refuses every request (${ctx.invokedAs} setup --site-listing <all|owners>)`,
   );
   const d = report.domain;
   row("Domain:", d ? `${d.host} (${d.mode} mode, ${d.status ?? "unknown"}${d.source ? `, ${d.source}` : ""})` : `none (${ctx.invokedAs} domain add <host>)`);

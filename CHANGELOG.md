@@ -6,6 +6,59 @@ All notable changes to Backyard are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Owners-only site listing** (both editions, opt-in): `sites.listing` (`all`, the default, or
+  `owners`; on the Cloudflare edition the Worker variable `SITE_LISTING`) decides which sites
+  the site directories list — the hub's site list and its preview images, the deploy gateway's
+  `GET /sites` (so `backyard sites list` and the `backyard mcp` tool `backyard_list_sites`) and
+  the Claude connector's `backyard_list_sites`. With `owners`, a signed-in person is listed the
+  sites they own, the sites without owners that they created (`created_by`), and every site as
+  an admin (`auth.admins`, `auth.admin_groups`, static tokens with `admin: true`; Cloudflare:
+  `ADMINS`, `ADMIN_GROUPS` and the `DEPLOY_TOKEN`); guests are listed none, and the connector's
+  `total` and `truncated` count only the listed sites. It hides sites from the directories and
+  is **not access control**: sites, their data and uploads, `GET /sites/{site}` (`backyard sites
+  info`), `backyard pull`, the site API's `GET /site` and the connector's file tools answer for
+  every site as before, and writes keep the ownership rules. `owners` implies ownership:
+  `sites.ownership` defaults to `owner` with it (Cloudflare: `OWNERSHIP` unset or `owner`), and
+  `sites.ownership: none` next to it is a configuration error; the Worker fails closed (`503`)
+  on an invalid `SITE_LISTING` or a contradicting `OWNERSHIP`. `GET /__backyard/api/info`
+  reports `site_listing` (`all` or `owners`). The hub says when only your sites are listed (to
+  admins, that every site is), and its deploy form looks up a name it does not list and says
+  when it belongs to a site you don't own. Guide:
+  [Owners-only site listing](docs/deploying-sites.md#owners-only-site-listing).
+- Cloudflare edition: `backyard cloudflare setup --site-listing owners` (remembered by every
+  later `setup`, `domain add`/`remove` and `access enable`/`disable`; `--site-listing all` lists
+  every site again) deploys with `SITE_LISTING=owners`. A `--var SITE_LISTING:…` that
+  contradicts it exits 2, and so does an `OWNERSHIP` other than `owner` while the listing is
+  owners-only. A machine without state adopts the choice, `status` shows `Site listing:`
+  (`siteListing` in `--json`), the Terraform module's `site_listing` (default `all`) always
+  puts `--site-listing <value>` into `setup_args`, and the GitHub Actions deployer takes
+  `BACKYARD_CF_SITE_LISTING=owners` (repository variable `vars.BACKYARD_CF_SITE_LISTING`;
+  `SITE_LISTING` in `BACKYARD_CF_VARS` or the deploy arguments is an error).
+- The deployment kits show how to turn the listing on: Helm `config.sites.listing` (commented in
+  `values.yaml` and `values-production.yaml`), the AWS module's `config_overrides` (the Lambda
+  gateway gets it too) and the GCP and Azure modules' `extra_config_yaml`, the Compose kit's
+  `BACKYARD_SITE_LISTING` with a commented `sites` block in `backyard.yaml`, and a commented
+  `listing: owners` in the systemd sample.
+  **Upgrade:** the listing is off by default, so nothing changes until you set it, at setup or
+  with any later upgrade. The Go configuration is strict and an older server refuses to start
+  with `sites.listing`: upgrade the server — and a standalone or AWS Lambda gateway (`make
+  lambda`) — first, then set the key, and remove it before rolling back. The Worker ignores
+  unknown variables, and `setup` of this release deploys the Worker that knows it. Turning it on
+  also turns ownership on where `sites.ownership` was unset: from then on only owners and admins
+  may redeploy or delete a site. Sites from before have no owners until their next deploy by a
+  signed-in person; until then they are listed to their creator and to admins (sites deployed
+  with a static CI token or the Cloudflare `DEPLOY_TOKEN` belong to that token: add their people
+  as owners). A CI deploy without `BACKYARD_CF_SITE_LISTING` lists every site again.
+
+### Changed
+
+- `backyard_list_sites` (`backyard mcp` and the Claude connector) and `backyard sites list`
+  describe their result as the sites you can see. The skill, the agent guides and the
+  `/backyard:new` command check that a name is free with `backyard sites info <name>` or
+  `backyard_site_files`, which find any site by name, rather than with `backyard_list_sites`.
+
 ## [0.3.0] - 2026-10-19
 
 ### Added

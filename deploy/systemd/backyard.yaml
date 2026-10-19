@@ -63,6 +63,15 @@ deploy:
   # Quoted: the trailing ":" would otherwise be read as YAML syntax.
   rsync_target: "backyard@backyard.example.com:"
 
+sites:
+  # Owners-only site listing (README.md): "owners" shows each person only the
+  # sites they own on the hub, in `backyard sites list` and in
+  # backyard_list_sites, and admins (such as the deploy token) every site. It
+  # implies ownership: owner and hides sites without restricting who can open
+  # them. The default "all" lists every site. Servers older than the option
+  # refuse the key.
+  # listing: owners
+
 # AI for backyard.ai (put ANTHROPIC_API_KEY=... in /etc/backyard/backyard.env):
 #
 # ai:

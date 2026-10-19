@@ -101,6 +101,7 @@ describe("backyard-cloudflare status", () => {
     assert.match(r.out, /Hub: {10}https:\/\/backyard\.example\.com/);
     assert.match(r.out, /R2: {11}bucket backyard-files/);
     assert.match(r.out, /AI: {11}on \(Workers AI\)/);
+    assert.match(r.out, /Site listing: every site/);
     assert.match(r.out, /Domain: {7}backyard\.example\.com \(path mode, active, cli\)/);
     assert.match(r.out, /Access: {7}team acme\.cloudflareaccess\.com · AUD [0-9a-f]{64} \(api\)/);
     assert.match(r.out, /Deploy token: byd_…cdef/);
@@ -112,7 +113,7 @@ describe("backyard-cloudflare status", () => {
     r = await sb.run(["status", "--json"]);
     assert.equal(r.code, 0, r.out);
     const j = JSON.parse(r.stdout);
-    assert.deepEqual(Object.keys(j), ["schema", "worker", "accountId", "statePath", "versions", "urls", "r2Bucket", "workersDev", "ai", "domain", "access", "checks"]);
+    assert.deepEqual(Object.keys(j), ["schema", "worker", "accountId", "statePath", "versions", "urls", "r2Bucket", "workersDev", "ai", "siteListing", "domain", "access", "checks"]);
     assert.equal(j.schema, 1);
     assert.equal(j.worker, "backyard");
     assert.equal(j.accountId, "acc1");
@@ -122,6 +123,7 @@ describe("backyard-cloudflare status", () => {
     assert.equal(j.r2Bucket, "backyard-files");
     assert.equal(j.workersDev, true);
     assert.deepEqual(j.ai, { enabled: true, binding: true });
+    assert.equal(j.siteListing, "all");
     assert.deepEqual(j.domain, JSON.parse(before).domain);
     assert.deepEqual(j.access, { team: TEAM, aud: JSON.parse(before).access.aud, source: "api" });
     assert.deepEqual(
@@ -301,6 +303,32 @@ describe("backyard-cloudflare status", () => {
     j = JSON.parse((await sb.run(["status", "--json"])).stdout);
     assert.deepEqual(j.ai, { enabled: true, binding: false });
     assert.match((await sb.run(["status"])).out, /AI: {11}on, without the Workers AI binding \(only Anthropic or OpenAI aliases work\)/);
+  });
+
+  it("reports the site listing (setup --site-listing) without a failing check, from the live Worker and from the state", async () => {
+    const sb = await domainSandbox();
+    const redeploy = (vars) =>
+      sb.updateCf((s) => {
+        const w = s.workers.backyard;
+        s.workers.backyard = deployedWorker({ vars: { ...w.vars, ...vars }, secrets: w.secrets, r2Bucket: w.r2Bucket, ai: true });
+      });
+    redeploy({ SITE_LISTING: "owners" });
+    sb.writeState("backyard", { ...sb.state(), siteListing: "owners" });
+    let r = await sb.run(["status", "--json"]);
+    assert.equal(r.code, 0, r.out);
+    const j = JSON.parse(r.stdout);
+    assert.equal(j.siteListing, "owners");
+    for (const c of j.checks) assert.equal(c.status, "ok", `${c.name}: ${c.detail}`);
+    assert.match((await sb.run(["status"])).out, /Site listing: owners only: each site is listed to its owners and admins \(npm run cf -- setup --site-listing all lists every site\)/);
+    // Not logged in: from this machine's state.
+    r = await sb.run(["status", "--json"], { FAKE_LOGGED_OUT: "1" });
+    assert.equal(JSON.parse(r.stdout).siteListing, "owners");
+    // The live Worker wins over the state; an invalid value is said so.
+    redeploy({ SITE_LISTING: "mine" });
+    assert.equal(JSON.parse((await sb.run(["status", "--json"])).stdout).siteListing, "invalid");
+    assert.match((await sb.run(["status"])).out, /Site listing: SITE_LISTING is neither all nor owners: the Worker refuses every request \(npm run cf -- setup --site-listing <all\|owners>\)/);
+    redeploy({ SITE_LISTING: "" });
+    assert.equal(JSON.parse((await sb.run(["status", "--json"])).stdout).siteListing, "all");
   });
 
   it("shows the live configuration on a machine without state, and writes none", async () => {

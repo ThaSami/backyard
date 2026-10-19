@@ -211,6 +211,25 @@ ingress:
   `clients: []` to `config.mcp`). An internal-only ingress works only with connectors added
   locally in Claude Code.
 
+## Owners-only site listing
+
+By default the hub, `backyard sites list` and `backyard_list_sites` show every site to everyone.
+To show each person only the sites they own (and admins every site), set
+[`sites.listing`](../../../docs/deploying-sites.md#owners-only-site-listing) in `config`, at
+install or with any later `helm upgrade` (the config checksum rolls the pods):
+
+```yaml
+config:
+  sites:
+    listing: owners
+```
+
+It implies `sites.ownership: owner` (an explicit `ownership: none` next to it makes the server
+refuse to start), and it hides sites from the directory without restricting who can open them.
+Name admins with `config.auth.admins` or `admin_groups`. The configuration is strict and servers
+older than this option reject the key, so set it with (or after) the chart version that brings
+the new image, and keep `image.tag` at that version or later.
+
 ## Cloud storage without keys
 
 | Cloud | `config.storage` | Service account annotation |

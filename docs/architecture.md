@@ -120,7 +120,9 @@ to the loopback URL → the CLI stores it.
 | `uploads/<site>/<id>/<name>` | Uploaded files and generated images |
 
 The hub's site list is `_meta/sites/*` plus first-level prefixes under `sites/` (sites
-deployed by a plain rsync appear too, without a title or preview until a refresh). A site's
+deployed by a plain rsync appear too, without a title or preview until a refresh); with
+`sites.listing: owners` each caller gets only the sites listed to them
+([owners-only site listing](deploying-sites.md#owners-only-site-listing)). A site's
 preview is one of its own files, chosen when its `SiteMeta` is written; the hub serves it from
 its own origin at `/__backyard/api/sites/<site>/preview`, so it loads with the same credentials
 as the site list ([Site preview](deploying-sites.md#site-preview)).

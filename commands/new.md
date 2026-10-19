@@ -15,8 +15,10 @@ rules and patterns; its `references/recipes.md` has complete apps to start from 
    Otherwise restate the app in one line and choose sensible defaults instead of asking more.
 2. **Name.** Pick a short, descriptive site name: lowercase letters, digits and `-`, at most 63
    characters (e.g. `lunch-vote`). Check that it is free with `backyard sites info <name>`
-   ("not found" means free) or the `backyard_list_sites` MCP tool. If an unrelated site already
-   uses it, pick another name; never overwrite someone else's site.
+   ("not found" means free) or the `backyard_site_files` MCP tool, which find any site by name.
+   `backyard_list_sites` shows only the sites you can see (on some servers only your own), so a
+   name missing there may still be taken. If an unrelated site already uses it, pick another
+   name; never overwrite someone else's site.
 3. **Scaffold.** Run `backyard init <name>` in the current directory (or the `backyard_init`
    tool with `dir` set to a new folder) and work inside the new folder. Keep `.backyard.json`;
    replace the starter `index.html`.

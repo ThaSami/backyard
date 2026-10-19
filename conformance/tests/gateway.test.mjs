@@ -28,11 +28,12 @@ describe("info", () => {
     for (const k of ["max_site_bytes", "max_files", "max_file_bytes"]) {
       assert.ok(Number.isInteger(i.limits?.[k]), `limits.${k}`);
     }
+    assert.ok(["all", "owners"].includes(i.site_listing), `site_listing is always present, "all" or "owners": ${r.text}`);
     if ("rsync_target" in i) assert.notEqual(i.rsync_target, "", "rsync_target is omitted when empty");
     if (i.storage !== undefined) assert.equal(typeof i.storage.type, "string");
   });
 
-  test("GET {gateway}/info is the same document", async () => {
+  test("GET {gateway}/info is the same document (site_listing included)", async () => {
     const a = (await client.get(hubURL + "/__backyard/api/info")).json;
     const b = expectStatus(await client.get(env.gateway + "/info"), 200).json;
     assert.deepEqual(b, a);

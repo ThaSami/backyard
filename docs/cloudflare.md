@@ -79,6 +79,7 @@ manage Cloudflare as code.
 | `auth.mode` | `AUTH_MODE=none` (anonymous cookies; deploys need `DEPLOY_TOKEN` unless `ALLOW_ANONYMOUS_DEPLOY`) or `access` (Cloudflare Access verifying `Cf-Access-Jwt-Assertion`, with Okta, Entra ID, Google… as Access identity providers) |
 | AI providers | Workers AI binding (free daily allowance) behind `smart`, `fast`, `image`, `embed`; optional Anthropic / OpenAI-compatible keys |
 | `ai.enabled: false` | `AI_ENABLED=false` (`setup --no-ai`, which also leaves the Workers AI binding out) |
+| `sites.listing: owners` | `SITE_LISTING=owners` (`setup --site-listing owners`; implies `OWNERSHIP=owner`) |
 | Warehouse | Not available (`501`), unless `WAREHOUSE_URL` proxies to a Go server |
 | Deploy methods | `api` only |
 | Rate limits | Daily caps per user / IP and per platform (`LIMITS`) |
@@ -125,6 +126,16 @@ Workers AI is not available, and with `AI_ENABLED=false`: every AI endpoint then
 `501 unsupported` ("AI is not configured on this server"), exactly as the Go server does with
 `ai.enabled: false`, so sites degrade the same way on both. `setup --ai` turns it back on. See
 the edition's [README](../deploy/cloudflare/README.md#turning-ai-off).
+
+**Owners-only site listing.** `backyard cloudflare setup --site-listing owners` (remembered;
+Terraform: `site_listing = "owners"`; GitHub Actions: `BACKYARD_CF_SITE_LISTING=owners`) sets
+`SITE_LISTING=owners`: the hub, `backyard sites list` and `backyard_list_sites` then show each
+person only their own sites, and admins (`ADMINS`, `ADMIN_GROUPS`, the `DEPLOY_TOKEN`) every
+site. It implies `OWNERSHIP=owner`. With the default `AUTH_MODE=none` every browser is a guest
+and is listed no site (only the `DEPLOY_TOKEN` sees them), so it is meant for
+`AUTH_MODE=access`. It hides sites from the directory and
+does not restrict who can open them; `--site-listing all` lists every site again. See
+[owners-only site listing](deploying-sites.md#owners-only-site-listing).
 
 Within the shared contract, a few edition differences are visible to pages and CLIs (all
 listed in the [specification](spec/SPEC.md#16-cloudflare-edition-free-tier)):

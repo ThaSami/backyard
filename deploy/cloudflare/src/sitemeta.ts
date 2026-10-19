@@ -1,4 +1,6 @@
-/** SiteMeta wire shape (SPEC §7.2), in the field order of the Go server. */
+/** SiteMeta wire shape (SPEC §7.2), in the field order of the Go server, and who sees a site listed. */
+import { isAdminIdentity, type Config } from "./config";
+import type { User } from "./identity";
 import type { SiteRecord } from "./registry-do";
 
 export interface SiteMeta {
@@ -37,4 +39,31 @@ export function siteMetaJSON(r: SiteRecord, url: string): SiteMeta {
 /** Whether id or email is listed as an owner (case-insensitive). */
 export function isOwner(r: SiteRecord, id: string, email: string): boolean {
   return (r.owners ?? []).some((o) => o.toLowerCase() === id.toLowerCase() || (email !== "" && o.toLowerCase() === email.toLowerCase()));
+}
+
+/**
+ * Whether r appears in u's site listings (SITE_LISTING, SPEC §7.2 "Listing";
+ * the Go server's sites.Listed): the hub's /__backyard/api/sites and its
+ * preview route, the gateway's GET /sites and backyard_list_sites. With
+ * "all" every site does. With "owners" a site is listed only to a caller who
+ * is not anonymous and is an admin (the gateway's rule: u.admin, or ADMINS /
+ * ADMIN_GROUPS), one of the site's owners (by id or email, case-insensitive),
+ * or, while the site has no owners, the one who created it (created_by, by id
+ * or email, case-insensitive), so that sites from before the option stay
+ * listed to their creator. Listing is not access control: lookups by name
+ * are not filtered.
+ */
+export function listedTo(cfg: Config, u: User | null | undefined, r: SiteRecord | null | undefined): boolean {
+  if (cfg.siteListing !== "owners") return true;
+  if (!u || u.anonymous || !r) return false;
+  const email = u.email ?? "";
+  if (u.admin || isAdminIdentity(cfg, u.id, email, u.groups ?? [])) return true;
+  if (r.owners?.length) return isOwner(r, u.id, email);
+  const c = (r.created_by ?? "").toLowerCase();
+  return c !== "" && ((u.id !== "" && c === u.id.toLowerCase()) || (email !== "" && c === email.toLowerCase()));
+}
+
+/** The records of list that are listed to u (listedTo), in order; list itself when every site is. */
+export function filterListed(cfg: Config, u: User | null | undefined, list: SiteRecord[]): SiteRecord[] {
+  return cfg.siteListing === "owners" ? list.filter((r) => listedTo(cfg, u, r)) : list;
 }

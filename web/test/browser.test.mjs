@@ -1067,6 +1067,196 @@ test("hub: the list view shows no previews and requests none", async (t) => {
   }
 });
 
+// --- owners-only site listing (sites.listing: owners, SPEC §7.1 site_listing, §7.2 "Listing")
+
+/** Alice's site, an ownerless one she created before the upgrade, Bob's and Carol's. */
+const listingSites = () => [
+  { name: "mine", url: "http://x/s/mine/", title: "My site", updated_at: ago(1), updated_by: "alice@acme.com", created_by: "alice@acme.com", owners: ["alice@acme.com"] },
+  { name: "legacy", url: "http://x/s/legacy/", title: "From before the upgrade", updated_at: ago(2), updated_by: "Alice@Acme.com", created_by: "Alice@Acme.com", owners: [] },
+  { name: "theirs", url: "http://x/s/theirs/", title: "Bob's site", updated_at: ago(3), updated_by: "bob@acme.com", created_by: "bob@acme.com", owners: ["bob@acme.com"] },
+  { name: "orphan", url: "http://x/s/orphan/", title: "Carol's old site", updated_at: ago(4), updated_by: "carol@acme.com", created_by: "carol@acme.com", owners: [] },
+];
+const TAKEN_HINT = "This name is taken by a site you don't own; only its owners or an admin can update it.";
+const NEW_HINT = "A new site will be created.";
+/** The site names the hub looked up with GET G/sites/{name}, in order. */
+const lookups = (stub) => stub.state.requests.filter((q) => q.method === "GET" && /^\/deploy\/sites\/[^/]+$/.test(q.path)).map((q) => q.path.slice("/deploy/sites/".length));
+const siteNames = (page) => page.$$eval(".site .site-name", (els) => els.map((e) => e.textContent));
+/** Longer than the hub's lookup debounce (300 ms): a lookup would have been sent by then. */
+const settle = () => new Promise((r) => setTimeout(r, 900));
+
+test("hub with an owners-only listing: a person is listed their sites with a note; a name taken by a site they don't own is looked up", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  const stub = await startStub({ listing: "owners", sites: listingSites() });
+  const { dir, site } = makeSiteDir({ "index.html": "<!doctype html><title>T</title>takeover" });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  await context.addCookies([{ name: "user", value: "alice@acme.com", url: stub.url }]);
+  try {
+    const { page, problems } = await open(context, stub.url + "/");
+    await page.waitForSelector(".site");
+    // Her own site and the ownerless one she created; the count keeps its form.
+    assert.deepEqual(await siteNames(page), ["mine", "legacy"]);
+    assert.equal(await page.textContent("#site-count"), "(2)");
+    assert.equal(await page.textContent("#sites-note"), "Only your sites are listed.");
+    assert.equal(await page.isVisible("#sites-note"), true);
+    const [title, note] = await page.$$eval(["#sites-title", "#sites-note"].join(","), (els) => els.map((e) => JSON.parse(JSON.stringify(e.getBoundingClientRect()))));
+    assert.ok(note.top >= title.bottom && note.top - title.bottom < 12 && Math.abs(note.left - title.left) < 1, `the note is right under the heading: ${JSON.stringify({ title, note })}`);
+    assert.equal(await page.isHidden("#sites-empty"), true);
+    await settle();
+    assert.deepEqual(lookups(stub), [], "nothing is looked up before a name is typed");
+
+    // A name the list leaves out is looked up (debounced) with the visitor's own session.
+    await page.click("#site-name");
+    await page.keyboard.type("theirs");
+    await page.waitForFunction((want) => document.getElementById("site-hint").textContent === want, TAKEN_HINT);
+    const asked = lookups(stub);
+    assert.equal(asked[asked.length - 1], "theirs");
+    assert.ok(asked.length < "theirs".length, "debounced, not one lookup per key: " + asked);
+    const req = stub.state.requests.find((q) => q.path === "/deploy/sites/theirs");
+    assert.deepEqual([req.headers.accept, req.headers["x-backyard"], req.headers.authorization], ["application/json", "1", undefined]);
+    assert.match(req.headers.cookie, /(^|; )user=alice@acme\.com($|;)/);
+    // A free name (404) and a listed one (no lookup) keep today's texts.
+    const free = page.waitForResponse((r) => r.url().endsWith("/__backyard/api/deploy/sites/fresh-name"));
+    await page.fill("#site-name", "fresh-name");
+    assert.equal((await free).status(), 404);
+    await settle();
+    assert.equal(await page.textContent("#site-hint"), NEW_HINT);
+    await page.fill("#site-name", "mine");
+    assert.equal(await page.textContent("#site-hint"), "Updates the existing site (last deployed by alice@acme.com, 1 hour ago).");
+    await settle();
+    assert.equal(lookups(stub).includes("mine"), false, "a listed site is not looked up");
+
+    // A slower, older lookup is aborted and never overrides a newer name's hint.
+    let held;
+    const reached = new Promise((r) => (held = r));
+    let release;
+    const released = new Promise((r) => (release = r));
+    const failed = [];
+    page.on("requestfailed", (r) => failed.push(new URL(r.url()).pathname + " " + r.failure().errorText));
+    await page.route(
+      "**/__backyard/api/deploy/sites/theirs",
+      async (route) => {
+        held();
+        await released;
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(listingSites()[2]) }).catch(() => {});
+      },
+      { times: 1 },
+    );
+    await page.fill("#site-name", "theirs");
+    await reached;
+    const other = page.waitForResponse((r) => r.url().endsWith("/__backyard/api/deploy/sites/other-name"));
+    await page.fill("#site-name", "other-name");
+    await other;
+    release();
+    await settle();
+    assert.equal(await page.textContent("#site-hint"), NEW_HINT);
+    assert.deepEqual(failed, ["/__backyard/api/deploy/sites/theirs net::ERR_ABORTED"]);
+
+    // Deploying over the taken name is refused by the gateway (the ownership policy): nothing is overwritten.
+    await page.fill("#site-name", "theirs");
+    await page.waitForFunction((want) => document.getElementById("site-hint").textContent === want, TAKEN_HINT);
+    await page.setInputFiles("#folder-input", site);
+    await page.waitForFunction(() => !document.getElementById("deploy-btn").disabled);
+    assert.equal(await page.inputValue("#site-name"), "theirs", "a typed name is kept");
+    await page.click("#deploy-btn");
+    await page.waitForSelector("#deploy-error:not([hidden])");
+    assert.equal(await page.textContent("#deploy-error"), "site theirs is owned by bob@acme.com; only owners and admins can change it");
+    assert.equal(stub.state.sites.find((s) => s.name === "theirs").updated_by, "bob@acme.com");
+    assert.deepEqual(problems.filter((p) => !/status of 403\b/.test(p)), []);
+
+    // An admin is listed every site, is told so, and nothing is looked up.
+    await context.addCookies([{ name: "user", value: "admin@acme.com", url: stub.url }]);
+    const before = lookups(stub).length;
+    const adm = await open(context, stub.url + "/");
+    await adm.page.waitForSelector(".site");
+    assert.deepEqual(await siteNames(adm.page), ["mine", "legacy", "theirs", "orphan"]);
+    assert.equal(await adm.page.textContent("#site-count"), "(4)");
+    assert.equal(await adm.page.textContent("#sites-note"), "You are an admin: every site is listed.");
+    await adm.page.fill("#site-name", "brand-new");
+    await settle();
+    assert.equal(await adm.page.textContent("#site-hint"), NEW_HINT);
+    assert.equal(lookups(stub).length, before, "an admin is listed every site: no lookup");
+    assert.deepEqual(adm.problems, []);
+  } finally {
+    await context.close();
+    await stub.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hub with an owners-only listing and none of the person's sites: the empty state; their first deploy is listed", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  const stub = await startStub({ listing: "owners", sites: listingSites() });
+  const { dir, site } = makeSiteDir({ "index.html": "<!doctype html><title>D</title>dave" });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  await context.addCookies([{ name: "user", value: "dave@acme.com", url: stub.url }]);
+  try {
+    const { page, problems } = await open(context, stub.url + "/");
+    await page.waitForSelector("#sites-empty:not([hidden])");
+    assert.equal(await page.textContent("#sites-empty"), "You don't own any sites yet. Drop a folder above to create one.");
+    assert.equal(await page.textContent("#sites-note"), "Only your sites are listed.");
+    assert.equal(await page.textContent("#site-count"), "");
+    assert.equal(await page.isHidden("#site-list"), true);
+    // Searching an empty directory says nothing about other people's sites.
+    await page.fill("#search", "theirs");
+    assert.equal(await page.textContent("#sites-empty"), "You don't own any sites yet. Drop a folder above to create one.");
+    await page.fill("#search", "");
+
+    await page.setInputFiles("#folder-input", site);
+    await page.waitForFunction(() => !document.getElementById("deploy-btn").disabled);
+    assert.equal(await page.inputValue("#site-name"), "guest-site");
+    await page.click("#deploy-btn");
+    await page.waitForSelector('.site[data-site="guest-site"].fresh');
+    assert.deepEqual(stub.state.sites.find((s) => s.name === "guest-site").owners, ["dave@acme.com"], "the deployer became the owner");
+    assert.deepEqual(await siteNames(page), ["guest-site"]);
+    assert.equal(await page.textContent("#site-count"), "(1)");
+    assert.equal(await page.textContent("#sites-note"), "Only your sites are listed.");
+    assert.equal(await page.isHidden("#sites-empty"), true);
+    assert.match(await page.textContent("#site-hint"), /^Updates the existing site \(last deployed by dave@acme\.com, just now\)\.$/);
+    assert.deepEqual(problems, []);
+  } finally {
+    await context.close();
+    await stub.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hub listing every site (site_listing all, or no field): no note, today's texts, no name lookups", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  const stub = await startStub({ sites: listingSites() });
+  const older = await startStub({ info: { site_listing: undefined } }); // a server from before the option
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  await context.addCookies([{ name: "user", value: "alice@acme.com", url: stub.url }]);
+  try {
+    const { page, problems } = await open(context, stub.url + "/");
+    await page.waitForSelector(".site");
+    assert.equal((await page.evaluate(() => fetch("/__backyard/api/info").then((r) => r.json()))).site_listing, "all");
+    assert.deepEqual(await siteNames(page), ["mine", "legacy", "theirs", "orphan"]);
+    assert.equal(await page.textContent("#site-count"), "(4)");
+    assert.equal(await page.isHidden("#sites-note"), true);
+    assert.equal(await page.textContent("#sites-note"), "");
+    await page.fill("#site-name", "theirs");
+    assert.equal(await page.textContent("#site-hint"), "Updates the existing site (last deployed by bob@acme.com, 3 hours ago).");
+    await page.click("#site-name", { clickCount: 3 });
+    await page.keyboard.type("brand-new");
+    await settle();
+    assert.equal(await page.textContent("#site-hint"), NEW_HINT);
+    assert.deepEqual(lookups(stub), [], "no lookup when every site is listed");
+
+    const old = await open(context, older.url + "/");
+    await old.page.waitForSelector("#sites-empty:not([hidden])");
+    assert.equal(await old.page.textContent("#sites-empty"), "No sites yet. Drop a folder above to create the first one.");
+    assert.equal(await old.page.isHidden("#sites-note"), true);
+    await old.page.fill("#site-name", "brand-new");
+    await settle();
+    assert.equal(await old.page.textContent("#site-hint"), NEW_HINT);
+    assert.deepEqual(lookups(older), []);
+    assert.deepEqual(problems.concat(old.problems), []);
+  } finally {
+    await context.close();
+    await Promise.all([stub.close(), older.close()]);
+  }
+});
+
 test("hub deploy to presigned storage URLs on another origin: headers verbatim; a CORS failure is explained", async (t) => {
   if (!browser) return t.skip(skipReason);
   const { dir, site } = makeSiteDir({ "index.html": "<!doctype html><title>B</title>bucket", "img/a.svg": "<svg/>" });

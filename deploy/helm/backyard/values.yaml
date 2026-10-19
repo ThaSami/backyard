@@ -79,6 +79,13 @@ config:
   # proxy, its four machine paths exempted from the proxy's login.
   # mcp:
   #   enabled: true
+  # Owners-only site listing (README: "Owners-only site listing"): the hub,
+  # `backyard sites list` and backyard_list_sites show each person only the
+  # sites they own, and admins every site. It implies sites.ownership: owner
+  # and hides sites from the directory without restricting who can open them.
+  # Servers older than this chart's image reject the key.
+  # sites:
+  #   listing: owners
 
 # Container ports; they must match config.server.listen and
 # config.telemetry.metrics_listen.

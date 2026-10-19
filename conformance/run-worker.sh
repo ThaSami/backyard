@@ -2,18 +2,22 @@
 # Run the conformance suite against the Cloudflare Workers edition under
 # `wrangler dev --env local` (npm run dev:local in deploy/cloudflare: no
 # Cloudflare login, Durable Objects and R2 simulated, temporary state):
-# once in path mode as an anonymous guest and once in host mode with the
-# DEPLOY_TOKEN, each against a fresh Worker with the Claude connector enabled
-# (MCP_ENABLED, SPEC §8.4; the suite runs with BACKYARD_CONFORMANCE_MCP=1):
+# in path mode as an anonymous guest, in host mode with the DEPLOY_TOKEN, and
+# with the owners-only site listing, each against a fresh Worker with the
+# Claude connector enabled (MCP_ENABLED, SPEC §8.4; the suite runs with
+# BACKYARD_CONFORMANCE_MCP=1):
 #
 #   path  path mode (the default) as an anonymous guest, with AI aliases
 #         backed by mock/openai.mjs through the "openai" provider
 #   host  host mode (BASE_DOMAIN=localhost) with the DEPLOY_TOKEN, with the same mock
 #         aliases but AI turned off (AI_ENABLED=false: its 501 unsupported answers, as the
 #         Go server's ai.enabled: false)
+#   listing path mode with SITE_LISTING=owners (OWNERSHIP unset, so owner) and an
+#         admin in ADMINS; runs only tests/listing.test.mjs, with API tokens the
+#         suite signs for its people and the DEPLOY_TOKEN (an admin)
 #
-#   conformance/run-worker.sh            # both passes
-#   conformance/run-worker.sh path       # one pass (path | host)
+#   conformance/run-worker.sh            # all three passes
+#   conformance/run-worker.sh path       # one pass (path | host | listing)
 #   conformance/run-worker.sh path -- --test-name-pattern=files
 #
 # Run `npm ci` in deploy/cloudflare first.
@@ -34,19 +38,21 @@ timeout="${CONFORMANCE_TIMEOUT:-180}"
 modes=""
 while [ $# -gt 0 ]; do
 	case "$1" in
-	host | path) modes="$modes $1" ;;
+	host | path | listing) modes="$modes $1" ;;
 	--)
 		shift
 		break
 		;;
 	*)
-		echo "usage: $0 [path|host]... [-- node --test args]" >&2
+		echo "usage: $0 [path|host|listing]... [-- node --test args]" >&2
 		exit 2
 		;;
 	esac
 	shift
 done
-[ -n "$modes" ] || modes="path host"
+[ -n "$modes" ] || modes="path host listing"
+# The admin of the listing pass (ADMINS); the suite signs an API token for it.
+listing_admin="listing-admin@conformance.test"
 
 log() { printf '>> %s\n' "$*" >&2; }
 fail() {
@@ -146,12 +152,15 @@ for mode in $modes; do
 			--var "BACKYARD_SECRET:$secret" --var "DEPLOY_TOKEN:$token"
 		if [ "$mode" = "host" ]; then
 			set -- "$@" --var URL_MODE:host --var BASE_DOMAIN:localhost --var AI_ENABLED:false
+		elif [ "$mode" = "listing" ]; then
+			# OWNERSHIP stays unset: owner is its default with this listing.
+			set -- "$@" --var URL_MODE:path --var SITE_LISTING:owners --var "ADMINS:$listing_admin"
 		else
 			set -- "$@" --var URL_MODE:path
 		fi
-		# Both passes get the mock aliases: in host mode they are usable too, so
-		# its 501 answers can only come from AI_ENABLED=false.
-		if [ -n "$ai_mode" ]; then
+		# The path and host passes get the mock aliases: in host mode they are
+		# usable too, so its 501 answers can only come from AI_ENABLED=false.
+		if [ -n "$ai_mode" ] && [ "$mode" != "listing" ]; then
 			set -- "$@" --var "AI_MODELS:$ai_models" --var "OPENAI_BASE_URL:http://127.0.0.1:$ai_port/v1" --var OPENAI_API_KEY:mock-key
 		fi
 		# $runner is empty or "setsid" (word splitting intended).
@@ -166,6 +175,9 @@ for mode in $modes; do
 
 	suite_token=""
 	suite_ai="$ai_mode"
+	suite_listing="all"
+	suite_admin=""
+	tests="tests/*.test.mjs"
 	who="an anonymous guest"
 	url="http://127.0.0.1:$port"
 	if [ "$mode" = "host" ]; then
@@ -174,6 +186,13 @@ for mode in $modes; do
 		suite_ai="${ai_mode:+off}"
 		who="the DEPLOY_TOKEN, with AI_ENABLED=false"
 		url="http://localhost:$port"
+	elif [ "$mode" = "listing" ]; then
+		suite_token="$token"
+		suite_ai=""
+		suite_listing="owners"
+		suite_admin="$listing_admin"
+		tests="tests/listing.test.mjs"
+		who="API tokens of the suite's people and the DEPLOY_TOKEN (an admin), only the site listing"
 	fi
 	log "running the suite ($mode mode, as $who)"
 	set +e
@@ -181,7 +200,8 @@ for mode in $modes; do
 		cd "$here"
 		BACKYARD_URL="$url" BACKYARD_TOKEN="$suite_token" BACKYARD_CONFORMANCE_AI="$suite_ai" \
 			BACKYARD_CONFORMANCE_SECRET="$secret" BACKYARD_CONFORMANCE_MCP=1 \
-			node --test --test-reporter=spec "$@" "tests/*.test.mjs"
+			BACKYARD_CONFORMANCE_LISTING="$suite_listing" BACKYARD_CONFORMANCE_ADMIN="$suite_admin" \
+			node --test --test-reporter=spec "$@" "$tests"
 	)
 	rc=$?
 	set -e

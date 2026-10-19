@@ -240,6 +240,7 @@ func checkOIDCFull(t *testing.T, c *config.Config) {
 func checkNonePath(t *testing.T, c *config.Config) {
 	eq(t, "auth.mode", c.Auth.Mode, "none")
 	eq(t, "server.url_mode", c.Server.URLMode, "path")
+	eq(t, "sites.listing", c.Sites.Listing, "all")
 	if c.AI.Enabled == nil || *c.AI.Enabled {
 		t.Error("ai must be disabled without providers")
 	}
@@ -265,6 +266,7 @@ func checkWarehouseExtra(t *testing.T, c *config.Config) {
 	// extra_config_yaml: appended verbatim, its references expanded.
 	eq(t, "identity.directory.path", c.Identity.Directory.Path, testDirectory)
 	eq(t, "sites.ownership", c.Sites.Ownership, "owner")
+	eq(t, "sites.listing", c.Sites.Listing, "owners")
 	eq(t, "sites.max_file_bytes", c.Sites.MaxFileBytes, int64(10<<20))
 	eq(t, "ratelimit.ai_per_minute", c.RateLimit.AIPerMinute, 5)
 }

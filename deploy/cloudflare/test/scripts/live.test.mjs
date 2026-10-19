@@ -11,7 +11,7 @@ import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { createApi } from "../../scripts/lib/cfapi.mjs";
-import { adopt, aiEnabledOf, authGuard, authModeOf, fillAuthFromInfo, hostOf, normalizeTeam, readLive } from "../../scripts/lib/live.mjs";
+import { adopt, aiEnabledOf, authGuard, authModeOf, fillAuthFromInfo, hostOf, normalizeTeam, readLive, siteListingOf } from "../../scripts/lib/live.mjs";
 import { parseJSONC } from "../../scripts/lib/layout.mjs";
 import { CliError } from "../../scripts/lib/ui.mjs";
 import { OAUTH_TOKEN, deployedWorker, startFakeCloudflare } from "./helpers/fake-cloudflare.mjs";
@@ -205,6 +205,48 @@ describe("AI on and off", () => {
     const noBinding = {};
     assert.deepEqual(adopt(noBinding, live({ vars: { ...BASE_VARS }, ai: false }), BASE_VARS).parts, []);
     assert.equal(noBinding.ai, undefined);
+  });
+});
+
+describe("site listing", () => {
+  it("reads SITE_LISTING like the Worker: trimmed, case-insensitive, unset = all, anything else invalid", () => {
+    for (const v of [undefined, null, "", " ", "all", " ALL "]) assert.equal(siteListingOf(v), "all", JSON.stringify(v));
+    for (const v of ["owners", " Owners "]) assert.equal(siteListingOf(v), "owners", JSON.stringify(v));
+    for (const v of ["owner", "none", "true", "mine"]) assert.equal(siteListingOf(v), null, JSON.stringify(v));
+  });
+
+  it("adopts SITE_LISTING as the remembered choice, never as a variable", () => {
+    const owners = {};
+    const r = adopt(owners, live({ vars: { ...BASE_VARS, SITE_LISTING: " Owners ", ADMINS: "a@example.com" } }), BASE_VARS);
+    assert.equal(owners.siteListing, "owners");
+    assert.deepEqual(owners.vars, { ADMINS: "a@example.com" }, "SITE_LISTING is managed by setup --site-listing");
+    assert.deepEqual(r.parts, ["owners-only site listing", "variables ADMINS"]);
+    assert.deepEqual(r.warnings, []);
+    // An invalid value (the Worker refuses every request) is never read as every site.
+    const invalid = {};
+    const w = adopt(invalid, live({ vars: { ...BASE_VARS, SITE_LISTING: "mine" } }), BASE_VARS);
+    assert.equal(invalid.siteListing, "owners");
+    assert.equal(invalid.vars, undefined);
+    assert.match(w.warnings.join("\n"), /SITE_LISTING="mine" is neither all nor owners \(the Worker refuses every request\): adopted as --site-listing owners/);
+    // all, written out or not: nothing to remember.
+    for (const vars of [{ ...BASE_VARS, SITE_LISTING: "all" }, { ...BASE_VARS }]) {
+      const all = {};
+      assert.deepEqual(adopt(all, live({ vars }), BASE_VARS).parts, []);
+      assert.equal(all.siteListing, undefined);
+      assert.equal(all.vars, undefined);
+    }
+  });
+
+  it("does not take OWNERSHIP \"none\", the written-out default of earlier releases, for an override", () => {
+    assert.equal(BASE_VARS.OWNERSHIP, undefined, "wrangler.jsonc leaves OWNERSHIP unset (none, or owner with SITE_LISTING=owners)");
+    const legacy = {};
+    assert.deepEqual(adopt(legacy, live({ vars: { ...BASE_VARS, OWNERSHIP: "none" } }), BASE_VARS).parts, []);
+    assert.equal(legacy.vars, undefined);
+    for (const v of ["owner", "None"]) {
+      const kept = {};
+      adopt(kept, live({ vars: { ...BASE_VARS, OWNERSHIP: v } }), BASE_VARS);
+      assert.deepEqual(kept.vars, { OWNERSHIP: v }, v);
+    }
   });
 });
 

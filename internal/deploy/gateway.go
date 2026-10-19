@@ -275,8 +275,9 @@ func (g *Gateway) info(base string) Info {
 			MaxFiles:     c.Sites.MaxFiles,
 			MaxFileBytes: c.Sites.MaxFileBytes,
 		},
-		Auth:   AuthInfo{Mode: c.Auth.Mode, AnonymousDeploy: g.anonymousDeploy()},
-		MCPURL: g.opts.MCPURL,
+		Auth:        AuthInfo{Mode: c.Auth.Mode, AnonymousDeploy: g.anonymousDeploy()},
+		SiteListing: sites.Listing(c),
+		MCPURL:      g.opts.MCPURL,
 	}
 	if gw := strings.TrimSuffix(c.Deploy.GatewayURL, "/"); gw != "" {
 		inf.GatewayURL = gw

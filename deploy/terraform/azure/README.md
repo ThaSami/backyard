@@ -334,6 +334,12 @@ single quotes or line breaks; the variables validate this).
   (`identity`, `warehouse`, `sites`, `files`, `ratelimit`, `realtime`, `mcp`), e.g.
   `sites:\n  ownership: owner\n`. Reference secrets as `${VAR}` and pass them
   with `extra_secret_env` (e.g. a warehouse DSN); plain values go in `extra_env`.
+* **Owners-only site listing:** `extra_config_yaml = "sites:\n  listing: owners\n"`
+  shows each person only the sites they own in the hub, `backyard sites list` and
+  `backyard_list_sites` (admins see every site); it implies `ownership: owner`
+  ([owners-only site listing](../../docs/deploying-sites.md#owners-only-site-listing)).
+  Servers older than the option refuse the key, so set it with an `image` of a
+  release that has it.
 * Terraform state contains the generated secrets — keep it in a private,
   encrypted backend.
 * Rotating `BACKYARD_SECRET` (`terraform apply -replace=module.backyard.random_password.backyard_secret`)

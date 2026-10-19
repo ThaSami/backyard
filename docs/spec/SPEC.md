@@ -130,15 +130,15 @@ Hub host:
 
 | Path | Purpose |
 |---|---|
-| `/` | hub UI: site directory/search (in the grid view each site card shows the site's preview image, §3, or a placeholder of the same size), drag-and-drop deploy, and side cards with CLI setup instructions, agent instructions and the Claude connector (§8.4.7), collapsible and collapsed by default |
+| `/` | hub UI: site directory/search of the sites listed to the viewer (§7.2 "Listing"; in the grid view each site card shows the site's preview image, §3, or a placeholder of the same size), drag-and-drop deploy, and side cards with CLI setup instructions, agent instructions and the Claude connector (§8.4.7), collapsible and collapsed by default. With `site_listing: "owners"` (§7.1) the directory says that only the viewer's sites are listed (to an admin: that every site is), and the deploy form looks up a name it does not list with `GET G/sites/{site}` to tell a name taken by someone else's site from a free one |
 | `/docs` | API docs (renders `skills/backyard/references/api.md`) |
 | `/docs/skill.md`, `/docs/<ref>.md`, `/docs/references/<ref>.md` | the skill documents as `text/markdown` |
 | `/llms.txt`, `/llms-full.txt` | agent-oriented docs (SKILL.md; SKILL.md + all references) |
 | `/__backyard/backyard.{js,mjs,d.ts}` | SDK (hub UI uses it too) |
 | `/__backyard/api/info` | server info (§7.1, same as deploy `info`) |
 | `/__backyard/api/me` | current user |
-| `/__backyard/api/sites` | site list (`{sites:[SiteMeta]}`) |
-| `/__backyard/api/sites/{site}/preview` | the site's preview image (`SiteMeta.preview`, §7.2; served as in §3) |
+| `/__backyard/api/sites` | site list (`{sites:[SiteMeta]}`): the sites listed to the caller (§7.2 "Listing") |
+| `/__backyard/api/sites/{site}/preview` | the preview image (`SiteMeta.preview`, §7.2; served as in §3) of a site listed to the caller |
 | `/__backyard/api/tokens` | `POST` mint a personal API token (§8.3) |
 | `/__backyard/api/deploy/...` | embedded deploy gateway (§7) |
 | `/__backyard/api/mcp/grants` | the signed-in user's Claude connector connections; admins: anyone's (§8.4) |
@@ -219,10 +219,12 @@ script with the site's origin.
 
 **Preview images.** `GET` and `HEAD` `/__backyard/api/sites/{site}/preview`, on the hub host only
 and behind the gate of the other hub APIs (§2), serve the site file that `SiteMeta.preview` names
-(§7.2). The hub thus loads every preview from its own origin with the viewer's own credentials,
+(§7.2) for a site that the site list would list to the caller (§7.2 "Listing"). The hub thus
+loads the previews of the sites it lists from its own origin with the viewer's own credentials,
 in both URL modes and in every auth mode (an identity proxy such as Cloudflare Access in front
 included), without fetching anything from site hosts. The answer is `404 not_found` (§5
-envelope) when the site does not exist (an invalid name included), its SiteMeta has no
+envelope) when the site does not exist (an invalid name included), is not listed to the caller
+(with `sites.listing: owners`: the same answer, so it tells nothing apart), its SiteMeta has no
 `preview`, the file is no longer stored, the file's extension is not one of the preview types
 below, or the stored file is larger than 1 MiB (the cap of §7.2 holds when serving too); other
 methods get `405` with `Allow` like every API route. A `200` carries the file's bytes and:
@@ -652,7 +654,8 @@ proxy identity is accepted as well (used by the hub's drag-and-drop deploy).
             "anonymous_deploy": false },
   "storage": { "type": "s3", "bucket": "acme-backyard", "prefix": "", "region": "us-east-1" },
   "methods": ["api", "s3"],
-  "limits": { "max_site_bytes": 524288000, "max_files": 10000, "max_file_bytes": 104857600 } }
+  "limits": { "max_site_bytes": 524288000, "max_files": 10000, "max_file_bytes": 104857600 },
+  "site_listing": "all" }
 ```
 
 `storage` reveals only what direct-sync clients need (`type`, `bucket`/`container`, `account`,
@@ -661,17 +664,19 @@ present in the `oidc`, `iap`, `alb` and `header` modes; `auth.device` whenever
 `auth.oidc.issuer` and `auth.oidc.device_client_id` are set (in any mode);
 `auth.anonymous_deploy` (bool) is true when deploys need no token (`auth.mode: none` +
 `deploy.allow_anonymous`). `gateway_url` is `deploy.gateway_url` when set. `rsync_target` is
-omitted when empty. The Cloudflare edition adds `"edition": "cloudflare"`. While the Claude
-connector is enabled (§8.4), the hub's embedded gateway adds `"mcp_url": "<R>"`, the remote MCP
-endpoint `<public_url>/__backyard/mcp` (§14.1); it is omitted when the connector is disabled and
-on standalone gateways.
+omitted when empty. `site_listing` (always present, standalone gateways included) is `"all"` or
+`"owners"`: the effective `sites.listing` (Worker `SITE_LISTING`, §16), which decides to whom the
+site lists show a site (§7.2 "Listing"). The Cloudflare edition adds `"edition": "cloudflare"`.
+While the Claude connector is enabled (§8.4), the hub's embedded gateway adds `"mcp_url": "<R>"`,
+the remote MCP endpoint `<public_url>/__backyard/mcp` (§14.1); it is omitted when the connector is
+disabled and on standalone gateways.
 
 ### 7.2 Sites
 
 * `GET G/me` → `User` (auth required — anonymous when anonymous deploys are allowed; lets CLIs
   verify a token)
-* `GET G/sites` → `{"sites": [SiteMeta]}`
-* `GET G/sites/{site}` → `SiteMeta` | 404
+* `GET G/sites` → `{"sites": [SiteMeta]}`: the sites listed to the caller ("Listing" below)
+* `GET G/sites/{site}` → `SiteMeta` | 404, for every site, listed to the caller or not
 * `GET G/sites/{site}/files` → `{"files": [{"path","size","sha256"?,"updated_at"}]}`
 * `GET G/sites/{site}/files/{path…}` → raw bytes (for `backyard pull` / agents reading other sites)
 * `DELETE G/sites/{site}` → `204` (ownership policy applies; admins always allowed)
@@ -683,6 +688,38 @@ updated_by, deploy_id, file_count, bytes, owners: []}`, with the keys in this or
 editions; `title`, `description`, `preview`, `created_by`, `updated_by` and `deploy_id` are
 omitted when empty. `deploy_id` here is a short opaque id of the last deploy (`d_<hex>`), not the
 signed deploy token.
+
+**Listing.** `sites.listing` (Worker `SITE_LISTING`, §16; reported as `site_listing` by §7.1)
+decides which sites the site directories return to a caller: the hub's
+`GET /__backyard/api/sites` and its preview route (§2, §3), `GET G/sites` (embedded and
+standalone gateways, hence `backyard sites list` and the `backyard mcp` tool
+`backyard_list_sites`) and the connector's `backyard_list_sites` (§14.1). With `all` (the
+default) they return every site to everyone who passes their gate, as without the option. With
+`owners` a site is listed to a caller only when the caller is not anonymous and
+
+1. is an admin — the gateway's rule: `auth.admins` ∪ members of `auth.admin_groups` (§8) and
+   static tokens with `admin: true`; on the Worker `ADMINS` / `ADMIN_GROUPS` and the
+   `DEPLOY_TOKEN` user `token:deploy`; a guest never is one;
+2. is one of the site's `owners`, by id or email (case-insensitive, as the ownership policy
+   matches); or
+3. the site has no owners and its `created_by` is the caller's id or email (case-insensitive), so
+   sites created before the option stay listed to whoever created them (their next deploy by a
+   signed-in user makes that user the owner, §7.3).
+
+The sites not listed are left out; nothing else in the answers changes (no new keys, and no count
+of what was left out). A site without SiteMeta (a direct sync before its refresh, §13) has neither
+owners nor `created_by`, so only admins see it until then; the Go server's dev sites
+(`backyard dev`) are always listed. A guest (auth mode `none`) is listed no site at all.
+`owners` implies ownership: an empty `sites.ownership` becomes `owner` (Worker: `OWNERSHIP` unset
+or `owner`), and `sites.listing: owners` with `sites.ownership: none` is a configuration error
+(§12; the Worker fails closed, §16), because owners are recorded only in ownership mode and a
+directory that hides a site must not let others overwrite it by name unnoticed. Listing is **not
+access control**:
+`GET G/sites/{site}`, `GET G/sites/{site}/files[/…]`, the site API's `GET /site` (§5.1), the site
+itself and its uploads, and the connector's `backyard_site_files` and `backyard_read_site_file`
+answer for every site as before — the CLI's and `backyard mcp`'s overwrite checks, `backyard pull`,
+dry-run plans and the hub's deploy form rely on them — and deploys, refreshes, `DELETE`, `owners`
+and `backyard_publish` keep their own rules (the ownership policy, §7.3, §14.1).
 
 `title`, `description` and `preview` are derived from the site's files whenever the site's files
 are written — a deploy commit, a refresh, a `backyard_publish` (§14.1) — from the files the site
@@ -785,8 +822,10 @@ actor (anonymous: per client IP).
 `auth.mode`: `none` | `oidc` | `iap` | `alb` | `header` (`okta`, `entra`, `azuread`, `azure-ad`,
 `google`, `auth0`, `keycloak`, `openid` are aliases of `oidc`; `off`/`disabled`/empty mean
 `none`). In all modes, `Authorization: Bearer` Backyard API tokens and static tokens are also
-accepted (API + deploy), and admins are `auth.admins` ∪ members of `auth.admin_groups`. Optional
-gates (admins pass them): `auth.allowed_domains` / `auth.allowed_emails` — when either is set,
+accepted (API + deploy), and admins are `auth.admins` ∪ members of `auth.admin_groups` (they
+may delete any site, overwrite any in ownership mode, and are listed every site with
+`sites.listing: owners`, §7.2). Optional gates (admins pass them): `auth.allowed_domains` /
+`auth.allowed_emails` — when either is set,
 the user's verified email must have a listed domain or be a listed address (case-insensitive) —
 and `auth.allowed_groups` (403 otherwise). A bearer token is tried first; if it is invalid the
 mode's own credentials are tried, and the bearer error is reported only when those are absent
@@ -1493,7 +1532,8 @@ Cloudflare edition's Access bypass list is in §16.
 | `_meta/manifests/<site>.json` | `{"site","updated_at","files":[{"path","size","sha256","etag"}]}` |
 | `uploads/<site>/<id>/<name>` | user uploads (§5.3) and generated images |
 
-Sites known to the hub = `_meta/sites/*` ∪ first-level prefixes under `sites/`.
+Sites known to the hub = `_meta/sites/*` ∪ first-level prefixes under `sites/` (which of them a
+caller is listed: §7.2 "Listing").
 Site names: `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`, not in `sites.reserved`
 (default: `www, api, admin, hub, auth, static, assets, cdn, docs, mail, backyard, s`).
 
@@ -1583,8 +1623,10 @@ rules of §2.
 Validation reports every problem at once and also rejects inconsistent combinations, among
 them `auth.mode: oidc` with `url_mode: host` unless `base_domain` can carry a cookie `Domain`
 (not `localhost`, `*.localhost`, an IP address or a single-label name) and the host of
-`public_url` is `base_domain` or one of its subdomains (§8.1), and `deploy.allow_anonymous`
-without `auth.mode: none`.
+`public_url` is `base_domain` or one of its subdomains (§8.1), `deploy.allow_anonymous`
+without `auth.mode: none`, and `sites.listing: owners` with `sites.ownership: none` (an empty
+`sites.ownership` defaults to `owner` with that listing, `none` otherwise; §7.2 "Listing").
+`sites.listing` must be `all` (the default) or `owners`.
 
 The Claude connector (§8.4) is configured in the `mcp` section: `mcp.enabled` (default
 `false`), `mcp.clients` (the allowlisted client metadata document URLs; default the two Claude
@@ -1835,7 +1877,9 @@ URLs or the server secret.
 * `backyard_list_sites` (`query`: case-insensitive substring of name, title or description) →
   `{"sites":[{"name","url","title"?,"description"?,"updated_at"?,"updated_by"?,"file_count","bytes","owners"?}],"total":<matches>,"truncated":<bool>}`,
   most recently updated first, then by name; `owners` only with ownership `owner`; no other keys
-  (no `preview`).
+  (no `preview`). Only the sites listed to the user (§7.2 "Listing") are matched, so with
+  `sites.listing: owners` `total` and `truncated` count the user's visible sites and say nothing
+  about the others (a guest gets `{"sites":[],"total":0,"truncated":false}`).
 * `backyard_site_files` → `{"site","url","files":[{"path","size"}],"total","truncated"}`, what
   is served, sorted by path.
 * `backyard_read_site_file` checks, in order: the site exists (E22), the path is valid (E8), the
@@ -2006,6 +2050,20 @@ storage are available on free); R2 and paid features are optional.
   accounts without Workers AI. The flag wins: while AI is off `AI_ENABLED` is a managed
   variable (`--var AI_ENABLED:…` is refused, exit 2); with AI on, `--var AI_ENABLED:false`
   turns only the endpoints off and keeps the binding.
+* **Site listing** (§7.2 "Listing"): `SITE_LISTING` (trimmed, case-insensitive) is the
+  counterpart of the Go server's `sites.listing`: unset, empty or `all` lists every site;
+  `owners` lists a site only to its owners, to its creator while it has none, and to admins. With
+  `owners`, `OWNERSHIP` unset or `owner` means ownership `owner`. Any other `SITE_LISTING` value,
+  and any other `OWNERSHIP` value alongside `SITE_LISTING=owners`, **fails closed** like an
+  unknown `AUTH_MODE` (every request except `/__backyard/healthz` answers `503`, and
+  `/__backyard/readyz` names the variables), because falling back to `all` would list every site.
+  Without `owners` the parsing of `OWNERSHIP` is unchanged. The engine's
+  `setup --site-listing owners` (remembered in its state as `"siteListing": "owners"`; absent
+  means `all`, and `--site-listing all` lists every site again) deploys with
+  `SITE_LISTING=owners`, and with `all` without the variable. The flag wins: `SITE_LISTING` is a
+  managed variable (a `--var SITE_LISTING:…` that contradicts the flag or the remembered choice
+  is refused, exit 2), and with `owners` a remembered or given `--var OWNERSHIP:` other than
+  `owner` is refused too (exit 2).
 * **Warehouse:** not available on Cloudflare (`501 unsupported`) unless `WAREHOUSE_URL` points
   to a Backyard Go server's warehouse API (proxy) — optional.
 * **Auth:** `AUTH_MODE` = `none` (anonymous cookie identity; deploys need `DEPLOY_TOKEN` unless
@@ -2066,9 +2124,14 @@ storage are available on free); R2 and paid features are optional.
   source. `domain add <host> [--host-mode]` and `access enable` add the custom domain and
   Cloudflare Access; deploys (setup and the CI deployer) never change routes or custom domains,
   and refuse to turn a live Access off unless confirmed. Every deploy of the engine (`setup`,
-  `domain add`/`remove`, `access enable`/`disable`) keeps the remembered choices, `--no-ai`
-  included. The Terraform module's `ai_enabled` (default true) puts `--ai` or `--no-ai` into its
-  `setup_args`. `/info` (§7.1) reports the build
+  `domain add`/`remove`, `access enable`/`disable`) keeps the remembered choices, `--no-ai` and
+  `--site-listing` included. The Terraform module's `ai_enabled` (default true) puts `--ai` or
+  `--no-ai` into its `setup_args`, and its `site_listing` (`all`, the default, or `owners`)
+  always puts `--site-listing <value>` there, so setting it back to `all` takes effect. The CI
+  deployer (`scripts/cloudflare-ci.mjs`) is declarative and has its own switch,
+  `BACKYARD_CF_SITE_LISTING` (`owners` sets `SITE_LISTING=owners` and refuses an `OWNERSHIP`
+  other than `owner`; empty or `all` sets nothing; any other value, and `SITE_LISTING` in
+  `BACKYARD_CF_VARS` or the deploy arguments, is an error). `/info` (§7.1) reports the build
   version (the release version, `<package version>-dev` for checkout builds). GitHub Actions
   example included.
 
@@ -2086,3 +2149,12 @@ MCP gate, the tools and the grants API. It is skipped when `/info` has no `mcp_u
 pass and set that variable. The Go runner adds an `oidc` pass: the server in `auth.mode: oidc`
 against a mock OpenID Connect provider (`conformance/mock/idp.mjs`), which signs two people in
 without a page, running only `tests/mcp.test.mjs`.
+
+`tests/listing.test.mjs` covers the site listing (§7.2 "Listing") with Backyard API tokens that
+the suite signs for its own people (the runners hand it the server's secret,
+`BACKYARD_CONFORMANCE_SECRET`). Both runners add a `listing` pass that runs only that file: a
+fresh server with `sites.listing: owners` (Worker `SITE_LISTING=owners`; ownership by its default)
+and one admin (`auth.admins`, `ADMINS`), where it checks who is listed which site in the hub's
+list, `GET G/sites`, the preview route and the connector's `backyard_list_sites`, and that the
+lookups by name still answer. In every other pass it checks `site_listing: "all"`: a site is
+listed to everyone.

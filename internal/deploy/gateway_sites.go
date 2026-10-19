@@ -28,8 +28,11 @@ func (g *Gateway) handleMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, u)
 }
 
+// handleListSites serves GET /sites: the sites listed to the caller
+// (sites.listing, sites.Listed). Lookups by name are not filtered.
 func (g *Gateway) handleListSites(w http.ResponseWriter, r *http.Request) {
-	if _, aerr := g.authenticate(w, r, accessRead); aerr != nil {
+	u, aerr := g.authenticate(w, r, accessRead)
+	if aerr != nil {
 		writeError(w, r, g.log, aerr)
 		return
 	}
@@ -38,6 +41,7 @@ func (g *Gateway) handleListSites(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, g.log, internalErr(err))
 		return
 	}
+	list = sites.FilterListed(g.cfg, u, list)
 	if list == nil {
 		list = []sites.Meta{}
 	}

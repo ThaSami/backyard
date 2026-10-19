@@ -61,8 +61,16 @@
     // Comma-separated admin emails / Access group names (admins may delete any site).
     "ADMINS": "",
     "ADMIN_GROUPS": "",
-    // "none" (anyone may overwrite a site, the Quick way) or "owner".
-    "OWNERSHIP": "none",
+    // "none" (anyone may overwrite a site, the Quick way) or "owner" (the first
+    // deployer owns a site; only its owners and admins may change or delete it).
+    // Unset = none, or owner with SITE_LISTING=owners (any other value fails closed then).
+    // "OWNERSHIP": "owner",
+    // "owners" lists a site in the hub, GET /sites and backyard_list_sites only to its
+    // owners (its creator while it has none) and admins; unset or "all" lists every
+    // site. It hides sites from the directory, it does not restrict who may open one
+    // by its URL. Any other value fails closed (503). `setup --site-listing owners`
+    // sets it.
+    // "SITE_LISTING": "owners",
     // Name shown in the hub.
     "SERVER_NAME": "Backyard",
     // "false" turns AI off: every /__backyard/api/ai/* endpoint answers 501 unsupported

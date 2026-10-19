@@ -27,7 +27,14 @@ export interface Env {
   ALLOW_ANONYMOUS_DEPLOY?: string;
   ADMINS?: string;
   ADMIN_GROUPS?: string;
+  /** "none" or "owner"; unset = none, or owner with SITE_LISTING=owners. */
   OWNERSHIP?: string;
+  /**
+   * "owners" lists a site only to its owners (its creator while it has none)
+   * and to admins, like the Go server's sites.listing: owners (SPEC §7.2
+   * "Listing"); unset, empty or "all" lists every site.
+   */
+  SITE_LISTING?: string;
   SERVER_NAME?: string;
   /** Extra reserved site names (comma separated), added to the defaults. */
   RESERVED_SITES?: string;

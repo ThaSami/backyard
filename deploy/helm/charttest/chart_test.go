@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/thasami/backyard/internal/config"
 )
 
 // chartDir is the chart, relative to this package.
@@ -332,4 +334,70 @@ networkPolicy:
 			}
 		})
 	}
+}
+
+// configYAML returns the backyard.yaml that the chart's ConfigMap holds.
+func configYAML(t *testing.T, docs []map[string]any) string {
+	t.Helper()
+	cms := ofKind(docs, "ConfigMap")
+	if len(cms) != 1 {
+		t.Fatalf("%d ConfigMaps rendered, want 1", len(cms))
+	}
+	raw, _ := get(cms[0], "data", "backyard.yaml").(string)
+	if raw == "" {
+		t.Fatal("the ConfigMap has no backyard.yaml")
+	}
+	return raw
+}
+
+// TestSiteListing: config.sites.listing reaches the server's backyard.yaml
+// as it is, and the server loads it with the ownership it implies.
+func TestSiteListing(t *testing.T) {
+	load := func(t *testing.T, overlays ...string) *config.Config {
+		t.Helper()
+		docs, err := render(t, overlays...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := configYAML(t, docs)
+		cfg, err := config.Parse([]byte(raw))
+		if err != nil {
+			t.Fatalf("the rendered backyard.yaml does not parse: %v\n%s", err, raw)
+		}
+		cfg.Server.Secret = "0123456789abcdef0123456789abcdef" // BACKYARD_SECRET in the pod
+		cfg.ApplyDefaults()
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("the server rejects the rendered backyard.yaml: %v\n%s", err, raw)
+		}
+		return cfg
+	}
+
+	t.Run("off by default", func(t *testing.T) {
+		cfg := load(t)
+		if cfg.Sites.Listing != "all" || cfg.Sites.Ownership != "none" {
+			t.Errorf("sites.listing/ownership = %q/%q, want all/none", cfg.Sites.Listing, cfg.Sites.Ownership)
+		}
+	})
+
+	t.Run("owners implies ownership", func(t *testing.T) {
+		cfg := load(t, "config: {sites: {listing: owners}}")
+		if cfg.Sites.Listing != "owners" || cfg.Sites.Ownership != "owner" {
+			t.Errorf("sites.listing/ownership = %q/%q, want owners/owner", cfg.Sites.Listing, cfg.Sites.Ownership)
+		}
+	})
+
+	t.Run("production values", func(t *testing.T) {
+		prod, err := os.ReadFile(filepath.Join(chartDir, "values-production.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		docs, err := render(t, string(prod), "config: {sites: {listing: owners}}")
+		if err != nil {
+			t.Fatal(err)
+		}
+		sites := get(toYAMLValue(t, configYAML(t, docs)), "sites")
+		if !reflect.DeepEqual(sites, toYAMLValue(t, "{ownership: owner, listing: owners}")) {
+			t.Errorf("sites = %v, want the production ownership plus listing: owners", sites)
+		}
+	})
 }

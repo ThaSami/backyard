@@ -152,6 +152,7 @@ run "warehouse_extra" {
           path: $${DIRECTORY_PATH}
       sites:
         ownership: owner
+        listing: owners
         max_file_bytes: 10485760
       ratelimit:
         ai_per_minute: 5

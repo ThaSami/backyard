@@ -794,6 +794,13 @@ label.check input {
   margin: 0;
   font-size: 20px;
 }
+.sites-heading {
+  min-width: 0;
+}
+/* Which sites the list shows (an owners-only listing, SPEC §7.2). */
+.sites-note {
+  margin: 2px 0 0;
+}
 .count {
   color: var(--fg-muted);
   font-weight: 500;

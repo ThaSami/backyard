@@ -13,7 +13,9 @@
 // gets the release's own bytes, with provenance (public repositories only),
 // from npm-publish.yml, which the release calls and maintainers can run by hand.
 //
-// cloudflare-deploy.yml: only a manual run can confirm an auth downgrade.
+// cloudflare-deploy.yml: only a manual run can confirm an auth downgrade, and
+// the deploy step passes every repository variable the CI deployer reads its
+// settings from.
 //
 // The files are read as text (no YAML dependency): jobs are the two-space
 // indented keys under `jobs:`, steps the six-space indented list items.
@@ -488,4 +490,17 @@ test("the Cloudflare deploy workflow confirms auth changes per manual run only, 
   assert.doesNotMatch(wf, /vars\.BACKYARD_CF_CONFIRM_AUTH_CHANGE/, "a repository variable would outlive the run and disable the guard for push deploys");
   assert.match(wf.slice(0, wf.indexOf("\non:")), /^# .*confirm_auth_change/m, "documented in the header");
   assert.doesNotMatch(wf, /BACKYARD_CF_API_TOKEN/, "the CI deployer never gets the admin token");
+});
+
+test("the Cloudflare deploy workflow passes every setting the CI deployer reads, from repository variables", () => {
+  const wf = workflows["cloudflare-deploy.yml"];
+  const ci = read("scripts", "cloudflare-ci.mjs");
+  const deploy = job("deploy", "cloudflare-deploy.yml");
+  const step = steps(deploy)[stepIndex(steps(deploy), "node scripts/cloudflare-ci.mjs deploy", "deploying")];
+  const header = wf.slice(0, wf.indexOf("\non:"));
+  for (const name of ["BACKYARD_CF_WORKER_NAME", "BACKYARD_CF_VARS", "BACKYARD_CF_R2_BUCKET", "BACKYARD_CF_AI", "BACKYARD_CF_SITE_LISTING", "BACKYARD_CF_DEPLOY_ARGS"]) {
+    assert.ok(ci.includes(`env.${name}`), `scripts/cloudflare-ci.mjs no longer reads ${name} (update this test)`);
+    assert.match(step, new RegExp(`^ {10}${name}: \\$\\{\\{ vars\\.${name} \\}\\}$`, "m"), `the deploy step passes ${name}`);
+    assert.match(header, new RegExp(`^#   vars\\.${name} `, "m"), `the header documents vars.${name}`);
+  }
 });

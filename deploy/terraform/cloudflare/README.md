@@ -63,9 +63,9 @@ terraform init && terraform apply
 
 # 3. Point the Worker at the domain and turn on Access verification (remembered by setup).
 terraform output -raw setup_command
-#   npm run setup -- --worker-name backyard --ai --var ACCESS_AUD:… --var ACCESS_TEAM_DOMAIN:acme.cloudflareaccess.com
-#                    --var AUTH_MODE:access --var BASE_DOMAIN:backyard.example.com --var MCP_ENABLED:false
-#                    --var URL_MODE:path
+#   npm run setup -- --worker-name backyard --ai --site-listing all --var ACCESS_AUD:…
+#                    --var ACCESS_TEAM_DOMAIN:acme.cloudflareaccess.com --var AUTH_MODE:access
+#                    --var BASE_DOMAIN:backyard.example.com --var MCP_ENABLED:false --var URL_MODE:path
 cd ../../../../cloudflare && <run it>          # in a checkout of deploy/cloudflare
 
 # 4. Sign in from the CLI (browser login through Access).
@@ -88,7 +88,13 @@ keeps the variables it is not given, so the module never leaves this one out). L
 always include `--ai` or `--no-ai`: `ai_enabled = false` deploys without the Workers AI binding
 and with `AI_ENABLED=false`, so every AI call of the sites answers `501 unsupported` (for an
 account where Workers AI is not available), and setting it back to `true` turns AI on again at
-the next `setup` (setup remembers `--no-ai` until it is given `--ai`).
+the next `setup` (setup remembers `--no-ai` until it is given `--ai`). And they always include
+`--site-listing all` or `--site-listing owners`: `site_listing = "owners"` lists each site only to
+its owners and admins in the hub, `GET /sites` and the Claude connector (it implies
+`OWNERSHIP=owner`; it hides sites from the directory and is not access control, since anyone who
+may open sites can still open one by its URL), and setting it back to `"all"` lists every site
+again at the next `setup` (see
+[Owners-only site listing](../../cloudflare/README.md#owners-only-site-listing)).
 
 These variables are then managed by Terraform: `setup` deploys and remembers them, and the
 CLI's `domain add` and `access enable` refuse to take them over (exit 2, with how to drop them
@@ -167,6 +173,7 @@ domains, so they leave the module's alone. Leave `routes` out of `wrangler.jsonc
 | `bypass_paths` | gateway + token minting + health + the Claude connector's four machine paths (nine paths) | Paths below `/__backyard/` (or one of the two OAuth discovery documents) that skip Access. |
 | `mcp_enabled` | `false` | Turn on the [Claude connector](../../../docs/claude-connector.md): `MCP_ENABLED=true` in `worker_vars` and `setup_args` (`false` otherwise, which turns a connector that was on off at the next `setup`). |
 | `ai_enabled` | `true` | Serve AI to sites: `--ai` in `setup_args`. `false` puts `--no-ai` there instead: no Workers AI binding and `AI_ENABLED=false`, so every AI endpoint answers `501 unsupported` (for an account without Workers AI); back to `true`, the next `setup` turns AI on again. |
+| `site_listing` | `"all"` | Who sees each site in the site lists: `all` (everyone) or `owners` (its owners and admins; implies `OWNERSHIP=owner`; not access control). `setup_args` always carry `--site-listing <value>`, so `"all"` lists every site again at the next `setup`. |
 | `okta_account_url`, `okta_client_id`, `okta_client_secret`, `okta_authorization_server_id`, `okta_idp_name` | `""` | Create an Okta identity provider. |
 | `okta_identity_provider_id` | `""` | Existing Okta provider for `allowed_okta_groups`. |
 
@@ -179,7 +186,7 @@ domains, so they leave the module's alone. Leave `routes` out of `wrangler.jsonc
 | `access_team_domain` | `<team>.cloudflareaccess.com`, used as the Worker's `ACCESS_TEAM_DOMAIN`. |
 | `okta_identity_provider_id` | Okta provider id (created or passed in). |
 | `worker_vars` | Map of the Worker variables for this setup. |
-| `setup_args` | The arguments of `setup` that apply them: `--worker-name <worker> --ai\|--no-ai --var KEY:VALUE …`, for `backyard cloudflare setup` or `npx backyard-cloudflare setup`. |
+| `setup_args` | The arguments of `setup` that apply them: `--worker-name <worker> --ai\|--no-ai --site-listing all\|owners --var KEY:VALUE …`, for `backyard cloudflare setup` or `npx backyard-cloudflare setup`. |
 | `setup_command` | The `npm run setup -- <setup_args>` command that applies them in a checkout. |
 
 ## Tests

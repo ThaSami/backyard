@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -210,7 +211,9 @@ func isDirErr(fsys fs.FS, name string) bool {
 	return err == nil && st.IsDir()
 }
 
-// handleSites serves GET /__backyard/api/sites (hub).
+// handleSites serves GET /__backyard/api/sites (hub): the sites listed to
+// the viewer (sites.listing, sites.Listed), plus the dev sites, which are
+// always listed.
 func (s *Server) handleSites(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := opCtx(r)
 	defer cancel()
@@ -222,6 +225,13 @@ func (s *Server) handleSites(w http.ResponseWriter, r *http.Request) {
 		}
 		s.writeAPIError(w, r, errInternal(err, "listing sites failed"))
 		return
+	}
+	if sites.Listing(s.cfg) == sites.ListingOwners {
+		u := info(r).user
+		list = slices.DeleteFunc(list, func(m sites.Meta) bool {
+			_, dev := s.devSites[m.Name]
+			return !dev && !sites.Listed(s.cfg, u, &m)
+		})
 	}
 	if list == nil {
 		list = []sites.Meta{}

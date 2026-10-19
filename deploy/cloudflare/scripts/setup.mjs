@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 // `backyard-cloudflare setup`: deploys (or upgrades) Backyard on your
 // Cloudflare account, free plan included. Safe to re-run: every choice is kept
-// (secrets, the deploy token, R2, AI, the domain, Access, --var overrides), and a
-// machine without state adopts the deployed configuration first.
+// (secrets, the deploy token, R2, AI, the site listing, the domain, Access, --var
+// overrides), and a machine without state adopts the deployed configuration first.
 //
 //   setup                          log in (browser) if needed, register the account's
 //                                  workers.dev subdomain if it has none, deploy, set secrets
 //                                  (and an R2 bucket for big files when R2 is enabled)
 //   setup --no-r2                  never use R2 (files capped at 25 MiB)
 //   setup --no-ai                  turn AI off: no Workers AI binding, AI_ENABLED=false (--ai: on again)
+//   setup --site-listing owners    list each site only to its owners and admins: SITE_LISTING=owners,
+//                                  which implies OWNERSHIP=owner (--site-listing all: every site again)
 //   setup --worker-name team       deploy under another Worker name
 //   setup --var LIMITS:'{"ai_per_day":50}'   override a variable (remembered; KEY: drops it)
 //   setup --rotate-token           issue a new DEPLOY_TOKEN
@@ -37,7 +39,7 @@ import { fileURLToPath } from "node:url";
 
 import { GO_CLI_INVOCATION } from "./cli.mjs";
 import { CfError } from "./lib/cfapi.mjs";
-import { MANAGED_ACCESS_KEYS, MANAGED_AI_KEYS, MANAGED_DOMAIN_KEYS, aiEnabledOf, hostOf } from "./lib/live.mjs";
+import { MANAGED_ACCESS_KEYS, MANAGED_AI_KEYS, MANAGED_DOMAIN_KEYS, MANAGED_LISTING_KEYS, aiEnabledOf, authModeOf, hostOf, siteListingOf } from "./lib/live.mjs";
 import { probe } from "./lib/net.mjs";
 import { CliError, EXIT, bold, cyan, dim, green, isCI, maskSecret, revealSecrets, ui, yellow } from "./lib/ui.mjs";
 
@@ -121,6 +123,55 @@ function refuseAIVar(overrides, aiOff, inv) {
       throw new CliError(EXIT.USAGE, `${k} is managed by \`${inv} setup --no-ai\` while AI is off (\`${inv} setup --ai\` turns AI back on)`);
     }
   }
+}
+
+/**
+ * The site listing remembered in the state: "owners" after `setup
+ * --site-listing owners`, else "all". A SITE_LISTING override that an earlier
+ * version remembered counts as what the Worker reads from it (an invalid
+ * value as owners, which the Worker never reads as all); setup drops it.
+ * @param {Record<string, any>} state
+ * @returns {"all" | "owners"}
+ */
+function rememberedListing(state) {
+  if (state.siteListing === "owners") return "owners";
+  const v = state.vars?.SITE_LISTING;
+  return v === undefined ? "all" : siteListingOf(v) ?? "owners";
+}
+
+/**
+ * Refuses (exit 2) what contradicts the site listing of this run (--site-listing,
+ * else the remembered one): a --var SITE_LISTING with another value (the flag
+ * manages the variable, see managedVars), and with owners-only listing an
+ * OWNERSHIP other than owner from --var, a remembered override or the base
+ * configuration (owners are recorded only with OWNERSHIP=owner, and the
+ * Worker refuses every request otherwise).
+ * @param {Record<string, string>} overrides   the --var flags
+ * @param {"all" | "owners"} listing
+ * @param {Record<string, any>} state
+ * @param {Record<string, unknown>} baseVars
+ * @param {string} inv
+ */
+function refuseListingVars(overrides, listing, state, baseVars, inv) {
+  for (const k of MANAGED_LISTING_KEYS) {
+    if (!Object.hasOwn(overrides, k)) continue;
+    const want = siteListingOf(overrides[k]);
+    if (want !== listing) {
+      const other = want ?? (listing === "all" ? "owners" : "all");
+      throw new CliError(EXIT.USAGE, `${k} is managed by \`${inv} setup --site-listing\`: the site listing is ${listing} (\`${inv} setup --site-listing ${other}\` changes it)`);
+    }
+  }
+  if (listing !== "owners") return;
+  const passed = Object.hasOwn(overrides, "OWNERSHIP") && overrides.OWNERSHIP !== "";
+  const remembered = !Object.hasOwn(overrides, "OWNERSHIP") && state.vars?.OWNERSHIP !== undefined;
+  const raw = passed ? overrides.OWNERSHIP : remembered ? state.vars.OWNERSHIP : baseVars.OWNERSHIP;
+  const text = typeof raw === "string" ? raw : raw === undefined || raw === null ? "" : JSON.stringify(raw);
+  const o = text.trim().toLowerCase();
+  if (o === "" || o === "owner") return;
+  const needs = "the owners-only site listing, which needs OWNERSHIP=owner (its default with --site-listing owners; owners are recorded only then)";
+  if (passed) throw new CliError(EXIT.USAGE, `--var OWNERSHIP:${text} contradicts ${needs}: leave OWNERSHIP out, or pass --var OWNERSHIP:owner`);
+  if (remembered) throw new CliError(EXIT.USAGE, `the remembered --var OWNERSHIP:${text} contradicts ${needs}: drop it with --var OWNERSHIP:`);
+  throw new CliError(EXIT.USAGE, `the base configuration (wrangler.jsonc) sets OWNERSHIP=${text}, which contradicts ${needs}: pass --var OWNERSHIP:owner`);
 }
 
 /**
@@ -274,6 +325,9 @@ export async function runSetup(opts, ctx) {
   if (opts.workersSubdomain !== undefined && !SUBDOMAIN_RE.test(opts.workersSubdomain)) {
     throw new CliError(EXIT.USAGE, `invalid workers.dev subdomain ${JSON.stringify(opts.workersSubdomain)} (a-z, 0-9 and -, at most 63 characters)`);
   }
+  if (opts.siteListing !== undefined && opts.siteListing !== "all" && opts.siteListing !== "owners") {
+    throw new CliError(EXIT.USAGE, `--site-listing must be all or owners (got ${JSON.stringify(opts.siteListing)})`);
+  }
   if (opts.dryRun && (opts.skipDeploy || opts.rotateToken || opts.rotateSecret)) {
     throw new CliError(EXIT.USAGE, "--dry-run changes nothing: it cannot be combined with --skip-deploy, --rotate-token or --rotate-secret");
   }
@@ -283,6 +337,10 @@ export async function runSetup(opts, ctx) {
   const aiChoice = opts.noAi ? false : opts.ai ? true : undefined;
   /** Whether AI is off for this run: --no-ai, or remembered and no --ai. */
   const aiOff = (state) => aiChoice === false || (aiChoice === undefined && state.ai === false);
+  /** @type {"all" | "owners" | undefined} */
+  const listingChoice = opts.siteListing;
+  /** The site listing of this run: --site-listing, else the remembered one. */
+  const listingOf = (state) => listingChoice ?? rememberedListing(state);
   const baseVars = ctx.base.vars ?? {};
 
   if (opts.dryRun) {
@@ -290,12 +348,14 @@ export async function runSetup(opts, ctx) {
     const state = ctx.loadState();
     refuseManagedVars(overrides, state, inv);
     refuseAIVar(overrides, aiOff(state), inv);
+    refuseListingVars(overrides, listingOf(state), state, baseVars, inv);
     const vars = { ...(state.vars ?? {}) };
     for (const [k, v] of Object.entries(overrides)) {
       if (v === "") delete vars[k];
       else vars[k] = v;
     }
-    const view = { ...state, vars, ai: aiOff(state) ? false : undefined };
+    for (const k of MANAGED_LISTING_KEYS) delete vars[k];
+    const view = { ...state, vars, ai: aiOff(state) ? false : undefined, siteListing: listingOf(state) === "owners" ? "owners" : undefined };
     if (opts.workersDev) view.workersDev = true;
     if (opts.noWorkersDev) view.workersDev = false;
     const bucket = r2Choice === false ? "" : opts.r2Bucket || (state.r2 !== false ? state.r2Bucket : "") || (r2Choice ? `${w}-files` : "");
@@ -309,6 +369,7 @@ export async function runSetup(opts, ctx) {
   const previousUrl = state.url ?? "";
   refuseManagedVars(overrides, state, inv);
   refuseAIVar(overrides, aiOff(state), inv);
+  refuseListingVars(overrides, listingOf(state), state, baseVars, inv);
 
   await ctx.login(state);
   const api = await ctx.api();
@@ -316,9 +377,12 @@ export async function runSetup(opts, ctx) {
   // The live Worker: adopted by a machine without state, checked by the guard.
   const live = await ctx.readLive();
   if (ctx.adopt(state, live)) externalizeAdopted(state, overrides, baseVars);
-  // An adopted --no-ai makes AI_ENABLED managed: refuse a --var for it now,
-  // before the workers.dev subdomain or the R2 bucket is touched.
+  // An adopted --no-ai makes AI_ENABLED managed, and an adopted owners-only
+  // listing (or OWNERSHIP) is checked like a remembered one: refuse a --var
+  // that contradicts them now, before the workers.dev subdomain or the R2
+  // bucket is touched.
   refuseAIVar(overrides, aiOff(state), inv);
+  refuseListingVars(overrides, listingOf(state), state, baseVars, inv);
 
   // The account's workers.dev subdomain (registered when there is none), once
   // the adopted setting and the flags are known: a Worker that does not serve
@@ -365,6 +429,13 @@ export async function runSetup(opts, ctx) {
   // for it was refused above, right after adoption).
   state.ai = aiOff(state) ? false : undefined;
 
+  // Owners-only site listing (--site-listing owners, remembered as "siteListing":
+  // "owners"; --site-listing all removes it). SITE_LISTING is managed (see
+  // managedVars), so no override of it is kept (a contradicting --var was
+  // refused above).
+  const listing = listingOf(state);
+  state.siteListing = listing === "owners" ? "owners" : undefined;
+
   // Variable overrides: remembered across runs, an empty value drops one.
   refuseManagedVars(overrides, state, inv);
   const vars = { ...(state.vars ?? {}) };
@@ -378,6 +449,11 @@ export async function runSetup(opts, ctx) {
       delete vars[k];
       ui.note(`Dropped the ${k} override: with AI off (--no-ai) setup sets ${k}=false itself.`);
     }
+  }
+  for (const k of MANAGED_LISTING_KEYS) {
+    if (vars[k] === undefined) continue;
+    delete vars[k];
+    ui.note(`Dropped the ${k} override: setup --site-listing sets ${k} itself (the site listing is ${listing}).`);
   }
   state.vars = Object.keys(vars).length ? vars : undefined;
   if (opts.noWorkersDev) {
@@ -447,6 +523,10 @@ export async function runSetup(opts, ctx) {
   if (state.ai === false) ui.note("AI is off (--ai turns it on): the AI endpoints answer 501 unsupported.");
   else if (!aiEnabledOf(d.vars.AI_ENABLED)) ui.note("AI is off: AI_ENABLED is false (--var AI_ENABLED: drops it); the Workers AI binding stays.");
   else ui.note("AI runs on Workers AI (free daily allowance); caps: --var LIMITS:'{\"ai_per_day\":50}'.");
+  if (state.siteListing === "owners") {
+    const guests = authModeOf(d.vars.AUTH_MODE) === "access" ? "" : " Without company login visitors are anonymous guests and see no sites.";
+    ui.note(`Site listing: owners only (--site-listing all lists every site).${guests}`);
+  }
   const noR2 = state.r2 === false ? "R2 is off (--r2 turns it on)" : `enable R2 on the account and re-run ${inv} setup for files up to 95 MiB`;
   ui.note(`Files: ${bucket ? `R2 bucket ${bucket} for files above FILE_INLINE_MAX` : `stored in Durable Objects (25 MiB per file); ${noR2}`}.`);
   if (!state.domain) ui.note(`Your own domain: ${inv} domain add <host>`);

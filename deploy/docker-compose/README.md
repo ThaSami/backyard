@@ -140,6 +140,24 @@ reaches the server from `160.79.104.0/21`, so the four machine paths (`/__backya
 identity-aware proxy, exempt exactly those from its login and keep
 `/__backyard/auth/authorize` behind it.
 
+### Owners-only site listing (optional)
+
+The hub, `backyard sites list` and `backyard_list_sites` show every site to everyone by
+default. To show each person only the sites they own (admins, such as the `deploy` token, see
+every site), set `BACKYARD_SITE_LISTING=owners` in `.env` and uncomment the `sites` block of
+`backyard.yaml`:
+
+```yaml
+sites:
+  listing: ${BACKYARD_SITE_LISTING:-all}
+```
+
+then `docker compose up -d`. It implies site ownership (the first deployer owns a site; only
+its owners and admins may redeploy or delete it) and hides sites from the directory without
+restricting who can open them. It is meant for a sign-in (step 4): with `auth.mode: none`
+every browser is a guest and is listed no site. Images older than the option refuse the key, so move `BACKYARD_IMAGE` to a release that
+has it first. Details: [owners-only site listing](../../docs/deploying-sites.md#owners-only-site-listing).
+
 ### 5. Start and upgrade
 
 ```sh

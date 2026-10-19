@@ -63,10 +63,11 @@ security review. Backyard removes all of that:
 - **Client SDK** (`/__backyard/backyard.js`): `backyard.db` (JSON documents, queries, change
   feeds, live queries), `backyard.files`, `backyard.ai` (chat, streaming, images, embeddings),
   `backyard.warehouse` (read-only SQL), `backyard.socket` (rooms with presence), `backyard.id`.
-- **Hub**: a searchable directory of every site with a preview image the site ships
-  ([`preview.svg` or `og:image`](docs/deploying-sites.md#site-preview), loaded through the hub
-  so it works behind Access or Okta), drag-and-drop deploys, collapsible CLI and agent setup
-  cards, API docs at `/docs` and `/llms.txt` for agents.
+- **Hub**: a searchable directory of every site — or, opt-in, of each person's own sites
+  ([owners-only listing](docs/deploying-sites.md#owners-only-site-listing)) — with a preview
+  image the site ships ([`preview.svg` or `og:image`](docs/deploying-sites.md#site-preview),
+  loaded through the hub so it works behind Access or Okta), drag-and-drop deploys, collapsible
+  CLI and agent setup cards, API docs at `/docs` and `/llms.txt` for agents.
 - **Sign-in**: Okta / any OIDC provider, Google IAP, AWS ALB, trusted proxy headers (oauth2-proxy,
   Pomerium, Azure Easy Auth, Cloudflare Access), or none for labs; API tokens, static CI tokens
   and the OAuth device flow for CLIs.
@@ -80,8 +81,9 @@ security review. Backyard removes all of that:
 - **Pluggable everything**: storage (disk, S3, GCS, Azure Blob), database (SQLite, PostgreSQL,
   DynamoDB), realtime fan-out (in-memory, Postgres, Redis), any AI provider, BigQuery /
   Redshift / Postgres / Athena.
-- **Enterprise-ready**: admin groups, allowed domains and groups, optional site ownership, rate
-  limits and quotas, audit logs, Prometheus metrics, health checks, horizontal scaling.
+- **Enterprise-ready**: admin groups, allowed domains and groups, optional site ownership and
+  owners-only site listing, rate limits and quotas, audit logs, Prometheus metrics, health
+  checks, horizontal scaling.
 - **Runs anywhere**: AWS, Google Cloud, Azure, Kubernetes, one VM without a bucket — or
   Cloudflare's free tier with no server at all.
 

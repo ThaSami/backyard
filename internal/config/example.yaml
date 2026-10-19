@@ -159,6 +159,11 @@ warehouse:
 sites:
   # none: anyone can overwrite any site (Quick philosophy) | owner: first deployer owns it
   ownership: none
+  # all (default): the hub, `backyard sites list` and the connector list every site |
+  # owners: people see only the sites they own, admins see every site (needs ownership:
+  # owner, its default then). It hides sites from the directory: anyone who may open
+  # sites can still open one by its URL.
+  # listing: owners
   # max_site_bytes: 524288000
   # max_files: 10000
 

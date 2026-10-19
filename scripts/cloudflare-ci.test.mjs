@@ -22,6 +22,7 @@ import {
   effectiveConfig,
   hubURL,
   parseAISwitch,
+  parseSiteListing,
   isMissingWorker,
   parseDeployArgs,
   parseJSONC,
@@ -167,6 +168,20 @@ test("effectiveConfig without AI drops the binding and sets AI_ENABLED", () => {
   assert.equal("ai" in got, false, "no Workers AI binding");
   assert.deepEqual(got.vars, { URL_MODE: "path", AI_ENABLED: "false" });
   assert.deepEqual(base.ai, { binding: "AI", remote: true }, "input is not modified");
+  assert.deepEqual(base.vars, { URL_MODE: "path" }, "input vars are not modified");
+});
+
+test("parseSiteListing", () => {
+  for (const v of [undefined, "", " ", "all", " ALL "]) assert.equal(parseSiteListing(v), "all", `${JSON.stringify(v)} lists every site`);
+  for (const v of ["owners", " Owners "]) assert.equal(parseSiteListing(v), "owners", JSON.stringify(v));
+  for (const v of ["owner", "true", "none", "mine"]) assert.throws(() => parseSiteListing(v), /BACKYARD_CF_SITE_LISTING must be "all" or "owners"/);
+});
+
+test("effectiveConfig with owners-only listing sets SITE_LISTING", () => {
+  const base = { name: "backyard", vars: { URL_MODE: "path" } };
+  assert.equal(effectiveConfig(base, { listing: "all" }), null, "every site (the default) changes nothing");
+  const got = effectiveConfig(base, { listing: "owners" });
+  assert.deepEqual(got.vars, { URL_MODE: "path", SITE_LISTING: "owners" });
   assert.deepEqual(base.vars, { URL_MODE: "path" }, "input vars are not modified");
 });
 
@@ -442,6 +457,47 @@ test("deploy: BACKYARD_CF_AI=false deploys without the Workers AI binding", asyn
   const bad = fixture({}, { config });
   bad.env.BACKYARD_CF_AI = "off";
   await assert.rejects(deploy({ env: bad.env, log: quiet }), /BACKYARD_CF_AI must be "true" or "false"/);
+});
+
+test("deploy: BACKYARD_CF_SITE_LISTING=owners sets SITE_LISTING, and refuses what contradicts it", async () => {
+  const owners = fixture({ exists: true, secrets: ["BACKYARD_SECRET", "DEPLOY_TOKEN"] });
+  owners.env.BACKYARD_CF_SITE_LISTING = "owners";
+  owners.env.BACKYARD_CF_VARS = '{"OWNERSHIP":"owner"}';
+  const log = recorder();
+  await deploy({ env: owners.env, log });
+  const cfg = parseJSONC(owners.state().config);
+  assert.equal(cfg.vars.SITE_LISTING, "owners");
+  assert.equal(cfg.vars.OWNERSHIP, "owner");
+  assert.match(log.text(), /Site listing: owners only \(BACKYARD_CF_SITE_LISTING=owners\)/);
+
+  // Empty or "all" (the default) sets nothing: wrangler.jsonc deploys as is.
+  for (const value of ["", "all"]) {
+    const all = fixture({ exists: true, secrets: ["BACKYARD_SECRET", "DEPLOY_TOKEN"] });
+    all.env.BACKYARD_CF_SITE_LISTING = value;
+    await deploy({ env: all.env, log: quiet });
+    const d = all.state().calls.find((c) => c.args[0] === "deploy");
+    assert.ok(!d.args.includes("--config"), `${JSON.stringify(value)}: no generated config`);
+  }
+
+  // The switch owns SITE_LISTING; with owners, OWNERSHIP may only be owner (also in wrangler.jsonc).
+  const refusals = [
+    [{ BACKYARD_CF_VARS: '{"SITE_LISTING":"owners"}' }, /SITE_LISTING is set by BACKYARD_CF_SITE_LISTING/],
+    [{ BACKYARD_CF_SITE_LISTING: "owners", BACKYARD_CF_DEPLOY_ARGS: "--var SITE_LISTING:all" }, /SITE_LISTING is set by BACKYARD_CF_SITE_LISTING/],
+    [{ BACKYARD_CF_SITE_LISTING: "owners", BACKYARD_CF_VARS: '{"OWNERSHIP":"none"}' }, /BACKYARD_CF_SITE_LISTING=owners needs OWNERSHIP=owner \(its default then\), but BACKYARD_CF_VARS sets OWNERSHIP to "none"/],
+    [{ BACKYARD_CF_SITE_LISTING: "owners", BACKYARD_CF_VARS: '{"OWNERSHIP":"owner"}', BACKYARD_CF_DEPLOY_ARGS: "--var OWNERSHIP:none" }, /but BACKYARD_CF_DEPLOY_ARGS sets OWNERSHIP to "none"/],
+    [{ BACKYARD_CF_SITE_LISTING: "mine" }, /BACKYARD_CF_SITE_LISTING must be "all" or "owners", not "mine"/],
+  ];
+  for (const [set, re] of refusals) {
+    const clash = fixture({ exists: true, secrets: ["BACKYARD_SECRET"] });
+    Object.assign(clash.env, set);
+    await assert.rejects(deploy({ env: clash.env, log: quiet }), re, JSON.stringify(set));
+    assert.deepEqual(clash.state().calls, [], `${JSON.stringify(set)}: refused before wrangler runs`);
+  }
+  const config = `{\n  "name": "backyard",\n  "main": "src/index.ts",\n  "vars": { "URL_MODE": "path", "AUTH_MODE": "none", "OWNERSHIP": "none" },\n}\n`;
+  const legacy = fixture({ exists: true, secrets: ["BACKYARD_SECRET"] }, { config });
+  legacy.env.BACKYARD_CF_SITE_LISTING = "owners";
+  await assert.rejects(deploy({ env: legacy.env, log: quiet }), /but wrangler\.jsonc sets OWNERSHIP to "none"/);
+  assert.deepEqual(legacy.state().calls, []);
 });
 
 test("deploy: an existing R2 bucket is fine, other R2 errors fail", async () => {

@@ -35,7 +35,7 @@ import { authErrorPage, cliConfirmPage, formActionSource, tokenPage } from "./pa
 import { previewType } from "./preview";
 import { redirect, siteNameError, siteURL, type RequestContext } from "./router";
 import { apiGate, dispatch, finishObject, forwardInit } from "./site-api";
-import { siteMetaJSON } from "./sitemeta";
+import { filterListed, listedTo, siteMetaJSON } from "./sitemeta";
 import { registry, siteStub } from "./stubs";
 
 /** Dispatches a request for the hub (ctx.kind === "hub"). */
@@ -78,8 +78,9 @@ const HUB_ROUTES = [
   { method: "DELETE", re: /^\/mcp\/grants\/([^/]+)$/, h: revokeMcpGrant },
 ];
 
-async function listSites(ctx: RequestContext): Promise<Response> {
-  const list = unwrap(await registry(ctx.env).listSites());
+/** GET /__backyard/api/sites: the sites listed to the viewer (SITE_LISTING, listedTo). */
+async function listSites(ctx: RequestContext, u: User): Promise<Response> {
+  const list = filterListed(ctx.cfg, u, unwrap(await registry(ctx.env).listSites()));
   return json({ sites: list.map((r) => siteMetaJSON(r, siteURL(ctx, r.name))) });
 }
 
@@ -88,14 +89,16 @@ async function listSites(ctx: RequestContext): Promise<Response> {
  * (SPEC §3, §7.2), from the hub's own origin, so that it loads with the
  * credentials of the site list in both URL modes and every auth mode. The
  * SiteDO serves the file typed by its extension and sandboxed (PREVIEW_CSP);
- * an R2-backed one is streamed here. A non-empty v makes it immutable.
+ * an R2-backed one is streamed here. A non-empty v makes it immutable. A
+ * site the site list does not show to the viewer (SITE_LISTING) answers as
+ * one without a preview.
  */
-async function sitePreview(ctx: RequestContext, _u: User, [site = ""]: string[]): Promise<Response> {
+async function sitePreview(ctx: RequestContext, u: User, [site = ""]: string[]): Promise<Response> {
   const none = () => notFound(`site ${JSON.stringify(truncate(site, 100))} has no preview`);
   // A name that cannot be a site wakes no Durable Object.
   if (siteNameError(site, null)) throw none();
   const rec = unwrap(await registry(ctx.env).getSite(site));
-  if (!rec?.preview || !previewType(rec.preview)) throw none();
+  if (!rec?.preview || !previewType(rec.preview) || !listedTo(ctx.cfg, u, rec)) throw none();
   const qs = new URLSearchParams({ path: rec.preview });
   if (hasVersion(ctx.url.search)) qs.set("versioned", "1");
   const res = await siteStub(ctx.env, site).fetch(`https://site/preview?${qs}`, forwardInit(ctx));

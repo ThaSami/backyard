@@ -4,8 +4,14 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/thasami/backyard/internal/config"
 	"github.com/thasami/backyard/scripts/tfrender"
 )
+
+// ownersListing names the runs of tests/module.tftest.hcl whose
+// extra_config_yaml turns on the owners-only site listing; every other run
+// keeps the default.
+var ownersListing = map[string]bool{"containerapp_edge_okta_vnet": true}
 
 // TestRenderedConfigsLoad renders the module's test scenarios and loads the
 // Container App's configuration of each one.
@@ -20,13 +26,26 @@ func TestRenderedConfigsLoad(t *testing.T) {
 	sort.Strings(names)
 	for _, name := range names {
 		run := runs[name]
-		t.Run(name, func(t *testing.T) { checkContainerApp(t, run) })
+		t.Run(name, func(t *testing.T) {
+			cfg := checkContainerApp(t, run)
+			switch {
+			case ownersListing[name] && (cfg.Sites.Listing != "owners" || cfg.Sites.Ownership != "owner"):
+				t.Errorf("sites.listing/ownership = %q/%q, want owners/owner", cfg.Sites.Listing, cfg.Sites.Ownership)
+			case !ownersListing[name] && cfg.Sites.Listing != "all":
+				t.Errorf("sites.listing = %q, want the default all", cfg.Sites.Listing)
+			}
+		})
+	}
+	for name := range ownersListing {
+		if _, ok := runs[name]; !ok {
+			t.Errorf("tests/module.tftest.hcl has no run %q: the owners-only site listing went unchecked", name)
+		}
 	}
 }
 
 // checkContainerApp loads BACKYARD_CONFIG_YAML of the backyard container
 // with its plain and secret-backed environment variables.
-func checkContainerApp(t *testing.T, run *tfrender.Run) {
+func checkContainerApp(t *testing.T, run *tfrender.Run) *config.Config {
 	app := run.Resource("azurerm_container_app.this")
 	if app == nil {
 		t.Fatal("no azurerm_container_app.this in the state")
@@ -65,4 +84,5 @@ func checkContainerApp(t *testing.T, run *tfrender.Run) {
 	if cfg.Database.Type != "postgres" || cfg.PubSub.Type != "postgres" {
 		t.Errorf("database/pubsub = %s/%s, want postgres/postgres (replicas share both)", cfg.Database.Type, cfg.PubSub.Type)
 	}
+	return cfg
 }

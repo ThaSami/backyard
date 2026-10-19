@@ -43,8 +43,10 @@ func (a *cliApp) newSitesListCommand() *cobra.Command {
 		Use:     "list [filter]",
 		Aliases: []string{"ls"},
 		Short:   "List sites",
-		Long:    "List all sites (optionally only those whose name, title or description contains filter).",
-		Args:    cobra.MaximumNArgs(1),
+		Long: "List the sites you can see (optionally only those whose name, title or description contains filter). " +
+			"That is every site, unless the server lists each site only to its owners and admins; " +
+			"`backyard sites info <name>` finds any site by name.",
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := context.WithTimeout(cmd.Context(), apiTimeout)
 			defer cancel()
@@ -67,6 +69,12 @@ func (a *cliApp) newSitesListCommand() *cobra.Command {
 				return a.printJSON(map[string]any{"sites": list})
 			}
 			if len(list) == 0 {
+				// The server may list only the caller's own sites (SPEC §7.2).
+				if inf, err := a.fetchInfo(ctx, c); err == nil && inf.SiteListing == sites.ListingOwners {
+					a.errf("You don't own any sites yet: this server lists each site only to its owners and admins " +
+						"(`backyard sites info <name>` finds any site). Create one with `backyard init` and publish it with `backyard deploy`.\n")
+					return nil
+				}
 				a.errf("No sites yet. Create one with `backyard init` and publish it with `backyard deploy`.\n")
 				return nil
 			}

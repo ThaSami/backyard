@@ -28,6 +28,10 @@ name: Deploy to Cloudflare
 #   vars.BACKYARD_CF_R2_BUCKET     optional R2 bucket for files above 5 MiB (created if missing)
 #   vars.BACKYARD_CF_AI            "false" turns AI off (like `setup --no-ai`): no Workers AI
 #                                  binding, for accounts without Workers AI (default: on)
+#   vars.BACKYARD_CF_SITE_LISTING  "owners" lists each site only to its owners and admins
+#                                  (like `setup --site-listing owners`; it hides sites from the
+#                                  directory, anyone who may open sites can still open one by
+#                                  its URL). Default "all": every site is listed
 #   vars.BACKYARD_CF_DEPLOY_ARGS   optional extra `wrangler deploy` arguments
 #   vars.BACKYARD_CF_AUTO_DEPLOY   "true" to deploy on every push to main that changes
 #                                  the Worker, the SDK, the hub or the agent docs
@@ -42,6 +46,9 @@ name: Deploy to Cloudflare
 # R2 bucket (`backyard cloudflare status`; by default <worker>-files), set
 # vars.BACKYARD_CF_R2_BUCKET to it: a deploy without it removes the R2 binding,
 # and the files stored in R2 answer 500 until a deploy binds the bucket again.
+# And when `setup --site-listing owners` lists sites only to their owners (the
+# "Site listing:" line of `backyard cloudflare status`), set
+# vars.BACKYARD_CF_SITE_LISTING to owners: a deploy without it lists every site.
 # Deploys from here always serve on workers.dev (workers_dev in wrangler.jsonc),
 # even after `setup --no-workers-dev`.
 #
@@ -135,6 +142,7 @@ jobs:
           BACKYARD_CF_VARS: ${{ vars.BACKYARD_CF_VARS }}
           BACKYARD_CF_R2_BUCKET: ${{ vars.BACKYARD_CF_R2_BUCKET }}
           BACKYARD_CF_AI: ${{ vars.BACKYARD_CF_AI }}
+          BACKYARD_CF_SITE_LISTING: ${{ vars.BACKYARD_CF_SITE_LISTING }}
           BACKYARD_CF_DEPLOY_ARGS: ${{ vars.BACKYARD_CF_DEPLOY_ARGS }}
           # Only a manual run can confirm (inputs is empty on push).
           BACKYARD_CF_CONFIRM_AUTH_CHANGE: ${{ inputs.confirm_auth_change && 'true' || '' }}

@@ -768,6 +768,25 @@ describe("backyard-cloudflare domain remove", () => {
   });
 });
 
+describe("site listing", () => {
+  it("keeps owners-only listing (setup --site-listing owners) in the deploys of domain add and domain remove", async () => {
+    const sb = await newSandbox({ state: { siteListing: "owners" } });
+    seedWorker(sb, { SITE_LISTING: "owners" });
+    let r = await sb.run(["domain", "add", "backyard.example.com", "--wait", "0"]);
+    assert.equal(r.code, 0, r.out);
+    let d = deployOf(sb.calls());
+    assert.equal(d.config.vars.SITE_LISTING, "owners");
+    assert.equal(d.config.vars.BASE_DOMAIN, "backyard.example.com");
+    assert.equal(sb.state().siteListing, "owners");
+    r = await sb.run(["domain", "remove", "--yes"]);
+    assert.equal(r.code, 0, r.out);
+    d = deployOf(sb.calls());
+    assert.equal(d.config.vars.SITE_LISTING, "owners");
+    assert.equal(d.config.vars.BASE_DOMAIN, "");
+    assert.equal(sb.state().siteListing, "owners");
+  });
+});
+
 describe("domain helpers", () => {
   it("normalizes host names, lists zone candidates and names the wildcard record", () => {
     assert.equal(parseHost("Backyard.Example.COM."), "backyard.example.com");

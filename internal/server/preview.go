@@ -21,7 +21,8 @@ const (
 // in every URL and auth mode. The file is site content on the hub's
 // origin: its type comes from its extension alone and it is sandboxed
 // (sites.PreviewCSP), so an SVG can neither run script nor load anything.
-// Dev sites have no stored preview.
+// Dev sites have no stored preview, and a site the site list does not show
+// to the viewer (sites.listing) answers as one without a preview.
 func (s *Server) handleSitePreview(w http.ResponseWriter, r *http.Request) {
 	site := r.PathValue("site")
 	noPreview := func() {
@@ -46,7 +47,7 @@ func (s *Server) handleSitePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ct := sites.PreviewType(m.Preview)
-	if ct == "" {
+	if ct == "" || !sites.Listed(s.cfg, info(r).user, m) {
 		noPreview()
 		return
 	}

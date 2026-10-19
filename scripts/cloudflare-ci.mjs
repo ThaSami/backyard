@@ -26,6 +26,11 @@
 //                             has no Workers AI binding and AI_ENABLED is "false"
 //                             (then BACKYARD_CF_VARS and BACKYARD_CF_DEPLOY_ARGS may
 //                             not set AI_ENABLED). Empty or "true": AI on (default)
+//   BACKYARD_CF_SITE_LISTING  "owners" lists each site only to its owners and admins, like
+//                             `setup --site-listing owners`: SITE_LISTING is "owners", which
+//                             implies OWNERSHIP=owner (so OWNERSHIP, when set, must be
+//                             "owner"). Empty or "all": every site is listed (default).
+//                             BACKYARD_CF_VARS and BACKYARD_CF_DEPLOY_ARGS never set SITE_LISTING
 //   BACKYARD_CF_DEPLOY_ARGS   extra `wrangler deploy` arguments (split on spaces)
 //   BACKYARD_CF_DIR           the Worker project (default: deploy/cloudflare)
 //   BACKYARD_CF_WAIT_SECONDS  how long to wait for /__backyard/readyz (default 60, 0 = skip)
@@ -170,6 +175,19 @@ export function parseAISwitch(raw) {
 }
 
 /**
+ * Parses BACKYARD_CF_SITE_LISTING: "all" (every site is listed, the default;
+ * empty or unset) or "owners" (SITE_LISTING=owners, like `setup --site-listing
+ * owners`).
+ * @returns {"all" | "owners"}
+ */
+export function parseSiteListing(raw) {
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (v === "" || v === "all") return "all";
+  if (v === "owners") return "owners";
+  throw new CIError(`BACKYARD_CF_SITE_LISTING must be "all" or "owners", not ${JSON.stringify(String(raw))}`);
+}
+
+/**
  * Parses BACKYARD_CF_VARS: a JSON object of Worker variables. Non-string
  * values (numbers, booleans, objects such as LIMITS) are JSON-encoded, since
  * Worker variables are strings. Secret names are refused: variables are
@@ -254,11 +272,12 @@ export function hasRoutes(config) {
 /**
  * Builds the effective wrangler configuration: wrangler.jsonc with variable
  * overrides and the optional R2 binding, without the Workers AI binding and
- * with AI_ENABLED=false when ai is false, and never routes (a deploy must not
- * attach or move routes and custom domains). Returns null when nothing changes.
+ * with AI_ENABLED=false when ai is false, with SITE_LISTING=owners when
+ * listing is "owners", and never routes (a deploy must not attach or move
+ * routes and custom domains). Returns null when nothing changes.
  */
-export function effectiveConfig(config, { vars = {}, bucket = "", ai = true } = {}) {
-  if (!Object.keys(vars).length && !bucket && ai && !hasRoutes(config)) return null;
+export function effectiveConfig(config, { vars = {}, bucket = "", ai = true, listing = "all" } = {}) {
+  if (!Object.keys(vars).length && !bucket && ai && listing !== "owners" && !hasRoutes(config)) return null;
   const out = { ...config, vars: { ...(config.vars ?? {}), ...vars } };
   delete out.routes;
   delete out.route;
@@ -266,6 +285,7 @@ export function effectiveConfig(config, { vars = {}, bucket = "", ai = true } = 
     delete out.ai;
     out.vars.AI_ENABLED = "false";
   }
+  if (listing === "owners") out.vars.SITE_LISTING = "owners";
   if (bucket) {
     const others = (config.r2_buckets ?? []).filter((b) => b.binding !== "R2");
     out.r2_buckets = [...others, { binding: "R2", bucket_name: bucket }];
@@ -517,14 +537,29 @@ export async function deploy({ env = process.env, dryRun = false, log = console.
   const bucket = (env.BACKYARD_CF_R2_BUCKET || "").trim();
   if (bucket && !BUCKET_RE.test(bucket)) throw new CIError(`invalid R2 bucket name ${JSON.stringify(bucket)}`);
   const ai = parseAISwitch(env.BACKYARD_CF_AI);
+  const listing = parseSiteListing(env.BACKYARD_CF_SITE_LISTING);
   const vars = parseVars(env.BACKYARD_CF_VARS);
   const extraArgs = parseDeployArgs(env.BACKYARD_CF_DEPLOY_ARGS);
+  const argVars = deployArgVars(extraArgs);
   // With AI off the switch owns AI_ENABLED, so the binding and the variable never disagree.
-  if (!ai && ("AI_ENABLED" in vars || "AI_ENABLED" in deployArgVars(extraArgs))) {
+  if (!ai && ("AI_ENABLED" in vars || "AI_ENABLED" in argVars)) {
     throw new CIError("AI_ENABLED is set by BACKYARD_CF_AI=false; remove it from BACKYARD_CF_VARS and BACKYARD_CF_DEPLOY_ARGS");
   }
+  // The listing switch owns SITE_LISTING, like `setup --site-listing` does.
+  if ("SITE_LISTING" in vars || "SITE_LISTING" in argVars) {
+    throw new CIError('SITE_LISTING is set by BACKYARD_CF_SITE_LISTING ("owners", or "all"/empty for every site); remove it from BACKYARD_CF_VARS and BACKYARD_CF_DEPLOY_ARGS');
+  }
+  // Owners are recorded only with OWNERSHIP=owner (the Worker's default with SITE_LISTING=owners;
+  // any other value makes it refuse every request).
+  if (listing === "owners") {
+    const [where, own] = "OWNERSHIP" in argVars ? ["BACKYARD_CF_DEPLOY_ARGS", argVars.OWNERSHIP] : "OWNERSHIP" in vars ? ["BACKYARD_CF_VARS", vars.OWNERSHIP] : ["wrangler.jsonc", config.vars?.OWNERSHIP];
+    const o = String(own ?? "").trim().toLowerCase();
+    if (o !== "" && o !== "owner") {
+      throw new CIError(`BACKYARD_CF_SITE_LISTING=owners needs OWNERSHIP=owner (its default then), but ${where} sets OWNERSHIP to ${JSON.stringify(String(own))}: remove it there or set it to "owner"`);
+    }
+  }
   // What the Worker will run with: wrangler.jsonc < BACKYARD_CF_VARS < --var in BACKYARD_CF_DEPLOY_ARGS.
-  const merged = { ...(config.vars ?? {}), ...vars, ...deployArgVars(extraArgs), ...(ai ? {} : { AI_ENABLED: "false" }) };
+  const merged = { ...(config.vars ?? {}), ...vars, ...argVars, ...(ai ? {} : { AI_ENABLED: "false" }), ...(listing === "owners" ? { SITE_LISTING: "owners" } : {}) };
   const ci = gha(env, log);
   for (const name of SECRET_NAMES) ci.mask(env[name]);
   // wrangler uses HTTPS_PROXY; the auth guard's API calls and the readiness check only with NODE_USE_ENV_PROXY=1.
@@ -575,7 +610,7 @@ export async function deploy({ env = process.env, dryRun = false, log = console.
     if (hasRoutes(config)) {
       ci.warn("routes in wrangler.jsonc are ignored: routes and custom domains are managed by `backyard cloudflare domain add` (or Terraform), and deploys never change them");
     }
-    const effective = effectiveConfig(config, { vars, bucket, ai });
+    const effective = effectiveConfig(config, { vars, bucket, ai, listing });
     // --env= selects the top-level environment explicitly (wrangler.jsonc also
     // defines "local" for offline development).
     const args = ["deploy", "--name", worker, "--env="];
@@ -585,6 +620,7 @@ export async function deploy({ env = process.env, dryRun = false, log = console.
       args.push("--config", generatedPath);
       if (Object.keys(vars).length) log(`Variable overrides: ${Object.keys(vars).sort().join(", ")}`);
     }
+    if (listing === "owners") log("Site listing: owners only (BACKYARD_CF_SITE_LISTING=owners): each site is listed to its owners and admins.");
     if (dryRun) {
       args.push("--dry-run", "--outdir", join(work, "bundle"));
     } else if (Object.keys(plan.secrets).length) {

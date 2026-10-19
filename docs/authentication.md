@@ -51,9 +51,12 @@ An address passes when its domain is in `allowed_domains` or the address itself 
 restrict a sign-in everyone can complete — Google with personal `@gmail.com` accounts, say —
 to named people. `allowed_groups` applies on top. People outside these gates get `403`.
 
-Admins pass every gate, and can delete and (in ownership mode) overwrite any site. Everything
-else — reading and writing a site's data — is open to everyone who passes the gates: Backyard
-deliberately has no per-site ACLs (see [security](security.md)).
+Admins pass every gate, can delete and (in ownership mode) overwrite any site, and see every
+site in the directories when they list each site only to its owners (`sites.listing: owners`,
+[owners-only site listing](deploying-sites.md#owners-only-site-listing)). Everything else —
+reading and writing a site's data — is open to everyone who passes the gates: Backyard
+deliberately has no per-site ACLs, and a directory that hides sites is not one (see
+[security](security.md)).
 
 ## `oidc`: built-in OpenID Connect login
 

@@ -74,6 +74,9 @@ config:
     default_model: smart
   sites:
     ownership: owner
+    # Each person sees only their own sites in the directory, admins every site
+    # (README: "Owners-only site listing").
+    # listing: owners
   telemetry:
     log_format: json
     metrics: true

@@ -17,7 +17,10 @@ colleague**.
 - **Insiders** can read and write the data of **every** site: there are no per-site or
   per-document permissions, and `_meta.created_by` is a UX hint, not an access control. Any
   employee can open any site, query its collections, read its uploads and redeploy it (unless
-  `sites.ownership: owner`). Sites should not hold data that not every employee may see.
+  `sites.ownership: owner`). `sites.listing: owners` changes only which sites the directories
+  list ([owners-only site listing](deploying-sites.md#owners-only-site-listing)): a hidden site
+  is still open to everyone by its URL and by name. Sites should not hold data that not every
+  employee may see.
 - **Site authors** run arbitrary JavaScript on their site's origin — that is the product. The
   platform must keep one site's code from acting on another site's data or on the hub.
 
@@ -181,7 +184,8 @@ bodies are bounded too (queries and most bodies 1 MiB, AI chat 32 MiB). See
   `Content-Security-Policy: sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'`,
   so an SVG preview can neither run script on the hub's origin nor load anything, also when
   opened directly ([Site preview](deploying-sites.md#site-preview)). Everyone who can list the
-  sites can see every site's preview.
+  sites can see the preview of every site the list shows them (with `sites.listing: owners`, the
+  preview of a site the list hides answers `404`; the image is still one of the site's files).
 - Deploy paths are validated (relative, no `..`, no leading `/`, nothing under `__backyard/`,
   no `.git` segment in any letter case); `/__backyard/` can never be shadowed by a site file,
   and repository metadata can neither be deployed nor read back through the gateway.
@@ -348,6 +352,8 @@ and the acting user and client IP; see [operations](operations.md#logs-and-audit
       Kubernetes, enable the Helm chart's `networkPolicy`, which the chart requires otherwise).
 - [ ] Read-only warehouse roles; raw SQL off unless intended.
 - [ ] `sites.ownership: owner` if teams must not overwrite each other's sites.
+- [ ] `sites.listing: owners` if people should see only their own sites in the directories (it
+      implies `sites.ownership: owner`; it hides sites, it does not restrict who can open them).
 - [ ] Short `auth.token_ttl` for automation; static CI tokens rotated.
 - [ ] Metrics on a private `telemetry.metrics_listen`, not the public hub.
 - [ ] TLS everywhere (`server.public_url` with `https://` makes cookies `Secure`).

@@ -16,6 +16,7 @@ import { R2_KEY_HEADER, R2_RANGE_HEADER } from "./object";
 import { validatePath } from "./paths";
 import type { SiteRecord } from "./registry-do";
 import { siteURL, type RequestContext } from "./router";
+import { filterListed } from "./sitemeta";
 import { registry, siteStub } from "./stubs";
 import { utf8SeqLen } from "./title";
 
@@ -137,7 +138,9 @@ async function toolWhoami(c: ToolCall): Promise<ToolResult> {
 async function toolListSites(c: ToolCall, a: Record<string, unknown>): Promise<ToolResult> {
   const { ctx } = c;
   const q = (typeof a.query === "string" ? a.query : "").trim().toLowerCase();
-  const all = unwrap(await registry(ctx.env).listSites());
+  // Only the sites listed to the user (SITE_LISTING) are matched and counted,
+  // so total and truncated say nothing about the others.
+  const all = filterListed(ctx.cfg, c.user, unwrap(await registry(ctx.env).listSites()));
   const keyed = all.map((r) => ({ r, t: micros(r.updated_at) }));
   // Most recently updated first, then by name.
   keyed.sort((x, y) => (y.t || 0) - (x.t || 0) || (x.r.name < y.r.name ? -1 : x.r.name > y.r.name ? 1 : 0));

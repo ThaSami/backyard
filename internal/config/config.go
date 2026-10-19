@@ -430,8 +430,14 @@ type NamedQuery struct {
 type SitesConfig struct {
 	// Ownership: none (default, anyone can overwrite — the Quick philosophy) |
 	// owner (first deployer owns the site; owners/admins may overwrite/delete).
-	Ownership string   `yaml:"ownership"`
-	Reserved  []string `yaml:"reserved"`
+	// The default is owner when Listing is owners.
+	Ownership string `yaml:"ownership"`
+	// Listing: all (default, every site appears in the hub's site list, the
+	// gateway's GET /sites and the connector's backyard_list_sites) | owners
+	// (a site appears there only to its owners and to admins). It hides sites
+	// from the directory, it does not restrict who may open one by its URL.
+	Listing  string   `yaml:"listing"`
+	Reserved []string `yaml:"reserved"`
 	// MaxSiteBytes total (default 500 MiB), MaxFiles (default 10000),
 	// MaxFileBytes per file (default 100 MiB).
 	MaxSiteBytes int64 `yaml:"max_site_bytes"`
@@ -921,8 +927,17 @@ func (c *Config) ApplyDefaults() {
 	}
 
 	si := &c.Sites
+	if si.Listing == "" {
+		si.Listing = "all"
+	}
 	if si.Ownership == "" {
+		// Owners-only listing implies ownership: owners are recorded only
+		// in ownership mode, and a directory that hides a site must not let
+		// anyone overwrite it by name without noticing.
 		si.Ownership = "none"
+		if si.Listing == "owners" {
+			si.Ownership = "owner"
+		}
 	}
 	if si.Reserved == nil {
 		si.Reserved = append([]string(nil), DefaultReserved...)
@@ -1206,6 +1221,15 @@ func (c *Config) Validate() error {
 
 	if c.Sites.Ownership != "none" && c.Sites.Ownership != "owner" {
 		add("sites.ownership must be none or owner")
+	}
+	switch c.Sites.Listing {
+	case "all":
+	case "owners":
+		if c.Sites.Ownership == "none" {
+			add("sites.listing: owners requires sites.ownership: owner (its default with this option)")
+		}
+	default:
+		add("sites.listing must be all or owners")
 	}
 	for _, m := range c.Deploy.Methods {
 		switch m {

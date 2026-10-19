@@ -86,6 +86,8 @@ prints every option. Highlights:
   creates `deploy` (its hash is `BACKYARD_DEPLOY_TOKEN_SHA256` in `backyard.env`); add more for CI
   with `backyard token hash <token>`. Remove the entry to revoke a token.
 * **AI** — the commented `ai` block; put the API key in `backyard.env`.
+* **Owners-only site listing** — `sites.listing: owners`, see
+  [below](#owners-only-site-listing).
 * **Path mode** — without wildcard DNS, `server.url_mode: path` serves sites at
   `https://<domain>/s/<site>/`.
 
@@ -197,6 +199,25 @@ a smaller limit must stay at `10m` or more. Publishing as a person needs single 
 (`/__backyard/mcp`, `/__backyard/oauth/*`, `/.well-known/oauth-authorization-server`,
 `/.well-known/oauth-protected-resource/__backyard/mcp`) from its login and keep
 `/__backyard/auth/authorize` behind it.
+
+## Owners-only site listing
+
+By default the hub, `backyard sites list` and `backyard_list_sites` show every site to everyone.
+To show each person only the sites they own (admins, such as the `deploy` token, see every
+site), set `sites.listing: owners` in `/etc/backyard/backyard.yaml` (new installs have the
+line, commented out), then validate and restart as in [Configure](#configure):
+
+```yaml
+sites:
+  listing: owners
+```
+
+It implies site ownership (the first deployer owns a site; only its owners and admins may
+redeploy or delete it) and hides sites from the directory without restricting who can open
+them. It is meant for single sign-on: with `auth.mode: none` every browser is a guest and is
+listed no site. Upgrade first (`install.sh` keeps your configuration): servers older than the
+option refuse the key. Details:
+[owners-only site listing](../../docs/deploying-sites.md#owners-only-site-listing).
 
 ## Deploying with rsync
 

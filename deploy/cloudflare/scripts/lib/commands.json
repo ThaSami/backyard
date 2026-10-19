@@ -17,6 +17,7 @@
         { "name": "r2-bucket", "type": "string", "value": "name", "help": "bucket name (default <worker>-files)" },
         { "name": "ai", "type": "bool", "help": "serve AI with the Workers AI binding (default; turns AI back on after --no-ai)" },
         { "name": "no-ai", "type": "bool", "help": "turn AI off: no Workers AI binding, AI calls answer 501 (remembered)" },
+        { "name": "site-listing", "type": "string", "value": "all|owners", "help": "list every site (all, default), or each site only to its owners and admins (owners; remembered)" },
         { "name": "var", "type": "string", "value": "KEY:VALUE", "repeatable": true, "help": "override a Worker variable (remembered; KEY: drops it)" },
         { "name": "rotate-token", "type": "bool", "help": "issue a new DEPLOY_TOKEN" },
         { "name": "rotate-secret", "type": "bool", "help": "replace BACKYARD_SECRET (revokes every API token)" },

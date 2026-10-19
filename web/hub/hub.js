@@ -1125,6 +1125,69 @@
     return out;
   }
 
+  // --- owners-only site listing (SPEC §7.1 site_listing, §7.2 "Listing")
+
+  /** Whether u (GET /me) is an admin as the gateway decides: a guest never is. */
+  function isAdminUser(u) {
+    return !!u && typeof u === "object" && !u.anonymous && u.admin === true;
+  }
+
+  /**
+   * Whether the site list may leave out sites that exist: the server lists
+   * only the viewer's own sites (site_listing "owners") and the viewer is not
+   * an admin (admins are listed every site). A server without the field lists
+   * every site.
+   */
+  function listsOwnSitesOnly(info, me) {
+    return !!info && info.site_listing === "owners" && !isAdminUser(me);
+  }
+
+  /** The note under the Sites heading: "" unless the server lists only owners' sites. */
+  function listingNote(info, me) {
+    if (!info || info.site_listing !== "owners") return "";
+    return isAdminUser(me) ? "You are an admin: every site is listed." : "Only your sites are listed.";
+  }
+
+  /** What the empty directory says: total sites are listed, none of them matches query. */
+  function emptySitesText(info, me, total, query) {
+    if (total) return `No sites match “${query}”.`;
+    return listsOwnSitesOnly(info, me) ? "You don't own any sites yet. Drop a folder above to create one." : "No sites yet. Drop a folder above to create the first one.";
+  }
+
+  /**
+   * The hint under a valid site name in the deploy form. existing is the
+   * listed SiteMeta of that name (or null); taken is what GET G/sites/{name}
+   * said about a name the list leaves out: true (a site exists), false (none)
+   * or null (not asked, still asking, or it failed).
+   */
+  function siteNameHint(existing, taken, now) {
+    if (existing) {
+      return `Updates the existing site${existing.updated_by ? " (last deployed by " + existing.updated_by + ", " + relativeTime(existing.updated_at, now) + ")" : ""}.`;
+    }
+    if (taken === true) return "This name is taken by a site you don't own; only its owners or an admin can update it.";
+    return "A new site will be created.";
+  }
+
+  /**
+   * Whether a site of that name exists, listed or not: GET G/sites/{site}
+   * is never filtered by the listing (SPEC §7.2). Resolves true (its
+   * SiteMeta), false (404) or null (any other answer, a login page, a
+   * network error or an abort). opts: { gateway, site, token, fetch, signal }.
+   */
+  async function siteExists(opts) {
+    const fetchImpl = opts.fetch || ((...a) => globalThis.fetch(...a));
+    const url = trimSlash(opts.gateway) + "/sites/" + encodeURIComponent(opts.site);
+    try {
+      const res = await fetchImpl(url, { method: "GET", credentials: "same-origin", redirect: "manual", headers: gatewayHeaders(opts.token, false), signal: opts.signal });
+      if (res.status === 404) return false;
+      if (!res.ok || isLoginResponse(res)) return null;
+      const meta = await res.json();
+      return !!meta && typeof meta === "object" && meta.name === opts.site ? true : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   // --- Claude connector (remote MCP, SPEC §8.4, §14.1)
 
   /** The hub API of the signed-in person's connector connections (SPEC §8.4.7). */
@@ -1252,6 +1315,12 @@
     parsePanels,
     serializePanels,
     filterSites,
+    isAdminUser,
+    listsOwnSitesOnly,
+    listingNote,
+    emptySitesText,
+    siteNameHint,
+    siteExists,
     connectorSetup,
     formatDate,
     grantSummary,
@@ -1525,6 +1594,49 @@
     return (state.sites || []).find((s) => s.name === name) || null;
   }
 
+  /**
+   * With an owners-only listing, a name the site list leaves out may still
+   * be taken: it is looked up with GET G/sites/{name}, debounced, one name at
+   * a time (a newer name aborts the older lookup). The result is kept for
+   * that name until the site list is loaded again.
+   */
+  const LOOKUP_DELAY_MS = 300;
+  const lookup = { name: "", done: false, taken: null, seq: 0, timer: 0, ctrl: null };
+
+  /** Stops a scheduled or running lookup; forget also drops the last result. */
+  function cancelLookup(forget) {
+    if (!lookup.done || forget) {
+      lookup.seq++;
+      clearTimeout(lookup.timer);
+      if (lookup.ctrl) lookup.ctrl.abort();
+      lookup.timer = 0;
+      lookup.ctrl = null;
+      lookup.name = "";
+      lookup.done = false;
+      lookup.taken = null;
+    }
+  }
+
+  /** What is known about name (true, false, or null while unknown); starts its lookup when needed. */
+  function lookedUp(name) {
+    if (lookup.name === name) return lookup.done ? lookup.taken : null;
+    cancelLookup(true);
+    lookup.name = name;
+    const seq = lookup.seq;
+    lookup.timer = setTimeout(async () => {
+      lookup.timer = 0;
+      const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+      lookup.ctrl = ctrl;
+      const taken = await siteExists({ gateway: GATEWAY, site: name, token: state.token, signal: ctrl ? ctrl.signal : undefined });
+      if (seq !== lookup.seq) return; // superseded by another name
+      lookup.ctrl = null;
+      lookup.done = true;
+      lookup.taken = taken;
+      renderName();
+    }, LOOKUP_DELAY_MS);
+    return null;
+  }
+
   function renderName() {
     const input = $("site-name");
     const name = input.value.trim();
@@ -1533,14 +1645,13 @@
     $("site-url").textContent = name && !err ? siteURLFor(state.info, name, location.origin) : "";
     const hint = $("site-hint");
     hint.classList.toggle("error", !!err);
+    const ex = name && !err ? existingSite(name) : null;
+    // Only a name the list leaves out, once the list is known, is looked up.
+    const ask = !!name && !err && !ex && state.sites !== null && listsOwnSitesOnly(state.info, state.me);
+    if (!ask) cancelLookup(false);
     if (err) hint.textContent = err;
     else if (!name) hint.textContent = "Lowercase letters, digits and dashes.";
-    else {
-      const ex = existingSite(name);
-      hint.textContent = ex
-        ? `Updates the existing site${ex.updated_by ? " (last deployed by " + ex.updated_by + ", " + relativeTime(ex.updated_at) + ")" : ""}.`
-        : "A new site will be created.";
-    }
+    else hint.textContent = siteNameHint(ex, ask ? lookedUp(name) : null);
     updateDeployButton();
   }
 
@@ -1842,6 +1953,9 @@
   function renderSites() {
     const list = $("site-list");
     const empty = $("sites-empty");
+    const note = listingNote(state.info, state.me);
+    $("sites-note").textContent = note;
+    $("sites-note").hidden = !note;
     if (state.sites === null) return;
     list.classList.remove("skeleton");
     list.removeAttribute("aria-busy");
@@ -1856,7 +1970,7 @@
     $("site-count").textContent = total ? (shown.length === total ? `(${total})` : `(${shown.length} of ${total})`) : "";
     $("search-status").textContent = state.query ? `${shown.length} site${shown.length === 1 ? "" : "s"} found` : "";
     empty.hidden = shown.length > 0;
-    if (!shown.length) empty.textContent = total ? `No sites match “${state.query}”.` : "No sites yet. Drop a folder above to create the first one.";
+    if (!shown.length) empty.textContent = emptySitesText(state.info, state.me, total, state.query);
     list.hidden = shown.length === 0;
   }
 
@@ -1868,6 +1982,7 @@
       state.sites = state.sites || [];
       if (!(err.status === 401 && err.loginUrl)) banner("Could not load the site list: " + (err.message || err));
     }
+    cancelLookup(true); // the sites may have changed: ask again
     renderSites();
     renderName();
   }

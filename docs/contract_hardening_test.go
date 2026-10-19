@@ -7,7 +7,8 @@ package docs
 // configuration can override, the login state cookie, the Cloudflare
 // edition's query page budget, its Access bypass list, the commands and flags
 // of its engine (backyard-cloudflare), what the entry points promise about
-// `backyard cloudflare setup` and what a CI deploy must carry over from it.
+// `backyard cloudflare setup`, what a CI deploy must carry over from it, and
+// how the owners-only site listing is turned on.
 
 import (
 	"encoding/json"
@@ -19,6 +20,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -27,6 +29,7 @@ import (
 	"testing"
 
 	"github.com/thasami/backyard/internal/auth"
+	"github.com/thasami/backyard/internal/config"
 	"github.com/thasami/backyard/internal/deploy"
 	"github.com/thasami/backyard/internal/pubsub"
 	"github.com/thasami/backyard/internal/sites"
@@ -888,16 +891,17 @@ func TestCloudflareSetupEntryPoints(t *testing.T) {
 
 // TestCloudflareCIDeployCarriesSetup checks the "Deploying from GitHub
 // Actions" section of deploy/cloudflare/README.md against
-// scripts/cloudflare-ci.mjs. A CI deploy names the Worker, its variables and
-// its R2 bucket and its AI switch from its environment only, and wrangler
-// removes a binding the configuration leaves out, so the section's workflow
-// passes all four and says what to carry over from a Worker that `setup`
-// made: the bucket (or the files stored in R2 fail), AI off, and that
-// workers.dev stays on.
+// scripts/cloudflare-ci.mjs. A CI deploy names the Worker, its variables, its
+// R2 bucket, its AI switch and its site listing from its environment only,
+// and wrangler removes a binding (and every deploy resets a variable) the
+// configuration leaves out, so the section's workflow passes all five and
+// says what to carry over from a Worker that `setup` made: the bucket (or the
+// files stored in R2 fail), AI off, the owners-only site listing (or every
+// site is listed again), and that workers.dev stays on.
 func TestCloudflareCIDeployCarriesSetup(t *testing.T) {
 	ci := readRepoFile(t, "scripts/cloudflare-ci.mjs")
 	section := markdownSection(t, readRepoFile(t, "deploy/cloudflare/README.md"), "Deploying from GitHub Actions")
-	for _, name := range []string{"BACKYARD_CF_WORKER_NAME", "BACKYARD_CF_VARS", "BACKYARD_CF_R2_BUCKET", "BACKYARD_CF_AI"} {
+	for _, name := range []string{"BACKYARD_CF_WORKER_NAME", "BACKYARD_CF_VARS", "BACKYARD_CF_R2_BUCKET", "BACKYARD_CF_AI", "BACKYARD_CF_SITE_LISTING"} {
 		if !strings.Contains(ci, "env."+name) {
 			t.Errorf("scripts/cloudflare-ci.mjs no longer reads %s (update this test and the README)", name)
 		}
@@ -912,7 +916,7 @@ func TestCloudflareCIDeployCarriesSetup(t *testing.T) {
 	for _, want := range []string{
 		"`backyard cloudflare status`", "`r2Bucket`", "set `BACKYARD_CF_R2_BUCKET` to it",
 		"A deploy without it removes the R2 binding", "`workers_dev`", "`setup --no-workers-dev`",
-		"set `BACKYARD_CF_AI` to `false`",
+		"set `BACKYARD_CF_AI` to `false`", "set `BACKYARD_CF_SITE_LISTING` to `owners`",
 	} {
 		if !strings.Contains(flat, want) {
 			t.Errorf("deploy/cloudflare/README.md (Deploying from GitHub Actions) lacks %q", want)
@@ -951,5 +955,83 @@ func TestCloudflareJSONFlagDocumented(t *testing.T) {
 	want := "`--json` only for " + strings.Join(with, ", ")
 	if text := flatten(readRepoFile(t, "skills/backyard/references/deploy.md")); !strings.Contains(text, want) {
 		t.Errorf("skills/backyard/references/deploy.md lists --json as a global flag without %q", want)
+	}
+}
+
+// TestSiteListingDocumented checks the "Owners-only site listing" section of
+// docs/deploying-sites.md against the code: the configuration error it quotes
+// is the one the Go server reports for sites.listing: owners with
+// sites.ownership: none, the defaults it states hold (all; ownership owner
+// with owners, none without), /info reports site_listing, and every switch
+// its table names is one the kit reads — the Helm values, the Compose
+// variable, the engine flag, the Cloudflare Terraform variable, the CI
+// deployer's variable and the Worker variable.
+func TestSiteListingDocumented(t *testing.T) {
+	load := func(listing, ownership string) (*config.Config, error) {
+		cfg := &config.Config{}
+		cfg.Server.BaseDomain = "backyard.acme.com"
+		cfg.Server.Secret = strings.Repeat("s", 40)
+		cfg.Sites.Listing, cfg.Sites.Ownership = listing, ownership
+		cfg.ApplyDefaults()
+		return cfg, cfg.Validate()
+	}
+	section := flatten(markdownSection(t, readRepoFile(t, "docs/deploying-sites.md"), "Owners-only site listing"))
+
+	for _, tc := range []struct{ listing, ownership, wantListing, wantOwnership string }{
+		{"", "", sites.ListingAll, "none"},
+		{sites.ListingOwners, "", sites.ListingOwners, "owner"},
+		{sites.ListingOwners, "owner", sites.ListingOwners, "owner"},
+	} {
+		cfg, err := load(tc.listing, tc.ownership)
+		if err != nil {
+			t.Errorf("sites.listing %q, ownership %q: %v", tc.listing, tc.ownership, err)
+			continue
+		}
+		if cfg.Sites.Listing != tc.wantListing || cfg.Sites.Ownership != tc.wantOwnership {
+			t.Errorf("sites.listing %q, ownership %q: loaded as %q/%q, want %q/%q (as docs/deploying-sites.md says)",
+				tc.listing, tc.ownership, cfg.Sites.Listing, cfg.Sites.Ownership, tc.wantListing, tc.wantOwnership)
+		}
+	}
+	_, err := load(sites.ListingOwners, "none")
+	var quoted string
+	if err != nil {
+		for _, line := range strings.Split(err.Error(), "\n") {
+			if strings.HasPrefix(line, "sites.listing") {
+				quoted = line
+			}
+		}
+	}
+	if quoted == "" {
+		t.Errorf("sites.listing: owners with sites.ownership: none: validation error = %v, want one about sites.listing", err)
+	} else if !strings.Contains(section, "`"+quoted+"`") {
+		t.Errorf("docs/deploying-sites.md (Owners-only site listing) does not quote the error `%s`", quoted)
+	}
+
+	info, ok := reflect.TypeFor[deploy.Info]().FieldByName("SiteListing")
+	if !ok || strings.Split(info.Tag.Get("json"), ",")[0] != "site_listing" {
+		t.Error("deploy.Info has no field site_listing (update docs/deploying-sites.md and this test)")
+	}
+	for _, want := range []string{"`site_listing`", "`sites.listing: owners`", "`SITE_LISTING=owners`", "`backyard sites info <name>`"} {
+		if !strings.Contains(section, want) {
+			t.Errorf("docs/deploying-sites.md (Owners-only site listing) does not mention %s", want)
+		}
+	}
+
+	// Each switch of the table, and where the kit reads it.
+	for _, sw := range []struct{ doc, file, code string }{
+		{"`config.sites.listing: owners`", "deploy/helm/backyard/values.yaml", "#   listing: owners"},
+		{"`BACKYARD_SITE_LISTING=owners`", "deploy/docker-compose/backyard.yaml", "listing: ${BACKYARD_SITE_LISTING:-all}"},
+		{"`BACKYARD_SITE_LISTING=owners`", "deploy/docker-compose/docker-compose.yml", "BACKYARD_SITE_LISTING: ${BACKYARD_SITE_LISTING:-all}"},
+		{"`backyard cloudflare setup --site-listing owners`", "deploy/cloudflare/scripts/lib/commands.json", `"name": "site-listing"`},
+		{"`site_listing = \"owners\"`", "deploy/terraform/cloudflare/variables.tf", `variable "site_listing"`},
+		{"`BACKYARD_CF_SITE_LISTING=owners`", "scripts/cloudflare-ci.mjs", "env.BACKYARD_CF_SITE_LISTING"},
+		{"`SITE_LISTING=owners`", "deploy/cloudflare/src/env.ts", "SITE_LISTING?: string"},
+	} {
+		if !strings.Contains(section, sw.doc) {
+			t.Errorf("docs/deploying-sites.md (Owners-only site listing) does not name %s", sw.doc)
+		}
+		if !strings.Contains(readRepoFile(t, sw.file), sw.code) {
+			t.Errorf("%s no longer has %q, which docs/deploying-sites.md (Owners-only site listing) documents as %s", sw.file, sw.code, sw.doc)
+		}
 	}
 }

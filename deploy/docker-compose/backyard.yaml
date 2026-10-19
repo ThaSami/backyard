@@ -75,6 +75,16 @@ deploy:
   # (playground mode; only with auth.mode none).
   allow_anonymous: ${BACKYARD_ALLOW_ANONYMOUS_DEPLOY:-false}
 
+# Owners-only site listing: "all" (the default) shows every site on the hub, in
+# `backyard sites list` and in backyard_list_sites; "owners" shows each person
+# only the sites they own, and admins (such as the deploy token) every site. It
+# implies site ownership and hides sites without restricting who can open them
+# (README.md). Set BACKYARD_SITE_LISTING in .env and uncomment; images older
+# than the option refuse the key, so update BACKYARD_IMAGE first:
+#
+# sites:
+#   listing: ${BACKYARD_SITE_LISTING:-all}
+
 # AI for backyard.ai (set the key in .env and uncomment):
 #
 # ai:

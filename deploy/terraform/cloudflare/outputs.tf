@@ -56,12 +56,15 @@ locals {
     # Always one of the two: setup remembers --no-ai, so leaving the flag out
     # could not turn AI back on.
     [var.ai_enabled ? "--ai" : "--no-ai"],
+    # Always set: setup remembers --site-listing owners, so leaving it out
+    # could not list every site again.
+    ["--site-listing", var.site_listing],
     [for k, v in local.worker_vars : "--var ${k}:${v}"],
   ))
 }
 
 output "setup_args" {
-  description = "Arguments of setup that redeploy the Worker with these variables and --ai or --no-ai (they are remembered for later runs): backyard cloudflare setup <setup_args>, or npx backyard-cloudflare@latest setup <setup_args>."
+  description = "Arguments of setup that redeploy the Worker with these variables, --ai or --no-ai and --site-listing (they are remembered for later runs): backyard cloudflare setup <setup_args>, or npx backyard-cloudflare@latest setup <setup_args>."
   value       = local.setup_args
 }
 

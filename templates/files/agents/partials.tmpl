@@ -49,7 +49,7 @@ presence) and `backyard.id` (the signed-in user).
 backyard dev                  # preview at http://{{.Site}}.localhost:4321/ with a local backend (long-running: start it in the background)
 backyard deploy               # publish this folder (overwrites the site; prints its URL)
 backyard deploy --dry-run     # show what would be uploaded and deleted
-backyard sites list [filter]  # existing sites; `backyard pull <site>` downloads one to study or reuse
+backyard sites list [filter]  # the sites you can see; `backyard pull <site>` downloads one to study or reuse
 ```
 
 - Check the running preview with curl: `curl -s -H 'Host: {{.Site}}.localhost:4321' http://127.0.0.1:4321/`.

@@ -9,7 +9,8 @@
 //
 //   { "version": 2, "accountId", "url", "deployToken", "workersDevUrl", "workersDev",
 //     "r2", "r2Bucket", "ai": false (setup --no-ai: no Workers AI binding and AI_ENABLED=false;
-//     absent = on), "vars": {…user --var overrides…},
+//     absent = on), "siteListing": "owners" (setup --site-listing owners: SITE_LISTING=owners;
+//     absent = every site is listed), "vars": {…user --var overrides…},
 //     "domain": {host, mode: "path"|"host", zoneId, zoneName, customDomainId, routeId,
 //                dnsRecordId, status: "active"|"pending-dns"|"pending-certificate",
 //                source: "cli"|"adopted"},

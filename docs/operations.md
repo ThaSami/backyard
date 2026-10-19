@@ -139,7 +139,9 @@ Backyard is one binary (or image). To upgrade:
 
 1. Read the [changelog](../CHANGELOG.md) for breaking changes.
 2. Replace the binary or image tag and restart (rolling restarts are fine with several
-   instances).
+   instances). Set configuration keys that the new version adds (such as `sites.listing`) only
+   after that: the configuration is strict, so an older server refuses to start with a key it
+   does not know, and a rollback needs the key removed first.
 3. PostgreSQL migrations run on start (`database.postgres.auto_migrate: true`), serialized
    across instances by an advisory lock; SQLite and DynamoDB need no migration step.
 4. Redeploy a standalone or Lambda gateway with the same version.

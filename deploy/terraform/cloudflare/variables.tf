@@ -159,6 +159,19 @@ variable "ai_enabled" {
   default     = true
 }
 
+# --- Site listing ---------------------------------------------------------------
+
+variable "site_listing" {
+  description = "Who sees each site in the hub's site list, GET /sites and the Claude connector's backyard_list_sites (SPEC §7.2): \"all\" (everyone who may open sites, the default) or \"owners\" (its owners and admins; implies OWNERSHIP=owner, so only owners and admins may change a site). It hides sites from the directory, it is not access control: anyone who may open sites can still open one by its URL. setup_args always carry --site-listing, so setting it back to \"all\" lists every site again at the next setup."
+  type        = string
+  default     = "all"
+
+  validation {
+    condition     = contains(["all", "owners"], var.site_listing)
+    error_message = "site_listing must be \"all\" or \"owners\"."
+  }
+}
+
 # --- Optional: create an Okta identity provider --------------------------------
 
 variable "okta_account_url" {

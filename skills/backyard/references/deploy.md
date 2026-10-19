@@ -95,6 +95,12 @@ backyard deploy -y --open             # no confirmation prompt, open the site af
 - **Overwriting someone else's site** asks for confirmation (`-y` skips it). On servers with
   `sites.ownership: owner`, only owners and admins can redeploy or delete a site
   (`forbidden` otherwise); the first deployer becomes the owner.
+- **Owners-only listing.** On servers with `sites.listing: owners` (Cloudflare:
+  `SITE_LISTING=owners`; it implies ownership) the hub, `backyard sites list` and
+  `backyard_list_sites` show each person only the sites they own (while a site has no owners,
+  its creator), admins every site, guests none. It only hides sites: everyone can still open a
+  site by its URL, and `backyard sites info <name>`, `backyard pull` and `backyard_site_files`
+  find any site by name — check names with those, not with the list.
 - **Limits** (defaults): 500 MiB per site, 10,000 files, 100 MiB per file, 60 deploys/hour.
 - The URL is printed at the end: `https://<site>.backyard.example.com/` (host mode) or
   `https://backyard.example.com/s/<site>/` (path mode).
@@ -223,7 +229,9 @@ Worker plus SQLite Durable Objects), creates the secrets (`BACKYARD_SECRET` and 
 also **logs the CLI in** to the new server with the deploy token (skip with `--no-login`).
 Re-run it any time to upgrade: every choice is remembered, and a machine without saved state
 adopts the deployed configuration. Options: `--worker-name <name>`, `--no-r2`,
-`--no-ai` (no Workers AI, for accounts without it; `--ai` turns it back on), `--var KEY:VALUE` (e.g. `--var ADMINS:alice@acme.com`), `--rotate-token`,
+`--no-ai` (no Workers AI, for accounts without it; `--ai` turns it back on),
+`--site-listing owners` (people see only their own sites; `--site-listing all` lists every site
+again), `--var KEY:VALUE` (e.g. `--var ADMINS:alice@acme.com`), `--rotate-token`,
 `--workers-subdomain <name>` (without a terminal), `--dry-run`; `backyard cloudflare setup
 --help` lists them all.
 
@@ -264,7 +272,9 @@ when unset). A CI deploy binds only what the workflow names, so before moving a 
 status` shows it; without it the files stored in R2 answer `500`) and copy its variables
 (`BASE_DOMAIN`, `URL_MODE`, `AUTH_MODE`, `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`) into
 `vars.BACKYARD_CF_VARS`; if `setup --no-ai` turned AI off (or the account has no Workers AI), set
-`vars.BACKYARD_CF_AI` to `false`. Teams that manage Cloudflare as code can use the optional Terraform module in
+`vars.BACKYARD_CF_AI` to `false`; if `setup --site-listing owners` lists each site only to its
+owners, set `vars.BACKYARD_CF_SITE_LISTING` to `owners` (a CI deploy without it lists every
+site). Teams that manage Cloudflare as code can use the optional Terraform module in
 `deploy/terraform/cloudflare` for the domain and Access instead.
 
 | Topic | Cloudflare edition |
@@ -350,8 +360,10 @@ signed-in user. The tools: `backyard_docs`, `backyard_whoami`, `backyard_list_si
 1. Call `backyard_whoami` once: it says whether this connection may publish (`can_publish`),
    the site URL pattern and `limits.max_publish_bytes`, the most file content one call may
    carry (4 MiB on the Go server, 2 MiB on the Cloudflare edition by default).
-2. Pick a name (lowercase letters, digits and `-`, at most 63) and check it with
-   `backyard_list_sites`. A new site needs an `index.html`.
+2. Pick a name (lowercase letters, digits and `-`, at most 63) and check that it is free:
+   `backyard_site_files` with that name says there is no such site. `backyard_list_sites` shows
+   only the sites you can see (on some servers only your own), so a name missing there may
+   still be taken. A new site needs an `index.html`.
 3. `backyard_publish` with `site` and `files`: each file has a relative `path` and its complete
    `content` — text as it is, binary files (images, fonts) as base64 with
    `"encoding": "base64"`. The result has the site's `url`: give it to the user.

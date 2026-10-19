@@ -18,6 +18,8 @@ describe("deploy gateway protocol", () => {
       methods: ["api"],
       edition: "cloudflare",
       auth: { mode: "none", anonymous_deploy: false },
+      // SITE_LISTING unset: every site is listed (SPEC §7.1).
+      site_listing: "all",
     });
     expect((info.limits as Record<string, number>).max_files).toBeGreaterThan(0);
     // The hub alias of /info is the same document.

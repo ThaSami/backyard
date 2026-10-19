@@ -432,3 +432,83 @@ func TestLoopbackHost(t *testing.T) {
 		}
 	}
 }
+
+func TestSitesListingDefaults(t *testing.T) {
+	cases := []struct {
+		name, yaml         string
+		listing, ownership string
+	}{
+		{"unset", "", "all", "none"},
+		{"all", "sites:\n  listing: all\n", "all", "none"},
+		{"all with owner", "sites:\n  listing: all\n  ownership: owner\n", "all", "owner"},
+		{"owner without listing", "sites:\n  ownership: owner\n", "all", "owner"},
+		// Owners-only listing implies ownership.
+		{"owners", "sites:\n  listing: owners\n", "owners", "owner"},
+		{"owners with owner", "sites:\n  listing: owners\n  ownership: owner\n", "owners", "owner"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := mcpConfig(t, tc.yaml)
+			if cfg.Sites.Listing != tc.listing || cfg.Sites.Ownership != tc.ownership {
+				t.Fatalf("listing=%q ownership=%q, want %q %q", cfg.Sites.Listing, cfg.Sites.Ownership, tc.listing, tc.ownership)
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("validate: %v", err)
+			}
+			// ApplyDefaults is idempotent.
+			cfg.ApplyDefaults()
+			if cfg.Sites.Listing != tc.listing || cfg.Sites.Ownership != tc.ownership {
+				t.Fatalf("second ApplyDefaults: listing=%q ownership=%q", cfg.Sites.Listing, cfg.Sites.Ownership)
+			}
+		})
+	}
+}
+
+func TestSitesListingValidation(t *testing.T) {
+	const (
+		badListing = "sites.listing must be all or owners"
+		needsOwner = "sites.listing: owners requires sites.ownership: owner (its default with this option)"
+	)
+	cases := []struct {
+		name, yaml string
+		want       []string // substrings of the joined error
+		unwanted   []string
+	}{
+		{"explicit ownership none", "sites:\n  listing: owners\n  ownership: none\n", []string{needsOwner}, []string{badListing}},
+		{"unknown value", "sites:\n  listing: mine\n", []string{badListing}, []string{needsOwner}},
+		{"case matters", "sites:\n  listing: Owners\n", []string{badListing}, []string{needsOwner}},
+		{"unknown value with ownership none", "sites:\n  listing: private\n  ownership: none\n", []string{badListing}, []string{needsOwner}},
+		{"bad ownership", "sites:\n  listing: owners\n  ownership: owners\n", []string{"sites.ownership must be none or owner"}, []string{badListing}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := mcpConfig(t, tc.yaml).Validate()
+			if err == nil {
+				t.Fatal("expected a validation error")
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("error %q does not contain %q", err, w)
+				}
+			}
+			for _, w := range tc.unwanted {
+				if strings.Contains(err.Error(), w) {
+					t.Errorf("error %q contains %q", err, w)
+				}
+			}
+		})
+	}
+}
+
+func TestExampleSitesListing(t *testing.T) {
+	if !strings.Contains(Example, "\n  # listing: owners\n") {
+		t.Fatal("example.yaml lacks the commented sites.listing line")
+	}
+	cfg, err := Parse([]byte(Example))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Sites.Listing != "" {
+		t.Fatalf("example sets sites.listing = %q", cfg.Sites.Listing)
+	}
+}

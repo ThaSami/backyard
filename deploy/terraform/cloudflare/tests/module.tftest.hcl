@@ -123,6 +123,7 @@ run "path_mode_with_access" {
     condition = output.setup_args == join(" ", [
       "--worker-name backyard",
       "--ai",
+      "--site-listing all",
       "--var ACCESS_AUD:737646a56ab1df6ec9bddc7e5ca84eaf3b0768850f3ffb5d74f1534911fe3893",
       "--var ACCESS_TEAM_DOMAIN:acme.cloudflareaccess.com",
       "--var AUTH_MODE:access",
@@ -246,7 +247,7 @@ run "without_access" {
     error_message = "the Worker runs with AUTH_MODE=none"
   }
   assert {
-    condition     = output.setup_args == "--worker-name backyard --ai --var AUTH_MODE:none --var BASE_DOMAIN:backyard.example.com --var MCP_ENABLED:false --var URL_MODE:path"
+    condition     = output.setup_args == "--worker-name backyard --ai --site-listing all --var AUTH_MODE:none --var BASE_DOMAIN:backyard.example.com --var MCP_ENABLED:false --var URL_MODE:path"
     error_message = "setup_args carry the variables without Access"
   }
 }
@@ -364,7 +365,7 @@ run "ai_enabled_by_default" {
   command = apply
 
   assert {
-    condition     = startswith(output.setup_args, "--worker-name backyard --ai --var ") && !strcontains(output.setup_args, "--no-ai")
+    condition     = startswith(output.setup_args, "--worker-name backyard --ai --site-listing all --var ") && !strcontains(output.setup_args, "--no-ai")
     error_message = "AI is on by default: setup_args always carry --ai (setup remembers --no-ai, so leaving the flag out could not turn AI back on)"
   }
   assert {
@@ -381,11 +382,51 @@ run "ai_disabled" {
   }
 
   assert {
-    condition     = startswith(output.setup_args, "--worker-name backyard --no-ai --var ") && !strcontains(output.setup_args, " --ai ")
+    condition     = startswith(output.setup_args, "--worker-name backyard --no-ai --site-listing all --var ") && !strcontains(output.setup_args, " --ai ")
     error_message = "ai_enabled = false: setup_args carry --no-ai (no Workers AI binding, AI_ENABLED=false)"
   }
   assert {
     condition     = output.setup_command == "npm run setup -- ${output.setup_args}" && !contains(keys(output.worker_vars), "AI_ENABLED")
     error_message = "setup_command carries --no-ai too, and worker_vars stays without AI_ENABLED"
   }
+}
+
+run "site_listing_all_by_default" {
+  command = apply
+
+  assert {
+    condition     = strcontains(output.setup_args, " --site-listing all ") && !strcontains(output.setup_args, "owners")
+    error_message = "every site is listed by default, and setup_args always carry --site-listing (setup remembers --site-listing owners, so leaving the flag out could not list every site again)"
+  }
+  assert {
+    condition     = !contains(keys(output.worker_vars), "SITE_LISTING") && !strcontains(output.setup_args, "SITE_LISTING") && !strcontains(output.setup_args, "OWNERSHIP")
+    error_message = "SITE_LISTING is never a --var: setup --site-listing manages it (and OWNERSHIP is left to the Worker's default)"
+  }
+}
+
+run "site_listing_owners" {
+  command = apply
+
+  variables {
+    site_listing = "owners"
+  }
+
+  assert {
+    condition     = startswith(output.setup_args, "--worker-name backyard --ai --site-listing owners --var ") && !strcontains(output.setup_args, "--site-listing all")
+    error_message = "site_listing = \"owners\": setup_args carry --site-listing owners (SITE_LISTING=owners, which implies OWNERSHIP=owner)"
+  }
+  assert {
+    condition     = output.setup_command == "npm run setup -- ${output.setup_args}" && !contains(keys(output.worker_vars), "SITE_LISTING")
+    error_message = "setup_command carries --site-listing owners too, and worker_vars stays without SITE_LISTING"
+  }
+}
+
+run "site_listing_must_be_all_or_owners" {
+  command = plan
+
+  variables {
+    site_listing = "owner"
+  }
+
+  expect_failures = [var.site_listing]
 }

@@ -942,6 +942,22 @@ describe("backyard-cloudflare access disable", () => {
     assert.equal(liveVars(sb).AI_ENABLED, "false");
   });
 
+  it("keeps owners-only listing (setup --site-listing owners) in the deploys of access enable and access disable", async () => {
+    const sb = await accessSandbox({ state: { siteListing: "owners" } });
+    let r = await sb.run(ENABLE, WITH_ADMIN);
+    assert.equal(r.code, 0, r.out);
+    let d = deployOf(sb.calls());
+    assert.equal(d.config.vars.AUTH_MODE, "access");
+    assert.equal(d.config.vars.SITE_LISTING, "owners");
+    r = await sb.run(["access", "disable", "--yes"]);
+    assert.equal(r.code, 0, r.out);
+    d = deployOf(sb.calls());
+    assert.equal(d.config.vars.AUTH_MODE, "none");
+    assert.equal(d.config.vars.SITE_LISTING, "owners");
+    assert.equal(sb.state().siteListing, "owners");
+    assert.equal(liveVars(sb).SITE_LISTING, "owners");
+  });
+
   it("cannot delete applications made in the dashboard", async () => {
     const sb = await accessSandbox();
     seedDashboardApps(sb);

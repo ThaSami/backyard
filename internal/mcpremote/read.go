@@ -64,7 +64,9 @@ func (h *handler) toolListSites(ctx context.Context, c *call, args json.RawMessa
 	}{Sites: []site{}}
 	q := strings.ToLower(strings.TrimSpace(a.Query))
 	ownership := h.cfg.Sites.Ownership == "owner"
-	for _, m := range list {
+	// Only the sites listed to the user (sites.listing) are matched and
+	// counted, so total and truncated say nothing about the others.
+	for _, m := range sites.FilterListed(h.cfg, c.user, list) {
 		if q != "" && !strings.Contains(strings.ToLower(m.Name), q) && !strings.Contains(strings.ToLower(m.Title), q) &&
 			!strings.Contains(strings.ToLower(m.Description), q) {
 			continue

@@ -5,8 +5,14 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/thasami/backyard/internal/config"
 	"github.com/thasami/backyard/scripts/tfrender"
 )
+
+// ownersListing names the runs of tests/module.tftest.hcl that turn on the
+// owners-only site listing (sites.listing: owners through config_overrides);
+// every other run keeps the default.
+var ownersListing = map[string]bool{"owners_only_site_listing": true}
 
 // TestRenderedConfigsLoad renders the module's test scenarios and loads the
 // ECS service's and the Lambda gateway's configuration of each one.
@@ -23,21 +29,38 @@ func TestRenderedConfigsLoad(t *testing.T) {
 	for _, name := range names {
 		run := runs[name]
 		t.Run(name, func(t *testing.T) {
-			checkService(t, run)
+			checkListing(t, "ECS service", ownersListing[name], checkService(t, run))
 			if fn := run.Resource("aws_lambda_function.gateway[0]"); fn != nil {
 				gateways++
-				checkGateway(t, run, fn)
+				checkListing(t, "Lambda gateway", ownersListing[name], checkGateway(t, run, fn))
 			}
 		})
 	}
 	if gateways == 0 {
 		t.Error("no scenario created the Lambda deploy gateway: its configuration went unchecked")
 	}
+	for name := range ownersListing {
+		if _, ok := runs[name]; !ok {
+			t.Errorf("tests/module.tftest.hcl has no run %q: the owners-only site listing went unchecked", name)
+		}
+	}
+}
+
+// checkListing checks sites.listing as loaded, and that owners implies
+// ownership (the hub and the gateway list the same sites).
+func checkListing(t *testing.T, what string, owners bool, cfg *config.Config) {
+	t.Helper()
+	switch {
+	case owners && (cfg.Sites.Listing != "owners" || cfg.Sites.Ownership != "owner"):
+		t.Errorf("%s: sites.listing/ownership = %q/%q, want owners/owner", what, cfg.Sites.Listing, cfg.Sites.Ownership)
+	case !owners && cfg.Sites.Listing != "all":
+		t.Errorf("%s: sites.listing = %q, want the default all", what, cfg.Sites.Listing)
+	}
 }
 
 // checkService loads BACKYARD_CONFIG_YAML of the ECS task definition with
 // the container's environment and secrets.
-func checkService(t *testing.T, run *tfrender.Run) {
+func checkService(t *testing.T, run *tfrender.Run) *config.Config {
 	td := run.Resource("aws_ecs_task_definition.this")
 	if td == nil {
 		t.Fatal("no aws_ecs_task_definition.this in the state")
@@ -85,12 +108,13 @@ func checkService(t *testing.T, run *tfrender.Run) {
 	if bucket, _ := run.Output("bucket"); cfg.Storage.Type != "s3" || cfg.Storage.S3.Bucket != bucket {
 		t.Errorf("storage = %s/%s, want s3/%s", cfg.Storage.Type, cfg.Storage.S3.Bucket, bucket)
 	}
+	return cfg
 }
 
 // checkGateway loads the Lambda gateway's BACKYARD_CONFIG_YAML the way
 // cmd/backyard-lambda does: server.secret comes from the Secrets Manager
 // secret named by BACKYARD_SECRET_ARN (here: a placeholder).
-func checkGateway(t *testing.T, run *tfrender.Run, fn map[string]any) {
+func checkGateway(t *testing.T, run *tfrender.Run, fn map[string]any) *config.Config {
 	vars, _ := tfrender.Get(fn, "environment", 0, "variables").(map[string]any)
 	env := map[string]string{}
 	for k, v := range vars {
@@ -124,4 +148,5 @@ func checkGateway(t *testing.T, run *tfrender.Run, fn map[string]any) {
 	if cfg.Deploy.AllowAnonymous {
 		t.Error("the public Lambda gateway allows anonymous deploys")
 	}
+	return cfg
 }

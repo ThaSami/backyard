@@ -327,6 +327,22 @@ task_role_policy_arns = [aws_iam_policy.backyard_athena.arn]
 extra_secrets         = { WAREHOUSE_DSN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:wh-AbCdEf:dsn::" }
 ```
 
+To show each person only the sites they own in the hub, `backyard sites list` and
+`backyard_list_sites` (admins see every site), add `listing: owners` to the `sites` section,
+at the first `terraform apply` or any later one
+([owners-only site listing](../../docs/deploying-sites.md#owners-only-site-listing)):
+
+```hcl
+config_overrides = <<-EOT
+  sites:
+    listing: owners   # implies ownership: owner
+EOT
+```
+
+The Lambda gateway gets the `sites` section too (it serves `backyard sites list`). Servers and
+gateways older than the option refuse the key, so roll out the new `image` and the
+`make lambda` zip of the same version before you add it.
+
 Other useful inputs: `admins`, `static_tokens` (CI tokens, stored as SHA-256),
 `allowed_cidrs`, `allowed_security_group_ids`, `internal`, `waf_web_acl_arn`,
 `kms_key_arn` (one customer-managed key for S3, DynamoDB, RDS, ElastiCache,

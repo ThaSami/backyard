@@ -182,11 +182,11 @@ scripts-test: ## Test the release/CI tooling in scripts/ (Go and node --test)
 	$(NODE) --test 'scripts/*.test.mjs'
 
 # CONFORMANCE_TARGET: go (conformance/run-go.sh: backyard serve --dev in host and
-# path mode, then auth.mode oidc against a mock IdP for the Claude connector),
-# worker (conformance/run-worker.sh: wrangler dev --env local, path
-# and host mode) or all (both editions, Go first; a failure in one still runs
-# the other). CONFORMANCE_ARGS is passed to the runners, e.g.
-# CONFORMANCE_ARGS="path -- --test-name-pattern=files".
+# path mode, then auth.mode oidc against a mock IdP for the Claude connector,
+# then sites.listing: owners), worker (conformance/run-worker.sh: wrangler dev
+# --env local, path and host mode, then SITE_LISTING=owners) or all (both
+# editions, Go first; a failure in one still runs the other). CONFORMANCE_ARGS
+# is passed to the runners, e.g. CONFORMANCE_ARGS="path -- --test-name-pattern=files".
 CONFORMANCE_TARGET ?= all
 CONFORMANCE_ARGS   ?=
 CONFORMANCE_RUNNERS = $(strip \

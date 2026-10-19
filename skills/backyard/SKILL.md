@@ -15,7 +15,8 @@ by the company identity provider before the page loads. There is nothing else: n
 no cron, no config files — saying no is a feature.
 
 The hub (`https://backyard.example.com`) lists every site as a card (title, description and a
-preview image the site ships) and serves these docs. Throughout these docs,
+preview image the site ships; a server may list each site only to its owners and admins) and
+serves these docs. Throughout these docs,
 `https://backyard.example.com` stands for the company's Backyard server; `backyard whoami` (or
 the project's `CLAUDE.md` / `AGENTS.md`) shows its real URL — use that one with people.
 
@@ -97,7 +98,9 @@ backyard deploy               # publishes the folder and prints the URL
 ### Agent workflow
 
 1. Restate the idea in one line; pick a site name; check it is free with
-   `backyard sites info <name>` ("not found" = free) or `backyard_list_sites`.
+   `backyard sites info <name>` ("not found" = free) or `backyard_site_files`, which find any
+   site by name. `backyard sites list` and `backyard_list_sites` show only the sites you can
+   see (on some servers only your own), so a name missing there may still be taken.
 2. `backyard init <name>` (or create the folder with `index.html` + `.backyard.json`).
 3. Build the page(s) following the rules above; keep data models simple (see Patterns). Draw
    `preview.svg` once the main screen exists.

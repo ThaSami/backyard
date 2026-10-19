@@ -18,7 +18,7 @@
 // from CI) never changes them. With AI off (state.ai === false, `setup
 // --no-ai`) it has no `ai` binding either. Variables merge as base config <
 // state.vars < the variables managed by `domain add` / `access enable` /
-// `setup --no-ai` (managedVars).
+// `setup --no-ai` / `setup --site-listing` (managedVars).
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -191,15 +191,18 @@ export function createRunDir() {
 }
 
 /**
- * The variables `domain add`, `access enable` and `setup --no-ai` manage,
- * derived from the state at every deploy. AI off sets AI_ENABLED=false, which
- * wins over a --var, so the Worker never runs without the AI binding while
- * its variable says AI is on.
+ * The variables `domain add`, `access enable`, `setup --no-ai` and `setup
+ * --site-listing` manage, derived from the state at every deploy. AI off sets
+ * AI_ENABLED=false, which wins over a --var, so the Worker never runs without
+ * the AI binding while its variable says AI is on. Owners-only site listing
+ * sets SITE_LISTING=owners (the Worker implies OWNERSHIP=owner then; setup
+ * refuses any other OWNERSHIP); listing every site leaves it unset.
  * @param {Record<string, any>} state
  */
 export function managedVars(state) {
   const m = {};
   if (state?.ai === false) m.AI_ENABLED = "false";
+  if (state?.siteListing === "owners") m.SITE_LISTING = "owners";
   if (state?.domain?.host) {
     m.BASE_DOMAIN = state.domain.host;
     m.URL_MODE = state.domain.mode === "host" && state.domain.status === "active" ? "host" : "path";
@@ -463,7 +466,8 @@ export async function dryRunDeploy(ctx, state, o = {}) {
     const v = vars[k];
     ui.log(`  ${k}=${typeof v === "string" ? v : JSON.stringify(v)}`);
   }
-  ui.log(dim(`R2: ${bucket ? `bucket ${bucket}` : "none"} · AI: ${ai ? "on" : "off (no Workers AI binding)"} · workers.dev: ${config.workers_dev ? "on" : "off"} · layout: ${ctx.layout.kind}`));
+  const listing = state.siteListing === "owners" ? "owners only" : "every site";
+  ui.log(dim(`R2: ${bucket ? `bucket ${bucket}` : "none"} · AI: ${ai ? "on" : "off (no Workers AI binding)"} · site listing: ${listing} · workers.dev: ${config.workers_dev ? "on" : "off"} · layout: ${ctx.layout.kind}`));
   if (r.code !== 0) ui.error("wrangler deploy --dry-run failed (see the output above)");
   return r.code;
 }

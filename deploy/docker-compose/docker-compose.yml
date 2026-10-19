@@ -24,6 +24,8 @@ services:
       BACKYARD_DEPLOY_TOKEN_SHA256: ${BACKYARD_DEPLOY_TOKEN_SHA256:?run ./init-env.sh (or set BACKYARD_DEPLOY_TOKEN_SHA256 in .env)}
       BACKYARD_ALLOW_ANONYMOUS_DEPLOY: ${BACKYARD_ALLOW_ANONYMOUS_DEPLOY:-false}
       BACKYARD_RSYNC_TARGET: ${BACKYARD_RSYNC_TARGET:-}
+      # Owners-only site listing (see the sites block in backyard.yaml).
+      BACKYARD_SITE_LISTING: ${BACKYARD_SITE_LISTING:-all}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run ./init-env.sh (or set POSTGRES_PASSWORD in .env)}
       # Single sign-on (see the oidc block in backyard.yaml).
       OIDC_ISSUER: ${OIDC_ISSUER:-}

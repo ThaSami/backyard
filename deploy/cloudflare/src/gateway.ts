@@ -36,7 +36,7 @@ import type { SiteRecord } from "./registry-do";
 import { gatewayURL, siteNameError, siteURL, type RequestContext } from "./router";
 import type { CommitResult, DeployFile, MergeOutcome, MergeRefusal, PageInfo } from "./site-do";
 import { fixedLength } from "./site-api";
-import { isOwner, siteMetaJSON } from "./sitemeta";
+import { filterListed, isOwner, siteMetaJSON } from "./sitemeta";
 import { chargeOrThrow, registry, siteStub, VERSION } from "./stubs";
 import { extractPage, TITLE_SCAN_BYTES, type Page } from "./title";
 
@@ -86,6 +86,8 @@ export function infoDocument(ctx: RequestContext): Record<string, unknown> {
       max_files: cfg.limits.max_files,
       max_file_bytes: maxFileBytes(cfg, !!ctx.env.R2),
     },
+    // Who the site lists show a site to (SPEC §7.1, §7.2 "Listing"): always present.
+    site_listing: cfg.siteListing,
   };
   // The Claude connector's endpoint (SPEC §7.1, §14.1), while it is on.
   if (mcpEnabled(ctx)) doc.mcp_url = mcpResource(ctx);
@@ -243,9 +245,10 @@ async function handleMe(ctx: RequestContext): Promise<Response> {
   return json(cleanUser(await gatewayUser(ctx, "read")));
 }
 
+/** GET /sites: the sites listed to the caller (SITE_LISTING, listedTo); lookups by name are not filtered. */
 async function handleListSites(ctx: RequestContext): Promise<Response> {
-  await gatewayUser(ctx, "read");
-  const list = unwrap(await registry(ctx.env).listSites());
+  const u = await gatewayUser(ctx, "read");
+  const list = filterListed(ctx.cfg, u, unwrap(await registry(ctx.env).listSites()));
   return json({ sites: list.map((r) => siteMetaJSON(r, siteURL(ctx, r.name))) });
 }
 

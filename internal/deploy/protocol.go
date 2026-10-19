@@ -81,6 +81,9 @@ type Info struct {
 	Methods     []string          `json:"methods"`
 	RsyncTarget string            `json:"rsync_target,omitempty"`
 	Limits      Limits            `json:"limits"`
+	// SiteListing is sites.listing (SPEC §7.1): "all" or "owners", always
+	// present.
+	SiteListing string `json:"site_listing"`
 	// MCPURL is the hub's remote MCP endpoint (SPEC §7.1, §14.1): present
 	// while the Claude connector is enabled, on the hub's embedded gateway
 	// only.

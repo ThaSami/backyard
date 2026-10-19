@@ -131,6 +131,10 @@ function wsAccept(req, socket, handlers) {
  * image a site in opts.sites names as its preview ("preview": "preview.svg";
  * GET /__backyard/api/sites/{site}/preview serves it, 404 when it is missing).
  * A deploy sets SiteMeta.preview to the first PREVIEW_NAMES file it holds.
+ * listing: "owners" lists sites like sites.listing: owners (SPEC §7.2
+ * "Listing", which implies ownership: deploys record the first deployer as the
+ * owner and refuse others but admins); /info reports it as site_listing
+ * ("all" otherwise). GET G/sites/{site} answers for every site.
  * Returns { url, state, close() }.
  */
 export async function startStub(opts = {}) {
@@ -168,6 +172,16 @@ export async function startStub(opts = {}) {
   };
   const summary = (u) => ({ id: u.id, name: u.name, email: u.email });
   const now = () => new Date().toISOString();
+  const ownersOnly = opts.listing === "owners";
+  /** Whether u is one of names, by id or email (case-insensitive), like Meta.IsOwner. */
+  const named = (u, names) => names.some((n) => [u.id, u.email].some((k) => !!k && String(k).toLowerCase() === String(n).toLowerCase()));
+  /** Whether the site list shows meta to u (SPEC §7.2 "Listing"). */
+  const listedTo = (u, meta) => {
+    if (!ownersOnly) return true;
+    if (u.anonymous) return false;
+    const owners = meta.owners || [];
+    return u.admin || named(u, owners) || (owners.length === 0 && !!meta.created_by && named(u, [meta.created_by]));
+  };
   const coll = (c) => {
     if (!state.docs.has(c)) state.docs.set(c, new Map());
     return state.docs.get(c);
@@ -298,6 +312,7 @@ export async function startStub(opts = {}) {
         auth: { mode: "none", anonymous_deploy: !state.requireToken },
         methods: ["api"],
         limits: { max_site_bytes: 524288000, max_files: 10000, max_file_bytes: 104857600 },
+        site_listing: ownersOnly ? "owners" : "all",
         ...(opts.mcp ? { mcp_url: base + "/__backyard/mcp" } : {}),
         ...(opts.info || {}),
       });
@@ -325,11 +340,11 @@ export async function startStub(opts = {}) {
       return apiError(res, 405, "bad_request", "method not allowed");
     }
     if (path === "/me") return json(res, 200, user);
-    if (path === "/sites") return json(res, 200, { sites: state.sites });
+    if (path === "/sites") return json(res, 200, { sites: state.sites.filter((s) => listedTo(user, s)) });
     // A site's preview image (SPEC §2, §7.2): from the hub's origin, typed by its extension, sandboxed.
     if ((m = /^\/sites\/([a-z0-9-]+)\/preview$/.exec(path))) {
       if (method !== "GET" && method !== "HEAD") return apiError(res, 405, "bad_request", "method not allowed");
-      const meta = state.sites.find((s) => s.name === m[1]);
+      const meta = state.sites.find((s) => s.name === m[1] && listedTo(user, s));
       const ext = meta && meta.preview ? meta.preview.slice(meta.preview.lastIndexOf(".") + 1).toLowerCase() : "";
       const bytes = meta && meta.preview ? state.stored.get(m[1] + "/" + meta.preview) : undefined;
       if (!bytes || !Object.hasOwn(PREVIEW_TYPES, ext)) return apiError(res, 404, "not_found", `site "${m[1]}" has no preview`);
@@ -357,10 +372,22 @@ export async function startStub(opts = {}) {
       const tu = tokenUser(req.headers.authorization);
       return tu ? json(res, 200, tu) : apiError(res, 401, "unauthenticated", "invalid or expired token (run: backyard login)");
     }
+    // GET G/sites/{site} (SPEC §7.2): any site by name, whatever the listing.
+    if ((m = /^\/deploy\/sites\/([a-z0-9-]+)$/.exec(path)) && method === "GET") {
+      if (req.headers.authorization && !tokenUser(req.headers.authorization)) return apiError(res, 401, "unauthenticated", "invalid or expired token (run: backyard login)");
+      const meta = state.sites.find((s) => s.name === m[1]);
+      return meta ? json(res, 200, meta) : apiError(res, 404, "not_found", `site "${m[1]}" not found`);
+    }
 
     // Deploy gateway (SPEC §7.3).
     if ((m = /^\/deploy\/sites\/([a-z0-9-]+)\/deploys$/.exec(path)) && method === "POST") {
       if (state.requireToken && req.headers.authorization !== "Bearer " + state.requireToken) return apiError(res, 401, "unauthenticated", "deploy token required");
+      // An owners-only listing implies the ownership policy (SPEC §7.2, §7.3).
+      const prev = ownersOnly && state.sites.find((s) => s.name === m[1]);
+      const actor = tokenUser(req.headers.authorization) || user;
+      if (prev && (prev.owners || []).length && !actor.admin && !named(actor, prev.owners)) {
+        return apiError(res, 403, "forbidden", `site ${m[1]} is owned by ${prev.owners.join(", ")}; only owners and admins can change it`);
+      }
       const reqBody = jsonBody();
       const deployID = "d" + state.deploys.length;
       const dep = { site: m[1], id: deployID, files: reqBody.files, message: reqBody.message, committed: false };
@@ -406,6 +433,12 @@ export async function startStub(opts = {}) {
       // SiteMeta.preview: only the fallback names (the stub reads no og:image).
       const preview = PREVIEW_NAMES.find((n) => dep.files.some((f) => f.path === n && f.size <= MAX_PREVIEW_BYTES));
       const meta = { name: m[1], url: base + "/s/" + m[1] + "/", title: m[1], ...(preview ? { preview } : {}), created_at: now(), updated_at: now(), updated_by: actor.id, file_count: dep.files.length, bytes: 0, owners: [] };
+      if (ownersOnly) {
+        // Ownership: the first deployer who is not a guest becomes the owner.
+        const prev = state.sites.find((s) => s.name === m[1]);
+        meta.created_by = (prev && prev.created_by) || actor.id;
+        meta.owners = prev && (prev.owners || []).length ? prev.owners : actor.anonymous ? [] : [actor.id];
+      }
       state.sites = state.sites.filter((s) => s.name !== m[1]).concat([meta]);
       return json(res, 200, { site: meta, url: meta.url, deleted: 0 });
     }

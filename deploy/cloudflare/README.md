@@ -29,6 +29,7 @@ deploys straight to Cloudflare in a couple of minutes.
 - [What `setup` does](#what-setup-does)
 - [Your own domain](#your-own-domain)
 - [Company login (Cloudflare Access)](#company-login-cloudflare-access)
+- [Owners-only site listing](#owners-only-site-listing)
 - [Use Backyard in Claude](#use-backyard-in-claude)
 - [Command reference](#command-reference)
 - [Credentials and permissions](#credentials-and-permissions)
@@ -159,7 +160,7 @@ everyone a personal login and API tokens. It's free for up to 50 users.
 ## What `setup` does
 
 Re-run it at any time to upgrade: every choice is kept (secrets, the deploy token, R2, AI, the
-domain, Access and your `--var` overrides). Each run:
+site listing, the domain, Access and your `--var` overrides). Each run:
 
 1. **Builds or finds the Worker.** From the npm package (or the CLI's release package) it
    deploys the prebuilt `dist/worker.js`, and every wrangler call runs in a private temporary
@@ -177,7 +178,8 @@ domain, Access and your `--var` overrides). Each run:
    that it is free and registers it. An existing subdomain is used as it is and never renamed.
 5. **Adopts the deployed configuration** when this machine has no saved state for the Worker
    but the Worker exists (another machine, a teammate, CI): the R2 bucket, AI off (a Worker
-   deployed with `--no-ai`: no Workers AI binding and `AI_ENABLED=false`), the variables that
+   deployed with `--no-ai`: no Workers AI binding and `AI_ENABLED=false`), the owners-only site
+   listing (`SITE_LISTING=owners`), the variables that
    differ from the defaults, the custom domain (`BASE_DOMAIN`, `URL_MODE`) and Cloudflare Access
    (`AUTH_MODE`, `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`). It prints one line, `Adopted the deployed
    configuration of <worker> (no setup state on this machine): …`, and the deploy keeps them.
@@ -187,9 +189,10 @@ domain, Access and your `--var` overrides). Each run:
    again. `--no-r2` turns this off for good.
 7. **Variables:** `wrangler.jsonc`'s defaults, then your remembered `--var` overrides, then the
    variables that [`domain add`](#your-own-domain),
-   [`access enable`](#company-login-cloudflare-access) and [`setup --no-ai`](#turning-ai-off)
-   manage. While they manage them, `--var BASE_DOMAIN:…` (and `URL_MODE`, `AUTH_MODE`,
-   `ACCESS_*`, `AI_ENABLED`) exits 2 and names the command that changes them.
+   [`access enable`](#company-login-cloudflare-access), [`setup --no-ai`](#turning-ai-off) and
+   [`setup --site-listing`](#owners-only-site-listing) manage. While they manage them,
+   `--var BASE_DOMAIN:…` (and `URL_MODE`, `AUTH_MODE`, `ACCESS_*`, `AI_ENABLED`, and a
+   `SITE_LISTING` that contradicts the listing) exits 2 and names the command that changes them.
 8. **Runs the auth guard.** A deploy that would turn a live Cloudflare Access off, switch its
    team or open a Worker that fails closed is refused (exit 3, nothing changed), and so is a
    deploy to an existing Worker whose auth mode cannot be read. The message names the cause and
@@ -489,6 +492,41 @@ policy, only objects this tool created and recorded, and needs `BACKYARD_CF_API_
 `access disable --delete-apps` also deletes what an earlier `access disable` left. Applications
 made in the dashboard are deleted there. Answering no changes nothing (exit 3).
 
+## Owners-only site listing
+
+By default every site is listed to everyone who may open sites: the hub's site list,
+`GET <gateway>/sites` (`backyard sites list`) and the Claude connector's `backyard_list_sites`
+show them all. To list each site only to its owners and to admins:
+
+```sh
+backyard cloudflare setup --site-listing owners   # remembered: later runs, domain add and access enable keep it
+backyard cloudflare setup --site-listing all      # every site again (the default)
+```
+
+- **It hides sites from the directory; it is not access control.** Anyone who may open sites can
+  still open one by its URL, and `backyard sites info <name>` (`GET <gateway>/sites/<name>`),
+  `backyard pull` and the site's own API answer as before. To limit who can open sites at all,
+  use [company login](#company-login-cloudflare-access).
+- **Who sees a site.** Admins (`ADMINS`, `ADMIN_GROUPS` and the `DEPLOY_TOKEN`) see every site.
+  Anyone else who is signed in sees the sites they own, plus the sites without owners that they
+  created. Anonymous visitors (the guests of `AUTH_MODE=none`) see none, so the option is most
+  useful with company login.
+- **It implies ownership.** `SITE_LISTING=owners` also turns on `OWNERSHIP=owner`: the first
+  deployer of a site owns it (anonymous guests never do), and only its owners and admins may
+  deploy over it or delete it, so a site you cannot see in the list is never overwritten by
+  someone picking the same name. Sites deployed while ownership was off have no owners: their
+  creator still sees them, and the next deploy of one by someone signed in makes that person its
+  owner. While the listing is owners-only, an `OWNERSHIP` other than `owner` (a `--var`, a
+  remembered override or `wrangler.jsonc`) exits 2: leave it unset.
+- **The hub** says under its Sites heading that only your sites are listed (to admins, that
+  every site is), and `/__backyard/api/info` reports `site_listing` (`all` or `owners`). When a
+  name typed for a new site already belongs to a site you don't own, the deploy box says so.
+- The flag manages the variable: a `--var SITE_LISTING:…` that contradicts it exits 2. `status`
+  shows the `Site listing:` line (`siteListing` in `--json`), and a machine without state adopts
+  the choice. The [Terraform module](#with-terraform-optional-infrastructure-as-code) has
+  `site_listing`, and the [CI deployer](#deploying-from-github-actions)
+  `BACKYARD_CF_SITE_LISTING`, which a CI deploy must carry over.
+
 ## Use Backyard in Claude
 
 The Claude connector turns the hub into a remote MCP server for Claude (claude.ai, Desktop,
@@ -567,6 +605,7 @@ Global options, for every command:
 | `--r2-bucket <name>` | Bucket name (default `<worker>-files`). |
 | `--ai` | Serve AI with the Workers AI binding (the default). Turns AI back on after `--no-ai`. |
 | `--no-ai` | Turn AI off (remembered): no Workers AI binding, and `AI_ENABLED=false`, so every AI call of the sites answers `501 unsupported`. For accounts where Workers AI is not available. See [Turning AI off](#turning-ai-off). |
+| `--site-listing <all\|owners>` | `owners` lists each site only to its owners and admins (`SITE_LISTING=owners`, which implies `OWNERSHIP=owner`); `all` lists every site again (the default). Remembered. It hides sites from the lists, it doesn't stop anyone from opening one by its URL. See [Owners-only site listing](#owners-only-site-listing). |
 | `--var <KEY:VALUE>` | Override a Worker variable (repeatable, remembered). `--var KEY:` drops an override. Secrets (`BACKYARD_SECRET`, `DEPLOY_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `WAREHOUSE_TOKEN`) are refused (exit 2): they are not variables. |
 | `--rotate-token` | Issue a new `DEPLOY_TOKEN`. The old one stops working. |
 | `--rotate-secret` | Replace `BACKYARD_SECRET`. This revokes every API token and anonymous identity. |
@@ -612,7 +651,7 @@ without state it shows the live configuration.
 
 | Option | Meaning |
 | --- | --- |
-| `--json` | Machine-readable output, alone on stdout: `schema`, `worker`, `accountId`, `statePath`, `versions` (`package`, `wrangler`, `deployed`), `urls` (`public`, `workersDev`), `r2Bucket`, `workersDev`, `ai` (`enabled`: `AI_ENABLED` as the Worker reads it; `binding`: Workers AI is bound), `domain` and `access` (`null` when there is none; their `source` is `external` when they are set with `--var`, and the Access `source` is `live` when it was read from the Worker) and `checks`. |
+| `--json` | Machine-readable output, alone on stdout: `schema`, `worker`, `accountId`, `statePath`, `versions` (`package`, `wrangler`, `deployed`), `urls` (`public`, `workersDev`), `r2Bucket`, `workersDev`, `ai` (`enabled`: `AI_ENABLED` as the Worker reads it; `binding`: Workers AI is bound), `siteListing` (`all`, `owners`, or `invalid` when the Worker refuses every request over its `SITE_LISTING`), `domain` and `access` (`null` when there is none; their `source` is `external` when they are set with `--var`, and the Access `source` is `live` when it was read from the Worker) and `checks`. |
 
 Its checks, each `ok`, `pending` or `failed` with a detail: `worker`, `workers-dev`, `hub`,
 `custom-domain`, `route`, `dns`, `tls`, `access-redirect`, `access-bypass`,
@@ -679,6 +718,7 @@ fields are kept):
 | `workersDevUrl`, `workersDev` | The workers.dev URL and whether the Worker serves there. |
 | `r2`, `r2Bucket` | The R2 choice and bucket. |
 | `ai` | `false` after `setup --no-ai`: deploys leave the Workers AI binding out and set `AI_ENABLED=false`. Absent: AI is on (`--ai` removes it). |
+| `siteListing` | `"owners"` after `setup --site-listing owners`: deploys set `SITE_LISTING=owners`. Absent: every site is listed (`--site-listing all` removes it). |
 | `vars` | Your `--var` overrides. |
 | `domain` | Set by `domain add`: `host`, `mode` (`path` or `host`), `zoneId`, `zoneName`, the ids of the custom domain, route and DNS record this tool attached or created, `status` (`active`, `pending-dns`, `pending-certificate`) and `source` (`cli` or `adopted`). |
 | `access` | Set by `access enable`: `team`, `aud`, `source` (`api`, `manual` or `adopted`), the ids of the applications and policies it created, and the `allow` list. |
@@ -860,7 +900,8 @@ endpoints off and keeps the binding (`--var AI_ENABLED:` drops it again). The Te
 Set variables with `backyard cloudflare setup --var KEY:VALUE` (repeatable, remembered;
 `--var KEY:` drops an override) or in `wrangler.jsonc` → `vars` in a checkout. `BASE_DOMAIN`
 and `URL_MODE` belong to `domain add`, `AUTH_MODE`, `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` to
-`access enable`, and `AI_ENABLED` to `setup --no-ai` while AI is off. Every deploy sets all
+`access enable`, `AI_ENABLED` to `setup --no-ai` while AI is off, and `SITE_LISTING` to
+`setup --site-listing`. Every deploy sets all
 variables, so a change made in the dashboard lasts until the next `setup`; and don't deploy
 with a plain `wrangler deploy`, which would deploy `wrangler.jsonc`'s defaults past the auth
 guard. Secrets go through
@@ -877,7 +918,8 @@ guard. Secrets go through
 | `ACCESS_GET_IDENTITY` | `true` | Fetch name and groups from Access `get-identity`. |
 | `ALLOW_ANONYMOUS_DEPLOY` | `false` | `true` lets anyone deploy without a token. Fine for a playground; `LIMITS` still apply. |
 | `ADMINS` / `ADMIN_GROUPS` | — | Comma-separated admin emails and IdP group names. |
-| `OWNERSHIP` | `none` | `none` (anyone may overwrite a site, the Quick way) or `owner` (only owners and admins). |
+| `OWNERSHIP` | `none` (`owner` with `SITE_LISTING=owners`) | `none` (anyone may overwrite a site, the Quick way) or `owner` (the first deployer owns a site; only its owners and admins may change or delete it). With `SITE_LISTING=owners` any other value than `owner` fails closed. |
+| `SITE_LISTING` | `all` | `owners` lists each site in the hub, `GET /sites` and `backyard_list_sites` only to its owners (its creator while it has none) and admins, and implies `OWNERSHIP=owner`; `all` (or unset) lists every site. It hides sites from the lists, it isn't access control. Any other value fails closed. Set by `setup --site-listing`; see [Owners-only site listing](#owners-only-site-listing). |
 | `SERVER_NAME` | `Backyard` | Name shown in the hub. |
 | `RESERVED_SITES` | — | Extra reserved site names (comma-separated). |
 | `LIMITS` | see above | Guardrails (JSON: a string, or an object). |
@@ -897,7 +939,9 @@ guard. Secrets go through
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | Optional AI providers. |
 
 Configuration problems (bad JSON, unknown `LIMITS` keys, missing Access settings, a variable of
-the wrong JSON type) are logged. Invalid `MCP_*` values turn only the Claude connector off and
+the wrong JSON type) are logged. An invalid `AUTH_MODE` or `SITE_LISTING`, or `SITE_LISTING=owners`
+with an `OWNERSHIP` other than `owner`, fails closed instead (`503` but for the health checks).
+Invalid `MCP_*` values turn only the Claude connector off and
 are listed by `/__backyard/readyz`. Watch them with `npx wrangler tail <worker>`. Variables
 written as JSON values (`"FILE_INLINE_MAX": 1000`, `"LIMITS": {…}`) are taken like their text.
 
@@ -923,8 +967,9 @@ backyard cloudflare setup                         # 1. deploy the Worker (worker
 backyard cloudflare setup $(terraform output -raw setup_args)   # 3. domain + Access variables
 ```
 
-`setup_args` is the module output `--worker-name <worker> --ai|--no-ai --var KEY:VALUE …`
-(`--no-ai` when `ai_enabled = false`); the module's
+`setup_args` is the module output `--worker-name <worker> --ai|--no-ai --site-listing all|owners
+--var KEY:VALUE …` (`--no-ai` when `ai_enabled = false`, `--site-listing owners` when
+`site_listing = "owners"`); the module's
 `examples/basic` exports it, and your own root configuration re-exports it the same way
 (`output "setup_args" { value = module.backyard.setup_args }`).
 `setup_command` holds the same as an `npm run setup -- …` command for a checkout. Variables set
@@ -970,6 +1015,7 @@ jobs:
           BACKYARD_CF_VARS: ${{ vars.BACKYARD_CF_VARS }}
           BACKYARD_CF_R2_BUCKET: ${{ vars.BACKYARD_CF_R2_BUCKET }}
           BACKYARD_CF_AI: ${{ vars.BACKYARD_CF_AI }}
+          BACKYARD_CF_SITE_LISTING: ${{ vars.BACKYARD_CF_SITE_LISTING }}
           # Only a manual run with the box checked lets a deploy past the auth guard.
           BACKYARD_CF_CONFIRM_AUTH_CHANGE: ${{ inputs.confirm_auth_change && 'true' || '' }}
 ```
@@ -991,7 +1037,12 @@ The CI deployer is declarative: every deploy sets `wrangler.jsonc`'s variables p
   `BACKYARD_CF_AI` to `false`. The CI deployer then leaves the Workers AI binding out and sets
   `AI_ENABLED` to `false`, as `setup --no-ai` does (so `BACKYARD_CF_VARS` and
   `BACKYARD_CF_DEPLOY_ARGS` may not set `AI_ENABLED` then). Empty or `true` keeps AI on: a
-  deploy binds Workers AI from `wrangler.jsonc`, which fails on an account without Workers AI.
+  deploy binds Workers AI from `wrangler.jsonc`, which fails on an account without Workers AI;
+- if `setup` lists sites only to their owners (`--site-listing owners`: the `Site listing:`
+  line, `siteListing` in `--json`), set `BACKYARD_CF_SITE_LISTING` to `owners`. The CI deployer
+  then sets `SITE_LISTING=owners`, as `setup --site-listing owners` does (`BACKYARD_CF_VARS` and
+  `BACKYARD_CF_DEPLOY_ARGS` never set `SITE_LISTING`, and set `OWNERSHIP` only to `owner` then).
+  Empty or `all` lists every site, so a deploy without it shows every site to everyone again.
 
 CI deploys always serve on `workers.dev` (`workers_dev` in `wrangler.jsonc`), even after
 `setup --no-workers-dev`. The CI deployer runs the same auth guard as `setup`: a deploy that would turn a live
@@ -1096,7 +1147,7 @@ npx needs the `./` (or `--package <path>`): `npx /absolute/path.tgz` does not wo
 | Realtime | In memory, or Redis/Postgres pub/sub across replicas | Each site's websocket hub runs in its own Durable Object (hibernation). Same protocol. The server sends no keep-alive pings (they would wake hibernated objects): the SDK's `{"t":"ping"}` every 25 s is answered with `{"t":"pong"}` by the runtime without waking the object, and closed connections are detected by the runtime. |
 | Uploads | Buffered by the server | Streamed: the site's Durable Object parses the multipart body and writes the file to SQLite or, above `FILE_INLINE_MAX`, to R2 in 10 MiB parts, so neither memory nor the Worker's CPU limit caps uploads below the file limits. |
 | Hub UI, SDK, docs | Embedded in the binary | Bundled into the Worker at build time from `web/` and `skills/` (prebuilt in the npm package). Redeploy to update. |
-| Site owners endpoint | Supported | Supported when `OWNERSHIP=owner`, otherwise `501`. |
+| Site owners endpoint | Supported | Supported when `OWNERSHIP=owner` (also implied by `SITE_LISTING=owners`), otherwise `501`. |
 | Claude connector | `mcp.enabled`; 4 MiB per publish call (`mcp.max_publish_bytes`); per-minute rate limits; publishes of one site serialized by a lease | `MCP_ENABLED`; 2 MiB per publish call (`LIMITS.mcp_publish_bytes`); `mcp_calls_per_day`; each publish is one transaction of the site's Durable Object. Same tools, sign-in flow and wire format. |
 
 Everything a site or agent uses behaves the same on both editions: the `backyard.js` SDK and its
@@ -1110,7 +1161,7 @@ other), `/llms.txt` and `/docs`.
 - **Upgrade:** re-run `setup`: `backyard cloudflare setup` with a newer `backyard` release (it
   installs that release's package), `npx backyard-cloudflare@latest setup` (once it is on npm), or
   `git pull && npm ci && npm run setup` in a checkout. Secrets, the deploy token, R2, AI, the
-  domain, Access and `--var` overrides are kept. Durable Object data survives deploys.
+  site listing, the domain, Access and `--var` overrides are kept. Durable Object data survives deploys.
   `backyard cloudflare status` shows the package, wrangler and deployed versions.
 - **Back up a site:** `backyard pull <site> ./backup` downloads its files. To export
   documents, query them through the site API (`/__backyard/api/db/<collection>`).
@@ -1145,6 +1196,8 @@ other), `/llms.txt` and `/docs`.
 | "this account has no workers.dev subdomain" or "register a workers.dev subdomain first" | Pass `setup --workers-subdomain <name>`, or run `setup` on a terminal and answer the prompt. |
 | `503` "BACKYARD_SECRET is not set" | `setup --skip-deploy`, or `npx wrangler secret put BACKYARD_SECRET --name <worker>` (≥ 32 chars). |
 | `503` "not configured correctly (AUTH_MODE must be …)" | `AUTH_MODE` is neither `none` nor `access` (a `--var` typo). Set it right with `setup --var AUTH_MODE:access` (plus `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`), or drop it with `setup --var AUTH_MODE: --confirm-auth-change` (the auth guard asks for the confirmation because this opens the Worker). |
+| `503` "not configured correctly (SITE_LISTING must be …)" or "SITE_LISTING=owners requires OWNERSHIP=owner" | A `--var` typo, or a dashboard edit. `setup --site-listing owners` (or `all`) sets `SITE_LISTING` right; with owners, drop an `OWNERSHIP` override with `setup --var OWNERSHIP:`. |
+| The hub shows no sites, or only some | `SITE_LISTING=owners` (`status` shows the `Site listing:` line): each site is listed only to its owners and admins, and to nobody who isn't signed in. `setup --site-listing all` lists every site again. |
 | `401` "sign-in cookies of more than one account" | The browser holds cookies of two users for this domain (a site's page may have set one). Reload; if it persists, clear the domain's cookies. |
 | `npm run dev`: "Failed to start the remote proxy session" | Workers AI only runs remotely. Run `npx wrangler login`, or use `npm run dev:local`. |
 | `backyard login`/`deploy` gets an HTML login page or `302` | Access is protecting the deploy gateway. Re-run `access enable`: its edge verification names the missing bypass path. |

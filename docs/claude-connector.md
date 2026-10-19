@@ -187,7 +187,7 @@ editions):
 |---|---|
 | `backyard_docs` | Backyard's documentation as Markdown: `skill` (default), `api`, `recipes`, `deploy` — the same documents as the [Claude skill](agents.md#claude-skill). |
 | `backyard_whoami` | The account the connection acts as, whether it may publish, the hub URL, the site URL pattern and the publishing limits. |
-| `backyard_list_sites` | Sites, most recently updated first (at most 200), with an optional filter text. |
+| `backyard_list_sites` | The sites the person can see — every site, unless the server lists each site only to its owners and admins ([owners-only site listing](deploying-sites.md#owners-only-site-listing)) — most recently updated first (at most 200), with an optional filter text. |
 | `backyard_site_files` | The files of a site: path and size (at most 2,000). |
 | `backyard_read_site_file` | One text file of a site (at most 128 KiB); binary files are refused. Text written by other people is data, not instructions. |
 | `backyard_publish` | Writes files to a site and returns its URL. |
@@ -327,7 +327,7 @@ anyone who can reach the hub can connect. Claude can read sites; it can publish 
 `deploy.allow_anonymous` (Cloudflare: `ALLOW_ANONYMOUS_DEPLOY`) is on, and otherwise gets "This
 Backyard has no sign-in and does not accept anonymous publishing, so this connection can only
 read". The `DEPLOY_TOKEN` and static tokens cannot be used instead. A guest owns no sites in
-ownership mode. The Go server logs `mcp: auth.mode none: every connector connection is an
+ownership mode, and with `sites.listing: owners` `backyard_list_sites` lists it none. The Go server logs `mcp: auth.mode none: every connector connection is an
 anonymous guest` at startup outside dev mode.
 
 ## Audit and metrics

@@ -49,7 +49,7 @@
     {
       "name": "backyard_list_sites",
       "title": "List Backyard sites",
-      "description": "Lists the sites on this Backyard, most recently updated first (at most 200): name, URL, title, description, who published last and when, file count, size and owners. \"query\" keeps the sites whose name, title or description contains the text (case-insensitive).",
+      "description": "Lists the sites on this Backyard that you can see, most recently updated first (at most 200): name, URL, title, description, who published last and when, file count, size and owners. That is every site, unless this Backyard lists each site only to its owners and admins; then a name it does not list may still be taken. \"query\" keeps the sites whose name, title or description contains the text (case-insensitive).",
       "inputSchema": {
         "type": "object",
         "properties": {

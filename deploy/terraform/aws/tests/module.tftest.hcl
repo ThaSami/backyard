@@ -953,6 +953,41 @@ run "alb_mode_with_the_claude_connector" {
   }
 }
 
+# Owners-only site listing: a sites section with listing alone (ownership is
+# implied); the Lambda gateway serves GET /sites, so it gets the key too.
+# configcheck loads both configs and checks the implied ownership.
+run "owners_only_site_listing" {
+  command = apply
+
+  variables {
+    auth_mode          = "oidc"
+    oidc_issuer        = "https://acme.okta.com/oauth2/default"
+    oidc_client_id     = "0oa-web"
+    oidc_client_secret = "s3cr3t"
+    admins             = ["platform@acme.com"]
+    config_overrides   = <<-EOT
+      sites:
+        listing: owners
+    EOT
+  }
+
+  assert {
+    condition = (
+      yamldecode(output.backyard_config_yaml).sites == { listing = "owners" } &&
+      yamldecode(output.backyard_config_yaml).auth.admins == ["platform@acme.com"]
+    )
+    error_message = "config_overrides passes sites.listing to the ECS service as it is."
+  }
+
+  assert {
+    condition = (
+      yamldecode(aws_lambda_function.gateway[0].environment[0].variables.BACKYARD_CONFIG_YAML).sites == { listing = "owners" } &&
+      yamldecode(aws_lambda_function.gateway[0].environment[0].variables.BACKYARD_CONFIG_YAML).auth.admins == ["platform@acme.com"]
+    )
+    error_message = "The Lambda gateway gets sites.listing and the admins, so its GET /sites lists like the hub's."
+  }
+}
+
 run "rejects_invalid_fargate_size" {
   command = plan
 

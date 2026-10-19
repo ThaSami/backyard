@@ -117,7 +117,7 @@ See [authentication](authentication.md) for step-by-step setups.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `auth.mode` | `none` \| `oidc` \| `iap` \| `alb` \| `header` | `none` | How people sign in. `okta`, `entra`, `azuread`, `azure-ad`, `google`, `auth0`, `keycloak` and `openid` are accepted aliases of `oidc`; `off` and `disabled` mean `none`. |
-| `auth.admins` | list of strings | `[]` | User ids / emails with admin rights (delete any site, overwrite in ownership mode). |
+| `auth.admins` | list of strings | `[]` | User ids / emails with admin rights (delete any site, overwrite in ownership mode, see every site with `sites.listing: owners`). |
 | `auth.admin_groups` | list of strings | `[]` | Groups whose members are admins. |
 | `auth.allowed_domains` | list of strings | `[]` (anyone) | Only these email domains may use Backyard (`403` otherwise). |
 | `auth.allowed_emails` | list of strings | `[]` | These exact (verified) email addresses may use Backyard too: an address passes when its domain is in `allowed_domains` or it is listed here. With only this list set, only the listed people get in. |
@@ -364,7 +364,8 @@ See [warehouse](warehouse.md).
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `sites.ownership` | `none` \| `owner` | `none` | `none`: anyone may overwrite any site (the Quick way). `owner`: the first deployer owns a site; only owners and admins may redeploy or delete it; owners can be managed through the gateway. |
+| `sites.ownership` | `none` \| `owner` | `none` (`owner` with `sites.listing: owners`) | `none`: anyone may overwrite any site (the Quick way). `owner`: the first deployer owns a site; only owners and admins may redeploy or delete it; owners can be managed through the gateway. |
+| `sites.listing` | `all` \| `owners` | `all` | Which sites the site directories list: the hub, `backyard sites list` (the gateway's `GET …/sites`) and `backyard_list_sites`. `all`: every site to everyone. `owners`: each site only to its owners (while it has none, to its creator) and to admins; guests see none. It hides sites, it does not protect them: anyone who may open sites can still open one by its URL or look it up by name. Implies ownership: `sites.ownership` defaults to `owner`, and `none` with it is an error. See [owners-only site listing](deploying-sites.md#owners-only-site-listing). An older server rejects the key: upgrade before you set it. |
 | `sites.reserved` | list | `www, api, admin, hub, auth, static, assets, cdn, docs, mail, backyard, s` | Names that can never be deployed. Setting the key replaces the list. |
 | `sites.max_site_bytes` | int | `524288000` (500 MiB) | Total size of a site's files. |
 | `sites.max_files` | int | `10000` | Files per site. |

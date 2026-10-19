@@ -323,6 +323,77 @@ test("filterSites: search terms across fields, newest first", () => {
   assert.deepEqual(plain(hub.filterSites(sites, "zzz")), []);
 });
 
+test("owners-only listing (site_listing): the note, the empty directory, who is listed every site", () => {
+  const owners = { site_listing: "owners" };
+  const alice = { id: "alice@acme.com", email: "alice@acme.com", admin: false, anonymous: false };
+  const admin = { id: "admin@acme.com", admin: true, anonymous: false };
+  const guest = { id: "anon:0123456789abcdef", admin: true, anonymous: true };
+  const ALL_EMPTY = "No sites yet. Drop a folder above to create the first one.";
+  const OWN_EMPTY = "You don't own any sites yet. Drop a folder above to create one.";
+  // Every site is listed: today's texts, whoever looks (older servers have no site_listing).
+  for (const info of [null, {}, { site_listing: "all" }, { site_listing: "" }, { site_listing: "OWNERS" }]) {
+    for (const me of [null, alice, admin, guest]) {
+      assert.equal(hub.listingNote(info, me), "", JSON.stringify([info, me]));
+      assert.equal(hub.listsOwnSitesOnly(info, me), false);
+      assert.equal(hub.emptySitesText(info, me, 0, ""), ALL_EMPTY);
+    }
+  }
+  assert.equal(hub.listingNote(owners, alice), "Only your sites are listed.");
+  assert.equal(hub.listingNote(owners, null), "Only your sites are listed.");
+  assert.equal(hub.listingNote(owners, guest), "Only your sites are listed.", "a guest is never an admin");
+  assert.equal(hub.listingNote(owners, { ...alice, admin: "yes" }), "Only your sites are listed.");
+  assert.equal(hub.listingNote(owners, admin), "You are an admin: every site is listed.");
+  assert.deepEqual([alice, null, guest, admin].map((me) => hub.listsOwnSitesOnly(owners, me)), [true, true, true, false]);
+  assert.deepEqual([alice, null, guest, admin].map((me) => hub.isAdminUser(me)), [false, false, false, true]);
+  assert.equal(hub.emptySitesText(owners, alice, 0, ""), OWN_EMPTY);
+  assert.equal(hub.emptySitesText(owners, guest, 0, ""), OWN_EMPTY);
+  assert.equal(hub.emptySitesText(owners, admin, 0, ""), ALL_EMPTY, "an admin is listed every site");
+  for (const info of [null, owners]) assert.equal(hub.emptySitesText(info, alice, 3, "poll"), "No sites match “poll”.");
+});
+
+test("siteNameHint: a listed site, a name taken by a site the list leaves out, a new name", () => {
+  const now = Date.parse("2026-10-19T12:00:00Z");
+  const ex = { name: "poll", updated_by: "bob@acme.com", updated_at: "2026-10-19T09:00:00Z" };
+  assert.match(hub.siteNameHint(ex, null, now), /^Updates the existing site \(last deployed by bob@acme\.com, .+\)\.$/);
+  assert.equal(hub.siteNameHint({ name: "poll" }, true, now), "Updates the existing site.", "the listed site wins");
+  assert.equal(hub.siteNameHint(null, true, now), "This name is taken by a site you don't own; only its owners or an admin can update it.");
+  for (const taken of [false, null, undefined]) assert.equal(hub.siteNameHint(null, taken, now), "A new site will be created.");
+});
+
+test("siteExists looks a name up with GET G/sites/{site}: 200 taken, 404 free, anything else unknown", async () => {
+  const calls = [];
+  const answer = (status, body, headers = { "Content-Type": "application/json" }) => async (url, init) => {
+    calls.push({ url, ...init });
+    return new Response(typeof body === "string" ? body : JSON.stringify(body), { status, headers });
+  };
+  assert.equal(await hub.siteExists({ gateway: "/__backyard/api/deploy/", site: "poll", token: "t", fetch: answer(200, { name: "poll", owners: ["bob@acme.com"] }) }), true);
+  assert.deepEqual(plain(calls[0]), {
+    url: "/__backyard/api/deploy/sites/poll",
+    method: "GET",
+    credentials: "same-origin",
+    redirect: "manual",
+    headers: { Accept: "application/json", "X-Backyard": "1", Authorization: "Bearer t" },
+  });
+  assert.equal(await hub.siteExists({ gateway: "/g", site: "free", fetch: answer(404, { error: { code: "not_found", message: "site not found" } }) }), false);
+  assert.equal(calls[1].headers.Authorization, undefined, "no token: the visitor's own session");
+  const ctrl = new AbortController();
+  await hub.siteExists({ gateway: "/g", site: "x", fetch: answer(404, {}), signal: ctrl.signal });
+  assert.equal(calls[2].signal, ctrl.signal, "the lookup can be aborted");
+  for (const [what, fetch] of [
+    ["401", answer(401, { error: { code: "unauthenticated", message: "sign in" } })],
+    ["403", answer(403, { error: { code: "forbidden", message: "no" } })],
+    ["500", answer(500, "oops", { "Content-Type": "text/plain" })],
+    ["a login page", answer(200, "<!doctype html><title>Sign in</title>", { "Content-Type": "text/html" })],
+    ["not JSON", answer(200, "nope", { "Content-Type": "application/json" })],
+    ["another site", answer(200, { name: "other" })],
+    ["a redirect", async () => ({ type: "opaqueredirect", status: 0, ok: false, headers: new Headers() })],
+    ["offline", async () => Promise.reject(new TypeError("Failed to fetch"))],
+    ["aborted", async () => Promise.reject(new DOMException("The operation was aborted.", "AbortError"))],
+  ]) {
+    assert.equal(await hub.siteExists({ gateway: "/g", site: "poll", fetch }), null, what);
+  }
+});
+
 test("previewURL: the hub route, versioned by the last change; nothing without SiteMeta.preview", () => {
   const base = { name: "lunch-vote", preview: "preview.svg" };
   assert.equal(

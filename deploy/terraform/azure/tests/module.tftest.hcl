@@ -503,6 +503,7 @@ run "containerapp_edge_okta_vnet" {
     extra_config_yaml = <<EOT
       sites:
         ownership: owner
+        listing: owners
       ratelimit:
         ai_per_minute: 10
       mcp:
@@ -537,6 +538,7 @@ run "containerapp_edge_okta_vnet" {
       yamldecode(output.backyard_config_yaml).auth.token_ttl == "168h" &&
       !can(yamldecode(output.backyard_config_yaml).auth.oidc.scopes) &&
       yamldecode(output.backyard_config_yaml).sites.ownership == "owner" &&
+      yamldecode(output.backyard_config_yaml).sites.listing == "owners" &&
       yamldecode(output.backyard_config_yaml).ratelimit.ai_per_minute == 10 &&
       yamldecode(output.backyard_config_yaml).warehouse.sources.default.dsn == "$${WAREHOUSE_DSN}" &&
       startswith(yamldecode(output.backyard_config_yaml).warehouse.queries.signups.sql, "SELECT day")
