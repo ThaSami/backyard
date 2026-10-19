@@ -57,7 +57,7 @@ services:
     # (and any monitoring) can use GET /__backyard/healthz and /__backyard/readyz.
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     restart: unless-stopped
     environment:
       POSTGRES_USER: backyard
