@@ -188,7 +188,7 @@ describe("bin/backyard-cloudflare.mjs", () => {
     let sb = await newSandbox();
     let r = await sb.run(["--version"]);
     assert.equal(r.code, 0, r.out);
-    assert.equal(r.stdout, "backyard-cloudflare 0.3.0-dev (source checkout) (wrangler 4.149.0)\n");
+    assert.equal(r.stdout, "backyard-cloudflare 0.4.0-dev (source checkout) (wrangler 4.149.0)\n");
     sb = await newSandbox({ layout: "packaged", version: "1.2.3-test" });
     r = await sb.run(["--version"]);
     assert.equal(r.code, 0, r.out);

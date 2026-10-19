@@ -1143,8 +1143,8 @@ build its digest into the `backyard` CLI and can publish it to npm.
 To try a local package:
 
 ```sh
-npx ./dist-npm/backyard-cloudflare-0.3.0.tgz setup                     # a ./relative path
-backyard cloudflare setup --package ./dist-npm/backyard-cloudflare-0.3.0.tgz
+npx ./dist-npm/backyard-cloudflare-0.4.0.tgz setup                     # a ./relative path
+backyard cloudflare setup --package ./dist-npm/backyard-cloudflare-0.4.0.tgz
 ```
 
 npx needs the `./` (or `--package <path>`): `npx /absolute/path.tgz` does not work.
