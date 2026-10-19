@@ -153,10 +153,12 @@ sites:
 ```
 
 then `docker compose up -d`. It implies site ownership (the first deployer owns a site; only
-its owners and admins may redeploy or delete it) and hides sites from the directory without
-restricting who can open them. It is meant for a sign-in (step 4): with `auth.mode: none`
-every browser is a guest and is listed no site. Images older than the option refuse the key, so move `BACKYARD_IMAGE` to a release that
-has it first. Details: [owners-only site listing](../../docs/deploying-sites.md#owners-only-site-listing).
+its owners and admins may redeploy or delete it, except that a site without owners, such as one
+from before, can be replaced and claimed by any signed-in deployer) and hides sites from the
+directory without restricting who can open them. It is meant for a sign-in (step 4): with
+`auth.mode: none` every browser is a guest and is listed no site. Images older than the option
+refuse the key, so move `BACKYARD_IMAGE` to a release that has it first. Details:
+[owners-only site listing](../../docs/deploying-sites.md#owners-only-site-listing).
 
 ### 5. Start and upgrade
 

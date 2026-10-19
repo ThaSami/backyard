@@ -29,8 +29,10 @@
 //   BACKYARD_CF_SITE_LISTING  "owners" lists each site only to its owners and admins, like
 //                             `setup --site-listing owners`: SITE_LISTING is "owners", which
 //                             implies OWNERSHIP=owner (so OWNERSHIP, when set, must be
-//                             "owner"). Empty or "all": every site is listed (default).
-//                             BACKYARD_CF_VARS and BACKYARD_CF_DEPLOY_ARGS never set SITE_LISTING
+//                             "owner"). Empty or "all": every site is listed (default), and
+//                             ownership is off again unless OWNERSHIP=owner is set.
+//                             BACKYARD_CF_VARS and BACKYARD_CF_DEPLOY_ARGS never set SITE_LISTING,
+//                             and a SITE_LISTING in wrangler.jsonc must agree with this switch
 //   BACKYARD_CF_DEPLOY_ARGS   extra `wrangler deploy` arguments (split on spaces)
 //   BACKYARD_CF_DIR           the Worker project (default: deploy/cloudflare)
 //   BACKYARD_CF_WAIT_SECONDS  how long to wait for /__backyard/readyz (default 60, 0 = skip)
@@ -73,7 +75,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { apiBase, createApi } from "../deploy/cloudflare/scripts/lib/cfapi.mjs";
-import { authGuard, authModeOf, fillAuthFromInfo, readLive } from "../deploy/cloudflare/scripts/lib/live.mjs";
+import { authGuard, authModeOf, fillAuthFromInfo, readLive, siteListingOf } from "../deploy/cloudflare/scripts/lib/live.mjs";
 import { proxyHint } from "../deploy/cloudflare/scripts/lib/net.mjs";
 import { CliError } from "../deploy/cloudflare/scripts/lib/ui.mjs";
 import { isMissingWorker, parseSecretList as parseSecretListOutput } from "../deploy/cloudflare/scripts/lib/wrangler.mjs";
@@ -548,6 +550,13 @@ export async function deploy({ env = process.env, dryRun = false, log = console.
   // The listing switch owns SITE_LISTING, like `setup --site-listing` does.
   if ("SITE_LISTING" in vars || "SITE_LISTING" in argVars) {
     throw new CIError('SITE_LISTING is set by BACKYARD_CF_SITE_LISTING ("owners", or "all"/empty for every site); remove it from BACKYARD_CF_VARS and BACKYARD_CF_DEPLOY_ARGS');
+  }
+  // A SITE_LISTING in wrangler.jsonc would outlive BACKYARD_CF_SITE_LISTING=all (only owners is
+  // added), so one the Worker reads as another listing is refused instead of deployed.
+  const baseListing = config.vars?.SITE_LISTING;
+  const baseText = typeof baseListing === "string" ? baseListing : baseListing === undefined || baseListing === null ? "" : JSON.stringify(baseListing);
+  if (baseText.trim() !== "" && siteListingOf(baseText) !== listing) {
+    throw new CIError(`wrangler.jsonc sets SITE_LISTING=${JSON.stringify(baseText)}, but the site listing of this deploy is ${listing} (BACKYARD_CF_SITE_LISTING; empty means all): remove SITE_LISTING from wrangler.jsonc and choose with BACKYARD_CF_SITE_LISTING`);
   }
   // Owners are recorded only with OWNERSHIP=owner (the Worker's default with SITE_LISTING=owners;
   // any other value makes it refuse every request).

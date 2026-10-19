@@ -130,7 +130,7 @@ Hub host:
 
 | Path | Purpose |
 |---|---|
-| `/` | hub UI: site directory/search of the sites listed to the viewer (§7.2 "Listing"; in the grid view each site card shows the site's preview image, §3, or a placeholder of the same size), drag-and-drop deploy, and side cards with CLI setup instructions, agent instructions and the Claude connector (§8.4.7), collapsible and collapsed by default. With `site_listing: "owners"` (§7.1) the directory says that only the viewer's sites are listed (to an admin: that every site is), and the deploy form looks up a name it does not list with `GET G/sites/{site}` to tell a name taken by someone else's site from a free one |
+| `/` | hub UI: site directory/search of the sites listed to the viewer (§7.2 "Listing"; in the grid view each site card shows the site's preview image, §3, or a placeholder of the same size), drag-and-drop deploy, and side cards with CLI setup instructions, agent instructions and the Claude connector (§8.4.7), collapsible and collapsed by default. With `site_listing: "owners"` (§7.1) the directory says that only the viewer's sites are listed (to an admin: that every site is; to a guest: that sites are listed only to their signed-in owners and admins), and the deploy form looks up a name it does not list with `GET G/sites/{site}`. To a signed-in viewer it tells a free name from one taken by a site with owners (which only they and admins may update) or by a site without owners (which a deploy replaces, and whose next signed-in deployer becomes its owner, §7.3). A guest (never an owner) without a deploy token is told when a name is taken by a site with owners; otherwise — with a token, or for a free name or a site without owners — a guest sees the texts of the full listing (a new site, or an update of the existing site) |
 | `/docs` | API docs (renders `skills/backyard/references/api.md`) |
 | `/docs/skill.md`, `/docs/<ref>.md`, `/docs/references/<ref>.md` | the skill documents as `text/markdown` |
 | `/llms.txt`, `/llms-full.txt` | agent-oriented docs (SKILL.md; SKILL.md + all references) |
@@ -713,8 +713,11 @@ owners nor `created_by`, so only admins see it until then; the Go server's dev s
 `owners` implies ownership: an empty `sites.ownership` becomes `owner` (Worker: `OWNERSHIP` unset
 or `owner`), and `sites.listing: owners` with `sites.ownership: none` is a configuration error
 (§12; the Worker fails closed, §16), because owners are recorded only in ownership mode and a
-directory that hides a site must not let others overwrite it by name unnoticed. Listing is **not
-access control**:
+directory that hides a site must not let others overwrite it by name unnoticed. That protects a
+site once it has owners: a site without owners (every site written only while ownership was
+off, item 3) accepts the write of anyone who may deploy, and its next signed-in deployer
+becomes its owner (§7.3); any signed-in caller may also `DELETE` it or set its owners. Without
+`owners` (the key removed or `all`) an empty `sites.ownership` is `none` again. Listing is **not access control**:
 `GET G/sites/{site}`, `GET G/sites/{site}/files[/…]`, the site API's `GET /site` (§5.1), the site
 itself and its uploads, and the connector's `backyard_site_files` and `backyard_read_site_file`
 answer for every site as before — the CLI's and `backyard mcp`'s overwrite checks, `backyard pull`,
@@ -770,7 +773,9 @@ absolute `og:image` URL for link unfurls and a `preview.*` file for the hub can 
    §7.1 enforced. A file is `unchanged` when the current manifest has the same sha256 **and**
    the manifest-recorded etag+size still match storage (detects out-of-band syncs). Ownership:
    in `sites.ownership: owner` mode the first deployer becomes owner; later deploys require
-   being an owner or admin.
+   being an owner or admin. A site without owners (new, or written only while ownership was
+   off or only by guests) accepts every deployer, and the first non-anonymous one becomes its
+   owner; until then any non-anonymous caller may also delete it or set its owners (§7.2).
 2. Client `PUT`s each upload URL with **all** the given headers and the raw bytes. Upload URLs
    are either presigned storage URLs (s3/gcs/azure) or `G/uploads/{signed-token}` (fs storage,
    `deploy.presign: false`, or credentials that cannot presign). Every upload is bound to the
@@ -2059,11 +2064,14 @@ storage are available on free); R2 and paid features are optional.
   `/__backyard/readyz` names the variables), because falling back to `all` would list every site.
   Without `owners` the parsing of `OWNERSHIP` is unchanged. The engine's
   `setup --site-listing owners` (remembered in its state as `"siteListing": "owners"`; absent
-  means `all`, and `--site-listing all` lists every site again) deploys with
-  `SITE_LISTING=owners`, and with `all` without the variable. The flag wins: `SITE_LISTING` is a
-  managed variable (a `--var SITE_LISTING:…` that contradicts the flag or the remembered choice
-  is refused, exit 2), and with `owners` a remembered or given `--var OWNERSHIP:` other than
-  `owner` is refused too (exit 2).
+  means `all`, and `--site-listing all` lists every site again and, unless `OWNERSHIP=owner` is
+  set, turns ownership off) deploys with `SITE_LISTING=owners`, and with `all` without the
+  variable. The flag wins: `SITE_LISTING` is a managed variable. A `--var SITE_LISTING:…` that
+  contradicts the flag or the remembered choice is refused (exit 2), and so is a `SITE_LISTING`
+  in the base configuration (`wrangler.jsonc` `vars`) that is invalid or that the Worker would
+  read as another listing: `setup`, `domain add`/`remove` and `access enable`/`disable` refuse it instead of
+  deploying it. With `owners`, a remembered or given `--var OWNERSHIP:` other than `owner` is
+  refused too (exit 2).
 * **Warehouse:** not available on Cloudflare (`501 unsupported`) unless `WAREHOUSE_URL` points
   to a Backyard Go server's warehouse API (proxy) — optional.
 * **Auth:** `AUTH_MODE` = `none` (anonymous cookie identity; deploys need `DEPLOY_TOKEN` unless
@@ -2130,10 +2138,11 @@ storage are available on free); R2 and paid features are optional.
   always puts `--site-listing <value>` there, so setting it back to `all` takes effect. The CI
   deployer (`scripts/cloudflare-ci.mjs`) is declarative and has its own switch,
   `BACKYARD_CF_SITE_LISTING` (`owners` sets `SITE_LISTING=owners` and refuses an `OWNERSHIP`
-  other than `owner`; empty or `all` sets nothing; any other value, and `SITE_LISTING` in
-  `BACKYARD_CF_VARS` or the deploy arguments, is an error). `/info` (§7.1) reports the build
-  version (the release version, `<package version>-dev` for checkout builds). GitHub Actions
-  example included.
+  other than `owner`; empty or `all` sets nothing; any other value, `SITE_LISTING` in
+  `BACKYARD_CF_VARS` or the deploy arguments, and a `SITE_LISTING` in `wrangler.jsonc` that is
+  invalid or that the Worker would read as another listing than the switch's, is an error). `/info` (§7.1) reports
+  the build version (the release version, `<package version>-dev` for checkout builds). GitHub
+  Actions example included.
 
 ## 17. Cross-edition API conformance
 

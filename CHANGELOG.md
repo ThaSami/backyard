@@ -24,33 +24,54 @@ All notable changes to Backyard are documented here. The format follows
   `sites.ownership: none` next to it is a configuration error; the Worker fails closed (`503`)
   on an invalid `SITE_LISTING` or a contradicting `OWNERSHIP`. `GET /__backyard/api/info`
   reports `site_listing` (`all` or `owners`). The hub says when only your sites are listed (to
-  admins, that every site is), and its deploy form looks up a name it does not list and says
-  when it belongs to a site you don't own. Guide:
+  admins, that every site is; to guests, that sites are listed only to their signed-in owners
+  and admins, without promising that a dropped folder will appear), and its deploy form looks up
+  a name it does not list and tells a signed-in person whether it belongs to a site with other
+  owners (only they and admins can update it) or to a site without owners, which deploying
+  replaces and makes yours; a guest without a deploy token is told when a name is taken by a
+  site with owners, and otherwise sees the texts it sees when every site is listed. Guide:
   [Owners-only site listing](docs/deploying-sites.md#owners-only-site-listing).
 - Cloudflare edition: `backyard cloudflare setup --site-listing owners` (remembered by every
   later `setup`, `domain add`/`remove` and `access enable`/`disable`; `--site-listing all` lists
   every site again) deploys with `SITE_LISTING=owners`. A `--var SITE_LISTING:…` that
   contradicts it exits 2, and so does an `OWNERSHIP` other than `owner` while the listing is
-  owners-only. A machine without state adopts the choice, `status` shows `Site listing:`
-  (`siteListing` in `--json`), the Terraform module's `site_listing` (default `all`) always
-  puts `--site-listing <value>` into `setup_args`, and the GitHub Actions deployer takes
-  `BACKYARD_CF_SITE_LISTING=owners` (repository variable `vars.BACKYARD_CF_SITE_LISTING`;
-  `SITE_LISTING` in `BACKYARD_CF_VARS` or the deploy arguments is an error).
+  owners-only. `setup`, `domain` and `access` also refuse (exit 2) a `SITE_LISTING` in
+  `wrangler.jsonc` that contradicts the chosen listing, instead of deploying it. A machine
+  without state adopts the choice, `status` shows `Site listing:` (`siteListing` in `--json`),
+  the Terraform module's `site_listing` (default `all`) always puts `--site-listing <value>`
+  into `setup_args`, and the GitHub Actions deployer takes `BACKYARD_CF_SITE_LISTING=owners`
+  (repository variable `vars.BACKYARD_CF_SITE_LISTING`; `SITE_LISTING` in `BACKYARD_CF_VARS` or
+  the deploy arguments, and one in `wrangler.jsonc` that contradicts the switch, is an error).
 - The deployment kits show how to turn the listing on: Helm `config.sites.listing` (commented in
   `values.yaml` and `values-production.yaml`), the AWS module's `config_overrides` (the Lambda
   gateway gets it too) and the GCP and Azure modules' `extra_config_yaml`, the Compose kit's
   `BACKYARD_SITE_LISTING` with a commented `sites` block in `backyard.yaml`, and a commented
-  `listing: owners` in the systemd sample.
+  `sites` block (`listing: owners`) in the systemd sample.
   **Upgrade:** the listing is off by default, so nothing changes until you set it, at setup or
   with any later upgrade. The Go configuration is strict and an older server refuses to start
   with `sites.listing`: upgrade the server — and a standalone or AWS Lambda gateway (`make
   lambda`) — first, then set the key, and remove it before rolling back. The Worker ignores
-  unknown variables, and `setup` of this release deploys the Worker that knows it. Turning it on
-  also turns ownership on where `sites.ownership` was unset: from then on only owners and admins
-  may redeploy or delete a site. Sites from before have no owners until their next deploy by a
-  signed-in person; until then they are listed to their creator and to admins (sites deployed
-  with a static CI token or the Cloudflare `DEPLOY_TOKEN` belong to that token: add their people
-  as owners). A CI deploy without `BACKYARD_CF_SITE_LISTING` lists every site again.
+  unknown variables, and `setup` of this release deploys the Worker that knows it. A
+  `backyard.yaml` made from the `backyard config example` of an earlier release sets
+  `sites.ownership: none`, with which `sites.listing: owners` stops the server from starting:
+  remove that line or set it to `owner`, and run `backyard config validate` before the restart.
+  Turning it on also turns ownership on where `sites.ownership` was unset: from then on only
+  owners and admins may redeploy or delete a site that has owners. Sites from before then have
+  no owners until their next deploy by a signed-in person, and that can be anyone: until then
+  they are listed to their creator and to admins, the next signed-in deployer — not only their
+  creator — replaces them and becomes their owner, and any signed-in user may delete them or
+  set their owners. Give the sites that matter owners right after turning it on (owners can be
+  set only once ownership is on): their creator redeploys them, or their creator or an admin
+  adds owners with the [owners call](docs/deploying-sites.md#ownership); sites deployed with a
+  static CI token or the Cloudflare `DEPLOY_TOKEN` belong to that token, so add their people as
+  owners. Switching the listing back to `all` (removing `sites.listing`, `setup --site-listing
+  all`, Terraform `site_listing = "all"`, or a CI deploy without `BACKYARD_CF_SITE_LISTING`)
+  lists every site again and turns ownership off with it, so anyone may overwrite any site
+  again, unless `sites.ownership: owner` (Cloudflare: `OWNERSHIP=owner`) is set explicitly. The
+  Cloudflare Terraform module's `setup_args` now always carry `--site-listing`, which older
+  `setup` rejects (`unknown option`, exit 2, nothing changed): run them with the `backyard` CLI
+  or `backyard-cloudflare` of this release or newer, so upgrade the CLI together with the
+  module ref.
 
 ### Changed
 

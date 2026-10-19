@@ -1078,6 +1078,13 @@ const listingSites = () => [
 ];
 const TAKEN_HINT = "This name is taken by a site you don't own; only its owners or an admin can update it.";
 const NEW_HINT = "A new site will be created.";
+/** The hint for a site without owners the list leaves out: a deploy replaces it and claims it (SPEC §7.2, §7.3). */
+const OWNERLESS_HINT = (creator) => `A site of this name exists without an owner${creator ? " (created by " + creator + ")" : ""}: deploying replaces it and makes you its owner.`;
+const OWN_EMPTY = "You don't own any sites yet. Drop a folder above to create one.";
+const GUEST_NOTE = "Sites are listed only to their signed-in owners and admins.";
+const GUEST_EMPTY = "Sites are listed only to signed-in people.";
+/** Waits until the deploy form's name hint reads want. */
+const hintIs = (page, want) => page.waitForFunction((w) => document.getElementById("site-hint").textContent === w, want);
 /** The site names the hub looked up with GET G/sites/{name}, in order. */
 const lookups = (stub) => stub.state.requests.filter((q) => q.method === "GET" && /^\/deploy\/sites\/[^/]+$/.test(q.path)).map((q) => q.path.slice("/deploy/sites/".length));
 const siteNames = (page) => page.$$eval(".site .site-name", (els) => els.map((e) => e.textContent));
@@ -1183,6 +1190,140 @@ test("hub with an owners-only listing: a person is listed their sites with a not
   }
 });
 
+test("hub with an owners-only listing: a name taken by a site without owners says a deploy replaces it and claims it", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  // "synced" has neither owners nor a creator (a direct sync without meta).
+  const synced = { name: "synced", url: "http://x/s/synced/", title: "Synced", updated_at: ago(5), file_count: 1, bytes: 1, owners: [] };
+  const stub = await startStub({ listing: "owners", sites: listingSites().concat([synced]) });
+  const { dir, site } = makeSiteDir({ "index.html": "<!doctype html><title>C</title>claimed" });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  await context.addCookies([{ name: "user", value: "alice@acme.com", url: stub.url }]);
+  try {
+    const { page, problems } = await open(context, stub.url + "/");
+    await page.waitForSelector(".site");
+    assert.deepEqual(await siteNames(page), ["mine", "legacy"], "Carol's ownerless site is not listed to Alice");
+    // Carol's ownerless site is not said to be protected; Bob's owned one is.
+    await page.fill("#site-name", "orphan");
+    await hintIs(page, OWNERLESS_HINT("carol@acme.com"));
+    assert.equal(lookups(stub).includes("orphan"), true);
+    await page.fill("#site-name", "synced");
+    await hintIs(page, OWNERLESS_HINT(""));
+    await page.fill("#site-name", "theirs");
+    await hintIs(page, TAKEN_HINT);
+
+    // The hint is right: the deploy replaces Carol's site and makes Alice its owner.
+    await page.fill("#site-name", "orphan");
+    await hintIs(page, OWNERLESS_HINT("carol@acme.com"));
+    await page.setInputFiles("#folder-input", site);
+    await page.waitForFunction(() => !document.getElementById("deploy-btn").disabled);
+    assert.equal(await page.inputValue("#site-name"), "orphan", "a typed name is kept");
+    await page.click("#deploy-btn");
+    await page.waitForSelector('.site[data-site="orphan"].fresh');
+    const claimed = stub.state.sites.find((s) => s.name === "orphan");
+    assert.deepEqual([claimed.owners, claimed.created_by, claimed.updated_by], [["alice@acme.com"], "carol@acme.com", "alice@acme.com"]);
+    assert.equal(stub.state.stored.get("orphan/index.html").toString(), "<!doctype html><title>C</title>claimed");
+    assert.deepEqual(await siteNames(page), ["orphan", "mine", "legacy"]);
+    assert.equal(await page.textContent("#site-count"), "(3)");
+    assert.match(await page.textContent("#site-hint"), /^Updates the existing site \(last deployed by alice@acme\.com, just now\)\.$/);
+    assert.deepEqual(problems, []);
+
+    // Carol is no longer listed it, and the hint now says it has an owner.
+    await context.addCookies([{ name: "user", value: "carol@acme.com", url: stub.url }]);
+    const carol = await open(context, stub.url + "/");
+    await carol.page.waitForSelector("#sites-empty:not([hidden])");
+    assert.equal(await carol.page.textContent("#sites-empty"), OWN_EMPTY);
+    await carol.page.fill("#site-name", "orphan");
+    await hintIs(carol.page, TAKEN_HINT);
+    assert.deepEqual(carol.problems, []);
+  } finally {
+    await context.close();
+    await stub.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hub with an owners-only listing seen by a guest: no site is listed or promised; the name hint says what holds with and without a token", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  // An admin token like the Cloudflare DEPLOY_TOKEN (the guest never owns a site).
+  const tokens = { d3pl0y: { id: "token:deploy", name: "deploy", groups: [], anonymous: false, admin: true } };
+  const stub = await startStub({ guest: true, listing: "owners", sites: listingSites(), tokens });
+  const { dir, site } = makeSiteDir({ "index.html": "<!doctype html><title>G</title>guest" });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  try {
+    const { page, problems } = await open(context, stub.url + "/");
+    await page.waitForSelector("#sites-empty:not([hidden])");
+    assert.equal(await page.textContent("#sites-note"), GUEST_NOTE);
+    assert.equal(await page.isVisible("#sites-note"), true);
+    assert.equal(await page.textContent("#sites-empty"), GUEST_EMPTY);
+    assert.equal(await page.textContent("#site-count"), "");
+    assert.equal(await page.isHidden("#site-list"), true);
+    await page.fill("#search", "theirs");
+    assert.equal(await page.textContent("#sites-empty"), GUEST_EMPTY);
+    await page.fill("#search", "");
+
+    // Names are still looked up. Without a token a guest is refused a site that has owners
+    // (true for it: a guest never owns one), and told only that a site without owners exists.
+    await page.fill("#site-name", "theirs");
+    await hintIs(page, TAKEN_HINT);
+    await page.fill("#site-name", "orphan");
+    await hintIs(page, "Updates the existing site (last deployed by carol@acme.com, 4 hours ago).");
+    assert.deepEqual(lookups(stub).filter((n) => n === "theirs" || n === "orphan"), ["theirs", "orphan"]);
+    const free = page.waitForResponse((r) => r.url().endsWith("/__backyard/api/deploy/sites/fresh-name"));
+    await page.fill("#site-name", "fresh-name");
+    assert.equal((await free).status(), 404);
+    await hintIs(page, NEW_HINT);
+
+    // A guest's deploy replaces an ownerless site but never owns it, so nothing gets listed.
+    await page.fill("#site-name", "orphan");
+    await page.setInputFiles("#folder-input", site);
+    await page.waitForFunction(() => !document.getElementById("deploy-btn").disabled);
+    assert.equal(await page.inputValue("#site-name"), "orphan");
+    await page.click("#deploy-btn");
+    await page.waitForSelector("#result:not([hidden])");
+    assert.equal(await page.textContent("#result-title"), "Deployed orphan!");
+    const replaced = stub.state.sites.find((s) => s.name === "orphan");
+    assert.deepEqual([replaced.owners, replaced.updated_by], [[], "anon:0123456789abcdef"]);
+    await hintIs(page, "Updates the existing site (last deployed by anon:0123456789abcdef, just now).");
+    assert.equal(await page.textContent("#sites-empty"), GUEST_EMPTY);
+    assert.equal(await page.textContent("#sites-note"), GUEST_NOTE);
+    for (const text of [await page.textContent("#site-hint"), await page.textContent("#sites-note"), await page.textContent("#sites-empty")]) {
+      assert.doesNotMatch(text, /don't own|Drop a folder/, text);
+    }
+
+    // With a token pasted the deploy runs as the token's account (here an admin): the hint
+    // follows the token box as it is filled and emptied, and says only that the site exists.
+    await page.fill("#site-name", "theirs");
+    await hintIs(page, TAKEN_HINT);
+    await page.click("#token-box summary");
+    await page.fill("#deploy-token", "d3pl0y");
+    await hintIs(page, "Updates the existing site (last deployed by bob@acme.com, 3 hours ago).");
+    await page.fill("#deploy-token", "");
+    await hintIs(page, TAKEN_HINT);
+    await page.fill("#deploy-token", "d3pl0y");
+    await hintIs(page, "Updates the existing site (last deployed by bob@acme.com, 3 hours ago).");
+    await page.fill("#site-name", "fresh-name");
+    await hintIs(page, NEW_HINT);
+    await page.fill("#site-name", "theirs");
+    await hintIs(page, "Updates the existing site (last deployed by bob@acme.com, 3 hours ago).");
+    // The hint was right: the admin token updates Bob's site, which keeps its owner.
+    await page.click("#deploy-btn");
+    await page.waitForFunction(() => document.getElementById("result-title").textContent === "Deployed theirs!");
+    const updated = stub.state.sites.find((s) => s.name === "theirs");
+    assert.deepEqual([updated.owners, updated.updated_by], [["bob@acme.com"], "token:deploy"]);
+    assert.equal(stub.state.stored.get("theirs/index.html").toString(), "<!doctype html><title>G</title>guest");
+    await hintIs(page, "Updates the existing site (last deployed by token:deploy, just now).");
+    assert.equal(await page.textContent("#sites-empty"), GUEST_EMPTY, "a guest's list stays empty: the token does not sign it in");
+    // Forget drops the token: the guest is refused the owned site again.
+    await page.click("#forget-token");
+    await hintIs(page, TAKEN_HINT);
+    assert.deepEqual(problems, []);
+  } finally {
+    await context.close();
+    await stub.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("hub with an owners-only listing and none of the person's sites: the empty state; their first deploy is listed", async (t) => {
   if (!browser) return t.skip(skipReason);
   const stub = await startStub({ listing: "owners", sites: listingSites() });
@@ -1192,13 +1333,13 @@ test("hub with an owners-only listing and none of the person's sites: the empty 
   try {
     const { page, problems } = await open(context, stub.url + "/");
     await page.waitForSelector("#sites-empty:not([hidden])");
-    assert.equal(await page.textContent("#sites-empty"), "You don't own any sites yet. Drop a folder above to create one.");
+    assert.equal(await page.textContent("#sites-empty"), OWN_EMPTY);
     assert.equal(await page.textContent("#sites-note"), "Only your sites are listed.");
     assert.equal(await page.textContent("#site-count"), "");
     assert.equal(await page.isHidden("#site-list"), true);
     // Searching an empty directory says nothing about other people's sites.
     await page.fill("#search", "theirs");
-    assert.equal(await page.textContent("#sites-empty"), "You don't own any sites yet. Drop a folder above to create one.");
+    assert.equal(await page.textContent("#sites-empty"), OWN_EMPTY);
     await page.fill("#search", "");
 
     await page.setInputFiles("#folder-input", site);

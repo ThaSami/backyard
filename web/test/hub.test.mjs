@@ -330,6 +330,8 @@ test("owners-only listing (site_listing): the note, the empty directory, who is 
   const guest = { id: "anon:0123456789abcdef", admin: true, anonymous: true };
   const ALL_EMPTY = "No sites yet. Drop a folder above to create the first one.";
   const OWN_EMPTY = "You don't own any sites yet. Drop a folder above to create one.";
+  const GUEST_NOTE = "Sites are listed only to their signed-in owners and admins.";
+  const GUEST_EMPTY = "Sites are listed only to signed-in people.";
   // Every site is listed: today's texts, whoever looks (older servers have no site_listing).
   for (const info of [null, {}, { site_listing: "all" }, { site_listing: "" }, { site_listing: "OWNERS" }]) {
     for (const me of [null, alice, admin, guest]) {
@@ -340,33 +342,85 @@ test("owners-only listing (site_listing): the note, the empty directory, who is 
   }
   assert.equal(hub.listingNote(owners, alice), "Only your sites are listed.");
   assert.equal(hub.listingNote(owners, null), "Only your sites are listed.");
-  assert.equal(hub.listingNote(owners, guest), "Only your sites are listed.", "a guest is never an admin");
+  assert.equal(hub.listingNote(owners, guest), GUEST_NOTE, "a guest is never an admin, nor listed its own deploys");
+  assert.equal(hub.listingNote(owners, { id: "anon:1", anonymous: true }), GUEST_NOTE);
   assert.equal(hub.listingNote(owners, { ...alice, admin: "yes" }), "Only your sites are listed.");
   assert.equal(hub.listingNote(owners, admin), "You are an admin: every site is listed.");
   assert.deepEqual([alice, null, guest, admin].map((me) => hub.listsOwnSitesOnly(owners, me)), [true, true, true, false]);
   assert.deepEqual([alice, null, guest, admin].map((me) => hub.isAdminUser(me)), [false, false, false, true]);
+  assert.deepEqual([alice, null, guest, admin, "anon"].map((me) => hub.isGuestUser(me)), [false, false, true, false, false]);
   assert.equal(hub.emptySitesText(owners, alice, 0, ""), OWN_EMPTY);
-  assert.equal(hub.emptySitesText(owners, guest, 0, ""), OWN_EMPTY);
+  assert.equal(hub.emptySitesText(owners, null, 0, ""), OWN_EMPTY);
+  // A guest's own deploys are never listed: no "drop a folder" promise.
+  assert.equal(hub.emptySitesText(owners, guest, 0, ""), GUEST_EMPTY);
+  assert.equal(hub.emptySitesText(owners, guest, 0, "poll"), GUEST_EMPTY);
   assert.equal(hub.emptySitesText(owners, admin, 0, ""), ALL_EMPTY, "an admin is listed every site");
   for (const info of [null, owners]) assert.equal(hub.emptySitesText(info, alice, 3, "poll"), "No sites match “poll”.");
 });
 
-test("siteNameHint: a listed site, a name taken by a site the list leaves out, a new name", () => {
+test("siteNameHint: a listed site, a name taken by an owned or an ownerless site the list leaves out, a new name, a guest with or without a token", () => {
   const now = Date.parse("2026-10-19T12:00:00Z");
+  const alice = { id: "alice@acme.com", email: "alice@acme.com", admin: false, anonymous: false };
+  const guest = { id: "anon:0123456789abcdef", admin: false, anonymous: true };
   const ex = { name: "poll", updated_by: "bob@acme.com", updated_at: "2026-10-19T09:00:00Z" };
-  assert.match(hub.siteNameHint(ex, null, now), /^Updates the existing site \(last deployed by bob@acme\.com, .+\)\.$/);
-  assert.equal(hub.siteNameHint({ name: "poll" }, true, now), "Updates the existing site.", "the listed site wins");
-  assert.equal(hub.siteNameHint(null, true, now), "This name is taken by a site you don't own; only its owners or an admin can update it.");
-  for (const taken of [false, null, undefined]) assert.equal(hub.siteNameHint(null, taken, now), "A new site will be created.");
+  const owned = { ...ex, created_by: "bob@acme.com", owners: ["bob@acme.com"] };
+  const ownerless = { ...ex, name: "orphan", created_by: "carol@acme.com", owners: [] };
+  const TAKEN = "This name is taken by a site you don't own; only its owners or an admin can update it.";
+  const NEW = "A new site will be created.";
+  const OWNERLESS = "A site of this name exists without an owner (created by carol@acme.com): deploying replaces it and makes you its owner.";
+  const UPDATES = /^Updates the existing site \(last deployed by bob@acme\.com, 3 hours ago\)\.$/;
+  for (const me of [alice, null, guest]) {
+    for (const hasToken of [false, true, undefined]) {
+      const why = JSON.stringify({ me, hasToken });
+      assert.match(hub.siteNameHint(ex, null, now, me, hasToken), UPDATES, why);
+      assert.equal(hub.siteNameHint({ name: "poll" }, owned, now, me, hasToken), "Updates the existing site.", "the listed site wins: " + why);
+      for (const taken of [false, null, undefined]) assert.equal(hub.siteNameHint(null, taken, now, me, hasToken), NEW, String(taken) + " " + why);
+    }
+  }
+  // A site that has owners refuses everyone but them and admins.
+  for (const me of [alice, null, undefined]) assert.equal(hub.siteNameHint(null, owned, now, me), TAKEN);
+  assert.equal(hub.siteNameHint(null, { ...owned, owners: ["bob@acme.com", "dave@acme.com"] }, now, alice), TAKEN);
+  // A site without owners is never said to be protected: a deploy replaces it and claims it.
+  assert.equal(hub.siteNameHint(null, ownerless, now, alice), OWNERLESS);
+  for (const meta of [{ name: "synced", owners: [] }, { name: "synced" }, { name: "synced", owners: null, created_by: "  " }]) {
+    assert.equal(hub.siteNameHint(null, meta, now, alice), "A site of this name exists without an owner: deploying replaces it and makes you its owner.", JSON.stringify(meta));
+  }
+  for (const h of [hub.siteNameHint(null, ownerless, now, alice), hub.siteNameHint(null, ownerless, now, null)]) assert.doesNotMatch(h, /only its owners|don't own|refuse/);
+  // A signed-in viewer (or one not known yet) who pasted a token is told what holds for them:
+  // the deploy runs as the token's account, which the hub does not look up.
+  for (const me of [alice, null]) {
+    assert.equal(hub.siteNameHint(null, owned, now, me, true), TAKEN);
+    assert.equal(hub.siteNameHint(null, ownerless, now, me, true), OWNERLESS);
+  }
+  // A guest without a token is never an owner: refused a site that has owners (true for it),
+  // told only that one without owners exists (its deploy replaces it, and never claims it).
+  for (const hasToken of [false, undefined, ""]) {
+    assert.equal(hub.siteNameHint(null, owned, now, guest, hasToken), TAKEN, String(hasToken));
+    assert.equal(hub.siteNameHint(null, { ...owned, owners: ["bob@acme.com", "dave@acme.com"] }, now, guest, hasToken), TAKEN);
+    const hint = hub.siteNameHint(null, ownerless, now, guest, hasToken);
+    assert.match(hint, UPDATES);
+    assert.doesNotMatch(hint, /don't own|owner/);
+    assert.equal(hub.siteNameHint(null, { name: "synced", owners: [] }, now, guest, hasToken), "Updates the existing site.");
+    assert.equal(hub.siteNameHint(null, { name: "synced" }, now, guest, hasToken), "Updates the existing site.");
+  }
+  // A guest with a token deploys as the token's account (maybe an owner or an admin, like the
+  // Cloudflare DEPLOY_TOKEN): only that the site exists, owned or not.
+  for (const meta of [owned, ownerless]) {
+    const hint = hub.siteNameHint(null, meta, now, guest, true);
+    assert.match(hint, UPDATES, JSON.stringify(meta));
+    assert.doesNotMatch(hint, /don't own|owner/);
+  }
+  assert.equal(hub.siteNameHint(null, { name: "synced", owners: ["bob@acme.com"] }, now, guest, true), "Updates the existing site.");
 });
 
-test("siteExists looks a name up with GET G/sites/{site}: 200 taken, 404 free, anything else unknown", async () => {
+test("siteExists looks a name up with GET G/sites/{site}: 200 its SiteMeta, 404 free, anything else unknown", async () => {
   const calls = [];
   const answer = (status, body, headers = { "Content-Type": "application/json" }) => async (url, init) => {
     calls.push({ url, ...init });
     return new Response(typeof body === "string" ? body : JSON.stringify(body), { status, headers });
   };
-  assert.equal(await hub.siteExists({ gateway: "/__backyard/api/deploy/", site: "poll", token: "t", fetch: answer(200, { name: "poll", owners: ["bob@acme.com"] }) }), true);
+  const owned = { name: "poll", created_by: "bob@acme.com", owners: ["bob@acme.com"] };
+  assert.deepEqual(plain(await hub.siteExists({ gateway: "/__backyard/api/deploy/", site: "poll", token: "t", fetch: answer(200, owned) })), owned);
   assert.deepEqual(plain(calls[0]), {
     url: "/__backyard/api/deploy/sites/poll",
     method: "GET",
@@ -379,6 +433,9 @@ test("siteExists looks a name up with GET G/sites/{site}: 200 taken, 404 free, a
   const ctrl = new AbortController();
   await hub.siteExists({ gateway: "/g", site: "x", fetch: answer(404, {}), signal: ctrl.signal });
   assert.equal(calls[2].signal, ctrl.signal, "the lookup can be aborted");
+  // An ownerless site resolves its SiteMeta too (the hint tells it from an owned one).
+  const ownerless = { name: "orphan", created_by: "carol@acme.com", updated_by: "carol@acme.com", owners: [] };
+  assert.deepEqual(plain(await hub.siteExists({ gateway: "/g", site: "orphan", fetch: answer(200, ownerless) })), ownerless);
   for (const [what, fetch] of [
     ["401", answer(401, { error: { code: "unauthenticated", message: "sign in" } })],
     ["403", answer(403, { error: { code: "forbidden", message: "no" } })],
@@ -386,6 +443,8 @@ test("siteExists looks a name up with GET G/sites/{site}: 200 taken, 404 free, a
     ["a login page", answer(200, "<!doctype html><title>Sign in</title>", { "Content-Type": "text/html" })],
     ["not JSON", answer(200, "nope", { "Content-Type": "application/json" })],
     ["another site", answer(200, { name: "other" })],
+    ["an array", answer(200, [{ name: "poll" }])],
+    ["null", answer(200, "null")],
     ["a redirect", async () => ({ type: "opaqueredirect", status: 0, ok: false, headers: new Headers() })],
     ["offline", async () => Promise.reject(new TypeError("Failed to fetch"))],
     ["aborted", async () => Promise.reject(new DOMException("The operation was aborted.", "AbortError"))],

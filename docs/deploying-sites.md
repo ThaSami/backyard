@@ -195,8 +195,11 @@ fork, fix and redeploy. The CLI still warns (and asks, on a terminal) before rep
 someone else deployed last; `-y` skips the question.
 
 With `sites.ownership: owner`, the first deployer owns the site, and only its owners and
-admins may redeploy or delete it (`403 forbidden` otherwise). Owners are managed through the
-gateway API:
+admins may redeploy or delete it (`403 forbidden` otherwise). A site without owners (one
+deployed before ownership mode was turned on, or only by guests) is not protected: anyone who
+may deploy can replace it, the first signed-in deployer becomes its owner, and any signed-in
+user may also delete it or set its owners. Owners are managed through the gateway API (only in
+ownership mode: without it the call answers `501`):
 
 ```sh
 curl -X POST -H "Authorization: Bearer $BACKYARD_TOKEN" -H "X-Backyard: 1" \
@@ -226,6 +229,10 @@ admins every site ([SPEC §7.2](spec/SPEC.md#72-sites)). The option is off by de
 - the site has no owners and they created it (its `created_by`). Sites from before ownership
   mode have no owners, so after the switch each stays listed to whoever created it, and its
   next deploy by a signed-in person makes that person the owner, as ownership mode always does.
+  That person can be anyone: until a site has an owner, any signed-in deployer can replace it
+  and claim it (and any signed-in user may delete it or set its owners), and it then leaves its
+  creator's list (**Upgrading** below says how to give the sites that matter their owners right
+  after the switch).
 
 Guests (auth mode `none`) are listed no site at all. A site without metadata yet (a direct sync
 before its refresh) has no creator, so only admins see it until the refresh; the sites of
@@ -237,51 +244,69 @@ that token and admins see it until its people are added as owners with the owner
 sites can still open any site by its URL and use its data and uploads; `backyard sites info
 <name>`, `backyard pull`, the site API's `GET /__backyard/api/site` and the
 `backyard_site_files` / `backyard_read_site_file` tools find every site by name, and a write to
-a site you do not own is refused with a message that names its owners. A list never says how
-many sites it left out, and the [preview image](#site-preview) of a site the list hides answers
-`404`. Sites still should not hold anything that not every colleague may see
+a site that has other owners is refused with a message that names them. A site without owners
+(with ownership off before, every site from before the switch) is not protected at all: it can
+be replaced, and claimed, by any signed-in deployer, and any signed-in user may delete it or set
+its owners. A list never says how many sites it left
+out, and the [preview image](#site-preview) of a site the list hides answers `404`. Sites still
+should not hold anything that not every colleague may see
 ([security](security.md#the-trust-bubble)).
 
 **It implies ownership.** Owners are recorded only in ownership mode, and a directory that hides
 a site must not let others overwrite it by name unnoticed, so `sites.listing: owners` makes
 `sites.ownership` default to `owner`: the first deployer owns a site, and only its owners and
-admins may redeploy or delete it ([Ownership](#ownership)). With an explicit
+admins may redeploy or delete it ([Ownership](#ownership)) — once it has owners: a site without
+any is replaced, and claimed, by its next signed-in deployer, as above. With an explicit
 `sites.ownership: none` the server refuses to start (`sites.listing: owners requires
 sites.ownership: owner (its default with this option)`). The Cloudflare edition reads
 `OWNERSHIP` unset or `owner` as ownership `owner` next to `SITE_LISTING=owners`; `setup` refuses
 any other `OWNERSHIP` (exit 2), and a Worker configured that way, or with a `SITE_LISTING` other
-than `all` or `owners`, answers `503` until it is fixed. Setting the listing back to `all` lists
-every site again; `sites.ownership` then returns to `none` unless you set `ownership: owner`
-yourself (Cloudflare: `--var OWNERSHIP:owner`).
+than `all` or `owners`, answers `503` until it is fixed. Setting the listing back to `all`, or
+removing `sites.listing`, lists every site again and turns ownership off with it:
+`sites.ownership` returns to `none`, so anyone may overwrite any site again, unless you set
+`sites.ownership: owner` yourself. The same holds on Cloudflare for `--site-listing all`,
+Terraform's `site_listing = "all"` and a CI deploy without `BACKYARD_CF_SITE_LISTING`, unless
+`OWNERSHIP=owner` is set (`--var OWNERSHIP:owner`, or `OWNERSHIP` in `BACKYARD_CF_VARS`).
 
 **Checking a name.** The directory no longer tells whether a name is free:
 `backyard sites info <name>` does ("not found" = free), and `backyard deploy` looks the name up
 before it replaces anything. The hub's deploy form looks up a name it does not list and says
-when it is taken by a site you don't own. Above the directory the hub says that only your sites
-are listed (to an admin, that every site is), and `GET /__backyard/api/info` reports
-`site_listing` (`all` or `owners`).
+whether it is free, taken by a site with other owners (only they and admins can update it) or
+taken by a site without owners, which deploying replaces and makes yours. That distinction is
+for signed-in people: a guest without a deploy token is told when a name is taken by a site with
+owners, and otherwise, like a guest with a token, sees the plain texts ("A new site will be
+created", "Updates the existing site …"), as when every site is listed. Above the directory
+the hub says that only your sites are listed (to an admin, that every site is; to a guest, that
+sites are listed only to their signed-in owners and admins), and `GET /__backyard/api/info`
+reports `site_listing` (`all` or `owners`).
 
 **Turning it on**, at setup or with any later upgrade:
 
 | Kit | Setting | Takes effect with |
 |---|---|---|
-| Any Go server | `sites.listing: owners` in `backyard.yaml` | a restart |
+| Any Go server | `sites.listing: owners` in `backyard.yaml` (a file made from the `backyard config example` of an earlier release sets `sites.ownership: none`: remove that line or set it to `owner`) | `backyard config validate`, then a restart |
 | [Kubernetes (Helm)](../deploy/helm/backyard/README.md#owners-only-site-listing) | `config.sites.listing: owners` | `helm upgrade` (the config checksum rolls the pods) |
 | [AWS](../deploy/terraform/aws/README.md#more-configuration) | `config_overrides = "sites:\n  listing: owners\n"` (the Lambda gateway gets it too) | `terraform apply` |
 | [Google Cloud](../deploy/terraform/gcp/README.md#configuration-notes) | `extra_config_yaml = "sites:\n  listing: owners\n  max_file_bytes: 32505856\n"` (a `sites` section replaces the module's, so it repeats the Cloud Run cap) | `terraform apply` |
 | [Azure](../deploy/terraform/azure/README.md#configuration-and-secrets) | `extra_config_yaml = "sites:\n  listing: owners\n"` | `terraform apply` |
 | [Docker Compose](../deploy/docker-compose/README.md#owners-only-site-listing-optional) | `BACKYARD_SITE_LISTING=owners` in `.env` and the `sites` block of `backyard.yaml` uncommented | `docker compose up -d` |
 | [systemd](../deploy/systemd/README.md#owners-only-site-listing) | `sites.listing: owners` in `/etc/backyard/backyard.yaml` (commented out in new installs; `install.sh` keeps the file when it upgrades) | `backyard config validate`, then `systemctl restart backyard` |
-| [Cloudflare](../deploy/cloudflare/README.md#owners-only-site-listing) | `backyard cloudflare setup --site-listing owners` (remembered by every later `setup`, `domain` and `access` deploy; `--site-listing all` lists every site again) | the same command |
-| [Cloudflare with Terraform](../deploy/terraform/cloudflare/README.md#inputs) | `site_listing = "owners"` (its `setup_args` always carry `--site-listing`, so `"all"` turns it off again) | `setup` with the new `setup_args` |
-| [Cloudflare from GitHub Actions](../deploy/cloudflare/README.md#deploying-from-github-actions) | the repository variable `BACKYARD_CF_SITE_LISTING=owners` (a CI deploy without it lists every site) | the next workflow run |
+| [Cloudflare](../deploy/cloudflare/README.md#owners-only-site-listing) | `backyard cloudflare setup --site-listing owners` (remembered by every later `setup`, `domain` and `access` deploy; `--site-listing all` lists every site again and turns ownership off) | the same command |
+| [Cloudflare with Terraform](../deploy/terraform/cloudflare/README.md#inputs) | `site_listing = "owners"` (its `setup_args` always carry `--site-listing`, so `"all"` turns it off again; run them with the `backyard` CLI or `backyard-cloudflare` of the module's release or newer, as older ones reject the flag) | `setup` with the new `setup_args` |
+| [Cloudflare from GitHub Actions](../deploy/cloudflare/README.md#deploying-from-github-actions) | the repository variable `BACKYARD_CF_SITE_LISTING=owners` (a CI deploy without it lists every site and turns ownership off) | the next workflow run |
 
 **Upgrading.** The Go server's configuration is strict: a server older than this option refuses
 to start with `sites.listing` (an unknown key). Upgrade first — the server, and a standalone or
 AWS Lambda deploy gateway, which reads the same `sites` section (on AWS: `make lambda` at the
 new version, then `terraform apply`) — and set the key afterwards; to go back to an older
 version, remove the key first. On Cloudflare, `setup` with the new release deploys the Worker
-that knows `SITE_LISTING` (an older Worker ignores the variable).
+that knows `SITE_LISTING` (an older Worker ignores the variable). Where ownership was off (the
+default), every existing site has no owners right after the switch: it is listed to its creator
+and admins, and until it has an owner any signed-in deployer can replace it and claim it, and
+any signed-in user may delete it or set its owners. To keep a site with its people, give it
+owners right after turning the listing on (owners can be set only once ownership is on): its
+creator redeploys it, or its creator or an admin adds owners with
+`POST …/sites/<site>/owners` ([Ownership](#ownership)).
 
 ## CI
 

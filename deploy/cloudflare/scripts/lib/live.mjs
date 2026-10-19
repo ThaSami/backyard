@@ -13,6 +13,10 @@
 //   turn a live AUTH_MODE=access off, change its team, or replace a Worker
 //   whose AUTH_MODE cannot be read, unless o.allow (setup
 //   --confirm-auth-change, BACKYARD_CF_CONFIRM_AUTH_CHANGE in CI).
+// * refuseListingVars(…) / refuseListingConfig(…) refuse (CliError 2) a deploy
+//   of setup, domain add/remove or access enable/disable whose SITE_LISTING or
+//   OWNERSHIP (--var, remembered, or wrangler.jsonc) contradicts the site
+//   listing (`setup --site-listing`, remembered: rememberedListing(state)).
 // * normalizeTeam() is the Worker's own normalization (src/config.ts).
 
 import { CfError } from "./cfapi.mjs";
@@ -302,4 +306,91 @@ export function authGuard(live, desired, o = {}) {
     );
   }
   return { checked: true, notes };
+}
+
+/**
+ * The site listing remembered in the state: "owners" after `setup
+ * --site-listing owners`, else "all". A SITE_LISTING override that an earlier
+ * version remembered counts as what the Worker reads from it (an invalid
+ * value as owners, which the Worker never reads as all); setup drops it.
+ * @param {Record<string, any>} state
+ * @returns {"all" | "owners"}
+ */
+export function rememberedListing(state) {
+  if (state.siteListing === "owners") return "owners";
+  const v = state.vars?.SITE_LISTING;
+  return v === undefined ? "all" : siteListingOf(v) ?? "owners";
+}
+
+/** A variable's value as the Worker reads it from wrangler config ("" when unset). */
+const varText = (raw) => (typeof raw === "string" ? raw : raw === undefined || raw === null ? "" : JSON.stringify(raw));
+
+/**
+ * Refuses (CliError 2) what contradicts the site listing of a deploy
+ * (setup: --site-listing, else the remembered one; every other command that
+ * deploys: the remembered one): a --var SITE_LISTING with another value (the
+ * flag manages the variable, see managedVars in layout.mjs), a SITE_LISTING
+ * in the base configuration (wrangler.jsonc vars) that the Worker reads as
+ * another listing (managedVars only ever adds SITE_LISTING=owners, so a base
+ * value would otherwise outlive --site-listing all), and with owners-only
+ * listing an OWNERSHIP other than owner from --var, a remembered override or
+ * the base configuration (owners are recorded only with OWNERSHIP=owner, and
+ * the Worker refuses every request otherwise).
+ * @param {Record<string, string>} overrides   the --var flags of setup ({} for the other commands)
+ * @param {"all" | "owners"} listing
+ * @param {Record<string, any>} state
+ * @param {Record<string, unknown>} baseVars
+ * @param {string} inv
+ * @param {{checkBase?: boolean, command?: string}} [opts]  checkBase: false skips the base
+ *   SITE_LISTING check (before adoption on a machine without state, whose listing is not
+ *   known yet); command: the command that runs ("setup"), another one is told to fix it with setup
+ */
+export function refuseListingVars(overrides, listing, state, baseVars, inv, { checkBase = true, command = "setup" } = {}) {
+  const bySetup = command === "setup";
+  // Another command changes nothing either: it is told so, and which setup run fixes it.
+  const nothing = bySetup ? "" : " (nothing was changed)";
+  const setupWith = (args) => (bySetup ? args : `\`${inv} setup ${args}\` first`);
+  for (const k of MANAGED_LISTING_KEYS) {
+    if (Object.hasOwn(overrides, k)) {
+      const want = siteListingOf(overrides[k]);
+      if (want !== listing) {
+        const other = want ?? (listing === "all" ? "owners" : "all");
+        throw new CliError(EXIT.USAGE, `${k} is managed by \`${inv} setup --site-listing\`: the site listing is ${listing} (\`${inv} setup --site-listing ${other}\` changes it)`);
+      }
+    }
+    if (!checkBase) continue;
+    const text = varText(baseVars[k]);
+    if (text.trim() !== "" && siteListingOf(text) !== listing) {
+      throw new CliError(
+        EXIT.USAGE,
+        `the base configuration (wrangler.jsonc) sets ${k}=${text}, but the site listing is ${listing}: remove ${k} from wrangler.jsonc (\`${inv} setup --site-listing <all|owners>\` sets it)${nothing}`,
+      );
+    }
+  }
+  if (listing !== "owners") return;
+  const passed = Object.hasOwn(overrides, "OWNERSHIP") && overrides.OWNERSHIP !== "";
+  const remembered = !Object.hasOwn(overrides, "OWNERSHIP") && state.vars?.OWNERSHIP !== undefined;
+  const text = varText(passed ? overrides.OWNERSHIP : remembered ? state.vars.OWNERSHIP : baseVars.OWNERSHIP);
+  const o = text.trim().toLowerCase();
+  if (o === "" || o === "owner") return;
+  const needs = "the owners-only site listing, which needs OWNERSHIP=owner (its default with --site-listing owners; owners are recorded only then)";
+  if (passed) throw new CliError(EXIT.USAGE, `--var OWNERSHIP:${text} contradicts ${needs}: leave OWNERSHIP out, or pass --var OWNERSHIP:owner`);
+  if (remembered) throw new CliError(EXIT.USAGE, `the remembered --var OWNERSHIP:${text} contradicts ${needs}: drop it with ${setupWith("--var OWNERSHIP:")}${nothing}`);
+  throw new CliError(
+    EXIT.USAGE,
+    `the base configuration (wrangler.jsonc) sets OWNERSHIP=${text}, which contradicts ${needs}: ${bySetup ? "pass" : "run"} ${setupWith("--var OWNERSHIP:owner")}${nothing}`,
+  );
+}
+
+/**
+ * The listing refusals of setup for a command that deploys the remembered
+ * configuration without --var (`domain add` / `domain remove`, `access
+ * enable` / `access disable`): call it before the command changes anything.
+ * @param {Record<string, any>} state       after adoption, when the command adopts
+ * @param {Record<string, unknown>} baseVars
+ * @param {string} inv
+ * @param {string} command                  e.g. "domain add"
+ */
+export function refuseListingConfig(state, baseVars, inv, command) {
+  refuseListingVars({}, rememberedListing(state), state, baseVars, inv, { command });
 }

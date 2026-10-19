@@ -58,8 +58,10 @@ func (a *cliApp) newSitesListCommand() *cobra.Command {
 			if err != nil {
 				return explain(err, s)
 			}
+			var filter string
 			if len(args) == 1 {
-				list = filterSites(list, args[0])
+				filter = strings.TrimSpace(args[0])
+				list = filterSites(list, filter)
 			}
 			slices.SortFunc(list, func(x, y sites.Meta) int { return strings.Compare(x.Name, y.Name) })
 			if a.g.json {
@@ -69,13 +71,7 @@ func (a *cliApp) newSitesListCommand() *cobra.Command {
 				return a.printJSON(map[string]any{"sites": list})
 			}
 			if len(list) == 0 {
-				// The server may list only the caller's own sites (SPEC §7.2).
-				if inf, err := a.fetchInfo(ctx, c); err == nil && inf.SiteListing == sites.ListingOwners {
-					a.errf("You don't own any sites yet: this server lists each site only to its owners and admins " +
-						"(`backyard sites info <name>` finds any site). Create one with `backyard init` and publish it with `backyard deploy`.\n")
-					return nil
-				}
-				a.errf("No sites yet. Create one with `backyard init` and publish it with `backyard deploy`.\n")
+				a.printNoSites(ctx, c, filter)
 				return nil
 			}
 			tw := tabwriter.NewWriter(a.streams.Out, 0, 4, 2, ' ', 0)
@@ -87,6 +83,27 @@ func (a *cliApp) newSitesListCommand() *cobra.Command {
 			}
 			return tw.Flush()
 		},
+	}
+}
+
+// printNoSites explains an empty `sites list`. A filter that matches nothing
+// says just that: the caller may own sites, or be an admin who sees every
+// site. Only an unfiltered empty list on a server that lists each site only
+// to its owners and admins (SPEC §7.2) says the caller owns none.
+func (a *cliApp) printNoSites(ctx context.Context, c *deploy.Client, filter string) {
+	inf, err := a.fetchInfo(ctx, c)
+	ownersOnly := err == nil && inf.SiteListing == sites.ListingOwners
+	switch {
+	case filter != "" && ownersOnly:
+		a.errf("No sites match %q. This server lists only your own sites (admins see every site); "+
+			"`backyard sites info <name>` finds any site.\n", filter)
+	case filter != "":
+		a.errf("No sites match %q.\n", filter)
+	case ownersOnly:
+		a.errf("You don't own any sites yet: this server lists each site only to its owners and admins " +
+			"(`backyard sites info <name>` finds any site). Create one with `backyard init` and publish it with `backyard deploy`.\n")
+	default:
+		a.errf("No sites yet. Create one with `backyard init` and publish it with `backyard deploy`.\n")
 	}
 }
 

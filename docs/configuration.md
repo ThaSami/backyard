@@ -364,7 +364,7 @@ See [warehouse](warehouse.md).
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `sites.ownership` | `none` \| `owner` | `none` (`owner` with `sites.listing: owners`) | `none`: anyone may overwrite any site (the Quick way). `owner`: the first deployer owns a site; only owners and admins may redeploy or delete it; owners can be managed through the gateway. |
+| `sites.ownership` | `none` \| `owner` | `none` (`owner` with `sites.listing: owners`) | `none`: anyone may overwrite any site (the Quick way). `owner`: the first deployer owns a site; only owners and admins may redeploy or delete it, except that a site without owners (one from before ownership mode) can be replaced and claimed by any signed-in deployer, and deleted or given owners by any signed-in user; owners can be managed through the gateway. |
 | `sites.listing` | `all` \| `owners` | `all` | Which sites the site directories list: the hub, `backyard sites list` (the gateway's `GET …/sites`) and `backyard_list_sites`. `all`: every site to everyone. `owners`: each site only to its owners (while it has none, to its creator) and to admins; guests see none. It hides sites, it does not protect them: anyone who may open sites can still open one by its URL or look it up by name. Implies ownership: `sites.ownership` defaults to `owner`, and `none` with it is an error. See [owners-only site listing](deploying-sites.md#owners-only-site-listing). An older server rejects the key: upgrade before you set it. |
 | `sites.reserved` | list | `www, api, admin, hub, auth, static, assets, cdn, docs, mail, backyard, s` | Names that can never be deployed. Setting the key replaces the list. |
 | `sites.max_site_bytes` | int | `524288000` (500 MiB) | Total size of a site's files. |

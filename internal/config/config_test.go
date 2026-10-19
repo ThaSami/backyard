@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -510,5 +512,66 @@ func TestExampleSitesListing(t *testing.T) {
 	}
 	if cfg.Sites.Listing != "" {
 		t.Fatalf("example sets sites.listing = %q", cfg.Sites.Listing)
+	}
+}
+
+// TestExampleSitesListingUncommented loads files made from `backyard config
+// example` the way an operator edits them: uncommenting `# listing: owners`
+// alone turns the owners-only listing on (ownership implied) and the file
+// loads and validates; uncommenting the ownership line instead keeps the
+// defaults. Both together are the documented error, which is why the example
+// leaves `ownership: none` commented out.
+func TestExampleSitesListingUncommented(t *testing.T) {
+	t.Setenv("BACKYARD_SECRET", strings.Repeat("x", 40))
+	const (
+		listingLine   = "listing: owners"
+		ownershipLine = "ownership: none   # default; owner with listing: owners"
+	)
+	uncomment := func(t *testing.T, src, line string) string {
+		t.Helper()
+		commented := "\n  # " + line + "\n"
+		if n := strings.Count(src, commented); n != 1 {
+			t.Fatalf("example.yaml has %d lines %q, want 1", n, strings.TrimSpace(commented))
+		}
+		return strings.Replace(src, commented, "\n  "+line+"\n", 1)
+	}
+	load := func(t *testing.T, src string) (*Config, error) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "backyard.yaml")
+		if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return Load(path, false)
+	}
+
+	cfg, err := load(t, Example)
+	if err != nil {
+		t.Fatalf("example as printed: %v", err)
+	}
+	if cfg.Sites.Listing != "all" || cfg.Sites.Ownership != "none" {
+		t.Fatalf("example as printed: listing=%q ownership=%q, want all none", cfg.Sites.Listing, cfg.Sites.Ownership)
+	}
+
+	cfg, err = load(t, uncomment(t, Example, listingLine))
+	if err != nil {
+		t.Fatalf("example with %q uncommented: %v", listingLine, err)
+	}
+	if cfg.Sites.Listing != "owners" || cfg.Sites.Ownership != "owner" {
+		t.Fatalf("example with %q uncommented: listing=%q ownership=%q, want owners owner",
+			listingLine, cfg.Sites.Listing, cfg.Sites.Ownership)
+	}
+
+	cfg, err = load(t, uncomment(t, Example, ownershipLine))
+	if err != nil {
+		t.Fatalf("example with the ownership line uncommented: %v", err)
+	}
+	if cfg.Sites.Listing != "all" || cfg.Sites.Ownership != "none" {
+		t.Fatalf("example with the ownership line uncommented: listing=%q ownership=%q, want all none",
+			cfg.Sites.Listing, cfg.Sites.Ownership)
+	}
+
+	_, err = load(t, uncomment(t, uncomment(t, Example, ownershipLine), listingLine))
+	if err == nil || !strings.Contains(err.Error(), "sites.listing: owners requires sites.ownership: owner") {
+		t.Fatalf("example with both lines uncommented: err = %v, want the sites.listing error", err)
 	}
 }

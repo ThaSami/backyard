@@ -500,6 +500,46 @@ test("deploy: BACKYARD_CF_SITE_LISTING=owners sets SITE_LISTING, and refuses wha
   assert.deepEqual(legacy.state().calls, []);
 });
 
+test("deploy: a SITE_LISTING in wrangler.jsonc that contradicts BACKYARD_CF_SITE_LISTING is refused, one that agrees deploys", async () => {
+  const withListing = (v) => `{\n  "name": "backyard",\n  "main": "src/index.ts",\n  "vars": { "URL_MODE": "path", "AUTH_MODE": "none", "SITE_LISTING": ${JSON.stringify(v)} },\n}\n`;
+  // Refused (dry runs too) before wrangler runs: the base value would otherwise outlive the switch.
+  for (const [base, switchValue, dryRun, listing] of [
+    ["owners", "", false, "all"],
+    ["owners", "all", true, "all"],
+    [" Owners ", "all", false, "all"],
+    ["all", "owners", false, "owners"],
+    ["mine", "owners", false, "owners"],
+    ["mine", "", true, "all"],
+  ]) {
+    const f = fixture({ exists: true, secrets: ["BACKYARD_SECRET", "DEPLOY_TOKEN"] }, { config: withListing(base) });
+    f.env.BACKYARD_CF_SITE_LISTING = switchValue;
+    const what = `${JSON.stringify(base)} with ${JSON.stringify(switchValue)}${dryRun ? " (dry run)" : ""}`;
+    const re = new RegExp(`wrangler\\.jsonc sets SITE_LISTING=${JSON.stringify(base).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}, but the site listing of this deploy is ${listing} \\(BACKYARD_CF_SITE_LISTING; empty means all\\): remove SITE_LISTING from wrangler\\.jsonc and choose with BACKYARD_CF_SITE_LISTING`);
+    await assert.rejects(deploy({ env: f.env, dryRun, log: quiet }), re, what);
+    assert.deepEqual(f.state().calls, [], `${what}: refused before wrangler runs`);
+  }
+  // A base value the switch agrees with (or an empty one) deploys.
+  for (const [base, switchValue, want] of [
+    ["owners", "owners", "owners"],
+    ["all", "", "all"],
+    ["", "owners", "owners"],
+    ["", "", ""],
+  ]) {
+    const f = fixture({ exists: true, secrets: ["BACKYARD_SECRET", "DEPLOY_TOKEN"] }, { config: withListing(base) });
+    f.env.BACKYARD_CF_SITE_LISTING = switchValue;
+    await deploy({ env: f.env, log: quiet });
+    const d = f.state().calls.find((c) => c.args[0] === "deploy");
+    const vars = d.args.includes("--config") ? parseJSONC(f.state().config).vars : parseJSONC(withListing(base)).vars;
+    assert.equal(vars.SITE_LISTING, want, `${JSON.stringify(base)} with ${JSON.stringify(switchValue)}`);
+  }
+  // With owners, a base OWNERSHIP other than owner is still refused.
+  const config = `{\n  "name": "backyard",\n  "main": "src/index.ts",\n  "vars": { "AUTH_MODE": "none", "SITE_LISTING": "owners", "OWNERSHIP": "none" },\n}\n`;
+  const own = fixture({ exists: true, secrets: ["BACKYARD_SECRET"] }, { config });
+  own.env.BACKYARD_CF_SITE_LISTING = "owners";
+  await assert.rejects(deploy({ env: own.env, log: quiet }), /but wrangler\.jsonc sets OWNERSHIP to "none"/);
+  assert.deepEqual(own.state().calls, []);
+});
+
 test("deploy: an existing R2 bucket is fine, other R2 errors fail", async () => {
   const ok = fixture({ exists: true, secrets: ["BACKYARD_SECRET", "DEPLOY_TOKEN"], r2Error: "The bucket you tried to create already exists, and you own it. [code: 10004]" });
   ok.env.BACKYARD_CF_R2_BUCKET = "files";

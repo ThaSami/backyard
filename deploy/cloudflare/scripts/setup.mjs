@@ -39,7 +39,7 @@ import { fileURLToPath } from "node:url";
 
 import { GO_CLI_INVOCATION } from "./cli.mjs";
 import { CfError } from "./lib/cfapi.mjs";
-import { MANAGED_ACCESS_KEYS, MANAGED_AI_KEYS, MANAGED_DOMAIN_KEYS, MANAGED_LISTING_KEYS, aiEnabledOf, authModeOf, hostOf, siteListingOf } from "./lib/live.mjs";
+import { MANAGED_ACCESS_KEYS, MANAGED_AI_KEYS, MANAGED_DOMAIN_KEYS, MANAGED_LISTING_KEYS, aiEnabledOf, authModeOf, hostOf, refuseListingVars, rememberedListing } from "./lib/live.mjs";
 import { probe } from "./lib/net.mjs";
 import { CliError, EXIT, bold, cyan, dim, green, isCI, maskSecret, revealSecrets, ui, yellow } from "./lib/ui.mjs";
 
@@ -123,55 +123,6 @@ function refuseAIVar(overrides, aiOff, inv) {
       throw new CliError(EXIT.USAGE, `${k} is managed by \`${inv} setup --no-ai\` while AI is off (\`${inv} setup --ai\` turns AI back on)`);
     }
   }
-}
-
-/**
- * The site listing remembered in the state: "owners" after `setup
- * --site-listing owners`, else "all". A SITE_LISTING override that an earlier
- * version remembered counts as what the Worker reads from it (an invalid
- * value as owners, which the Worker never reads as all); setup drops it.
- * @param {Record<string, any>} state
- * @returns {"all" | "owners"}
- */
-function rememberedListing(state) {
-  if (state.siteListing === "owners") return "owners";
-  const v = state.vars?.SITE_LISTING;
-  return v === undefined ? "all" : siteListingOf(v) ?? "owners";
-}
-
-/**
- * Refuses (exit 2) what contradicts the site listing of this run (--site-listing,
- * else the remembered one): a --var SITE_LISTING with another value (the flag
- * manages the variable, see managedVars), and with owners-only listing an
- * OWNERSHIP other than owner from --var, a remembered override or the base
- * configuration (owners are recorded only with OWNERSHIP=owner, and the
- * Worker refuses every request otherwise).
- * @param {Record<string, string>} overrides   the --var flags
- * @param {"all" | "owners"} listing
- * @param {Record<string, any>} state
- * @param {Record<string, unknown>} baseVars
- * @param {string} inv
- */
-function refuseListingVars(overrides, listing, state, baseVars, inv) {
-  for (const k of MANAGED_LISTING_KEYS) {
-    if (!Object.hasOwn(overrides, k)) continue;
-    const want = siteListingOf(overrides[k]);
-    if (want !== listing) {
-      const other = want ?? (listing === "all" ? "owners" : "all");
-      throw new CliError(EXIT.USAGE, `${k} is managed by \`${inv} setup --site-listing\`: the site listing is ${listing} (\`${inv} setup --site-listing ${other}\` changes it)`);
-    }
-  }
-  if (listing !== "owners") return;
-  const passed = Object.hasOwn(overrides, "OWNERSHIP") && overrides.OWNERSHIP !== "";
-  const remembered = !Object.hasOwn(overrides, "OWNERSHIP") && state.vars?.OWNERSHIP !== undefined;
-  const raw = passed ? overrides.OWNERSHIP : remembered ? state.vars.OWNERSHIP : baseVars.OWNERSHIP;
-  const text = typeof raw === "string" ? raw : raw === undefined || raw === null ? "" : JSON.stringify(raw);
-  const o = text.trim().toLowerCase();
-  if (o === "" || o === "owner") return;
-  const needs = "the owners-only site listing, which needs OWNERSHIP=owner (its default with --site-listing owners; owners are recorded only then)";
-  if (passed) throw new CliError(EXIT.USAGE, `--var OWNERSHIP:${text} contradicts ${needs}: leave OWNERSHIP out, or pass --var OWNERSHIP:owner`);
-  if (remembered) throw new CliError(EXIT.USAGE, `the remembered --var OWNERSHIP:${text} contradicts ${needs}: drop it with --var OWNERSHIP:`);
-  throw new CliError(EXIT.USAGE, `the base configuration (wrangler.jsonc) sets OWNERSHIP=${text}, which contradicts ${needs}: pass --var OWNERSHIP:owner`);
 }
 
 /**
@@ -369,7 +320,9 @@ export async function runSetup(opts, ctx) {
   const previousUrl = state.url ?? "";
   refuseManagedVars(overrides, state, inv);
   refuseAIVar(overrides, aiOff(state), inv);
-  refuseListingVars(overrides, listingOf(state), state, baseVars, inv);
+  // Without the flag a machine without state may still adopt the listing from
+  // the live Worker: the base SITE_LISTING is checked against it below.
+  refuseListingVars(overrides, listingOf(state), state, baseVars, inv, { checkBase: listingChoice !== undefined || !!state.updatedAt });
 
   await ctx.login(state);
   const api = await ctx.api();

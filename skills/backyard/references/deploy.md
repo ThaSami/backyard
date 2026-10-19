@@ -93,14 +93,18 @@ backyard deploy -y --open             # no confirmation prompt, open the site af
   not atomic: visitors may briefly see a mix of old and new files.
 - **Data survives deploys:** database collections, uploaded files and rooms are not touched.
 - **Overwriting someone else's site** asks for confirmation (`-y` skips it). On servers with
-  `sites.ownership: owner`, only owners and admins can redeploy or delete a site
-  (`forbidden` otherwise); the first deployer becomes the owner.
+  `sites.ownership: owner`, only owners and admins can redeploy or delete a site that has owners
+  (`forbidden` otherwise); the first signed-in deployer of a site without owners (a new one, or
+  one from before ownership mode) becomes its owner, and until then anyone signed in may also
+  delete it or set its owners.
 - **Owners-only listing.** On servers with `sites.listing: owners` (Cloudflare:
   `SITE_LISTING=owners`; it implies ownership) the hub, `backyard sites list` and
   `backyard_list_sites` show each person only the sites they own (while a site has no owners,
   its creator), admins every site, guests none. It only hides sites: everyone can still open a
   site by its URL, and `backyard sites info <name>`, `backyard pull` and `backyard_site_files`
-  find any site by name — check names with those, not with the list.
+  find any site by name — check names with those, not with the list. A hidden site without
+  owners is not protected: deploying to its name replaces it and makes you its owner, so pick
+  another name unless the user means to take it over.
 - **Limits** (defaults): 500 MiB per site, 10,000 files, 100 MiB per file, 60 deploys/hour.
 - The URL is printed at the end: `https://<site>.backyard.example.com/` (host mode) or
   `https://backyard.example.com/s/<site>/` (path mode).
@@ -373,7 +377,9 @@ signed-in user. The tools: `backyard_docs`, `backyard_whoami`, `backyard_list_si
    exactly the given files (use it only when the user wants a clean slate).
 5. A site someone else published last is refused with a message naming them: ask the user, and
    only if they agree publish again with `"overwrite": true`, otherwise pick another name.
-   In ownership mode only owners and admins may change a site.
+   In ownership mode only owners and admins may change a site, except that a site without
+   owners (one from before ownership mode) can be replaced and claimed by any signed-in
+   deployer: don't publish over one unless the user means to take it over.
 6. Larger sites: split the files over several calls, **one after another, never in parallel**;
    each call stays below `max_publish_bytes`. Expect a few hundred KB per call to be
    comfortable. Big media (videos, large images, archives) do not belong in a chat: ask the

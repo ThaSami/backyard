@@ -202,7 +202,8 @@ How `backyard_publish` changes a site:
 - **Someone else's site.** A site that another person published last is changed only with
   `overwrite: true`, which Claude sets only after asking you. With `sites.ownership: owner`
   (Cloudflare: `OWNERSHIP=owner`) only owners and admins may change a site, and whoever publishes
-  a new site first becomes its owner.
+  a new site first becomes its owner; a site without owners (one from before ownership mode) can
+  be replaced and claimed by any signed-in deployer.
 - **Same rules as every deploy.** Reserved names, path rules, the per-file and per-site limits,
   `ratelimit.deploys_per_hour` (Cloudflare: `deploys_per_day`) and the audit log apply. On the
   Go server two connector publishes of one site never run at the same time (the second gets "in
@@ -327,8 +328,9 @@ anyone who can reach the hub can connect. Claude can read sites; it can publish 
 `deploy.allow_anonymous` (Cloudflare: `ALLOW_ANONYMOUS_DEPLOY`) is on, and otherwise gets "This
 Backyard has no sign-in and does not accept anonymous publishing, so this connection can only
 read". The `DEPLOY_TOKEN` and static tokens cannot be used instead. A guest owns no sites in
-ownership mode, and with `sites.listing: owners` `backyard_list_sites` lists it none. The Go server logs `mcp: auth.mode none: every connector connection is an
-anonymous guest` at startup outside dev mode.
+ownership mode, and with `sites.listing: owners` `backyard_list_sites` lists it none. The Go
+server logs `mcp: auth.mode none: every connector connection is an anonymous guest` at startup
+outside dev mode.
 
 ## Audit and metrics
 

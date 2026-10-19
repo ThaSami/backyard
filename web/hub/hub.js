@@ -1142,36 +1142,63 @@
     return !!info && info.site_listing === "owners" && !isAdminUser(me);
   }
 
+  /** Whether u (GET /me) is a guest: never an owner, never listed a site with site_listing "owners". */
+  function isGuestUser(u) {
+    return !!u && typeof u === "object" && !!u.anonymous;
+  }
+
   /** The note under the Sites heading: "" unless the server lists only owners' sites. */
   function listingNote(info, me) {
     if (!info || info.site_listing !== "owners") return "";
+    if (isGuestUser(me)) return "Sites are listed only to their signed-in owners and admins.";
     return isAdminUser(me) ? "You are an admin: every site is listed." : "Only your sites are listed.";
   }
 
-  /** What the empty directory says: total sites are listed, none of them matches query. */
+  /**
+   * What the empty directory says: total sites are listed, none of them
+   * matches query. A guest is listed no site with site_listing "owners", not
+   * even one it deploys, so it is promised none.
+   */
   function emptySitesText(info, me, total, query) {
     if (total) return `No sites match “${query}”.`;
-    return listsOwnSitesOnly(info, me) ? "You don't own any sites yet. Drop a folder above to create one." : "No sites yet. Drop a folder above to create the first one.";
+    if (!listsOwnSitesOnly(info, me)) return "No sites yet. Drop a folder above to create the first one.";
+    return isGuestUser(me) ? "Sites are listed only to signed-in people." : "You don't own any sites yet. Drop a folder above to create one.";
   }
 
   /**
    * The hint under a valid site name in the deploy form. existing is the
    * listed SiteMeta of that name (or null); taken is what GET G/sites/{name}
-   * said about a name the list leaves out: true (a site exists), false (none)
-   * or null (not asked, still asking, or it failed).
+   * said about a name the list leaves out: its SiteMeta (a site exists),
+   * false (none) or null (not asked, still asking, or it failed). me is the
+   * viewer (GET /me), if known; hasToken whether a deploy token is pasted. A
+   * site that has owners refuses everyone else but admins; a site without
+   * owners is replaced by anyone's deploy, and a signed-in deployer becomes
+   * its owner (SPEC §7.2, §7.3). A guest is never an owner: without a token
+   * it is refused a site that has owners and may replace one without (told
+   * only that it exists, as when every site is listed); with a token the
+   * deploy runs as the token's account, which may be an owner or an admin
+   * (the Cloudflare DEPLOY_TOKEN is one), so it is told only that the site
+   * exists.
+   * A signed-in viewer is told what holds for them even with a token pasted,
+   * although the deploy then runs as the token's account too (a bearer
+   * token wins over the sign-in), which the hub does not look up.
    */
-  function siteNameHint(existing, taken, now) {
-    if (existing) {
-      return `Updates the existing site${existing.updated_by ? " (last deployed by " + existing.updated_by + ", " + relativeTime(existing.updated_at, now) + ")" : ""}.`;
+  function siteNameHint(existing, taken, now, me, hasToken) {
+    const site = existing || (taken && typeof taken === "object" ? taken : null);
+    if (!site) return "A new site will be created.";
+    const owned = Array.isArray(site.owners) && site.owners.length > 0;
+    if (existing || (isGuestUser(me) && (!!hasToken || !owned))) {
+      return `Updates the existing site${site.updated_by ? " (last deployed by " + site.updated_by + ", " + relativeTime(site.updated_at, now) + ")" : ""}.`;
     }
-    if (taken === true) return "This name is taken by a site you don't own; only its owners or an admin can update it.";
-    return "A new site will be created.";
+    if (owned) return "This name is taken by a site you don't own; only its owners or an admin can update it.";
+    const creator = typeof site.created_by === "string" ? site.created_by.trim() : "";
+    return `A site of this name exists without an owner${creator ? " (created by " + creator + ")" : ""}: deploying replaces it and makes you its owner.`;
   }
 
   /**
    * Whether a site of that name exists, listed or not: GET G/sites/{site}
-   * is never filtered by the listing (SPEC §7.2). Resolves true (its
-   * SiteMeta), false (404) or null (any other answer, a login page, a
+   * is never filtered by the listing (SPEC §7.2). Resolves its SiteMeta (a
+   * site exists), false (404) or null (any other answer, a login page, a
    * network error or an abort). opts: { gateway, site, token, fetch, signal }.
    */
   async function siteExists(opts) {
@@ -1182,7 +1209,7 @@
       if (res.status === 404) return false;
       if (!res.ok || isLoginResponse(res)) return null;
       const meta = await res.json();
-      return !!meta && typeof meta === "object" && meta.name === opts.site ? true : null;
+      return !!meta && typeof meta === "object" && !Array.isArray(meta) && meta.name === opts.site ? meta : null;
     } catch (_) {
       return null;
     }
@@ -1316,6 +1343,7 @@
     serializePanels,
     filterSites,
     isAdminUser,
+    isGuestUser,
     listsOwnSitesOnly,
     listingNote,
     emptySitesText,
@@ -1617,7 +1645,7 @@
     }
   }
 
-  /** What is known about name (true, false, or null while unknown); starts its lookup when needed. */
+  /** What is known about name (its SiteMeta, false, or null while unknown); starts its lookup when needed. */
   function lookedUp(name) {
     if (lookup.name === name) return lookup.done ? lookup.taken : null;
     cancelLookup(true);
@@ -1651,7 +1679,7 @@
     if (!ask) cancelLookup(false);
     if (err) hint.textContent = err;
     else if (!name) hint.textContent = "Lowercase letters, digits and dashes.";
-    else hint.textContent = siteNameHint(ex, ask ? lookedUp(name) : null);
+    else hint.textContent = siteNameHint(ex, ask ? lookedUp(name) : null, undefined, state.me, !!state.token);
     updateDeployButton();
   }
 
@@ -2239,6 +2267,7 @@
     saveToken();
     renderTokenBox();
     renderSites(); // delete buttons depend on the token
+    renderName(); // and so does a guest's name hint
     toast(remembering() ? "Deploy token saved in this browser" : "Deploy token set for this visit");
   }
 
@@ -2306,7 +2335,10 @@
       const had = !!state.token;
       state.token = tokenInput.value.trim();
       saveToken();
-      if (had !== !!state.token) renderSites(); // delete buttons depend on the token
+      if (had !== !!state.token) {
+        renderSites(); // delete buttons depend on the token
+        renderName(); // and so does a guest's name hint
+      }
     });
     $("remember-token").addEventListener("change", (e) => {
       state.remember = e.target.checked;
@@ -2319,6 +2351,7 @@
       tokenInput.value = "";
       renderTokenBox();
       renderSites();
+      renderName();
       toast("Token removed from this browser");
     });
 

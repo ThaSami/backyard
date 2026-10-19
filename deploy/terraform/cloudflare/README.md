@@ -92,9 +92,16 @@ the next `setup` (setup remembers `--no-ai` until it is given `--ai`). And they 
 `--site-listing all` or `--site-listing owners`: `site_listing = "owners"` lists each site only to
 its owners and admins in the hub, `GET /sites` and the Claude connector (it implies
 `OWNERSHIP=owner`; it hides sites from the directory and is not access control, since anyone who
-may open sites can still open one by its URL), and setting it back to `"all"` lists every site
-again at the next `setup` (see
+may open sites can still open one by its URL; a site without owners, such as one deployed
+before, goes to its next signed-in deployer), and setting it back to `"all"` lists every site
+again at the next `setup` and turns ownership off again, so anyone may overwrite any site, unless
+`OWNERSHIP=owner` is set (`setup --var OWNERSHIP:owner`, remembered; see
 [Owners-only site listing](../../cloudflare/README.md#owners-only-site-listing)).
+
+Since `setup_args` always carry `--site-listing`, this module version needs the `backyard` CLI
+or the `backyard-cloudflare` package (or a checkout) of the same release or newer to run them:
+an older `setup` rejects `--site-listing` (`unknown option`, exit 2, nothing changed). Upgrade
+the CLI together with the module `?ref=`, or use `npx backyard-cloudflare@latest`.
 
 These variables are then managed by Terraform: `setup` deploys and remembers them, and the
 CLI's `domain add` and `access enable` refuse to take them over (exit 2, with how to drop them
@@ -173,7 +180,7 @@ domains, so they leave the module's alone. Leave `routes` out of `wrangler.jsonc
 | `bypass_paths` | gateway + token minting + health + the Claude connector's four machine paths (nine paths) | Paths below `/__backyard/` (or one of the two OAuth discovery documents) that skip Access. |
 | `mcp_enabled` | `false` | Turn on the [Claude connector](../../../docs/claude-connector.md): `MCP_ENABLED=true` in `worker_vars` and `setup_args` (`false` otherwise, which turns a connector that was on off at the next `setup`). |
 | `ai_enabled` | `true` | Serve AI to sites: `--ai` in `setup_args`. `false` puts `--no-ai` there instead: no Workers AI binding and `AI_ENABLED=false`, so every AI endpoint answers `501 unsupported` (for an account without Workers AI); back to `true`, the next `setup` turns AI on again. |
-| `site_listing` | `"all"` | Who sees each site in the site lists: `all` (everyone) or `owners` (its owners and admins; implies `OWNERSHIP=owner`; not access control). `setup_args` always carry `--site-listing <value>`, so `"all"` lists every site again at the next `setup`. |
+| `site_listing` | `"all"` | Who sees each site in the site lists: `all` (everyone) or `owners` (its owners and admins; implies `OWNERSHIP=owner`, so only owners and admins may change a site that has owners; not access control). `setup_args` always carry `--site-listing <value>` (older `setup` rejects it), so `"all"` lists every site again at the next `setup`, and turns ownership off again unless `OWNERSHIP=owner` is set (`setup --var OWNERSHIP:owner`). |
 | `okta_account_url`, `okta_client_id`, `okta_client_secret`, `okta_authorization_server_id`, `okta_idp_name` | `""` | Create an Okta identity provider. |
 | `okta_identity_provider_id` | `""` | Existing Okta provider for `allowed_okta_groups`. |
 

@@ -6,7 +6,7 @@
 // (deploy token, BACKYARD_SECRET, OAuth or admin token) leaks into a wrangler
 // argv or env, the state, the result file or the output.
 import assert from "node:assert/strict";
-import { readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 
@@ -956,6 +956,59 @@ describe("backyard-cloudflare access disable", () => {
     assert.equal(d.config.vars.SITE_LISTING, "owners");
     assert.equal(sb.state().siteListing, "owners");
     assert.equal(liveVars(sb).SITE_LISTING, "owners");
+  });
+
+  it("refuses a wrangler.jsonc SITE_LISTING or OWNERSHIP that contradicts the site listing, as setup does, before access enable or access disable changes anything", async () => {
+    const sb = await accessSandbox();
+    const config = join(sb.pkg, "wrangler.jsonc");
+    const original = readFileSync(config, "utf8");
+    /** The base configuration (wrangler.jsonc) with these variables set. */
+    const setBase = (vars) => writeFileSync(config, original.replace('"vars": {', `"vars": {\n${Object.entries(vars).map(([k, v]) => `    ${JSON.stringify(k)}: ${JSON.stringify(v)},`).join("\n")}`));
+    const listingRefusal = (base, listing) =>
+      `the base configuration (wrangler.jsonc) sets SITE_LISTING=${base}, but the site listing is ${listing}: remove SITE_LISTING from wrangler.jsonc (\`npm run cf -- setup --site-listing <all|owners>\` sets it) (nothing was changed)`;
+    /** A refused run: exit 2 with want, no deploy, no Cloudflare API write, the state as it was. */
+    const refused = async (argv, env, want) => {
+      const before = JSON.stringify(sb.state());
+      sb.calls();
+      sb.requests();
+      const r = await sb.run(argv, env);
+      assert.equal(r.code, 2, r.out);
+      assert.ok(r.out.includes(want), r.out);
+      assert.equal(deployOf(sb.calls()), undefined, "no deploy");
+      assert.deepEqual(writesOf(sb.requests()).map((x) => `${x.method} ${x.path}`), [], "nothing changed on Cloudflare");
+      assert.equal(JSON.stringify(sb.state()), before, "the state is unchanged");
+    };
+
+    // Every site is listed (nothing remembered): a base SITE_LISTING=owners would deploy owners.
+    setBase({ SITE_LISTING: "owners" });
+    await refused(ENABLE, WITH_ADMIN, listingRefusal("owners", "all"));
+    // Owners-only listing remembered: a base OWNERSHIP other than owner.
+    sb.writeState("backyard", { ...sb.state(), siteListing: "owners" });
+    setBase({ OWNERSHIP: "none" });
+    await refused(
+      ENABLE,
+      WITH_ADMIN,
+      "the base configuration (wrangler.jsonc) sets OWNERSHIP=none, which contradicts the owners-only site listing, which needs OWNERSHIP=owner (its default with --site-listing owners; owners are recorded only then): run `npm run cf -- setup --var OWNERSHIP:owner` first (nothing was changed)",
+    );
+    assert.equal(sb.cf().access.acc1.apps.length, 0, "no Access application was created");
+    // What agrees turns Access on.
+    setBase({ SITE_LISTING: "owners", OWNERSHIP: "owner" });
+    let r = await sb.run(ENABLE, WITH_ADMIN);
+    assert.equal(r.code, 0, r.out);
+    let d = deployOf(sb.calls());
+    assert.deepEqual([d.config.vars.AUTH_MODE, d.config.vars.SITE_LISTING, d.config.vars.OWNERSHIP], ["access", "owners", "owner"]);
+
+    // access disable: refused before it asks or deploys; Access stays on.
+    setBase({ SITE_LISTING: "all" });
+    await refused(["access", "disable", "--yes"], {}, listingRefusal("all", "owners"));
+    assert.equal(liveVars(sb).AUTH_MODE, "access");
+    assert.equal(sb.state().access.team, TEAM);
+    setBase({});
+    r = await sb.run(["access", "disable", "--yes"]);
+    assert.equal(r.code, 0, r.out);
+    d = deployOf(sb.calls());
+    assert.deepEqual([d.config.vars.AUTH_MODE, d.config.vars.SITE_LISTING, d.config.vars.OWNERSHIP], ["none", "owners", undefined]);
+    assert.equal(sb.state().access, undefined);
   });
 
   it("cannot delete applications made in the dashboard", async () => {

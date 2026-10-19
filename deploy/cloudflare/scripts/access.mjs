@@ -42,7 +42,7 @@
 
 import { CfError } from "./lib/cfapi.mjs";
 import { ACCESS_BYPASS_PATHS, ACCESS_TOKEN_PERMISSIONS, accessNames, appBodies, isConsumerMailDomain, policyBodies, printGuidedSteps } from "./lib/access-plan.mjs";
-import { MANAGED_ACCESS_KEYS, normalizeTeam } from "./lib/live.mjs";
+import { MANAGED_ACCESS_KEYS, normalizeTeam, refuseListingConfig } from "./lib/live.mjs";
 import { parseAccessRedirect, probe, randomProbeLabel, waitFor } from "./lib/net.mjs";
 import { CliError, EXIT, bold, dim, ui } from "./lib/ui.mjs";
 
@@ -658,6 +658,8 @@ export async function runAccessEnable(opts, ctx) {
       `${ext.join(", ")} ${ext.length === 1 ? "is" : "are"} set with --var (e.g. by the Terraform module): drop ${ext.length === 1 ? "it" : "them"} with ${ext.map((k) => `--var ${k}:`).join(" ")} or keep managing ${ext.length === 1 ? "it" : "them"} with Terraform`,
     );
   }
+  // The deploy must not contradict the site listing (as setup refuses it).
+  refuseListingConfig(state, ctx.base.vars ?? {}, inv, "access enable");
   const domain = state.domain;
   if (!domain?.host || domain.status !== "active") {
     let why = "";
@@ -958,6 +960,8 @@ export async function runAccessDisable(opts, ctx) {
     return EXIT.OK;
   }
 
+  // The deploy must not contradict the site listing (as setup refuses it).
+  refuseListingConfig(state, ctx.base.vars ?? {}, inv, "access disable");
   // --delete-apps needs the ids of objects this tool created, and credential A: checked before anything changes.
   const ids = { ...createdFor(state, host), ...(state.access.source === "api" ? pickIds(state.access) : {}) };
   let admin = null;

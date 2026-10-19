@@ -522,6 +522,20 @@ func TestSitesCommands(t *testing.T) {
 	if err := json.Unmarshal([]byte(h.out.String()), &list); err != nil || len(list.Sites) != 1 || list.Sites[0].Name != "lunch-vote" {
 		t.Fatalf("filter: %v %s", err, h.out.String())
 	}
+	// A filter that matches nothing says so, not that there are no sites,
+	// and on an owners-only server not that the caller owns none.
+	notOwned := "You don't own any sites yet"
+	out = h.mustRun("sites", "list", "nomatch")
+	if errOut := h.err.String(); out != "" || errOut != "No sites match \"nomatch\".\n" {
+		t.Fatalf("filter without a match: %q %q", out, errOut)
+	}
+	g.Info.SiteListing = "owners"
+	out = h.mustRun("sites", "list", "nomatch")
+	if errOut := h.err.String(); out != "" || !strings.HasPrefix(errOut, "No sites match \"nomatch\". This server lists only your own sites") ||
+		!strings.Contains(errOut, "`backyard sites info <name>` finds any site") || strings.Contains(errOut, notOwned) {
+		t.Fatalf("owners-only filter without a match: %q %q", out, errOut)
+	}
+	g.Info.SiteListing = "all"
 
 	out = h.mustRun("sites", "info", "dashboard")
 	if !strings.Contains(out, "Files:") || !strings.Contains(out, "2 (") || !strings.Contains(out, g.SiteURL("dashboard")) {
@@ -560,6 +574,16 @@ func TestSitesCommands(t *testing.T) {
 	out = h.mustRun("sites", "list")
 	if out != "" || !strings.Contains(h.err.String(), "You don't own any sites yet: this server lists each site only to its owners and admins") {
 		t.Fatalf("empty owners list: %q %q", out, h.err.String())
+	}
+	// Even with nothing listed, a filter gets the no-match text.
+	out = h.mustRun("sites", "list", "lunch")
+	if errOut := h.err.String(); out != "" || !strings.HasPrefix(errOut, "No sites match \"lunch\".") || strings.Contains(errOut, notOwned) {
+		t.Fatalf("empty owners list with a filter: %q %q", out, errOut)
+	}
+	g.Info.SiteListing = "all"
+	out = h.mustRun("sites", "list", "lunch")
+	if errOut := h.err.String(); out != "" || errOut != "No sites match \"lunch\".\n" {
+		t.Fatalf("empty list with a filter: %q %q", out, errOut)
 	}
 }
 

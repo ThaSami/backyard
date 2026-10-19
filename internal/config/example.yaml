@@ -158,7 +158,7 @@ warehouse:
 
 sites:
   # none: anyone can overwrite any site (Quick philosophy) | owner: first deployer owns it
-  ownership: none
+  # ownership: none   # default; owner with listing: owners
   # all (default): the hub, `backyard sites list` and the connector list every site |
   # owners: people see only the sites they own, admins see every site (needs ownership:
   # owner, its default then). It hides sites from the directory: anyone who may open

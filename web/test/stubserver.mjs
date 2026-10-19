@@ -132,9 +132,11 @@ function wsAccept(req, socket, handlers) {
  * GET /__backyard/api/sites/{site}/preview serves it, 404 when it is missing).
  * A deploy sets SiteMeta.preview to the first PREVIEW_NAMES file it holds.
  * listing: "owners" lists sites like sites.listing: owners (SPEC §7.2
- * "Listing", which implies ownership: deploys record the first deployer as the
- * owner and refuse others but admins); /info reports it as site_listing
- * ("all" otherwise). GET G/sites/{site} answers for every site.
+ * "Listing", which implies ownership, §7.3: a site with owners refuses
+ * everyone else but admins; a site without owners takes anyone's deploy, and
+ * the first deployer who is not a guest becomes its owner); /info reports it
+ * as site_listing ("all" otherwise). GET G/sites/{site} answers for every
+ * site, listed or not, owned or not.
  * Returns { url, state, close() }.
  */
 export async function startStub(opts = {}) {

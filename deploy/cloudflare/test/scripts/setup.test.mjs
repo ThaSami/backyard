@@ -485,6 +485,94 @@ describe("backyard-cloudflare setup", () => {
     assert.equal(sb.state().vars, undefined);
   });
 
+  it("refuses a SITE_LISTING in wrangler.jsonc that contradicts the site listing (dry-run, real and adopted runs)", async () => {
+    const sb = await newSandbox();
+    const config = join(sb.pkg, "wrangler.jsonc");
+    const setBase = (v) =>
+      writeFileSync(config, readFileSync(config, "utf8").replace(/^ *(\/\/ )?"SITE_LISTING": "[^"]*",$/m, v === undefined ? '    // "SITE_LISTING": "owners",' : `    "SITE_LISTING": ${JSON.stringify(v)},`));
+    const refusal = (base, listing) =>
+      `the base configuration (wrangler.jsonc) sets SITE_LISTING=${base}, but the site listing is ${listing}: remove SITE_LISTING from wrangler.jsonc (\`npm run cf -- setup --site-listing <all|owners>\` sets it)`;
+    setBase("owners");
+    assert.equal(parseJSONC(readFileSync(config, "utf8")).vars.SITE_LISTING, "owners");
+    // Without the flag or a remembered choice the listing is all: the base value would deploy
+    // owners while setup says every site (and skip the OWNERSHIP check), so it is refused. On a
+    // machine without state that happens after the live read (adoption may still pick owners),
+    // before the workers.dev subdomain or an R2 bucket is touched.
+    sb.requests();
+    let r = await sb.run(["setup", "--var", "OWNERSHIP:none"]);
+    assert.equal(r.code, 2, r.out);
+    assert.ok(r.out.includes(refusal("owners", "all")), r.out);
+    assert.deepEqual(names(sb.calls()), ["whoami --json", "auth token"]);
+    assert.deepEqual(sb.cf().buckets ?? [], [], "no R2 bucket was created");
+    assert.ok(!sb.requests().some((x) => x.path.endsWith("/workers/subdomain")), "the workers.dev subdomain is not touched");
+    for (const argv of [
+      ["setup", "--dry-run"],
+      ["setup", "--site-listing", "all"],
+      ["setup", "--dry-run", "--site-listing", "all"],
+    ]) {
+      r = await sb.run(argv);
+      assert.equal(r.code, 2, `${argv.join(" ")}: ${r.out}`);
+      assert.ok(r.out.includes(refusal("owners", "all")), `${argv.join(" ")}: ${r.out}`);
+      assert.deepEqual(sb.calls(), [], argv.join(" "));
+    }
+    // A base value that agrees deploys; the flag (remembered) is what setup manages.
+    r = await sb.run(["setup", "--no-r2", "--site-listing", "owners"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(deployOf(sb.calls()).config.vars.SITE_LISTING, "owners");
+    assert.equal(sb.state().siteListing, "owners");
+    r = await sb.run(["setup", "--dry-run"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(sb.calls()[0].config.vars.SITE_LISTING, "owners");
+    // With state, --site-listing all is refused before anything happens, real or dry run.
+    for (const argv of [
+      ["setup", "--no-r2", "--site-listing", "all"],
+      ["setup", "--dry-run", "--site-listing", "all"],
+    ]) {
+      r = await sb.run(argv);
+      assert.equal(r.code, 2, `${argv.join(" ")}: ${r.out}`);
+      assert.ok(r.out.includes(refusal("owners", "all")), `${argv.join(" ")}: ${r.out}`);
+      assert.deepEqual(sb.calls(), [], argv.join(" "));
+    }
+    assert.equal(sb.state().siteListing, "owners", "a refused run changes nothing");
+    // Adopted runs: a live owners-only listing agrees with the base value, a live "every site" does not.
+    forgetState(sb);
+    r = await sb.run(["setup", "--no-r2"]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /Adopted the deployed configuration of backyard .*owners-only site listing/);
+    assert.equal(deployOf(sb.calls()).config.vars.SITE_LISTING, "owners");
+    forgetState(sb);
+    seedWorker(sb, { vars: { SITE_LISTING: "all" } });
+    r = await sb.run(["setup", "--no-r2"]);
+    assert.equal(r.code, 2, r.out);
+    assert.ok(r.out.includes(refusal("owners", "all")), r.out);
+    assert.deepEqual(names(sb.calls()), ["whoami --json", "auth token"]);
+    // Read like the Worker (trimmed, case-insensitive): "all" contradicts owners, an invalid value both.
+    setBase(" Owners ");
+    r = await sb.run(["setup", "--no-r2", "--site-listing", "owners"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(deployOf(sb.calls()).config.vars.SITE_LISTING, "owners");
+    setBase("all");
+    r = await sb.run(["setup", "--no-r2"]);
+    assert.equal(r.code, 2, r.out);
+    assert.ok(r.out.includes(refusal("all", "owners")), r.out);
+    assert.deepEqual(sb.calls(), []);
+    setBase("mine");
+    for (const listing of ["owners", "all"]) {
+      r = await sb.run(["setup", "--dry-run", "--site-listing", listing]);
+      assert.equal(r.code, 2, r.out);
+      assert.ok(r.out.includes(refusal("mine", listing)), r.out);
+    }
+    setBase("all");
+    r = await sb.run(["setup", "--no-r2", "--site-listing", "all"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(deployOf(sb.calls()).config.vars.SITE_LISTING, "all");
+    assert.equal(sb.state().siteListing, undefined);
+    setBase("");
+    r = await sb.run(["setup", "--no-r2", "--site-listing", "owners"]);
+    assert.equal(r.code, 0, r.out, "an empty base value is unset");
+    assert.equal(deployOf(sb.calls()).config.vars.SITE_LISTING, "owners");
+  });
+
   it("exits 4 with the reason when the hub does not become ready, instead of saying it is live", async () => {
     const sb = await newSandbox();
     const fast = { FAKE_FAST_SLEEP: "1", BACKYARD_CF_RESULT_FILE: sb.resultPath };

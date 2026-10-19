@@ -48,7 +48,9 @@ name: Deploy to Cloudflare
 # and the files stored in R2 answer 500 until a deploy binds the bucket again.
 # And when `setup --site-listing owners` lists sites only to their owners (the
 # "Site listing:" line of `backyard cloudflare status`), set
-# vars.BACKYARD_CF_SITE_LISTING to owners: a deploy without it lists every site.
+# vars.BACKYARD_CF_SITE_LISTING to owners: a deploy without it lists every site
+# and turns ownership off again (anyone may overwrite any site) unless
+# vars.BACKYARD_CF_VARS sets "OWNERSHIP":"owner".
 # Deploys from here always serve on workers.dev (workers_dev in wrangler.jsonc),
 # even after `setup --no-workers-dev`.
 #

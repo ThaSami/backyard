@@ -56,12 +56,12 @@ backyard cloudflare access enable --allow-email-domain acme.com   # company logi
 backyard cloudflare status                                        # read-only live check
 ```
 
-Re-run setup to upgrade: every choice is kept (secrets, the deploy token, R2, AI, the domain,
-Access and `--var` overrides). A machine without saved state (a teammate, a new laptop, CI)
-adopts the deployed configuration, and keeps a Worker's existing `DEPLOY_TOKEN` unless you pass
-`--rotate-token` (run it with `DEPLOY_TOKEN=<token>` to remember the token there). A deploy that
-would turn a live Cloudflare Access off is refused unless you confirm it, and deploys never
-change routes or custom domains. Every command and flag:
+Re-run setup to upgrade: every choice is kept (secrets, the deploy token, R2, AI, the site
+listing, the domain, Access and `--var` overrides). A machine without saved state (a teammate,
+a new laptop, CI) adopts the deployed configuration, and keeps a Worker's existing
+`DEPLOY_TOKEN` unless you pass `--rotate-token` (run it with `DEPLOY_TOKEN=<token>` to remember
+the token there). A deploy that would turn a live Cloudflare Access off is refused unless you
+confirm it, and deploys never change routes or custom domains. Every command and flag:
 [`backyard cloudflare`](cli.md#backyard-cloudflare) and the
 [edition's README](../deploy/cloudflare/README.md#command-reference). A GitHub Actions workflow
 is included, and an optional Terraform module
@@ -131,10 +131,14 @@ the edition's [README](../deploy/cloudflare/README.md#turning-ai-off).
 Terraform: `site_listing = "owners"`; GitHub Actions: `BACKYARD_CF_SITE_LISTING=owners`) sets
 `SITE_LISTING=owners`: the hub, `backyard sites list` and `backyard_list_sites` then show each
 person only their own sites, and admins (`ADMINS`, `ADMIN_GROUPS`, the `DEPLOY_TOKEN`) every
-site. It implies `OWNERSHIP=owner`. With the default `AUTH_MODE=none` every browser is a guest
-and is listed no site (only the `DEPLOY_TOKEN` sees them), so it is meant for
-`AUTH_MODE=access`. It hides sites from the directory and
-does not restrict who can open them; `--site-listing all` lists every site again. See
+site. It implies `OWNERSHIP=owner`, which protects a site once it has owners: sites deployed
+while `OWNERSHIP` was off have none, so until then any signed-in deployer can replace one and
+becomes its owner, and any signed-in user may delete one or set its owners (give the sites that
+matter owners right after turning the listing on). With the default `AUTH_MODE=none` every
+browser is a guest and is listed no site (only the CLI logged in with the `DEPLOY_TOKEN` sees them; pasting the token into the hub
+does not change its list), so it is meant for `AUTH_MODE=access`. It hides sites from the
+directory and does not restrict who can open them. `--site-listing all` lists every site again
+and turns ownership off with it, unless `OWNERSHIP=owner` is set (`--var OWNERSHIP:owner`). See
 [owners-only site listing](deploying-sites.md#owners-only-site-listing).
 
 Within the shared contract, a few edition differences are visible to pages and CLIs (all

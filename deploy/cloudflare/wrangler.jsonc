@@ -68,8 +68,10 @@
     // "owners" lists a site in the hub, GET /sites and backyard_list_sites only to its
     // owners (its creator while it has none) and admins; unset or "all" lists every
     // site. It hides sites from the directory, it does not restrict who may open one
-    // by its URL. Any other value fails closed (503). `setup --site-listing owners`
-    // sets it.
+    // by its URL. Any other value fails closed (503). Choose it with `setup
+    // --site-listing owners|all` (remembered) or, in CI, BACKYARD_CF_SITE_LISTING
+    // rather than here: setup, domain, access and the CI deployer refuse a value
+    // here that disagrees with the listing they deploy (unset there = all).
     // "SITE_LISTING": "owners",
     // Name shown in the hub.
     "SERVER_NAME": "Backyard",

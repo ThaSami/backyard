@@ -178,5 +178,7 @@ The Cloudflare edition serves the same paths.
 
 Guardrails that apply to agents as to people: deploys are diffed, rate limited and audited; a
 site last deployed by someone else is never replaced without an explicit `overwrite`/`-y`; in
-ownership mode only owners and admins can replace a site; and everything an agent publishes is
-readable by every employee, so the skill tells agents never to put secrets in a site.
+ownership mode only owners and admins can replace a site (a site without owners, one from
+before ownership mode, can be replaced and claimed by any signed-in deployer); and everything an
+agent publishes is readable by every employee, so the skill tells agents never to put secrets in
+a site.

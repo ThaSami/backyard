@@ -192,7 +192,8 @@ site listing, the domain, Access and your `--var` overrides). Each run:
    [`access enable`](#company-login-cloudflare-access), [`setup --no-ai`](#turning-ai-off) and
    [`setup --site-listing`](#owners-only-site-listing) manage. While they manage them,
    `--var BASE_DOMAIN:…` (and `URL_MODE`, `AUTH_MODE`, `ACCESS_*`, `AI_ENABLED`, and a
-   `SITE_LISTING` that contradicts the listing) exits 2 and names the command that changes them.
+   `SITE_LISTING` that contradicts the listing, in `wrangler.jsonc` too) exits 2 and names the
+   command that changes them.
 8. **Runs the auth guard.** A deploy that would turn a live Cloudflare Access off, switch its
    team or open a Worker that fails closed is refused (exit 3, nothing changed), and so is a
    deploy to an existing Worker whose auth mode cannot be read. The message names the cause and
@@ -503,6 +504,11 @@ backyard cloudflare setup --site-listing owners   # remembered: later runs, doma
 backyard cloudflare setup --site-listing all      # every site again (the default)
 ```
 
+Back to `all` (also a [CI deploy](#deploying-from-github-actions) without
+`BACKYARD_CF_SITE_LISTING`), ownership is off again, so anyone may overwrite any site, unless
+`OWNERSHIP=owner` is set (`--var OWNERSHIP:owner`, or `"OWNERSHIP":"owner"` in
+`BACKYARD_CF_VARS`).
+
 - **It hides sites from the directory; it is not access control.** Anyone who may open sites can
   still open one by its URL, and `backyard sites info <name>` (`GET <gateway>/sites/<name>`),
   `backyard pull` and the site's own API answer as before. To limit who can open sites at all,
@@ -513,16 +519,22 @@ backyard cloudflare setup --site-listing all      # every site again (the defaul
   useful with company login.
 - **It implies ownership.** `SITE_LISTING=owners` also turns on `OWNERSHIP=owner`: the first
   deployer of a site owns it (anonymous guests never do), and only its owners and admins may
-  deploy over it or delete it, so a site you cannot see in the list is never overwritten by
-  someone picking the same name. Sites deployed while ownership was off have no owners: their
-  creator still sees them, and the next deploy of one by someone signed in makes that person its
-  owner. While the listing is owners-only, an `OWNERSHIP` other than `owner` (a `--var`, a
-  remembered override or `wrangler.jsonc`) exits 2: leave it unset.
+  deploy over it or delete it, so a site that has owners is never overwritten by someone who
+  cannot see it in the list and picks the same name. Sites deployed while ownership was off have
+  no owners, and nothing protects them: their creator still sees them, but anyone who may deploy
+  can replace one by picking its name, the next signed-in deployer becomes its owner, and anyone
+  signed in may delete it or set its owners, so give the sites that matter owners right after
+  turning the listing on (the [owners call](../../docs/deploying-sites.md#ownership)). While
+  the listing is owners-only, an `OWNERSHIP` other than `owner` (a `--var`, a remembered
+  override or `wrangler.jsonc`) exits 2: leave it unset.
 - **The hub** says under its Sites heading that only your sites are listed (to admins, that
-  every site is), and `/__backyard/api/info` reports `site_listing` (`all` or `owners`). When a
-  name typed for a new site already belongs to a site you don't own, the deploy box says so.
-- The flag manages the variable: a `--var SITE_LISTING:…` that contradicts it exits 2. `status`
-  shows the `Site listing:` line (`siteListing` in `--json`), and a machine without state adopts
+  every site is; to guests, that sites are listed only to their signed-in owners and admins), and `/__backyard/api/info` reports `site_listing` (`all` or `owners`). When a
+  name typed for a new site already belongs to a site you don't own, the deploy box says so, and
+  for a site without owners that deploying replaces it (a guest without a deploy token is told
+  only when a name is taken by a site with owners).
+- The flag manages the variable: a `--var SITE_LISTING:…` that contradicts it, or a
+  `SITE_LISTING` in `wrangler.jsonc` that is invalid or that the Worker would read as another
+  listing, exits 2. `status` shows the `Site listing:` line (`siteListing` in `--json`), and a machine without state adopts
   the choice. The [Terraform module](#with-terraform-optional-infrastructure-as-code) has
   `site_listing`, and the [CI deployer](#deploying-from-github-actions)
   `BACKYARD_CF_SITE_LISTING`, which a CI deploy must carry over.
@@ -901,8 +913,8 @@ Set variables with `backyard cloudflare setup --var KEY:VALUE` (repeatable, reme
 `--var KEY:` drops an override) or in `wrangler.jsonc` → `vars` in a checkout. `BASE_DOMAIN`
 and `URL_MODE` belong to `domain add`, `AUTH_MODE`, `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` to
 `access enable`, `AI_ENABLED` to `setup --no-ai` while AI is off, and `SITE_LISTING` to
-`setup --site-listing`. Every deploy sets all
-variables, so a change made in the dashboard lasts until the next `setup`; and don't deploy
+`setup --site-listing` (a `SITE_LISTING` in `wrangler.jsonc` must agree with it). Every deploy
+sets all variables, so a change made in the dashboard lasts until the next `setup`; and don't deploy
 with a plain `wrangler deploy`, which would deploy `wrangler.jsonc`'s defaults past the auth
 guard. Secrets go through
 `npx wrangler secret put NAME --name <worker>`.
@@ -918,7 +930,7 @@ guard. Secrets go through
 | `ACCESS_GET_IDENTITY` | `true` | Fetch name and groups from Access `get-identity`. |
 | `ALLOW_ANONYMOUS_DEPLOY` | `false` | `true` lets anyone deploy without a token. Fine for a playground; `LIMITS` still apply. |
 | `ADMINS` / `ADMIN_GROUPS` | — | Comma-separated admin emails and IdP group names. |
-| `OWNERSHIP` | `none` (`owner` with `SITE_LISTING=owners`) | `none` (anyone may overwrite a site, the Quick way) or `owner` (the first deployer owns a site; only its owners and admins may change or delete it). With `SITE_LISTING=owners` any other value than `owner` fails closed. |
+| `OWNERSHIP` | `none` (`owner` with `SITE_LISTING=owners`) | `none` (anyone may overwrite a site, the Quick way) or `owner` (the first deployer owns a site; only its owners and admins may change or delete it, except that a site without owners, such as one from before, can be replaced and claimed by any signed-in deployer). With `SITE_LISTING=owners` any other value than `owner` fails closed. |
 | `SITE_LISTING` | `all` | `owners` lists each site in the hub, `GET /sites` and `backyard_list_sites` only to its owners (its creator while it has none) and admins, and implies `OWNERSHIP=owner`; `all` (or unset) lists every site. It hides sites from the lists, it isn't access control. Any other value fails closed. Set by `setup --site-listing`; see [Owners-only site listing](#owners-only-site-listing). |
 | `SERVER_NAME` | `Backyard` | Name shown in the hub. |
 | `RESERVED_SITES` | — | Extra reserved site names (comma-separated). |
@@ -969,7 +981,8 @@ backyard cloudflare setup $(terraform output -raw setup_args)   # 3. domain + Ac
 
 `setup_args` is the module output `--worker-name <worker> --ai|--no-ai --site-listing all|owners
 --var KEY:VALUE …` (`--no-ai` when `ai_enabled = false`, `--site-listing owners` when
-`site_listing = "owners"`); the module's
+`site_listing = "owners"`; older `setup` rejects `--site-listing`, so run them with the
+`backyard` CLI or `backyard-cloudflare` of the module's release or newer); the module's
 `examples/basic` exports it, and your own root configuration re-exports it the same way
 (`output "setup_args" { value = module.backyard.setup_args }`).
 `setup_command` holds the same as an `npm run setup -- …` command for a checkout. Variables set
@@ -1042,7 +1055,10 @@ The CI deployer is declarative: every deploy sets `wrangler.jsonc`'s variables p
   line, `siteListing` in `--json`), set `BACKYARD_CF_SITE_LISTING` to `owners`. The CI deployer
   then sets `SITE_LISTING=owners`, as `setup --site-listing owners` does (`BACKYARD_CF_VARS` and
   `BACKYARD_CF_DEPLOY_ARGS` never set `SITE_LISTING`, and set `OWNERSHIP` only to `owner` then).
-  Empty or `all` lists every site, so a deploy without it shows every site to everyone again.
+  Empty or `all` lists every site, so a deploy without it shows every site to everyone again,
+  and ownership is off again (anyone may overwrite any site) unless `BACKYARD_CF_VARS` sets
+  `"OWNERSHIP":"owner"`. A `SITE_LISTING` in `wrangler.jsonc` that contradicts
+  `BACKYARD_CF_SITE_LISTING` is refused.
 
 CI deploys always serve on `workers.dev` (`workers_dev` in `wrangler.jsonc`), even after
 `setup --no-workers-dev`. The CI deployer runs the same auth guard as `setup`: a deploy that would turn a live

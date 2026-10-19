@@ -162,7 +162,7 @@ variable "ai_enabled" {
 # --- Site listing ---------------------------------------------------------------
 
 variable "site_listing" {
-  description = "Who sees each site in the hub's site list, GET /sites and the Claude connector's backyard_list_sites (SPEC §7.2): \"all\" (everyone who may open sites, the default) or \"owners\" (its owners and admins; implies OWNERSHIP=owner, so only owners and admins may change a site). It hides sites from the directory, it is not access control: anyone who may open sites can still open one by its URL. setup_args always carry --site-listing, so setting it back to \"all\" lists every site again at the next setup."
+  description = "Who sees each site in the hub's site list, GET /sites and the Claude connector's backyard_list_sites (SPEC §7.2): \"all\" (everyone who may open sites, the default) or \"owners\" (its owners and admins; implies OWNERSHIP=owner, so only owners and admins may change a site that has owners; a site without owners, e.g. one deployed before, goes to its next signed-in deployer). It hides sites from the directory, it is not access control: anyone who may open sites can still open one by its URL. setup_args always carry --site-listing (older setup engines reject it), so setting it back to \"all\" lists every site again at the next setup, and turns ownership off again unless OWNERSHIP=owner is set (setup --var OWNERSHIP:owner, remembered)."
   type        = string
   default     = "all"
 

@@ -5,7 +5,7 @@
 // wildcard record, certificate), the refusals and the removal order are checked
 // without a Cloudflare account.
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 
@@ -784,6 +784,80 @@ describe("site listing", () => {
     assert.equal(d.config.vars.SITE_LISTING, "owners");
     assert.equal(d.config.vars.BASE_DOMAIN, "");
     assert.equal(sb.state().siteListing, "owners");
+  });
+
+  it("refuses a wrangler.jsonc SITE_LISTING or OWNERSHIP that contradicts the site listing, as setup does, before domain add or domain remove changes anything", async () => {
+    const HOST = "backyard.example.com";
+    const sb = await newSandbox();
+    const config = join(sb.pkg, "wrangler.jsonc");
+    const original = readFileSync(config, "utf8");
+    /** The base configuration (wrangler.jsonc) with these variables set. */
+    const setBase = (vars) => writeFileSync(config, original.replace('"vars": {', `"vars": {\n${Object.entries(vars).map(([k, v]) => `    ${JSON.stringify(k)}: ${JSON.stringify(v)},`).join("\n")}`));
+    const NEEDS = "the owners-only site listing, which needs OWNERSHIP=owner (its default with --site-listing owners; owners are recorded only then)";
+    const listingRefusal = (base, listing) =>
+      `the base configuration (wrangler.jsonc) sets SITE_LISTING=${base}, but the site listing is ${listing}: remove SITE_LISTING from wrangler.jsonc (\`npm run cf -- setup --site-listing <all|owners>\` sets it) (nothing was changed)`;
+    /** A refused run: exit 2 with want, no deploy, no Cloudflare API write, the state as it was. */
+    const refused = async (argv, want) => {
+      const before = JSON.stringify(sb.state());
+      sb.calls();
+      sb.requests();
+      const r = await sb.run(argv);
+      assert.equal(r.code, 2, r.out);
+      assert.ok(r.out.includes(want), r.out);
+      assert.equal(deployOf(sb.calls()), undefined, "no deploy");
+      assert.deepEqual(writesOf(sb.requests()).map(line), [], "nothing changed on Cloudflare");
+      assert.equal(JSON.stringify(sb.state()), before, "the state is unchanged");
+    };
+
+    // Every site is listed (nothing remembered): a base SITE_LISTING=owners would deploy owners.
+    setBase({ SITE_LISTING: "owners" });
+    await refused(["domain", "add", HOST, "--wait", "0"], listingRefusal("owners", "all"));
+    // Owners-only listing remembered: a base SITE_LISTING the Worker reads as another listing,
+    // a base OWNERSHIP other than owner, or a remembered OWNERSHIP override other than owner.
+    sb.writeState("backyard", { ...sb.state(), siteListing: "owners" });
+    for (const v of ["all", "mine"]) {
+      setBase({ SITE_LISTING: v });
+      await refused(["domain", "add", HOST, "--wait", "0"], listingRefusal(v, "owners"));
+    }
+    setBase({ OWNERSHIP: "none" });
+    await refused(["domain", "add", HOST, "--wait", "0"], `the base configuration (wrangler.jsonc) sets OWNERSHIP=none, which contradicts ${NEEDS}: run \`npm run cf -- setup --var OWNERSHIP:owner\` first (nothing was changed)`);
+    setBase({});
+    sb.writeState("backyard", { ...sb.state(), vars: { OWNERSHIP: "none" } });
+    await refused(["domain", "add", HOST, "--wait", "0"], `the remembered --var OWNERSHIP:none contradicts ${NEEDS}: drop it with \`npm run cf -- setup --var OWNERSHIP:\` first (nothing was changed)`);
+    // What agrees deploys: the base value read like the Worker, OWNERSHIP owner (base or remembered).
+    sb.writeState("backyard", { ...sb.state(), vars: { OWNERSHIP: "owner" } });
+    setBase({ SITE_LISTING: " Owners ", OWNERSHIP: "none" });
+    let r = await sb.run(["domain", "add", HOST, "--wait", "0"]);
+    assert.equal(r.code, 0, r.out);
+    let d = deployOf(sb.calls());
+    assert.deepEqual([d.config.vars.SITE_LISTING, d.config.vars.OWNERSHIP, d.config.vars.BASE_DOMAIN], ["owners", "owner", HOST]);
+    assert.equal(sb.state().domain.host, HOST);
+
+    // domain remove: refused before it asks, deploys or detaches anything.
+    setBase({ SITE_LISTING: "all" });
+    await refused(["domain", "remove", "--yes"], listingRefusal("all", "owners"));
+    assert.ok(sb.cf().customDomains.some((x) => x.hostname === HOST), "the custom domain stays attached");
+    assert.equal(sb.cf().workers.backyard.vars.BASE_DOMAIN, HOST);
+    setBase({ OWNERSHIP: "owner" });
+    sb.writeState("backyard", { ...sb.state(), vars: undefined });
+    r = await sb.run(["domain", "remove", "--yes"]);
+    assert.equal(r.code, 0, r.out);
+    d = deployOf(sb.calls());
+    assert.deepEqual([d.config.vars.SITE_LISTING, d.config.vars.OWNERSHIP, d.config.vars.BASE_DOMAIN], ["owners", "owner", ""]);
+    assert.ok(!sb.cf().customDomains.some((x) => x.hostname === HOST));
+  });
+
+  it("checks wrangler.jsonc against the listing a machine without state adopts from the live Worker", async () => {
+    const sb = await newSandbox({ state: null });
+    seedWorker(sb, { SITE_LISTING: "owners" });
+    const config = join(sb.pkg, "wrangler.jsonc");
+    writeFileSync(config, readFileSync(config, "utf8").replace('"vars": {', '"vars": {\n    "SITE_LISTING": "all",'));
+    const r = await sb.run(["domain", "add", "backyard.example.com", "--wait", "0"]);
+    assert.equal(r.code, 2, r.out);
+    assert.match(r.out, /Adopted the deployed configuration of backyard .*owners-only site listing/);
+    assert.ok(r.out.includes("the base configuration (wrangler.jsonc) sets SITE_LISTING=all, but the site listing is owners"), r.out);
+    assert.equal(deployOf(sb.calls()), undefined);
+    assert.deepEqual(writesOf(sb.requests()).map(line), []);
   });
 });
 

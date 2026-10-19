@@ -27,7 +27,7 @@
 // already taken; the admin token is never stored, printed or given to wrangler.
 
 import { CfError } from "./lib/cfapi.mjs";
-import { MANAGED_DOMAIN_KEYS, authGuard } from "./lib/live.mjs";
+import { MANAGED_DOMAIN_KEYS, authGuard, refuseListingConfig } from "./lib/live.mjs";
 import { dohResolves, parseAccessRedirect, probe, randomProbeLabel, waitFor } from "./lib/net.mjs";
 import { CliError, EXIT, bold, cyan, dim, green, ui } from "./lib/ui.mjs";
 
@@ -430,7 +430,9 @@ export async function runDomainAdd(opts, ctx) {
   if (state.access && (!prev || prevMode !== mode)) {
     throw new CliError(EXIT.REFUSED, `Cloudflare Access is on: run \`${inv} access disable\` first, then domain add and access enable again (nothing was changed)`);
   }
-  // A deploy the auth guard refuses must not get as far as attaching anything.
+  // A deploy the auth guard refuses must not get as far as attaching anything,
+  // nor one whose wrangler.jsonc contradicts the site listing (as setup refuses it).
+  refuseListingConfig(state, ctx.base.vars ?? {}, inv, "domain add");
   authGuard(live, ctx.vars(state), { worker: w, remedy: guardRemedy(ctx) });
   await fillWorkersDevUrl(ctx, api, state);
 
@@ -634,6 +636,8 @@ export async function runDomainRemove(opts, ctx) {
   }
   live ??= await ctx.readLive();
   if (live.exists === null) throw new CliError(EXIT.FAILED, `could not read the live configuration of Worker ${w} (nothing was changed): ${live.error || "unknown error"}`);
+  // The deploy below must not contradict the site listing (as setup refuses it).
+  if (live.exists) refuseListingConfig(state, ctx.base.vars ?? {}, inv, "domain remove");
   await fillWorkersDevUrl(ctx, api, state);
 
   // 3. Confirm.

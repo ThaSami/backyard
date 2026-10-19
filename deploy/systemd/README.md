@@ -204,8 +204,10 @@ a smaller limit must stay at `10m` or more. Publishing as a person needs single 
 
 By default the hub, `backyard sites list` and `backyard_list_sites` show every site to everyone.
 To show each person only the sites they own (admins, such as the `deploy` token, see every
-site), set `sites.listing: owners` in `/etc/backyard/backyard.yaml` (new installs have the
-line, commented out), then validate and restart as in [Configure](#configure):
+site), set `sites.listing: owners` in `/etc/backyard/backyard.yaml`, then validate and restart
+as in [Configure](#configure). New installs have the block below, commented out: uncomment
+both lines. If your file already has a `sites:` section, add `listing: owners` under it
+instead (a second `sites:` key is an error that `backyard config validate` reports):
 
 ```yaml
 sites:
@@ -213,10 +215,17 @@ sites:
 ```
 
 It implies site ownership (the first deployer owns a site; only its owners and admins may
-redeploy or delete it) and hides sites from the directory without restricting who can open
-them. It is meant for single sign-on: with `auth.mode: none` every browser is a guest and is
-listed no site. Upgrade first (`install.sh` keeps your configuration): servers older than the
-option refuse the key. Details:
+redeploy or delete it once it has owners) and hides sites from the directory without
+restricting who can open them. Sites from before have no owners (ownership was off): each
+stays listed to its creator, and until it has an owner any signed-in deployer can replace it
+and becomes its owner, and any signed-in user may delete it or set its owners. So give the
+sites that matter owners right after turning it on (owners can be set only once ownership is
+on): their creator redeploys them, or adds owners with the
+[owners call](../../docs/deploying-sites.md#ownership).
+Removing the key lists every site again and turns ownership off, unless
+`sites.ownership: owner` is set. It is meant for single sign-on: with `auth.mode: none` every
+browser is a guest and is listed no site. Upgrade first (`install.sh` keeps your
+configuration): servers older than the option refuse the key. Details:
 [owners-only site listing](../../docs/deploying-sites.md#owners-only-site-listing).
 
 ## Deploying with rsync

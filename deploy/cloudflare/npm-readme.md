@@ -40,8 +40,8 @@ npx backyard-cloudflare@latest access enable --allow-email-domain acme.com   # c
 npx backyard-cloudflare@latest status                                     # read-only live check
 ```
 
-To upgrade, re-run `setup`: secrets, the deploy token, R2, AI, the domain, Access and your
-variables are kept. A global install works too: `npm i -g backyard-cloudflare && backyard-cloudflare setup`.
+To upgrade, re-run `setup`: secrets, the deploy token, R2, AI, the site listing, the domain,
+Access and your variables are kept. A global install works too: `npm i -g backyard-cloudflare && backyard-cloudflare setup`.
 With the Backyard CLI, `backyard cloudflare setup` installs this package (verified against its
 release) and logs the CLI in.
 

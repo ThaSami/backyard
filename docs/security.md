@@ -17,9 +17,10 @@ colleague**.
 - **Insiders** can read and write the data of **every** site: there are no per-site or
   per-document permissions, and `_meta.created_by` is a UX hint, not an access control. Any
   employee can open any site, query its collections, read its uploads and redeploy it (unless
-  `sites.ownership: owner`). `sites.listing: owners` changes only which sites the directories
-  list ([owners-only site listing](deploying-sites.md#owners-only-site-listing)): a hidden site
-  is still open to everyone by its URL and by name. Sites should not hold data that not every
+  `sites.ownership: owner` and the site has owners). `sites.listing: owners` changes only which
+  sites the directories list
+  ([owners-only site listing](deploying-sites.md#owners-only-site-listing)): a hidden site is
+  still open to everyone by its URL and by name. Sites should not hold data that not every
   employee may see.
 - **Site authors** run arbitrary JavaScript on their site's origin — that is the product. The
   platform must keep one site's code from acting on another site's data or on the hub.
@@ -354,6 +355,9 @@ and the acting user and client IP; see [operations](operations.md#logs-and-audit
 - [ ] `sites.ownership: owner` if teams must not overwrite each other's sites.
 - [ ] `sites.listing: owners` if people should see only their own sites in the directories (it
       implies `sites.ownership: owner`; it hides sites, it does not restrict who can open them).
+      Sites from before have no owners, and until they have some any signed-in deployer can
+      take one over (and any signed-in user delete it or set its owners): give the ones that
+      matter owners right after turning it on (owners can be set only once ownership is on).
 - [ ] Short `auth.token_ttl` for automation; static CI tokens rotated.
 - [ ] Metrics on a private `telemetry.metrics_listen`, not the public hub.
 - [ ] TLS everywhere (`server.public_url` with `https://` makes cookies `Secure`).
