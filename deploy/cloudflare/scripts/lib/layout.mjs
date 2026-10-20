@@ -91,7 +91,7 @@ export function parseJSONC(text) {
  * @typedef {object} Layout
  * @property {"packaged"|"source"} kind
  * @property {string} root            the package directory
- * @property {string} version         "1.2.3" (packaged) or "0.4.0-dev (source checkout)"
+ * @property {string} version         "1.2.3" (packaged) or "0.5.0-dev (source checkout)"
  * @property {string} packageVersion  package.json "version"
  * @property {Record<string, any>} build   dist/build.json (packaged), else {}
  */

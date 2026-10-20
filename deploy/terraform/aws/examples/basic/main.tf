@@ -1,6 +1,6 @@
 # Basic Backyard deployment on AWS using the module in ../.. (copy this
 # directory and change `source` to a pinned Git reference, e.g.
-# "git::https://github.com/thasami/backyard.git//deploy/terraform/aws?ref=v0.4.0").
+# "git::https://github.com/thasami/backyard.git//deploy/terraform/aws?ref=v0.5.0").
 #
 #   make lambda                       # from the repository root: dist/backyard-lambda.zip
 #   cp terraform.tfvars.example terraform.tfvars && $EDITOR terraform.tfvars

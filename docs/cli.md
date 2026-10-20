@@ -416,7 +416,7 @@ backyard cloudflare setup --worker-name team --no-r2
 backyard cloudflare setup --no-ai                                      # an account without Workers AI
 backyard cloudflare setup --site-listing owners                        # people see only their own sites
 backyard cloudflare setup --non-interactive --workers-subdomain acme   # CI
-backyard cloudflare setup --package ./dist-npm/backyard-cloudflare-0.4.0.tgz
+backyard cloudflare setup --package ./dist-npm/backyard-cloudflare-0.5.0.tgz
 backyard cloudflare domain add backyard.acme.com
 backyard cloudflare domain add acme-sites.dev --host-mode
 backyard cloudflare access enable --allow-email-domain acme.com

@@ -97,7 +97,7 @@ describe("backyard-cloudflare status", () => {
     assert.equal(r.code, 0, r.out);
     assert.ok(r.out.includes(`State:        ${sb.statePath()}`), r.out);
     assert.match(r.out, /Account: {6}Acme \(acc1\)/);
-    assert.match(r.out, /Versions: {5}backyard-cloudflare 0\.4\.0-dev \(source checkout\) · wrangler 4\.149\.0 · deployed 0\.1\.0-dev/);
+    assert.match(r.out, /Versions: {5}backyard-cloudflare 0\.5\.0-dev \(source checkout\) · wrangler 4\.149\.0 · deployed 0\.1\.0-dev/);
     assert.match(r.out, /Hub: {10}https:\/\/backyard\.example\.com/);
     assert.match(r.out, /R2: {11}bucket backyard-files/);
     assert.match(r.out, /AI: {11}on \(Workers AI\)/);
@@ -118,7 +118,7 @@ describe("backyard-cloudflare status", () => {
     assert.equal(j.worker, "backyard");
     assert.equal(j.accountId, "acc1");
     assert.equal(j.statePath, sb.statePath());
-    assert.deepEqual(j.versions, { package: "0.4.0-dev (source checkout)", wrangler: "4.149.0", deployed: "0.1.0-dev" });
+    assert.deepEqual(j.versions, { package: "0.5.0-dev (source checkout)", wrangler: "4.149.0", deployed: "0.1.0-dev" });
     assert.deepEqual(j.urls, { public: `https://${HOST}`, workersDev: WD });
     assert.equal(j.r2Bucket, "backyard-files");
     assert.equal(j.workersDev, true);

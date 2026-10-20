@@ -6,6 +6,8 @@ All notable changes to Backyard are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-20
+
 ### Added
 
 - **ChatGPT can connect** to the Claude connector (both editions). ChatGPT identifies itself
@@ -605,7 +607,8 @@ zero-config backend for every site.
 - Further hardening from an adversarial review of both editions: stricter input validation,
   safer defaults and narrower error messages.
 
-[Unreleased]: https://github.com/thasami/backyard/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/thasami/backyard/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/thasami/backyard/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/thasami/backyard/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/thasami/backyard/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/thasami/backyard/compare/v0.1.0...v0.2.0

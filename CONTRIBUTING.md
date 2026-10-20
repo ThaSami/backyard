@@ -267,8 +267,8 @@ builds the same locally without publishing (snapshot binaries embed no package d
 version is stamped into `internal/version` (`make build VERSION=1.2.3`).
 
 To try the packaged Cloudflare flow before a release, run `make cloudflare-pack`, then
-`npx ./dist-npm/backyard-cloudflare-0.4.0.tgz setup` or
-`backyard cloudflare setup --package ./dist-npm/backyard-cloudflare-0.4.0.tgz`.
+`npx ./dist-npm/backyard-cloudflare-0.5.0.tgz setup` or
+`backyard cloudflare setup --package ./dist-npm/backyard-cloudflare-0.5.0.tgz`.
 
 ### npm
 
