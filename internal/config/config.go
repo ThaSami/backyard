@@ -491,16 +491,18 @@ type MCPConfig struct {
 
 // Defaults of the mcp section.
 var (
-	// DefaultMCPClients are Claude's client metadata documents (claude.ai,
-	// Desktop, mobile and Cowork; Claude Code).
+	// DefaultMCPClients are the client metadata documents of Claude
+	// (claude.ai, Desktop, mobile and Cowork; Claude Code) and ChatGPT.
 	DefaultMCPClients = []string{
 		"https://claude.ai/oauth/mcp-oauth-client-metadata",
 		"https://claude.ai/oauth/claude-code-client-metadata",
+		"https://chatgpt.com/oauth/client.json",
 	}
-	// DefaultMCPRedirectURIs are Claude's OAuth callbacks.
+	// DefaultMCPRedirectURIs are the OAuth callbacks of Claude and ChatGPT.
 	DefaultMCPRedirectURIs = []string{
 		"https://claude.ai/api/mcp/auth_callback",
 		"https://claude.com/api/mcp/auth_callback",
+		"https://chatgpt.com/connector_platform_oauth_redirect",
 	}
 )
 

@@ -148,14 +148,14 @@
           <section class="card panel connector" id="connector" aria-labelledby="connector-title" hidden>
             <details data-panel="connector">
               <summary>
-                <h2 id="connector-title">Use Backyard in Claude</h2>
-                <span class="panel-hint">Let Claude publish sites for you.</span>
+                <h2 id="connector-title">Use Backyard in Claude or ChatGPT</h2>
+                <span class="panel-hint">Let your AI app publish sites for you.</span>
                 <svg class="icon chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
               </summary>
               <div class="panel-body">
                 <p class="muted">
-                  Add Backyard to Claude as a connector: Claude can then publish and update sites for you. You sign in with
-                  your usual account and approve the connection once.
+                  Add Backyard to Claude, ChatGPT or another MCP app as a connector: it can then publish and update sites
+                  for you. You sign in with your usual account and approve the connection once.
                 </p>
                 <span class="label">Connector URL</span>
                 <div class="cmd">
@@ -183,6 +183,19 @@
                     <div class="cmd"><pre><code id="connector-cmd">claude mcp add --transport http backyard</code></pre></div>
                     <p class="step-text">Then run <code>/mcp</code> in Claude Code and choose Authenticate.</p>
                   </li>
+                  <li>
+                    <span class="step-title">ChatGPT</span>
+                    <p class="step-text">
+                      Plugins → + → Add custom MCP server. Paste the URL, choose OAuth, then Connect and sign in.
+                    </p>
+                  </li>
+                  <li>
+                    <span class="step-title">Other MCP apps</span>
+                    <p class="step-text">
+                      Add the URL as a remote (HTTP) MCP server with OAuth sign-in, for example in opencode, Codex or Hermes
+                      Agent. Apps on your computer open the sign-in in your browser.
+                    </p>
+                  </li>
                 </ol>
 
                 <h3 id="connector-grants-title" tabindex="-1">Your connections</h3>
@@ -195,7 +208,7 @@
                 <form class="connector-admin" id="connector-revoke-user" novalidate hidden>
                   <h3 id="connector-admin-title">Disconnect a person</h3>
                   <p class="hint">
-                    Admins: end all Claude connections of one person, for example when they leave. They can connect again
+                    Admins: end all app connections of one person, for example when they leave. They can connect again
                     for as long as they can still sign in.
                   </p>
                   <label for="connector-user">Email or user ID</label>

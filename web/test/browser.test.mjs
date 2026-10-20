@@ -591,7 +591,7 @@ test("hub: the Claude connector card shows the URL, the setup steps and the conn
     await page.waitForSelector("#connector-grants li");
     const url = stub.url + "/__backyard/mcp";
     assert.equal(await page.isVisible("#connector"), true);
-    assert.equal(await page.textContent("#connector h2"), "Use Backyard in Claude");
+    assert.equal(await page.textContent("#connector h2"), "Use Backyard in Claude or ChatGPT");
     assert.equal(await page.textContent("#connector-url"), url);
     assert.equal(await page.textContent("#connector-cmd"), "claude mcp add --transport http backyard " + url);
     assert.match(
@@ -833,7 +833,7 @@ test("hub: the side cards start collapsed (Sites in the first screen), open by c
     assert.deepEqual(await opened(page), []);
     assert.deepEqual(
       await page.$$eval(".side details > summary", (ss) => ss.map((s) => s.innerText.replace(/\s+/g, " ").trim())),
-      ["Use Backyard in Claude Let Claude publish sites for you.", "Use the CLI Deploy from your terminal or CI.", "For agents Docs and tools for coding agents."],
+      ["Use Backyard in Claude or ChatGPT Let your AI app publish sites for you.", "Use the CLI Deploy from your terminal or CI.", "For agents Docs and tools for coding agents."],
     );
     for (const sel of ["#connector-url", "#connector-copy", "#cmd-login", ".links a"]) assert.equal(await page.isVisible(sel), false, sel + " is collapsed");
     const sitesTitle = await page.$eval("#sites-title", (h) => h.getBoundingClientRect().bottom);

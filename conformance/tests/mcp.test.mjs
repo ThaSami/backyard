@@ -329,13 +329,13 @@ function connectorSuite() {
       assert.equal(c.token_endpoint_auth_method, "none");
     });
 
-    test("loopback hosts with or without a port, and the default Claude callback", async () => {
+    test("loopback hosts with or without a port, and the default Claude and ChatGPT callbacks", async () => {
       const uris = ["http://localhost/callback", "http://127.0.0.1:53682/callback", "http://[::1]:1/cb", "http://localhost:8080/cb?x=1"];
       const c = await newClient({ redirectURIs: uris });
       assert.deepEqual(c.redirect_uris, uris);
       if (required) {
         // The runners use the default mcp.redirect_uris / MCP_REDIRECT_URIS.
-        for (const u of ["https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback"]) {
+        for (const u of ["https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback", "https://chatgpt.com/connector_platform_oauth_redirect"]) {
           assert.deepEqual((await newClient({ redirectURIs: [u] })).redirect_uris, [u]);
         }
       }
@@ -853,7 +853,7 @@ function connectorSuite() {
         assertBody(r, forbidden, what);
       }
       const ok = [new URL(P).origin, "https://claude.ai", "HTTPS://CLAUDE.AI"];
-      if (required) ok.push("https://claude.com");
+      if (required) ok.push("https://claude.com", "https://chatgpt.com");
       for (const origin of ok) {
         const r = await mcp.post(ping(), { headers: { Origin: origin } });
         assert.equal(r.status, 200, `Origin ${origin}: ${r}`);

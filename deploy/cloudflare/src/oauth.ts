@@ -945,9 +945,8 @@ function parseCIMD(cfg: Config, id: string, body: Uint8Array): McpClient | strin
   }
   const allowed = (uris as string[]).filter((u) => redirectAllowed(cfg, u));
   if (allowed.length === 0) return "none of its redirect_uris is allowed on this server (MCP_REDIRECT_URIS and http loopback URIs)";
-  if (Object.hasOwn(doc, "token_endpoint_auth_method") && doc.token_endpoint_auth_method !== "none") {
-    return "it asks for client authentication (token_endpoint_auth_method), which Backyard does not support";
-  }
+  const method = cimdAuthMethodProblem(doc);
+  if (method) return method;
   if (Object.hasOwn(doc, "client_secret") || Object.hasOwn(doc, "client_secret_expires_at")) return "it contains a client secret";
   const host = new URL(id).host.toLowerCase();
   let name = host;
@@ -956,6 +955,26 @@ function parseCIMD(cfg: Config, id: string, body: Uint8Array): McpClient | strin
     name = cleanClientName(doc.client_name) || host;
   }
   return { id, kind: KIND_CIMD, name, host, redirects: allowed };
+}
+
+/**
+ * Why a client metadata document cannot use the token endpoint without
+ * client authentication, or "" (SPEC §8.4.3). The list
+ * token_endpoint_auth_methods_supported (MCP SEP-3149) wins when present: it
+ * must contain "none", which is then used whatever the singular
+ * token_endpoint_auth_method prefers (ChatGPT's document prefers
+ * private_key_jwt and lists none). Without it, the singular member must be
+ * absent or "none".
+ */
+function cimdAuthMethodProblem(doc: Record<string, unknown>): string {
+  const refused = "it asks for client authentication (token_endpoint_auth_method), which Backyard does not support";
+  if (Object.hasOwn(doc, "token_endpoint_auth_methods_supported")) {
+    const methods = doc.token_endpoint_auth_methods_supported;
+    if (!Array.isArray(methods) || !methods.every((m) => typeof m === "string")) return "token_endpoint_auth_methods_supported is not an array of strings";
+    return methods.includes("none") ? "" : refused;
+  }
+  if (Object.hasOwn(doc, "token_endpoint_auth_method") && doc.token_endpoint_auth_method !== "none") return refused;
+  return "";
 }
 
 /**

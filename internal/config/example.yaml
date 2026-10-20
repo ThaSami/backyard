@@ -176,8 +176,9 @@ deploy:
 mcp:
   # Claude connector (remote MCP, SPEC §8.4): <public_url>/__backyard/mcp
   enabled: false
-  # clients: [https://claude.ai/oauth/mcp-oauth-client-metadata, https://claude.ai/oauth/claude-code-client-metadata]
-  # redirect_uris: [https://claude.ai/api/mcp/auth_callback, https://claude.com/api/mcp/auth_callback]
+  # Default: Claude's and ChatGPT's. Setting a list replaces it, so keep the entries you need.
+  # clients: [https://claude.ai/oauth/mcp-oauth-client-metadata, https://claude.ai/oauth/claude-code-client-metadata, https://chatgpt.com/oauth/client.json]
+  # redirect_uris: [https://claude.ai/api/mcp/auth_callback, https://claude.com/api/mcp/auth_callback, https://chatgpt.com/connector_platform_oauth_redirect]
   # max_publish_bytes: 4194304
 
 ratelimit:

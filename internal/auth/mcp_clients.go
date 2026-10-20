@@ -525,11 +525,8 @@ func (m *MCP) parseCIMD(id string, body []byte) (*mcpClient, error) {
 	if len(allowed) == 0 {
 		return nil, errors.New("none of its redirect_uris is allowed on this server (mcp.redirect_uris and http loopback URIs)")
 	}
-	if raw, ok := doc["token_endpoint_auth_method"]; ok {
-		var method string
-		if json.Unmarshal(raw, &method) != nil || method != "none" {
-			return nil, errors.New("it asks for client authentication (token_endpoint_auth_method), which Backyard does not support")
-		}
+	if err := cimdAuthMethodOK(doc); err != nil {
+		return nil, err
 	}
 	for _, k := range []string{"client_secret", "client_secret_expires_at"} {
 		if _, ok := doc[k]; ok {
@@ -548,6 +545,34 @@ func (m *MCP) parseCIMD(id string, body []byte) (*mcpClient, error) {
 		}
 	}
 	return &mcpClient{id: id, kind: clientKindCIMD, name: name, host: host, redirects: allowed}, nil
+}
+
+// cimdAuthMethodOK checks that a client metadata document lets the client
+// use the token endpoint without client authentication (SPEC §8.4.3). The
+// list token_endpoint_auth_methods_supported (MCP SEP-3149) wins when
+// present: it must contain "none", which is then used whatever the singular
+// token_endpoint_auth_method prefers (ChatGPT's document prefers
+// private_key_jwt and lists none). Without it, the singular member must be
+// absent or "none".
+func cimdAuthMethodOK(doc map[string]json.RawMessage) error {
+	refused := errors.New("it asks for client authentication (token_endpoint_auth_method), which Backyard does not support")
+	if raw, ok := doc["token_endpoint_auth_methods_supported"]; ok {
+		var methods []string
+		if json.Unmarshal(raw, &methods) != nil || methods == nil {
+			return errors.New("token_endpoint_auth_methods_supported is not an array of strings")
+		}
+		if !containsString(methods, "none") {
+			return refused
+		}
+		return nil
+	}
+	if raw, ok := doc["token_endpoint_auth_method"]; ok {
+		var method string
+		if json.Unmarshal(raw, &method) != nil || method != "none" {
+			return refused
+		}
+	}
+	return nil
 }
 
 // cimdCacheTTL returns how long a document may be cached according to its

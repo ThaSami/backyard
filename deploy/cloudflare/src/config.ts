@@ -89,11 +89,19 @@ export const DEFAULT_LIMITS: Limits = {
   mcp_calls_per_day: 5000,
 };
 
-/** Claude's client metadata documents (claude.ai, Desktop, mobile and Cowork; Claude Code): the default MCP_CLIENTS. */
-export const DEFAULT_MCP_CLIENTS = ["https://claude.ai/oauth/mcp-oauth-client-metadata", "https://claude.ai/oauth/claude-code-client-metadata"];
+/** The client metadata documents of Claude (claude.ai, Desktop, mobile and Cowork; Claude Code) and ChatGPT: the default MCP_CLIENTS. */
+export const DEFAULT_MCP_CLIENTS = [
+  "https://claude.ai/oauth/mcp-oauth-client-metadata",
+  "https://claude.ai/oauth/claude-code-client-metadata",
+  "https://chatgpt.com/oauth/client.json",
+];
 
-/** Claude's OAuth callbacks: the default MCP_REDIRECT_URIS. */
-export const DEFAULT_MCP_REDIRECT_URIS = ["https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback"];
+/** The OAuth callbacks of Claude and ChatGPT: the default MCP_REDIRECT_URIS. */
+export const DEFAULT_MCP_REDIRECT_URIS = [
+  "https://claude.ai/api/mcp/auth_callback",
+  "https://claude.com/api/mcp/auth_callback",
+  "https://chatgpt.com/connector_platform_oauth_redirect",
+];
 
 /** The Claude connector (remote MCP, SPEC §8.4, §14.1, §16). */
 export interface MCPConfig {

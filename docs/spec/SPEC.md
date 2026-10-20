@@ -1089,8 +1089,9 @@ There are no pre-registered clients and no client secrets. A `client_id` is reso
 
 * **`https://…` — a Client ID Metadata Document (CIMD).** It must be byte-equal to an entry of
   the effective `mcp.clients` / `MCP_CLIENTS` (default
-  `https://claude.ai/oauth/mcp-oauth-client-metadata` and
-  `https://claude.ai/oauth/claude-code-client-metadata`); otherwise it is refused ("App not
+  `https://claude.ai/oauth/mcp-oauth-client-metadata`,
+  `https://claude.ai/oauth/claude-code-client-metadata` and ChatGPT's
+  `https://chatgpt.com/oauth/client.json`); otherwise it is refused ("App not
   allowed") and nothing is fetched. `client_kind` is `metadata_document`, the display name is
   the document's sanitized `client_name` (else the URL host), and the verified host is the URL
   host.
@@ -1106,7 +1107,11 @@ There are no pre-registered clients and no client secrets. A `client_id` is reso
 through its SSRF guard (public addresses only, also through an `HTTPS_PROXY`). The document
 must have `client_id` equal to the URL; `redirect_uris` an array of 1–10 strings of which at
 least one passes the redirect policy (§8.4.4; the others are ignored);
-`token_endpoint_auth_method` absent or `"none"`; no `client_secret` or
+`token_endpoint_auth_methods_supported` (MCP SEP-3149), when present, an array of strings that
+contains `"none"` — the client then uses `none`, the only method of the AS metadata, whatever
+the singular `token_endpoint_auth_method` prefers (ChatGPT's document prefers
+`private_key_jwt`) — and without that list `token_endpoint_auth_method` absent or `"none"`;
+no `client_secret` or
 `client_secret_expires_at`; `client_name` optional (sanitized as below; not a string → failure;
 empty after sanitizing → the URL host). Other members,
 `grant_types` included, are ignored. Any failure renders "Could not verify the app" with the
@@ -1145,9 +1150,11 @@ allowed, ≤ 16 KiB), else `400 {"error":"invalid_client_metadata","error_descri
 
 A redirect URI is allowed — at registration, authorize, the consent `POST` and the token
 endpoint — if and only if it is (a) byte-equal to an entry of the effective `mcp.redirect_uris` /
-`MCP_REDIRECT_URIS` (https; default `https://claude.ai/api/mcp/auth_callback` and
-`https://claude.com/api/mcp/auth_callback`), or (b) a **loopback URI**: scheme `http`, host
-string exactly `localhost`, `127.0.0.1` or `[::1]`, an optional port, no userinfo, no fragment,
+`MCP_REDIRECT_URIS` (https; default `https://claude.ai/api/mcp/auth_callback`,
+`https://claude.com/api/mcp/auth_callback` and ChatGPT's
+`https://chatgpt.com/connector_platform_oauth_redirect`), or (b) a **loopback URI**: scheme
+`http`, host string exactly `localhost`, `127.0.0.1` or `[::1]`, an optional port, no userinfo,
+no fragment,
 any path and query — but no backslash, ASCII control character or Unicode white space (Go's
 `unicode.IsSpace`; U+FEFF is not one) anywhere, and no `%` before the query that does not start
 a two-hex-digit escape. Nothing else, ever.
@@ -1399,10 +1406,11 @@ not accepted there, and it answers `404` while the connector is disabled.
 * Guests (mode `none`) see and revoke their own grants. A static token acts as `token:<name>`,
   which owns no grants; an admin static token may use `?user=`.
 
-The hub UI shows a "Use Backyard in Claude" card while `info.mcp_url` exists, a collapsible card
-like the hub's other side cards (collapsed by default, §2): expanded, it holds the URL with a copy
-button, the setup steps, the caller's connections with a "Disconnect" button each, and for admins
-a form that disconnects one person.
+The hub UI shows a "Use Backyard in Claude or ChatGPT" card while `info.mcp_url` exists, a
+collapsible card like the hub's other side cards (collapsed by default, §2): expanded, it holds
+the URL with a copy button, the setup steps (Claude, Claude Code, ChatGPT, other MCP apps), the
+caller's connections with a "Disconnect" button each, and for admins a form that disconnects one
+person.
 
 #### 8.4.8 Tokens, grants and rotation
 
@@ -1787,7 +1795,7 @@ the §5 envelope unless noted:
 3. **Origin.** Absent is fine. Present, it must equal (case-insensitively) the hub origin, the
    request's own origin, the origin of an https entry of the effective `mcp.redirect_uris` /
    `MCP_REDIRECT_URIS`, or the origin of an entry of `mcp.clients` / `MCP_CLIENTS` (by default
-   `https://claude.ai` and `https://claude.com`); otherwise
+   `https://claude.ai`, `https://claude.com` and `https://chatgpt.com`); otherwise
    `403 {"error":{"code":"forbidden","message":"requests from this origin are not accepted"}}`.
 4. **Credentials.** More than one `Authorization` header — also one value that joins several
    `<scheme> <credentials>` parts with commas, as proxies and the Workers runtime merge repeated
@@ -2101,8 +2109,9 @@ storage are available on free); R2 and paid features are optional.
   sites' own `/.well-known` files stay behind Access. `/__backyard/auth/authorize` stays behind
   the main Access application.
 * **Claude connector** (§8.4, §14.1), off unless `MCP_ENABLED` is true (`true/1/yes/on`).
-  `MCP_CLIENTS` (default the two Claude client metadata documents; set but empty: no CIMD, so
-  clients register) and `MCP_REDIRECT_URIS` (default the two Claude callbacks; set but empty:
+  `MCP_CLIENTS` (default the two Claude client metadata documents and ChatGPT's; set but empty:
+  no CIMD, so clients register) and `MCP_REDIRECT_URIS` (default the two Claude callbacks and
+  ChatGPT's; set but empty:
   loopback redirects only) are comma or whitespace separated and follow the entry rules of §12
   (using `BASE_DOMAIN` and the `PUBLIC_URL` host). An invalid entry does not make the Worker
   fail closed: it turns the connector off (every connector path `404`) and adds a problem line

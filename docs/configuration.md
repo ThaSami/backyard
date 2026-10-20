@@ -399,8 +399,8 @@ default; while it is off every connector path answers `404`.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `mcp.enabled` | bool | `false` | Serve the Claude connector: `<public_url>/__backyard/mcp` plus Backyard's OAuth endpoints (SPEC §8.4). Needs an https `server.public_url` without a path. |
-| `mcp.clients` | list of URLs | the two Claude client metadata URLs | Client ID Metadata Document URLs that may connect. Only these are fetched. `[]` turns CIMD off, so apps register automatically. |
-| `mcp.redirect_uris` | list of URLs | `[https://claude.ai/api/mcp/auth_callback, https://claude.com/api/mcp/auth_callback]` | Exact https addresses that may receive sign-in codes. http loopback addresses are always allowed. |
+| `mcp.clients` | list of URLs | the two Claude client metadata URLs and ChatGPT's (`https://chatgpt.com/oauth/client.json`) | Client ID Metadata Document URLs that may connect. Only these are fetched. `[]` turns CIMD off, so apps register automatically. A list replaces the default: keep the entries you still need. |
+| `mcp.redirect_uris` | list of URLs | `[https://claude.ai/api/mcp/auth_callback, https://claude.com/api/mcp/auth_callback, https://chatgpt.com/connector_platform_oauth_redirect]` | Exact https addresses that may receive sign-in codes. http loopback addresses are always allowed. A list replaces the default. |
 | `mcp.max_publish_bytes` | int | `4194304` | Decoded file bytes per `backyard_publish` call. The MCP request body limit is 2× this + 1 MiB. |
 
 The two Claude client metadata URLs are `https://claude.ai/oauth/mcp-oauth-client-metadata`

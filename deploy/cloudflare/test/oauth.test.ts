@@ -628,6 +628,13 @@ describe("client metadata documents (SPEC §8.4.3)", () => {
       ["5121 bytes (streamed)", () => new Response(new Blob([pad(5121)]).stream(), { status: 200, headers: { "Content-Type": "application/json" } }), "larger than 5120 bytes"],
       ["a declared length over 5120", () => new Response(pad(6000), { status: 200, headers: { "Content-Type": "application/json", "Content-Length": "6000" } }), "larger than 5120 bytes"],
       ["private_key_jwt", () => jsonResponse(cimdDoc({ token_endpoint_auth_method: "private_key_jwt" })), "client authentication"],
+      [
+        "a methods list without none",
+        () => jsonResponse(cimdDoc({ token_endpoint_auth_method: "none", token_endpoint_auth_methods_supported: ["private_key_jwt"] })),
+        "client authentication",
+      ],
+      ["a methods string", () => jsonResponse(cimdDoc({ token_endpoint_auth_methods_supported: "none" })), "token_endpoint_auth_methods_supported is not an array of strings"],
+      ["a methods null", () => jsonResponse(cimdDoc({ token_endpoint_auth_methods_supported: null })), "token_endpoint_auth_methods_supported is not an array of strings"],
       ["a client_secret", () => jsonResponse(cimdDoc({ client_secret: "s" })), "client secret"],
       ["no allowed redirect URI", () => jsonResponse(cimdDoc({ redirect_uris: ["https://evil.example/cb"] })), "none of its redirect_uris is allowed"],
       ["11 redirect URIs", () => jsonResponse(cimdDoc({ redirect_uris: Array.from({ length: 11 }, (_, i) => `http://localhost/${i}`) })), "redirect_uris must be an array of 1 to 10 URIs"],
@@ -651,6 +658,22 @@ describe("client metadata documents (SPEC §8.4.3)", () => {
     resetMcpCaches();
     doc = () => jsonResponse(cimdDoc({ client_name: undefined }));
     expect(await (await authorizeCIMD()).text()).toContain("<strong>client.example</strong> — verified by <strong>client.example</strong>");
+    // ChatGPT's published document prefers private_key_jwt but lists none
+    // (MCP SEP-3149): the list wins.
+    resetMcpCaches();
+    doc = () =>
+      jsonResponse(
+        cimdDoc({
+          client_name: "ChatGPT",
+          token_endpoint_auth_method: "private_key_jwt",
+          token_endpoint_auth_methods_supported: ["none", "private_key_jwt"],
+          token_endpoint_auth_signing_alg: "RS256",
+          jwks_uri: "https://chatgpt.com/oauth/jwks.json",
+        }),
+      );
+    const chatgpt = await authorizeCIMD();
+    expect(chatgpt.status).toBe(200);
+    expect(await chatgpt.text()).toContain("<strong>ChatGPT</strong> — verified by <strong>client.example</strong>");
   });
 
   it("never fetches a URL that is not allowlisted", async () => {

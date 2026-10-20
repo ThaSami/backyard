@@ -269,10 +269,10 @@ func TestMCPDefaults(t *testing.T) {
 	if m.Enabled || m.MaxPublishBytes != 4194304 {
 		t.Fatalf("defaults: %+v", m)
 	}
-	if strings.Join(m.Clients, " ") != "https://claude.ai/oauth/mcp-oauth-client-metadata https://claude.ai/oauth/claude-code-client-metadata" {
+	if strings.Join(m.Clients, " ") != "https://claude.ai/oauth/mcp-oauth-client-metadata https://claude.ai/oauth/claude-code-client-metadata https://chatgpt.com/oauth/client.json" {
 		t.Fatalf("clients = %q", m.Clients)
 	}
-	if strings.Join(m.RedirectURIs, " ") != "https://claude.ai/api/mcp/auth_callback https://claude.com/api/mcp/auth_callback" {
+	if strings.Join(m.RedirectURIs, " ") != "https://claude.ai/api/mcp/auth_callback https://claude.com/api/mcp/auth_callback https://chatgpt.com/connector_platform_oauth_redirect" {
 		t.Fatalf("redirect_uris = %q", m.RedirectURIs)
 	}
 	if err := cfg.Validate(); err != nil {
@@ -294,7 +294,7 @@ func TestMCPDefaults(t *testing.T) {
 		t.Fatalf("empty lists: %v", err)
 	}
 	cfg = mcpConfig(t, "mcp:\n  clients:\n  redirect_uris:\n")
-	if len(cfg.MCP.Clients) != 2 || len(cfg.MCP.RedirectURIs) != 2 {
+	if len(cfg.MCP.Clients) != 3 || len(cfg.MCP.RedirectURIs) != 3 {
 		t.Fatalf("null lists: %q %q", cfg.MCP.Clients, cfg.MCP.RedirectURIs)
 	}
 

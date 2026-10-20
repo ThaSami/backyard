@@ -526,8 +526,16 @@ describe("Claude connector variables (MCP_*, SPEC §16)", () => {
   it("is off by default, with Claude's clients and callbacks", () => {
     const c = parseConfig(base);
     expect(c.mcp).toEqual({ enabled: false, clients: DEFAULT_MCP_CLIENTS, redirectURIs: DEFAULT_MCP_REDIRECT_URIS, problems: [] });
-    expect(DEFAULT_MCP_CLIENTS).toEqual(["https://claude.ai/oauth/mcp-oauth-client-metadata", "https://claude.ai/oauth/claude-code-client-metadata"]);
-    expect(DEFAULT_MCP_REDIRECT_URIS).toEqual(["https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback"]);
+    expect(DEFAULT_MCP_CLIENTS).toEqual([
+      "https://claude.ai/oauth/mcp-oauth-client-metadata",
+      "https://claude.ai/oauth/claude-code-client-metadata",
+      "https://chatgpt.com/oauth/client.json",
+    ]);
+    expect(DEFAULT_MCP_REDIRECT_URIS).toEqual([
+      "https://claude.ai/api/mcp/auth_callback",
+      "https://claude.com/api/mcp/auth_callback",
+      "https://chatgpt.com/connector_platform_oauth_redirect",
+    ]);
     expect(c.limits.mcp_publish_bytes).toBe(2097152);
     expect(c.limits.mcp_calls_per_day).toBe(5000);
     expect(cfg({ LIMITS: '{"mcp_publish_bytes": 1048576, "mcp_calls_per_day": 0}' }).limits).toMatchObject({ mcp_publish_bytes: 1048576, mcp_calls_per_day: 0 });

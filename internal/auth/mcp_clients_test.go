@@ -406,6 +406,22 @@ func TestMCPCIMDFailures(t *testing.T) {
 				return `{"client_id":"` + id + `","redirect_uris":["` + claudeCB + `"],"token_endpoint_auth_method":"private_key_jwt"}`
 			}
 		}, "/client", "client authentication"},
+		{"methods without none", func(s *cimdServer) {
+			s.body = func(id string) string {
+				return `{"client_id":"` + id + `","redirect_uris":["` + claudeCB + `"],"token_endpoint_auth_method":"none",` +
+					`"token_endpoint_auth_methods_supported":["private_key_jwt"]}`
+			}
+		}, "/client", "client authentication"},
+		{"methods not strings", func(s *cimdServer) {
+			s.body = func(id string) string {
+				return `{"client_id":"` + id + `","redirect_uris":["` + claudeCB + `"],"token_endpoint_auth_methods_supported":"none"}`
+			}
+		}, "/client", "token_endpoint_auth_methods_supported"},
+		{"methods null", func(s *cimdServer) {
+			s.body = func(id string) string {
+				return `{"client_id":"` + id + `","redirect_uris":["` + claudeCB + `"],"token_endpoint_auth_methods_supported":null}`
+			}
+		}, "/client", "token_endpoint_auth_methods_supported"},
 		{"client secret", func(s *cimdServer) {
 			s.body = func(id string) string {
 				return `{"client_id":"` + id + `","redirect_uris":["` + claudeCB + `"],"client_secret":"s3cret"}`
@@ -451,6 +467,28 @@ func TestMCPCIMDFailures(t *testing.T) {
 	e, id := cimdEnv(t, s)
 	if res := e.authorize(newBrowser(), authzParams(id, claudeCB, ch, "s")); res.StatusCode != http.StatusOK {
 		t.Errorf("5120-byte document: %d %s", res.StatusCode, body(t, res))
+	}
+}
+
+// ChatGPT's published document (https://chatgpt.com/oauth/client.json)
+// prefers private_key_jwt in the singular member and lists none among
+// token_endpoint_auth_methods_supported (MCP SEP-3149): the list wins.
+func TestMCPCIMDAuthMethodsList(t *testing.T) {
+	_, ch := pkce()
+	s := newCIMDServer(t)
+	s.set(func(s *cimdServer) {
+		s.body = func(id string) string {
+			return `{"client_id":"` + id + `","client_uri":"https://chatgpt.com/","redirect_uris":["` + claudeCB + `"],` +
+				`"token_endpoint_auth_method":"private_key_jwt","token_endpoint_auth_methods_supported":["none","private_key_jwt"],` +
+				`"grant_types":["authorization_code","refresh_token"],"response_types":["code"],"client_name":"ChatGPT",` +
+				`"logo_uri":"https://persistent.oaistatic.com/sonic/misc/openai-logo.png","token_endpoint_auth_signing_alg":"RS256",` +
+				`"jwks_uri":"https://chatgpt.com/oauth/jwks.json"}`
+		}
+	})
+	e, id := cimdEnv(t, s)
+	res := e.authorize(newBrowser(), authzParams(id, claudeCB, ch, "s"))
+	if b := body(t, res); res.StatusCode != http.StatusOK || !strings.Contains(b, "ChatGPT") {
+		t.Errorf("ChatGPT's document: %d %s", res.StatusCode, b)
 	}
 }
 

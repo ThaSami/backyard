@@ -1221,7 +1221,7 @@
   const GRANTS = API + "/mcp/grants";
 
   /**
-   * What the "Use Backyard in Claude" card shows, from GET /info: null when
+   * What the "Use Backyard in Claude or ChatGPT" card shows, from GET /info: null when
    * the server has no Claude connector (no mcp_url, SPEC §7.1), else
    * { url, claudeCode } with the Claude Code command.
    */

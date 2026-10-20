@@ -6,6 +6,34 @@ All notable changes to Backyard are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **ChatGPT can connect** to the Claude connector (both editions). ChatGPT identifies itself
+  with its client metadata document `https://chatgpt.com/oauth/client.json` and receives the
+  approval at `https://chatgpt.com/connector_platform_oauth_redirect`; both are now in the
+  defaults of `mcp.clients` / `mcp.redirect_uris` (Cloudflare: `MCP_CLIENTS` /
+  `MCP_REDIRECT_URIS`), next to Claude's. Before, ChatGPT got `400` "App not allowed" (or
+  `400 invalid_redirect_uri` when it registered itself). Guide:
+  [Adding it in ChatGPT](docs/claude-connector.md#adding-it-in-chatgpt).
+- The hub card is now **Use Backyard in Claude or ChatGPT**, with steps for ChatGPT and other
+  MCP apps.
+
+### Fixed
+
+- A client metadata document that lists `none` in `token_endpoint_auth_methods_supported` (MCP
+  SEP-3149) is accepted whatever its singular `token_endpoint_auth_method` prefers. ChatGPT's
+  prefers `private_key_jwt`, so even an allowlisted ChatGPT failed with "Could not verify the
+  app" (`502`).
+
+### Upgrade
+
+- Deployments that leave `mcp.clients` / `mcp.redirect_uris` (`MCP_CLIENTS` /
+  `MCP_REDIRECT_URIS`) unset now admit ChatGPT too; people still sign in and approve Backyard's
+  consent page for every connection. To keep Claude only, set both lists to Claude's entries
+  ([clients and redirect addresses](docs/claude-connector.md#clients-and-redirect-addresses)).
+  The Go server also fetches `https://chatgpt.com/oauth/client.json` (outbound HTTPS) when
+  someone connects ChatGPT.
+
 ## [0.4.0] - 2026-10-19
 
 ### Added

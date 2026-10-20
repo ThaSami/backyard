@@ -568,8 +568,11 @@ With the [Terraform module](#with-terraform-optional-infrastructure-as-code), se
   command names the four destinations to add in the dashboard, waits for them (`--wait`; 900
   seconds on a terminal), and ends with exit 4 while they are missing. `/__backyard/auth/authorize` stays behind Access: that login
   is the connector's sign-in, with Okta or any other identity provider of Access.
-- **The URL** is shown on the hub's card "Use Backyard in Claude" (and as `mcp_url` in
+- **The URL** is shown on the hub's card "Use Backyard in Claude or ChatGPT" (and as `mcp_url` in
   `/__backyard/api/info`). The hub URL must be https: `workers.dev` and custom domains are.
+- **ChatGPT** connects the same way (Plugins → **+** → **Add custom MCP server**, the same URL,
+  OAuth): its client metadata document and callback are in the default `MCP_CLIENTS` and
+  `MCP_REDIRECT_URIS`. See [Adding it in ChatGPT](../../docs/claude-connector.md#adding-it-in-chatgpt).
 - **Limits.** One `backyard_publish` call carries at most 2 MiB of file content
   (`LIMITS.mcp_publish_bytes`); a bigger site goes over several calls, one after another, and big
   media go through the hub's drag-and-drop deploy or `backyard deploy`. Tool calls count against
@@ -940,8 +943,8 @@ guard. Secrets go through
 | `AI_ENABLED` | `true` | Anything but `true`, `1`, `yes`, `on` or empty (e.g. `false`) turns AI off: every `/__backyard/api/ai/*` endpoint answers `501 unsupported`, like the Go server with `ai.enabled: false`. `setup --no-ai` sets it and drops the Workers AI binding; see [Turning AI off](#turning-ai-off). |
 | `AI_*`, `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL` | — | See [AI](#ai). |
 | `MCP_ENABLED` | `false` | `true` serves the [Claude connector](#use-backyard-in-claude) at `<hub>/__backyard/mcp` (needs an https hub URL). Unset or false: every connector path answers `404`. |
-| `MCP_CLIENTS` | Claude's two client metadata URLs | Client ID Metadata Document URLs that may connect (comma-separated, compared exactly; only these are fetched). Set but empty (`--var MCP_CLIENTS:,`) turns this off, so apps register automatically; `--var MCP_CLIENTS:` drops the override. |
-| `MCP_REDIRECT_URIS` | `https://claude.ai/api/mcp/auth_callback`, `https://claude.com/api/mcp/auth_callback` | Exact https addresses that may receive sign-in codes (comma-separated). http loopback addresses are always allowed. |
+| `MCP_CLIENTS` | Claude's two client metadata URLs and ChatGPT's (`https://chatgpt.com/oauth/client.json`) | Client ID Metadata Document URLs that may connect (comma-separated, compared exactly; only these are fetched). Set but empty (`--var MCP_CLIENTS:,`) turns this off, so apps register automatically; `--var MCP_CLIENTS:` drops the override. |
+| `MCP_REDIRECT_URIS` | `https://claude.ai/api/mcp/auth_callback`, `https://claude.com/api/mcp/auth_callback`, `https://chatgpt.com/connector_platform_oauth_redirect` | Exact https addresses that may receive sign-in codes (comma-separated). http loopback addresses are always allowed. A value replaces the default: list every address you still want. |
 | `WAREHOUSE_URL` | — | Optional: proxy `/warehouse/*` to a Backyard Go server's site API (secret `WAREHOUSE_TOKEN`). Its query errors (400/403/404/429/501) pass through; other failures answer `502`/`504 upstream_error` with a generic message naming the request id (details in the Worker log). |
 
 | Secret | Meaning |

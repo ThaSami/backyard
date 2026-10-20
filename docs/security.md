@@ -234,7 +234,7 @@ A site is written by whoever deployed it, so its files are untrusted on your mac
 
 Backyard fetches remote content in two places. The [Claude connector](#the-claude-connector)
 fetches client metadata documents, but only the exact URLs an admin listed in `mcp.clients`
-(by default Claude's two documents), never a URL a request names: https only, no redirects, 5 s,
+(by default Claude's two documents and ChatGPT's), never a URL a request names: https only, no redirects, 5 s,
 at most 5 KiB (on the Go server through the same public-address guard as below), with failures
 throttled per URL.
 The other is on behalf of users: image URLs in AI chat
@@ -270,7 +270,7 @@ What it defends against, and how:
   probing oracle. Self-registration (DCR) is stateless — the client id is HMAC-signed with
   `backyard/mcp-client/v1` and nothing is stored — and its name is shown as unverified.
 - **Where codes go.** Only to an exact `mcp.redirect_uris` entry (default: Claude's two callback
-  URLs, never a whole host) or an http loopback address of the user's own machine; anything else
+  URLs and ChatGPT's, never a whole host) or an http loopback address of the user's own machine; anything else
   fails before a redirect happens, and redirect addresses on the hub or a site are rejected by
   configuration validation.
 - **Codes and tokens.** PKCE with `S256` is required (`plain` and no challenge are refused).
@@ -365,4 +365,5 @@ and the acting user and client IP; see [operations](operations.md#logs-and-audit
 - [ ] The Claude connector (`mcp.enabled`) only with a sign-in (`oidc`, `iap`, `alb`, `header`;
       Cloudflare Access), its four machine paths exempt from the proxy and
       `/__backyard/auth/authorize` behind it, and `mcp.clients` / `mcp.redirect_uris` left at
-      Claude's exact defaults unless you add a client you trust.
+      their exact defaults (Claude and ChatGPT) unless you add a client you trust or leave one
+      out.
