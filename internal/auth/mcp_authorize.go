@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -394,7 +395,7 @@ func (m *MCP) renderConsent(w http.ResponseWriter, r *http.Request, u *identity.
 		Verified:   req.client.kind == clientKindCIMD,
 		Unlisted:   req.client.kind == clientKindUnlisted,
 		ClientHost: req.client.host,
-		Origin:     strings.ToLower(target.Scheme + "://" + target.Host),
+		Origin:     redirectOrigin(target),
 		Loopback:   loopback,
 		Host:       m.host,
 		Until:      m.now().Add(m.family).UTC().Format("2006-01-02"),
@@ -403,6 +404,27 @@ func (m *MCP) renderConsent(w http.ResponseWriter, r *http.Request, u *identity.
 	}
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	renderPage(w, http.StatusOK, pageData{Title: "Connect an app to Backyard", Consent: form, formAction: formActionSource(target)})
+}
+
+// redirectOrigin is the origin of a redirect URI as item 4 of the consent
+// page and its CSP form-action show it (SPEC §8.4.5), as the Worker shows
+// it for loopback and plain https URIs: scheme and host lowercased, the port
+// in decimal without leading zeros, and dropped when it is the scheme's
+// default. Hosts are not IDNA- or IP-canonicalized.
+func redirectOrigin(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if p := u.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err != nil {
+			host += ":" + p
+		} else if p = strconv.Itoa(n); p != defaultPort("", scheme) {
+			host += ":" + p
+		}
+	}
+	return scheme + "://" + host
 }
 
 // consentWho names the signed-in user: email, else name, else id.

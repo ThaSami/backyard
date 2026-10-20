@@ -229,9 +229,8 @@ func formActionSource(u *url.URL) string {
 	if u == nil {
 		return ""
 	}
-	scheme := strings.ToLower(u.Scheme)
 	if strings.Contains(u.Hostname(), ":") {
-		return scheme + ":"
+		return strings.ToLower(u.Scheme) + ":"
 	}
-	return scheme + "://" + strings.ToLower(u.Host)
+	return redirectOrigin(u)
 }

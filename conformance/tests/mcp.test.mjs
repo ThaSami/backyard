@@ -841,8 +841,9 @@ function connectorSuite() {
     // A valid client metadata URL outside the (default) allowlist, as local
     // apps such as opencode send their own: never fetched — the .example
     // host does not even resolve, so a fetch would end in "Could not verify
-    // the app" — and admitted with a loopback redirect URI only.
-    const unlisted = () => `https://opencode.example/oauth/conformance-${tag()}/client.json`;
+    // the app" — and admitted with a loopback redirect URI only. Longer than
+    // 64 characters: its name is the whole address, never cut.
+    const unlisted = () => `https://opencode.example/oauth/conformance-${tag()}/a-name-longer-than-64-characters/client.json`;
     const clientsKey = cloudflare ? "MCP_CLIENTS" : "mcp.clients";
     const redirectsKey = cloudflare ? "MCP_REDIRECT_URIS" : "mcp.redirect_uris";
     const authorizeAs = (id, redirectURI) => oauth.authorizeParams({ client: id, redirectURI, challenge: oauth.pkce().challenge, state: oauth.newState(), resource: R });
@@ -898,6 +899,8 @@ function connectorSuite() {
         ["a < in the host", "https://a<b.example.com/client.json"],
         ["an escape in the host", "https://ex%41mple.com/client.json"],
         ["a punycode label", "https://xn--bcher-kva.example/client.json"],
+        ["an empty host label", "https://open..code.ai/client.json"],
+        ["a host starting with a dot", "https://.opencode.ai/client.json"],
         ["a numeric last label", "https://example.123/client.json"],
         ["a hexadecimal last label", "https://example.0x1f/client.json"],
       ];
@@ -937,6 +940,7 @@ function connectorSuite() {
     test("with a loopback redirect URI: consent, code, tokens, an MCP call, refresh and the grant", async (t) => {
       if (signInSkip) return t.skip(signInSkip);
       const id = unlisted();
+      assert.ok(id.length > 64, "a name longer than 64 characters");
       const browser = person(0);
       const redirectURI = "http://127.0.0.1:53682/callback";
       const { verifier, challenge } = oauth.pkce();
@@ -1001,6 +1005,41 @@ function connectorSuite() {
         assert.equal(form.redirect_uri, redirectURI);
         assert.equal(form.client_id, id);
       }
+    });
+
+    test("the consent page shows the redirect origin: no default port, no leading zeros (SPEC §8.4.5 item 4)", async (t) => {
+      if (signInSkip) return t.skip(signInSkip);
+      const id = unlisted();
+      const browser = person(0);
+      for (const [redirectURI, origin] of [
+        ["http://localhost:80/cb", "http://localhost"],
+        ["http://127.0.0.1:080/cb", "http://127.0.0.1"],
+        ["http://[::1]:00080/cb", "http://[::1]"],
+        ["http://localhost:08080/cb", "http://localhost:8080"],
+      ]) {
+        const { page, form } = await oauth.openConsent(browser, P, authorizeAs(id, redirectURI));
+        assert.equal(page.status, 200, `${redirectURI}: the consent page: ${page}`);
+        assert.ok(page.text.includes(`(${origin})`), `${redirectURI}: the page shows (${origin})`);
+        assert.equal(form.redirect_uri, redirectURI, `${redirectURI}: the form keeps the address as sent`);
+      }
+    });
+
+    test("the address is HTML-escaped where it is the app's name", async (t) => {
+      const id = "https://evil.example/x</strong><strong>Claude</strong>&\"'<!--";
+      /** The raw page names id, but none of its markup. */
+      const assertEscaped = (r, what) => {
+        assert.ok(oauth.decodeHTML(r.text).includes(id), `${what}: the page names the app`);
+        for (const raw of [id, "</strong><strong>", "<strong>Claude</strong>", "<!--"]) assert.ok(!r.text.includes(raw), `${what}: no raw ${raw}`);
+      };
+      const r = await new oauth.Browser().request(oauth.authorizeURL(P, authorizeAs(id, "https://claude.ai/api/mcp/auth_callback")), { headers: oauth.CROSS_SITE_NAVIGATION });
+      assertPage(r, 400, "App not allowed");
+      assert.match(r.text, /App not allowed/, "the page title");
+      assertEscaped(r, "App not allowed");
+      if (signInSkip) return t.skip(signInSkip);
+      const { page, form } = await oauth.openConsent(person(0), P, authorizeAs(id, LOOPBACK));
+      assert.equal(page.status, 200, `the consent page: ${page}`);
+      assertEscaped(page, "the consent page");
+      assert.equal(form.client_id, id, "the form keeps the address as sent");
     });
   });
 

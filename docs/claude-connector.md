@@ -222,8 +222,9 @@ These apps were checked against Backyard:
 | Gemini CLI | Registers itself. |
 
 Codex CLI and Gemini CLI speak the MCP protocol revision 2025-06-18, which Backyard supports next
-to 2025-11-25. The official MCP SDKs for TypeScript (1.x, 2.x) and Python (2.x) connect as well,
-including their probe for the protocol revision 2026-07-28, which falls back to 2025-11-25.
+to 2025-11-25. The official MCP SDKs for TypeScript (1.x, 2.x) and Python (2.x) connect as well;
+the TypeScript 2.x and Python 2.x SDKs first probe the protocol revision 2026-07-28 and fall back
+to 2025-11-25, while TypeScript 1.x starts with 2025-11-25.
 
 - **DeepChat, signing in again.** DeepChat keeps its first registration but asks for a new
   callback path at a later sign-in; Backyard allows a registered app only the loopback address
@@ -375,9 +376,14 @@ mcp:
 ```
 
 On the Cloudflare edition: `backyard cloudflare setup --var MCP_CLIENTS:<url>,<url>
---var MCP_REDIRECT_URIS:<url>,<url>`. If ChatGPT ever shows an app-specific redirect address
-(`https://chatgpt.com/connector/oauth/<id>`, which it uses with servers that do not identify
-themselves in the approval; Backyard does), add that exact address to the redirect list.
+--var MCP_REDIRECT_URIS:<url>,<url>`. If ChatGPT's server management page ever shows an
+app-specific redirect address (`https://chatgpt.com/connector/oauth/<id>`, which it uses with
+servers that do not identify themselves in the approval; Backyard does), it also shows the
+matching client metadata document (`https://chatgpt.com/oauth/<id>/client.json`). Add both
+exactly as shown, next to the defaults: the address to `mcp.redirect_uris`
+(`MCP_REDIRECT_URIS`) and the document to `mcp.clients` (`MCP_CLIENTS`). With the address
+alone, the sign-in ends with "App not allowed". If ChatGPT registers itself instead (dynamic
+client registration), only the address is needed.
 
 ## Machine paths and identity proxies
 
@@ -440,8 +446,15 @@ What each sign-in mode does at `/__backyard/auth/authorize`:
   the Go server) excludes them — the same posture as CLI API tokens, plus the disconnect lever.
 - **Changing the lists.** Removing an address from `mcp.redirect_uris` (`MCP_REDIRECT_URIS`), or
   an app's URL from `mcp.clients` (`MCP_CLIENTS`), stops its connections to an https address
-  from exchanging a code or refreshing, so they end within the hour; connections that return to
-  a loopback address of the user's computer keep working.
+  from exchanging a code or refreshing, so they end within the hour. After an app's URL is
+  removed from `mcp.clients`, its connections that return to a loopback address of the user's
+  computer keep working only if the URL has the strict form an app outside the list may use (no
+  port, an ASCII host without `xn--` labels, no `%2F`, …; see
+  [SPEC §8.4.3](spec/SPEC.md#843-client-identification)), and the app can then sign in again
+  from the user's computer, unverified. Any other removed URL loses every connection, loopback
+  ones included, at its next code exchange or refresh (`invalid_client`), and signing in again
+  gives "Unknown app". To end a local app's connections, use **Disconnect** or **Disconnect a
+  person** above, or rotate `server.secret`.
 - **Rotating `server.secret`** (Cloudflare: `BACKYARD_SECRET`) ends every connection at once.
   Connectors added with "Register automatically" must then be removed and added again in Claude.
 - **Replays.** A sign-in code used twice, or an old refresh token used again, deletes the
@@ -476,7 +489,7 @@ On the Go server the HTTP metrics count the areas `mcp` and `oauth`, and
 | Claude cannot add or connect the connector; `https://<hub>/__backyard/mcp` answers `404` | The connector is off (`mcp.enabled`, `MCP_ENABLED`), the URL names a site or another host name of the hub, or (Cloudflare) an `MCP_*` variable is invalid — `/__backyard/readyz` says which. |
 | Claude or ChatGPT reports that the server is unreachable, while it works from your laptop | The hub is not reachable from Anthropic (`160.79.104.0/21`) or OpenAI ([`chatgpt-connectors.json`](https://openai.com/chatgpt-connectors.json)): private DNS, a private certificate, a firewall or WAF. Make the four machine paths public, or use an app on your computer (a connector added locally in Claude Code, or one of the [other MCP apps](#other-mcp-apps)). |
 | A login page or a proxy error instead of JSON at `/__backyard/mcp` | The proxy does not exempt the [machine paths](#machine-paths-and-identity-proxies). On the Cloudflare edition run `backyard cloudflare access enable` again. |
-| "Could not verify the app" (502) | The page names the document and the reason. **Backyard could not fetch it** (network, timeout, a redirect, not `200`, not JSON, too large): allow outbound HTTPS to `claude.ai` and `chatgpt.com`, or set `mcp.clients: []` and add the connector with "Register automatically" (ChatGPT then registers itself). **The document breaks Backyard's rules**: if the reason is its `redirect_uris` ("none of its redirect_uris is allowed"), add the app's callback to `mcp.redirect_uris` / `MCP_REDIRECT_URIS` — a custom list without `https://chatgpt.com/connector_platform_oauth_redirect` gives ChatGPT this; otherwise (it asks for client authentication, contains a client secret, …) remove its URL from `mcp.clients` / `MCP_CLIENTS` and add the app with "Register automatically". |
+| "Could not verify the app" (502) | The page names the document and the reason. **Backyard could not fetch it** (network, timeout, a redirect, not `200`, a `Content-Type` that is not JSON, too large): allow outbound HTTPS to `claude.ai` and `chatgpt.com`, or set `mcp.clients: []` and add the connector with "Register automatically" (ChatGPT then registers itself). **The document breaks Backyard's rules**: if the reason is its `redirect_uris` ("none of its redirect_uris is allowed"), add the app's callback to `mcp.redirect_uris` / `MCP_REDIRECT_URIS` — a custom list without `https://chatgpt.com/connector_platform_oauth_redirect` gives ChatGPT this; otherwise (it is not UTF-8 JSON or not a JSON object, asks for client authentication, contains a client secret, …) remove its URL from `mcp.clients` / `MCP_CLIENTS` and add the app with "Register automatically". |
 | "App not allowed" (400) | A hosted app — one whose approval goes to an https address — identified itself by a metadata URL that is not in `mcp.clients` / `MCP_CLIENTS`; the page names it. Add its URL to `mcp.clients` and its callback to `mcp.redirect_uris` (`MCP_REDIRECT_URIS`); for ChatGPT with a list that leaves its document out, add the document back or choose dynamic client registration when adding the server. An app whose approval goes to your own computer never gets this. Older releases refused every document outside the list: ChatGPT (listed by default now), opencode 2.x, Codex CLI and Hermes Agent got this there; upgrade. |
 | ChatGPT: "registration failed" / `invalid_redirect_uri` (400) | ChatGPT registered itself with a redirect address outside `mcp.redirect_uris` / `MCP_REDIRECT_URIS`: keep `https://chatgpt.com/connector_platform_oauth_redirect` in the list (the default), or add the exact address ChatGPT shows. |
 | "Unknown app" | A registered app's id is no longer valid (after a secret rotation): remove the connector in Claude and add it again. Or the app named an `https://` client id that is not a valid client metadata URL (a port, an IP address, a query, no path, …). |

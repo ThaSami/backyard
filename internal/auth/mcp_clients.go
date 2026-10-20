@@ -435,7 +435,9 @@ func (m *MCP) clientRedirect(c *mcpClient, requested string) bool {
 // grantRedirectAllowed applies the redirect policy to a grant at the token
 // endpoint: its redirect URI must still be allowed, and be a loopback URI
 // when its client_id is a metadata document URL outside the allowlist
-// (unlisted, or removed from mcp.clients since).
+// (unlisted, or removed from mcp.clients since; a removed URL that is not
+// of the strict form of unlistedClientURL never gets here, as knownClient
+// refuses it).
 func (m *MCP) grantRedirectAllowed(g *grantRecord) bool {
 	if !m.redirectAllowed(g.RedirectURI) {
 		return false

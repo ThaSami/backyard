@@ -1140,12 +1140,12 @@ There are no pre-registered clients and no client secrets. A `client_id` is reso
 **CIMD fetch** (only allowlisted URLs, never an unlisted one; the token and revoke endpoints
 never fetch): a `GET` with `Accept: application/json`, no cookies or credentials, no redirects
 (any `3xx` is an error), 5 s in total, only `200`, a `Content-Type` of `application/json` or
-ending in `+json` (parameters allowed), at most 5120 bytes, UTF-8 JSON that is an object. The Go
-server dials through its SSRF guard (public addresses only, also through an `HTTPS_PROXY`). The
-document must have `client_id` equal to the URL; `redirect_uris` an array of 1–10 members, every
-one a string (`null` is not), of which at least one passes the redirect policy (§8.4.4; the
-others are ignored); `token_endpoint_auth_methods_supported` (MCP SEP-3149), when present, an
-array whose every member is a string (`null` is not) and that contains `"none"` — the client
+ending in `+json` (parameters allowed), at most 5120 bytes. The Go server dials through its SSRF
+guard (public addresses only, also through an `HTTPS_PROXY`). The document must be UTF-8 JSON
+that is an object, with `client_id` equal to the URL; `redirect_uris` an array of 1–10 members,
+every one a string (`null` is not), of which at least one passes the redirect policy (§8.4.4;
+the others are ignored); `token_endpoint_auth_methods_supported` (MCP SEP-3149), when present,
+an array whose every member is a string (`null` is not) and that contains `"none"` — the client
 then uses `none`, the only method of the AS metadata, whatever the singular
 `token_endpoint_auth_method` prefers (ChatGPT's document prefers `private_key_jwt`) — and
 without that list `token_endpoint_auth_method` absent or `"none"`; no `client_secret` or
@@ -1200,13 +1200,15 @@ a two-hex-digit escape. Nothing else, ever.
 The client's own URIs narrow this further: a CIMD client's are its document's `redirect_uris`, a
 registered client's those of its registration. An **unlisted metadata document** client
 (§8.4.3) has no list: any loopback URI (b) is allowed for it, and no https URI ever is, an entry
-of `mcp.redirect_uris` included. The code exchange and refresh match it as for every client: the
-token request's `redirect_uri`, when present, must equal the authorization's byte for byte
-(§8.4.6). There a grant's redirect URI is checked again against the current policy, else
-`invalid_grant` "the app's redirect address is no longer allowed on this server" — which, for a
-URL `client_id` that is not (or no longer) allowlisted, admits a loopback URI only: once a URL
-is removed from `mcp.clients`, its grants to https redirect URIs can no longer exchange a code
-or refresh.
+of `mcp.redirect_uris` included. At the code exchange, as for every client, the token request's
+`redirect_uri`, when present, must equal the authorization's byte for byte (§8.4.6); a refresh
+does not read it. At both the code exchange and a refresh, a grant's redirect URI is checked
+again against the current policy, else `invalid_grant` "the app's redirect address is no longer
+allowed on this server" — which, for a URL `client_id` that is not (or no longer) allowlisted,
+admits a loopback URI only: once a URL is removed from `mcp.clients`, its grants to https
+redirect URIs can no longer exchange a code or refresh. A removed URL that does not have the
+strict form of §8.4.3 (a port, an `xn--` label, …) is no longer a known client at all: every one
+of its grants, loopback ones included, then gets `401 invalid_client` (§8.4.6).
 
 A requested `redirect_uri` matches a registered one when both are https and byte-equal, or both
 are loopback URIs with equal scheme, host string, path and query, the port being ignored on
@@ -1262,10 +1264,11 @@ decides:
    administrator can allow it from anywhere by adding its client metadata URL to `mcp.clients`
    and its redirect address to `mcp.redirect_uris` (Worker: `MCP_CLIENTS`, `MCP_REDIRECT_URIS`);
    CIMD failure → `502` page "Could not verify the app" naming the URL and the reason, whose
-   advice depends on the cause — a failed fetch (network, timeout, a redirect, not `200`, not
-   JSON, too large): Backyard needs outbound HTTPS to that address, else an administrator can set
-   `mcp.clients: []` (Worker: an empty `MCP_CLIENTS`) and the app can be added with "Register
-   automatically"; a document that breaks the rules: an administrator can add the app's
+   advice depends on the cause — a failed fetch (network, timeout, a redirect, not `200`, a
+   `Content-Type` that is not JSON, too large): Backyard needs outbound HTTPS to that address,
+   else an administrator can set `mcp.clients: []` (Worker: an empty `MCP_CLIENTS`) and the app
+   can be added with "Register automatically"; a document that breaks the rules of §8.4.3 (a
+   body that is not UTF-8 JSON or not a JSON object included): an administrator can add the app's
    redirect address to `mcp.redirect_uris` (`MCP_REDIRECT_URIS`) if the reason is its
    `redirect_uris`, otherwise the app can be added with "Register automatically" once its URL
    is removed from `mcp.clients` (`MCP_CLIENTS`). Both name "Register automatically".
@@ -1321,7 +1324,12 @@ differ between editions, but every element is required:
    "**"<client_name>"** (name provided by the app, not verified)";
 4. where the approval goes: https "Backyard will send the approval to **<redirect origin>**";
    loopback "Backyard will send the approval to **an app on this computer (<redirect
-   origin>)**. Only continue if you just started the sign-in from an app on this computer.";
+   origin>)**. Only continue if you just started the sign-in from an app on this computer."
+   (`<redirect origin>` is the redirect URI's scheme and host, lowercase, and its port in decimal
+   without leading zeros, left out when it is the scheme's default, so `http://localhost:80/cb`
+   and `http://127.0.0.1:080/cb` show `http://localhost` and `http://127.0.0.1`; an
+   `mcp.redirect_uris` entry with a non-ASCII host or an IP literal not in canonical form may
+   be shown differently by the two editions);
 5. what the app can do: "See the sites on <H> and read their files, and publish or change sites
    as you. Published sites are visible to everyone who can sign in to this Backyard.";
 6. the lifetime: "This connection lasts until <YYYY-MM-DD (UTC) of consent + family lifetime>
@@ -1412,7 +1420,8 @@ present it must canonicalize to R, else `invalid_target`. Then, each failure bei
 1. `code` has the `byac_` prefix, a valid MAC and `x` ≥ now;
 2. the grant exists and its code has not expired (a grant already redeemed is not rejected
    here: the replay is detected in step 6, after PKCE has verified);
-3. `client_id` equals the grant's;
+3. `client_id` equals the grant's, then the grant's redirect URI passes the current redirect
+   policy (§8.4.4: "the app's redirect address is no longer allowed on this server");
 4. the `redirect_uri` rule above;
 5. `code_verifier` matches `^[A-Za-z0-9._~-]{43,128}$` and `BASE64URL(SHA-256(ascii(verifier)))`
    equals the grant's `code_challenge` (constant-time) — a failure here consumes and revokes
@@ -1432,7 +1441,9 @@ subset of the granted scope (else `invalid_scope`); it only changes the `scope` 
 
 1. `byrt_` prefix, a valid MAC and `n` ≥ 1, else `invalid_grant`;
 2. the grant exists, has been redeemed and has not expired, else `invalid_grant`;
-3. `client_id` equals the grant's, else `invalid_grant` (steps 1–3 revoke nothing);
+3. `client_id` equals the grant's, then the grant's redirect URI passes the current redirect
+   policy (§8.4.4: "the app's redirect address is no longer allowed on this server"), else
+   `invalid_grant` (steps 1–3 revoke nothing; a `redirect_uri` parameter is not read);
 4. `rotate(gid, n, grace=true)`: `ok` → the refresh token of generation n+1; `grace` → the same
    generation n+1 token another request already received (refresh tokens are deterministic per
    generation); `reuse` → the grant is revoked, `invalid_grant`, audit `mcp.refresh_reuse` and
@@ -1607,7 +1618,8 @@ Cloudflare edition's Access bypass list is in §16.
    happens before the consent page. It creates only Backyard's own browser session, never an
    MCP grant. The consent page is shown on every authorization before any code exists, so the
    "consent before upstream state" rule of the MCP proxy guidance is met in substance.
-9. **Token-endpoint `redirect_uri`.** Optional, as in OAuth 2.1; when present it must match.
+9. **Token-endpoint `redirect_uri`.** Optional at the code exchange, as in OAuth 2.1; when
+   present it must match. A refresh does not read it.
 10. **`code_challenge_method`.** Absent means `plain` per OAuth, and is therefore refused: S256
     is required.
 
@@ -1676,7 +1688,7 @@ that user (guests included). The Cloudflare edition's daily caps are in §16. It
 | `state` | ≤ 512 bytes |
 | registered `client_id` | ≤ 1024 bytes |
 | registered `redirect_uris` | 1–4 entries of ≤ 512 bytes |
-| displayed `client_name` | ≤ 64 code points after sanitizing |
+| displayed `client_name` | ≤ 64 code points after sanitizing; an unlisted metadata document's is its `client_id` (≤ 512 bytes, never cut) |
 | CIMD fetch | 5 s, ≤ 5120 bytes, no redirects, cached 60–3600 s (default 300), failures throttled 10 s |
 | OAuth request bodies (register, token, revoke, consent `POST`) | ≤ 16 KiB |
 | bearer token at `/__backyard/mcp` | ≤ 4096 bytes |

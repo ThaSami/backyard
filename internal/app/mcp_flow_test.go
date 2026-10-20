@@ -711,9 +711,11 @@ func TestMCPFlowCIMD(t *testing.T) {
 // by a client metadata document no deployment lists (opencode 2.x, Codex
 // CLI, Hermes Agent) connects with the default mcp.clients: its URL is the
 // client_id, the sign-in returns to a loopback address, and the document is
-// never fetched (SPEC §8.4.3).
+// never fetched (SPEC §8.4.3). Hermes Agent's URL is 75 characters, more
+// than a registered name keeps: the name is the client_id in full, on the
+// consent page, in whoami and in the grants API.
 func TestMCPFlowUnlistedCIMD(t *testing.T) {
-	const clientURL = "https://opencode.ai/oauth/opencode/client.json"
+	const clientURL = "https://nousresearch.github.io/hermes-agent/docs/oauth/client-metadata.json"
 	var fetches atomic.Int32
 	cimdClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		fetches.Add(1)

@@ -49,7 +49,9 @@ var verifierRe = regexp.MustCompile(`^[A-Za-z0-9._~-]{43,128}$`)
 // errRedirectGone: the redirect policy (SPEC §8.4.4) applies at token time too, so
 // removing an address from mcp.redirect_uris ends its connections, and removing a
 // metadata URL from mcp.clients ends those of its connections that do not return
-// to a loopback address.
+// to a loopback address. A removed URL that is not of the strict form of an
+// unlisted one (unlistedClientURL: a port, an xn-- label, ...) loses them all:
+// knownClient refuses it first (invalid_client).
 const errRedirectGone = "the app's redirect address is no longer allowed on this server"
 
 // signToken returns prefix + keys.Sign(key, compact JSON of v).

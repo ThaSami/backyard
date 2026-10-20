@@ -46,10 +46,14 @@ All notable changes to Backyard are documented here. The format follows
 - A client metadata document that lists `none` in `token_endpoint_auth_methods_supported` (MCP
   SEP-3149) is accepted whatever its singular `token_endpoint_auth_method` prefers. ChatGPT's
   prefers `private_key_jwt`, so even an allowlisted ChatGPT failed with "Could not verify the
-  app" (`502`).
-- The Go server, like the Worker, refuses a client metadata document whose `redirect_uris` or
-  `token_endpoint_auth_methods_supported` has a member that is not a string; it read `null` as
-  an empty string, so `["none", null]` passed.
+  app" (`502`). When present, that list must now be an array of strings that contains `none`;
+  0.4.0 ignored it.
+- The Go server, like the Worker, refuses a client metadata document whose `redirect_uris` has a
+  member that is not a string; it read `null` as an empty string, so
+  `["https://claude.ai/api/mcp/auth_callback", null]` passed.
+- The Go server's consent page (where the approval goes, and its CSP `form-action`) writes the
+  redirect address's port as the Worker does: without the scheme's default port or leading
+  zeros (`http://127.0.0.1:080/cb` shows `http://127.0.0.1`, not `http://127.0.0.1:080`).
 
 ### Upgrade
 
@@ -73,6 +77,17 @@ All notable changes to Backyard are documented here. The format follows
   (`[]` included) — what such an app could already do by registering itself. `mcp.clients` now
   decides which documents are fetched and shown as verified, and which apps identified by a
   document may connect with an https redirect address.
+- Removing a document URL from `mcp.clients` (`MCP_CLIENTS`) still ends that app's connections
+  to an https redirect address within the hour, but no longer its connections that return to a
+  loopback address when the URL has the strict form an app outside the list may use (no port,
+  an ASCII host without `xn--` labels, …; SPEC §8.4.3): they keep refreshing until they expire
+  (`auth.token_ttl`, `TOKEN_TTL_HOURS`), and the app can sign in again from the user's computer,
+  unverified. Before, removing the URL ended all of its connections. To cut them off, disconnect
+  them one by one (**Disconnect** on the hub card, or `DELETE /__backyard/api/mcp/grants/<id>`),
+  remove every connection of a person (**Disconnect a person**,
+  `DELETE /__backyard/api/mcp/grants?user=<id>`), or rotate `server.secret` (`BACKYARD_SECRET`),
+  which ends every connection
+  ([changing the lists](docs/claude-connector.md#connections-disconnecting-and-offboarding)).
 
 ## [0.4.0] - 2026-10-19
 

@@ -292,6 +292,66 @@ func TestMCPConsentHeaders(t *testing.T) {
 	}
 }
 
+// Item 4 of the consent page shows the redirect URI's origin as the
+// Worker's WHATWG URL serializes it: scheme and host lowercased, the port in
+// decimal without leading zeros, none when it is the scheme's default.
+func TestMCPConsentOrigin(t *testing.T) {
+	for raw, want := range map[string]string{
+		"http://localhost:80/cb":                      "http://localhost",
+		"http://127.0.0.1:080/cb":                     "http://127.0.0.1",
+		"http://[::1]:00080/cb":                       "http://[::1]",
+		"http://localhost:08080/cb":                   "http://localhost:8080",
+		"http://localhost:443/cb":                     "http://localhost:443",
+		"http://127.0.0.1:53682/callback":             "http://127.0.0.1:53682",
+		"http://[::1]:5/cb":                           "http://[::1]:5",
+		"http://localhost/cb":                         "http://localhost",
+		"https://claude.ai:443/api/mcp/auth_callback": "https://claude.ai",
+		"https://Apps.Example.COM:0443/cb":            "https://apps.example.com",
+		"https://apps.example.com:80/cb":              "https://apps.example.com:80",
+		"https://apps.example.com:8443/cb":            "https://apps.example.com:8443",
+		"https://apps.example.com:/cb":                "https://apps.example.com",
+		claudeCB:                                      "https://claude.ai",
+	} {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := redirectOrigin(u); got != want {
+			t.Errorf("redirectOrigin(%s) = %q, want %q", raw, got, want)
+		}
+	}
+
+	// On the page: an app on this computer, and a hosted app whose listed
+	// callback names the default port.
+	const hosted = "https://Apps.Example.COM:443/cb"
+	e := newMCPEnv(t, ModeNone, func(c *config.Config) { c.MCP.RedirectURIs = []string{hosted} })
+	_, ch := pkce()
+	// The CSP form-action names the same origin (IPv6: the scheme alone).
+	for _, tc := range []struct{ uri, origin, action string }{
+		{"http://localhost:80/cb", "http://localhost", "http://localhost"},
+		{"http://127.0.0.1:080/cb", "http://127.0.0.1", "http://127.0.0.1"},
+		{"http://[::1]:00080/cb", "http://[::1]", "http:"},
+	} {
+		res := e.authorize(newBrowser(), authzParams(opencodeCIMD, tc.uri, ch, "s"))
+		if csp := res.Header.Get("Content-Security-Policy"); !strings.HasSuffix(csp, "form-action 'self' "+tc.action) {
+			t.Errorf("%s: CSP %q, want form-action 'self' %s", tc.uri, csp, tc.action)
+		}
+		_, page := consentFields(t, res)
+		if want := "Backyard will send the approval to <strong>an app on this computer (" + tc.origin + ")</strong>."; !strings.Contains(page, want) {
+			t.Errorf("%s: consent page lacks %q\n%s", tc.uri, want, page)
+		}
+	}
+	id := e.register("App", hosted)
+	res := e.authorize(newBrowser(), authzParams(id, hosted, ch, "s"))
+	if csp := res.Header.Get("Content-Security-Policy"); !strings.HasSuffix(csp, "form-action 'self' https://apps.example.com") {
+		t.Errorf("hosted: CSP %q", csp)
+	}
+	_, page := consentFields(t, res)
+	if want := "Backyard will send the approval to <strong>https://apps.example.com</strong>."; !strings.Contains(page, want) {
+		t.Errorf("consent page lacks %q\n%s", want, page)
+	}
+}
+
 func TestMCPCanConnectApps(t *testing.T) {
 	guest := &identity.User{ID: "anon:0123456789abcdef", Anonymous: true}
 	static := &identity.User{ID: "token:ci"}

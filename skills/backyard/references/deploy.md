@@ -8,7 +8,7 @@ Contents: [Install](#install-the-cli) · [Commands](#commands) · [Log in](#log-
 [Deploy](#deploy) · [Project files](#project-files) · [Deploy methods](#deploy-methods) ·
 [Host vs path mode](#host-mode-and-path-mode) · [Local preview](#local-preview) ·
 [Cloudflare edition](#cloudflare-edition-free-tier) · [CI](#ci-and-automation) ·
-[Agents](#agents-and-editors) · [From Claude](#publishing-from-claude-connector) ·
+[Agents](#agents-and-editors) · [Connector](#publishing-through-the-connector-remote-mcp) ·
 [Troubleshooting](#troubleshooting)
 
 ## Install the CLI
@@ -353,13 +353,14 @@ bucket credentials and no Backyard token.
   `AGENTS.md`, `.cursor/rules/backyard.mdc` and `.github/copilot-instructions.md`.
 - **Docs for LLMs:** `https://backyard.example.com/llms.txt` and `/llms-full.txt`.
 
-## Publishing from Claude (connector)
+## Publishing through the connector (remote MCP)
 
-When the Backyard connector is connected in Claude (an admin added
-`https://backyard.example.com/__backyard/mcp` as a custom connector and the user signed in),
-there is no CLI and no folder: files travel inside the tool calls, and every call acts as the
-signed-in user. The tools: `backyard_docs`, `backyard_whoami`, `backyard_list_sites`,
-`backyard_site_files`, `backyard_read_site_file` and `backyard_publish`.
+When Backyard's remote MCP connector is connected (`https://backyard.example.com/__backyard/mcp`
+added as a custom connector in Claude, a custom MCP server in ChatGPT, or a remote MCP server in
+another MCP app such as opencode or Codex CLI, and the user signed in), no CLI or folder is
+needed: files travel inside the tool calls, and every call acts as the signed-in user. The tools:
+`backyard_docs`, `backyard_whoami`, `backyard_list_sites`, `backyard_site_files`,
+`backyard_read_site_file` and `backyard_publish`.
 
 1. Call `backyard_whoami` once: it says whether this connection may publish (`can_publish`),
    the site URL pattern and `limits.max_publish_bytes`, the most file content one call may

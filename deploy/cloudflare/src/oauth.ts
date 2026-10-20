@@ -99,7 +99,10 @@ const GID_RE = /^[0-9a-f]{32}$/;
 /**
  * At token time the redirect policy applies too: removing an address ends its
  * connections, and removing a metadata URL from MCP_CLIENTS ends those of its
- * connections that do not return to a loopback address.
+ * connections that do not return to a loopback address. A removed URL that is
+ * not of the strict form of an unlisted one (unlistedClientURL: a port, an
+ * xn-- label, ...) loses them all: knownClient refuses it first
+ * (invalid_client).
  */
 const REDIRECT_GONE = "the app's redirect address is no longer allowed on this server";
 
@@ -833,7 +836,8 @@ function clientRedirect(cfg: Config, c: McpClient, requested: string): boolean {
  * The redirect policy applied to a grant at the token endpoint: its redirect
  * URI must still be allowed, and be a loopback URI when its client_id is a
  * metadata document URL outside MCP_CLIENTS (unlisted, or removed from it
- * since).
+ * since; a removed URL that is not of the strict form of unlistedClientURL
+ * never gets here, as knownClient refuses it).
  */
 function grantRedirectAllowed(cfg: Config, g: McpGrant): boolean {
   if (!redirectAllowed(cfg, g.redirect_uri)) return false;

@@ -8,7 +8,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resetAccessCaches } from "../src/auth";
-import { getConfig } from "../src/config";
+import { getConfig, validMCPClientURL } from "../src/config";
 import { KeyLabel, b64url, deriveKey, hex, signValue } from "../src/crypto";
 import type { Env } from "../src/env";
 import { issueAPIToken } from "../src/jwt";
@@ -679,6 +679,7 @@ describe("client metadata documents (SPEC §8.4.3)", () => {
       // Within the failure throttle the same failure, with the same detail.
       const again = decodeHTML(await expectPage(await authorizeCIMD(), 502, `${what} (throttled)`));
       expect(again, what).toContain(want);
+      expect(again, what).not.toContain(other);
     }
     // 5120 bytes exactly is fine; a +json type too; unknown members are ignored.
     resetMcpCaches();
@@ -807,6 +808,8 @@ describe("client metadata documents (SPEC §8.4.3)", () => {
 /** Client metadata URLs of apps on the user's computer that name themselves by their own document, which no deployment lists. */
 const OPENCODE = "https://opencode.ai/oauth/opencode/client.json";
 const PI = "https://pi.dev/oauth/client.json";
+/** 75 characters: longer than the 64 code points a DCR or document name is cut to, so it shows the name is never cut. */
+const HERMES = "https://nousresearch.github.io/hermes-agent/docs/oauth/client-metadata.json";
 
 describe("unlisted client metadata documents (SPEC §8.4.3, §8.4.4)", () => {
   const LOCAL = "http://127.0.0.1:53682/callback";
@@ -842,7 +845,7 @@ describe("unlisted client metadata documents (SPEC §8.4.3, §8.4.4)", () => {
       // The documents of opencode 2.x, Codex CLI, Hermes Agent and pi.
       OPENCODE,
       "https://chatgpt.com/oauth/codex/client.json",
-      "https://nousresearch.github.io/hermes-agent/docs/oauth/client-metadata.json",
+      HERMES,
       PI,
       long,
       // Escapes stay as sent.
@@ -882,6 +885,7 @@ describe("unlisted client metadata documents (SPEC §8.4.3, §8.4.4)", () => {
       "https://opencode.ai:443/client.json",
       "https://opencode.ai./client.json",
       "https://open..code.ai/client.json",
+      "https://.opencode.ai/client.json",
       "https://open_code.ai/client.json",
       "https://1.2.3.999/client.json",
       "https://01.2.3.4/client.json",
@@ -910,35 +914,41 @@ describe("unlisted client metadata documents (SPEC §8.4.3, §8.4.4)", () => {
     }
   });
 
-  it("connects an app on this computer without a fetch, named by its address and not verified", async () => {
+  it("connects an app on this computer without a fetch, named by its whole address and not verified", async () => {
     const { calls, other } = stubFetch(() => jsonResponse(cimdDoc()));
     const log = vi.spyOn(console, "log");
-    const r = await authorizeAs(OPENCODE, LOCAL);
+    expect(HERMES.length, "a name a 64-code-point cut would shorten").toBeGreaterThan(64);
+    const r = await authorizeAs(HERMES, LOCAL);
     const page = await r.text();
     expect(r.status, page.slice(0, 300)).toBe(200);
     for (const want of [
-      `<p id="consent-app"><strong>${OPENCODE}</strong> (address provided by the app, not verified) wants to use Backyard as you.</p>`,
+      `<p id="consent-app"><strong>${HERMES}</strong> (address provided by the app, not verified) wants to use Backyard as you.</p>`,
       "Backyard will send the approval to <strong>an app on this computer (http://127.0.0.1:53682)</strong>. Only continue if you just started the sign-in from an app on this computer.",
-      `Only allow this if you started connecting ${OPENCODE} to Backyard yourself just now.`,
+      `Only allow this if you started connecting ${HERMES} to Backyard yourself just now.`,
       "overflow-wrap:anywhere",
     ]) {
       expect(page).toContain(want);
     }
     expect(page).not.toContain("verified by");
-    expect(hiddenInputs(page)).toMatchObject({ client_id: OPENCODE, redirect_uri: LOCAL });
+    expect(hiddenInputs(page)).toMatchObject({ client_id: HERMES, redirect_uri: LOCAL });
+    // The name is never cut, also at 512 bytes (the longest client_id).
+    const long = "https://opencode.ai/" + "a".repeat(512 - "https://opencode.ai/".length);
+    const longPage = await (await authorizeAs(long, LOCAL)).text();
+    expect(longPage).toContain(`<p id="consent-app"><strong>${long}</strong> (address provided by the app, not verified) wants to use Backyard as you.</p>`);
+    expect(longPage).toContain(`Only allow this if you started connecting ${long} to Backyard yourself just now.`);
     // There is no document, so no registered list: any loopback URI.
     for (const uri of ["http://localhost/callback", "http://localhost:27890/callback", "http://[::1]:5/cb?x=1", "http://127.0.0.1:9", "http://localhost/"]) {
-      const o = await openConsent(authorizeQuery({ clientId: OPENCODE, challenge: (await pkcePair()).challenge, redirectURI: uri }));
+      const o = await openConsent(authorizeQuery({ clientId: HERMES, challenge: (await pkcePair()).challenge, redirectURI: uri }));
       expect(o.page.status, uri).toBe(200);
       expect(o.form.redirect_uri, uri).toBe(uri);
     }
 
     // The whole flow: consent, code exchange, an MCP call, refresh, revocation.
-    const c = await mcpConnect({ clientId: OPENCODE, redirectURI: LOCAL });
+    const c = await mcpConnect({ clientId: HERMES, redirectURI: LOCAL });
     const v = await verify(c.access_token);
-    expect(v.ok && v.grant).toMatchObject({ client_id: OPENCODE, client_name: OPENCODE, client_kind: "unlisted_metadata_document", client_host: "", redirect_uri: LOCAL });
+    expect(v.ok && v.grant).toMatchObject({ client_id: HERMES, client_name: HERMES, client_kind: "unlisted_metadata_document", client_host: "", redirect_uri: LOCAL });
     const audit = log.mock.calls.map((x) => String(x[0])).find((x) => x.includes('"action":"mcp.authorize"'));
-    expect(JSON.parse(audit ?? "{}")).toMatchObject({ client_name: OPENCODE, client_kind: "unlisted_metadata_document", client_host: "", redirect_host: "127.0.0.1:53682" });
+    expect(JSON.parse(audit ?? "{}")).toMatchObject({ client_name: HERMES, client_kind: "unlisted_metadata_document", client_host: "", redirect_host: "127.0.0.1:53682" });
     log.mockRestore();
     const rpc = await call(
       "/__backyard/mcp",
@@ -951,24 +961,24 @@ describe("unlisted client metadata documents (SPEC §8.4.3, §8.4.4)", () => {
     );
     expect(rpc.status).toBe(200);
     const who = JSON.parse(((await rpc.json()) as { result: { content: { text: string }[] } }).result.content[0]!.text) as { connection: { client: string } };
-    expect(who.connection.client, "the connection is named by the address").toBe(OPENCODE);
+    expect(who.connection.client, "the connection is named by the address").toBe(HERMES);
     // It adds no origin to the MCP endpoint (SPEC §14.1).
-    expect(mcpAllowedOrigin(ctxFor(), "https://opencode.ai")).toBe(false);
+    expect(mcpAllowedOrigin(ctxFor(), "https://nousresearch.github.io")).toBe(false);
     const list = await call("/__backyard/api/mcp/grants", { headers: c.identity }, MCP_ENV);
     expect(((await list.json()) as { grants: Record<string, unknown>[] }).grants).toEqual([
-      expect.objectContaining({ client_name: OPENCODE, client_kind: "unlisted_metadata_document", client_host: "", redirect_host: "127.0.0.1:53682", scope: "mcp offline_access" }),
+      expect.objectContaining({ client_name: HERMES, client_kind: "unlisted_metadata_document", client_host: "", redirect_host: "127.0.0.1:53682", scope: "mcp offline_access" }),
     ]);
-    const t2 = await refresh(OPENCODE, c.refresh_token);
+    const t2 = await refresh(HERMES, c.refresh_token);
     expect(t2.status).toBe(200);
     const rt2 = ((await t2.json()) as { refresh_token: string }).refresh_token;
     // Codes and refresh tokens stay bound to the client_id.
     await expectOAuthError(await refresh(PI, rt2), 400, "invalid_grant", "a refresh as another unlisted client");
-    const a = await authorize({ clientId: OPENCODE });
+    const a = await authorize({ clientId: HERMES });
     await expectOAuthError(await exchange({ ...a, clientId: PI }), 400, "invalid_grant", "the code with another unlisted client_id");
     await expectOAuthError(await exchange(a, { redirect_uri: "http://127.0.0.1:53683/callback" }), 400, "invalid_grant", "another redirect_uri");
     expect((await exchange(a, { redirect_uri: LOOPBACK })).status, "the code, with its own redirect_uri").toBe(200);
     // RFC 7009 revocation by the same client.
-    const rv = await tokenRequest({ client_id: OPENCODE, token: rt2 }, { path: "/__backyard/oauth/revoke" });
+    const rv = await tokenRequest({ client_id: HERMES, token: rt2 }, { path: "/__backyard/oauth/revoke" });
     expect(rv.status).toBe(200);
     expect(await verify(c.access_token)).toEqual({ ok: false, error: "token revoked" });
 
@@ -976,7 +986,38 @@ describe("unlisted client metadata documents (SPEC §8.4.3, §8.4.4)", () => {
     expect(calls).toHaveLength(0);
     expect(other).toHaveLength(0);
     // With MCP_CLIENTS empty the rule still applies (nothing is fetched anyway).
-    expect((await authorizeAs(OPENCODE, LOCAL, { MCP_CLIENTS: "" })).status).toBe(200);
+    expect((await authorizeAs(HERMES, LOCAL, { MCP_CLIENTS: "" })).status).toBe(200);
+    expect(other).toHaveLength(0);
+  });
+
+  it("escapes the address where it is the app's name: the consent page and the App not allowed page", async () => {
+    const { other } = stubFetch(() => jsonResponse(cimdDoc()));
+    // The strict form lets < > " ' & into the path; the pages are checked as sent (no decodeHTML).
+    const evil = `https://evil.example/x</strong><strong>Claude</strong>&"'<!--`;
+    const escaped = "https://evil.example/x&lt;/strong&gt;&lt;strong&gt;Claude&lt;/strong&gt;&amp;&quot;&#39;&lt;!--";
+    expect(unlistedClientURL(evil)).toBe(true);
+    const expectNoMarkup = (html: string, what: string) => {
+      for (const raw of [evil, "</strong><strong>", "<strong>Claude</strong>", "<!--"]) expect(html, `${what}: ${raw}`).not.toContain(raw);
+    };
+    const r = await authorizeAs(evil, LOCAL);
+    const page = await r.text();
+    expect(r.status, page.slice(0, 300)).toBe(200);
+    expect(page).toContain(`<p id="consent-app"><strong>${escaped}</strong> (address provided by the app, not verified) wants to use Backyard as you.</p>`);
+    expect(page).toContain(`<p class="warn">Only allow this if you started connecting ${escaped} to Backyard yourself just now.`);
+    expectNoMarkup(page, "the consent page");
+    expect(hiddenInputs(page).client_id).toBe(evil);
+    // A sign-in that leaves this computer, at authorize and at the consent POST.
+    const o = await openConsent(authorizeQuery({ clientId: evil, challenge: (await pkcePair()).challenge, redirectURI: LOCAL }));
+    expect(o.page.status).toBe(200);
+    for (const [what, res] of [
+      ["authorize", await authorizeAs(evil, CLAUDE_CB)],
+      ["the consent POST", await submitConsent({ ...o.form, redirect_uri: CLAUDE_CB }, o.identity)],
+    ] as const) {
+      const html = await expectPage(res, 400, what);
+      expect(html, what).toContain("<h1>App not allowed</h1>");
+      expect(html, what).toContain(`<p>The app ${escaped} may connect to this Backyard only from this computer (a sign-in that returns to localhost). `);
+      expectNoMarkup(html, what);
+    }
     expect(other).toHaveLength(0);
   });
 
@@ -1062,6 +1103,30 @@ describe("unlisted client metadata documents (SPEC §8.4.3, §8.4.4)", () => {
     // Listed again, the hosted connection and the code work again (nothing was revoked).
     expect((await refresh(CIMD_URL, hosted.refresh_token, {}, CIMD_ENV)).status).toBe(200);
     expect((await exchange(pending, {}, CIMD_ENV)).status).toBe(200);
+  });
+
+  it("once a URL outside the strict form leaves MCP_CLIENTS, its connections that return to this computer end too", async () => {
+    const portID = "https://client.example:8443/oauth/metadata";
+    expect(validMCPClientURL(portID)).toBe(true);
+    expect(unlistedClientURL(portID)).toBe(false);
+    const fetched: string[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      fetched.push(url);
+      if (url !== portID) throw new Error("no network in tests");
+      return jsonResponse(cimdDoc({ client_id: portID }));
+    });
+    const env: Partial<Env> = { MCP_CLIENTS: `${CIMD_URL},${portID}` };
+    const local = await mcpConnect({ clientId: portID, env, redirectURI: "http://localhost:4444/callback" });
+    expect(fetched).toEqual([portID]);
+    // The administrator removes it from MCP_CLIENTS (the default list): it is no client at all now.
+    const r = await expectOAuthError(await refresh(portID, local.refresh_token), 401, "invalid_client", "the local connection");
+    expect(r.error_description).toBe("unknown client");
+    await expectOAuthError(await tokenRequest({ client_id: portID, token: local.access_token }, { path: "/__backyard/oauth/revoke" }), 401, "invalid_client", "revoke");
+    expect(await expectPage(await authorizeAs(portID, "http://localhost:4444/callback"), 400, "signing in again from this computer")).toContain("Unknown app");
+    expect(fetched).toEqual([portID]);
+    // Listed again, the connection works again (nothing was revoked).
+    expect((await refresh(portID, local.refresh_token, {}, env)).status).toBe(200);
   });
 });
 

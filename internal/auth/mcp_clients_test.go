@@ -467,6 +467,16 @@ func TestMCPCIMDFailures(t *testing.T) {
 			if !strings.Contains(b, want) || strings.Contains(b, other) {
 				t.Errorf("detail: want %q in\n%s", want, b)
 			}
+			// Within the 10 s failure throttle the same failure, with the
+			// same detail, is served without a fetch.
+			n := s.count()
+			e.clock.Advance(time.Second)
+			res = e.authorize(newBrowser(), authzParams(s.URL+tc.path, claudeCB, ch, "s"))
+			b = html.UnescapeString(body(t, res))
+			if res.StatusCode != http.StatusBadGateway || !strings.Contains(b, tc.reason) || !strings.Contains(b, want) ||
+				strings.Contains(b, other) || s.count() != n {
+				t.Errorf("throttled: %d, fetches %d → %d; want %q in\n%s", res.StatusCode, n, s.count(), want, b)
+			}
 		})
 	}
 	// The exact 5120-byte document is accepted; unknown grant types and
@@ -609,6 +619,55 @@ func TestMCPCIMDSingleFlight(t *testing.T) {
 	}
 }
 
+// Requests that wait for a shared fetch that fails get the detail of its
+// cause, as the request that started it does: a failed fetch, or a
+// document that breaks the rules.
+func TestMCPCIMDSingleFlightFailure(t *testing.T) {
+	_, ch := pkce()
+	for _, tc := range []struct {
+		name        string
+		setup       func(s *cimdServer)
+		reason      string
+		want, other string
+	}{
+		{"fetch", func(s *cimdServer) { s.status = http.StatusServiceUnavailable }, "HTTP 503", cimdFetchDetail, cimdRulesDetail},
+		{"rules", func(s *cimdServer) {
+			s.body = func(id string) string {
+				return `{"client_id":"` + id + `","redirect_uris":["https://evil.example/cb"]}`
+			}
+		}, "redirect_uris", cimdRulesDetail, cimdFetchDetail},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newCIMDServer(t)
+			release := make(chan struct{})
+			s.set(func(s *cimdServer) { tc.setup(s); s.release = release })
+			e, id := cimdEnv(t, s)
+			var wg sync.WaitGroup
+			pages := make([]string, 10)
+			codes := make([]int, len(pages))
+			for i := range pages {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					res := e.authorize(newBrowser(), authzParams(id, claudeCB, ch, "s"))
+					codes[i], pages[i] = res.StatusCode, html.UnescapeString(body(t, res))
+				}()
+			}
+			time.Sleep(200 * time.Millisecond)
+			close(release)
+			wg.Wait()
+			if s.count() != 1 {
+				t.Errorf("fetches = %d, want 1", s.count())
+			}
+			for i, b := range pages {
+				if codes[i] != http.StatusBadGateway || !strings.Contains(b, tc.reason) || !strings.Contains(b, tc.want) || strings.Contains(b, tc.other) {
+					t.Errorf("request %d: %d; want %q in\n%s", i, codes[i], tc.want, b)
+				}
+			}
+		})
+	}
+}
+
 func TestMCPCIMDGuardedByDefault(t *testing.T) {
 	// Without the test client the SSRF guard refuses the loopback test server.
 	s := newCIMDServer(t)
@@ -693,6 +752,19 @@ func TestMCPRegisterNotUTF8(t *testing.T) {
 // itself by its own document, which no deployment lists.
 const opencodeCIMD = "https://opencode.ai/oauth/opencode/client.json"
 
+// hermesCIMD is Hermes Agent's client metadata URL, 75 characters: longer
+// than the 64 code points a registered or document name is cut to.
+const hermesCIMD = "https://nousresearch.github.io/hermes-agent/docs/oauth/client-metadata.json"
+
+// markupCIMD is a client metadata URL of the strict form with markup in its
+// path, and markupCIMDHTML the same escaped as page text: wherever an
+// unlisted app's name is shown, it must not fake a line such as "verified
+// by".
+const (
+	markupCIMD     = `https://evil.example/x</strong><strong>Claude</strong>&"'<!--`
+	markupCIMDHTML = `https://evil.example/x&lt;/strong&gt;&lt;strong&gt;Claude&lt;/strong&gt;&amp;&#34;&#39;&lt;!--`
+)
+
 // fetchCounter is an MCP HTTP client transport that counts and fails every
 // request: a client metadata document fetch, of any URL, reaches it.
 type fetchCounter struct{ n atomic.Int32 }
@@ -732,6 +804,24 @@ func TestMCPUnlistedCIMD(t *testing.T) {
 	}
 	if strings.Contains(page, "verified by") {
 		t.Error("an unlisted metadata document is shown as verified")
+	}
+	// The name is escaped (items 3 and 7, the hidden fields).
+	if !unlistedClientURL(markupCIMD) {
+		t.Fatalf("unlistedClientURL(%q) = false", markupCIMD)
+	}
+	_, page = consentFields(t, e.authorize(newBrowser(), authzParams(markupCIMD, cb, ch, "s")))
+	for _, want := range []string{
+		`<p id="consent-app"><strong>` + markupCIMDHTML + `</strong> (address provided by the app, not verified) wants to use Backyard as you.</p>`,
+		"Only allow this if you started connecting " + markupCIMDHTML + " to Backyard yourself just now.",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("consent page lacks %q\n%s", want, page)
+		}
+	}
+	for _, unwanted := range []string{markupCIMD, "<strong>Claude</strong>", "<!--"} {
+		if strings.Contains(page, unwanted) {
+			t.Errorf("consent page contains %q\n%s", unwanted, page)
+		}
 	}
 	// There is no document, so no registered list: any loopback URI.
 	for _, uri := range []string{"http://localhost/callback", "http://localhost:27890/callback", "http://[::1]:5/cb?x=1", "http://127.0.0.1:9"} {
@@ -835,6 +925,60 @@ func TestMCPUnlistedCIMDNotLocal(t *testing.T) {
 	if e.grantCount() != 0 || fc.n.Load() != 0 {
 		t.Errorf("grants %d, fetches %d", e.grantCount(), fc.n.Load())
 	}
+	// The address in the message is escaped.
+	res = e.authorize(newBrowser(), authzParams(markupCIMD, claudeCB, ch, "s"))
+	b := body(t, res)
+	if res.StatusCode != http.StatusBadRequest || !strings.Contains(b, "<h1>App not allowed</h1>") ||
+		!strings.Contains(b, "<p>The app "+markupCIMDHTML+" may connect to this Backyard only from this computer (a sign-in that returns to localhost).</p>") {
+		t.Errorf("markup in the client_id: %d\n%s", res.StatusCode, b)
+	}
+	for _, unwanted := range []string{markupCIMD, "<strong>Claude</strong>", "<!--"} {
+		if strings.Contains(b, unwanted) {
+			t.Errorf("App not allowed page contains %q\n%s", unwanted, b)
+		}
+	}
+}
+
+// TestMCPUnlistedCIMDFullName: an unlisted app's name is its client_id
+// exactly as sent, never cut to 64 code points like a registered or
+// document name: on the consent page, in the grant and in the audit (SPEC
+// §8.4.3).
+func TestMCPUnlistedCIMDFullName(t *testing.T) {
+	if len(hermesCIMD) <= maxClientNameRunes {
+		t.Fatalf("%q is not longer than %d characters", hermesCIMD, maxClientNameRunes)
+	}
+	fc := &fetchCounter{}
+	e := unlistedEnv(t, fc, nil)
+	ctx := context.Background()
+	const cb = "http://127.0.0.1:27890/callback"
+	_, ch := pkce()
+	_, page := consentFields(t, e.authorize(newBrowser(), authzParams(hermesCIMD, cb, ch, "s")))
+	for _, want := range []string{
+		`<p id="consent-app"><strong>` + hermesCIMD + `</strong> (address provided by the app, not verified) wants to use Backyard as you.</p>`,
+		"Only allow this if you started connecting " + hermesCIMD + " to Backyard yourself just now.",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("consent page lacks %q\n%s", want, page)
+		}
+	}
+	at, _ := e.tokens(newBrowser(), newFlow(hermesCIMD, cb))
+	u, g, err := e.m.VerifyAccessToken(ctx, at)
+	if err != nil || g.ClientName != hermesCIMD || g.ClientKind != clientKindUnlisted {
+		t.Fatalf("VerifyAccessToken = %+v %v", g, err)
+	}
+	gs, err := e.m.Grants(ctx, u.ID)
+	if err != nil || len(gs) != 1 || gs[0].ClientName != hermesCIMD {
+		t.Fatalf("Grants = %+v %v", gs, err)
+	}
+	q := docstore.Query{Limit: 100}
+	_ = q.Normalize(100)
+	audit, _ := e.docs.Query(ctx, docstore.SystemSite, auditCollection, q)
+	if len(audit.Docs) != 1 || audit.Docs[0].Data["client_name"] != hermesCIMD {
+		t.Errorf("audit = %+v", audit.Docs)
+	}
+	if n := fc.n.Load(); n != 0 {
+		t.Errorf("fetches = %d", n)
+	}
 }
 
 // TestMCPUnlistedCIMDInvalidURL: an https client_id that is neither
@@ -855,6 +999,7 @@ func TestMCPUnlistedCIMDInvalidURL(t *testing.T) {
 		"https:///client.json", long + "a",
 		// The strict form of an address shown as the app's name.
 		"https://opencode.ai:443/client.json", "https://opencode.ai./client.json", "https://open_code.ai/client.json",
+		"https://open..code.ai/client.json", "https://.opencode.ai/client.json",
 		"https://1.2.3.999/client.json", "https://op\u202eencode.ai/client.json", "https://opencode.ai/\u202eclient.json",
 		"https://opencode.ai/a\u00a0b", "https://opencode.ai/a\u0085b", "https://exämple.com/client.json",
 		"https://opencode.ai/a%2Fb", "https://opencode.ai/a%2fb", "https://opencode.ai/a%2", "https://opencode.ai/a%",
@@ -871,8 +1016,11 @@ func TestMCPUnlistedCIMDInvalidURL(t *testing.T) {
 		r := oauthPost(OAuthTokenPath, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"byrt_x"}, "client_id": {id}})
 		oauthErr(t, e.do(r), http.StatusUnauthorized, "invalid_client")
 	}
-	// 512 bytes is a client metadata URL; escapes stay as sent.
-	consentFields(t, e.authorize(newBrowser(), authzParams(long, "http://localhost/callback", ch, "s")))
+	// 512 bytes is a client metadata URL, shown whole; escapes stay as sent.
+	if _, page := consentFields(t, e.authorize(newBrowser(), authzParams(long, "http://localhost/callback", ch, "s"))); !strings.Contains(page,
+		"<strong>"+long+"</strong> (address provided by the app, not verified)") {
+		t.Errorf("the 512-byte address is not shown whole:\n%s", page)
+	}
 	for _, id := range []string{"https://example.com/%E2%80%AEclient.json", "https://Example.COM/a@b/~c!$&'()*+,;=:x.json",
 		"https://my-app.example.co.uk/oauth/client", "https://x/y", "https://1a.example/2", "https://foo.0xg/a", "https://0x1f.example/a"} {
 		if !unlistedClientURL(id) {
@@ -889,11 +1037,17 @@ func TestMCPUnlistedCIMDInvalidURL(t *testing.T) {
 
 // TestMCPDelistedCIMD: once its URL leaves mcp.clients, a metadata document
 // client is an unlisted one: it keeps only the connections that return to
-// this computer, and is no longer fetched.
+// this computer, and is no longer fetched. A listed URL outside the strict
+// form of an unlisted one (here: with a port) is then no client at all:
+// every connection ends, loopback ones included.
 func TestMCPDelistedCIMD(t *testing.T) {
 	s := newCIMDServer(t)
-	const id = "https://example.com/client" // served by s (namedClient)
-	e := newMCPEnv(t, ModeNone, func(c *config.Config) { c.MCP.Clients = []string{id} },
+	const id = "https://example.com/client"          // served by s (namedClient)
+	const portID = "https://example.com:8443/client" // a valid mcp.clients entry, not of the strict form
+	if !config.ValidMCPClientURL(portID) || unlistedClientURL(portID) {
+		t.Fatalf("%s: ValidMCPClientURL %v, unlistedClientURL %v", portID, config.ValidMCPClientURL(portID), unlistedClientURL(portID))
+	}
+	e := newMCPEnv(t, ModeNone, func(c *config.Config) { c.MCP.Clients = []string{id, portID} },
 		func(o *Options) { o.MCPHTTPClient = s.namedClient() })
 	hosted := newFlow(id, claudeCB)
 	_, hostedRT := e.tokens(newBrowser(), hosted)
@@ -901,7 +1055,9 @@ func TestMCPDelistedCIMD(t *testing.T) {
 	pendingCode := e.code(newBrowser(), pending)
 	local := newFlow(id, "http://localhost:4444/callback")
 	_, localRT := e.tokens(newBrowser(), local)
-	if s.count() != 1 {
+	portLocal := newFlow(portID, "http://localhost:4444/callback")
+	portAT, portRT := e.tokens(newBrowser(), portLocal)
+	if s.count() != 2 {
 		t.Fatalf("fetches = %d", s.count())
 	}
 
@@ -914,6 +1070,15 @@ func TestMCPDelistedCIMD(t *testing.T) {
 	if res := e2.refresh(local, localRT, nil); res.StatusCode != http.StatusOK {
 		t.Errorf("local refresh: %d %s", res.StatusCode, body(t, res))
 	}
+	if m := oauthErr(t, e2.refresh(portLocal, portRT, nil), http.StatusUnauthorized, "invalid_client"); m["error_description"] != "unknown client" {
+		t.Errorf("local refresh of %s: %v", portID, m)
+	}
+	oauthErr(t, e2.do(oauthPost(OAuthRevokePath, url.Values{"token": {portAT}, "client_id": {portID}})), http.StatusUnauthorized, "invalid_client")
+	_, pch := pkce()
+	if res := e2.authorize(newBrowser(), authzParams(portID, "http://localhost:4444/callback", pch, "s")); res.StatusCode != http.StatusBadRequest ||
+		!strings.Contains(body(t, res), "Unknown app") {
+		t.Errorf("authorize %s from this computer: %d", portID, res.StatusCode)
+	}
 	// Signing in again: not with Claude's callback; from this computer as
 	// an unlisted app, without a fetch.
 	_, ch := pkce()
@@ -925,7 +1090,7 @@ func TestMCPDelistedCIMD(t *testing.T) {
 	if !strings.Contains(page, "<strong>"+id+"</strong> (address provided by the app, not verified)") {
 		t.Errorf("consent page:\n%s", page)
 	}
-	if s.count() != 1 {
+	if s.count() != 2 {
 		t.Errorf("fetches = %d after delisting", s.count())
 	}
 }
