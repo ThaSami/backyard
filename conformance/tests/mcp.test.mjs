@@ -13,7 +13,9 @@
 // skipped there.
 //
 // Every flow registers its own client (stateless DCR) with the loopback
-// redirect URI http://127.0.0.1:9/callback and stops at the redirect to it.
+// redirect URI http://127.0.0.1:9/callback and stops at the redirect to it;
+// the unlisted metadata document flows name themselves by a client metadata
+// URL on an .example host instead, which Backyard never fetches.
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -447,7 +449,8 @@ function connectorSuite() {
         ["a tampered client_id", { ...good(), client_id: tamper(client.client_id) }, 400],
         ["no client_id", { ...good(), client_id: undefined }, 400],
         ["an unknown kind of client_id", { ...good(), client_id: "hello" }, 400],
-        ["a client metadata URL that is not allowlisted", { ...good(), client_id: "https://example.com/x" }, 400],
+        ["an https client_id that is no client metadata URL (the root path)", { ...good(), client_id: "https://example.com/" }, 400],
+        ["an unlisted client metadata URL with an https redirect URI", { ...good(), client_id: "https://example.com/x", redirect_uri: "https://claude.ai/api/mcp/auth_callback" }, 400],
         ["an unregistered redirect URI", { ...good(), redirect_uri: "http://127.0.0.1:9/other" }, 400],
         ["a foreign redirect URI", { ...good(), redirect_uri: "https://evil.example/cb" }, 400],
         ["another loopback host", { ...good(), redirect_uri: "http://localhost:9/callback" }, 400],
@@ -743,7 +746,10 @@ function connectorSuite() {
         ["a UTF-8 BOM before the form", { raw: "\ufeff" + new URLSearchParams(base).toString() }, 400, ["invalid_request"]],
         ["Basic naming another client", { form: base, headers: { Authorization: oauth.basicAuth(other.client_id) } }, 400, ["invalid_request"]],
         ["a tampered client_id", { form: { ...base, client_id: tamper(client.client_id) } }, 401, ["invalid_client"]],
-        ["a client metadata URL that is not allowlisted", { form: { ...base, client_id: "https://example.com/x" } }, 401, ["invalid_client"]],
+        ["an https client_id that is no client metadata URL (the root path)", { form: { ...base, client_id: "https://example.com/" } }, 401, ["invalid_client"]],
+        ["an https client_id that is no client metadata URL (a query)", { form: { ...base, client_id: "https://example.com/x?y=1" } }, 401, ["invalid_client"]],
+        // A valid client metadata URL is a client (unlisted, SPEC §8.4.3), but not this code's.
+        ["an unlisted client metadata URL", { form: { ...base, client_id: "https://example.com/x" } }, 400, ["invalid_grant"]],
         ["no client_id", { form: { ...base, client_id: undefined } }, null, ["invalid_request", "invalid_client"]],
         ["another client's code", { form: { ...base, client_id: other.client_id } }, 400, ["invalid_grant"]],
         ["no code_verifier", { form: { ...base, code_verifier: undefined } }, 400, ["invalid_request", "invalid_grant"]],
@@ -826,6 +832,175 @@ function connectorSuite() {
       const narrowed = oauth.assertTokens(await oauth.refresh(P, { clientId: wide.client.client_id, refreshToken: wide.refresh_token, scope: "mcp" }), { what: "a narrower scope" });
       assert.equal(narrowed.scope, "mcp");
       assert.ok(ok.refresh_token);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+
+  describe("unlisted client metadata documents (SPEC §8.4.3, §8.4.4)", () => {
+    // A valid client metadata URL outside the (default) allowlist, as local
+    // apps such as opencode send their own: never fetched — the .example
+    // host does not even resolve, so a fetch would end in "Could not verify
+    // the app" — and admitted with a loopback redirect URI only.
+    const unlisted = () => `https://opencode.example/oauth/conformance-${tag()}/client.json`;
+    const clientsKey = cloudflare ? "MCP_CLIENTS" : "mcp.clients";
+    const redirectsKey = cloudflare ? "MCP_REDIRECT_URIS" : "mcp.redirect_uris";
+    const authorizeAs = (id, redirectURI) => oauth.authorizeParams({ client: id, redirectURI, challenge: oauth.pkce().challenge, state: oauth.newState(), resource: R });
+
+    /** Asserts the "App not allowed" page of SPEC §8.4.5 step 3 for id. */
+    function assertNotLocal(r, id, what) {
+      assertPage(r, 400, what);
+      assert.match(r.text, /App not allowed/, `${what}: the page title`);
+      assert.doesNotMatch(r.text, /Unknown app/, `${what}: not "Unknown app"`);
+      assert.ok(r.text.includes(id), `${what}: the page names the app ${id}`);
+      assert.match(r.text, /this computer/i, `${what}: only from this computer`);
+      for (const key of [clientsKey, redirectsKey]) assert.ok(r.text.includes(key), `${what}: the page names ${key}`);
+    }
+
+    test("with any redirect URI but a loopback one: 400 App not allowed, before any sign-in", async () => {
+      const id = unlisted();
+      const browser = new oauth.Browser();
+      for (const [what, redirectURI] of [
+        ["Claude's callback (a default of mcp.redirect_uris)", "https://claude.ai/api/mcp/auth_callback"],
+        ["ChatGPT's callback (a default of mcp.redirect_uris)", "https://chatgpt.com/connector_platform_oauth_redirect"],
+        ["a foreign https address", "https://opencode.example/callback"],
+        ["https on a loopback host", "https://127.0.0.1:9/callback"],
+        ["http on another host", "http://opencode.example/callback"],
+        ["another loopback address than the three loopback hosts", "http://127.0.0.2:9/callback"],
+        ["no redirect_uri", undefined],
+      ]) {
+        const r = await browser.request(oauth.authorizeURL(P, authorizeAs(id, redirectURI)), { headers: oauth.CROSS_SITE_NAVIGATION });
+        assertNotLocal(r, id, what);
+      }
+    });
+
+    test("an https client_id that is no valid client metadata URL: 400 Unknown app", async () => {
+      const browser = new oauth.Browser();
+      const cases = [
+        ["the root path", "https://example.com/"],
+        ["no path", "https://example.com"],
+        ["a query", "https://example.com/client.json?v=1"],
+        ["a fragment", "https://example.com/client.json#x"],
+        ["userinfo", "https://user@example.com/client.json"],
+        ["an IP literal host", "https://203.0.113.7/client.json"],
+        ["an IPv6 literal host", "https://[2001:db8::1]/client.json"],
+        ["a dot segment", "https://example.com/a/../client.json"],
+        ["over 512 bytes", `https://example.com/${"a".repeat(500)}`],
+        // The strict form of an unlisted client_id (shown as the app's name).
+        ["a port", "https://example.com:8443/client.json"],
+        ["a raw bidi control (U+202E)", "https://example.com/\u202eclient.json"],
+        ["a raw non-ASCII letter", "https://example.com/cli\u00e9nt.json"],
+        ["a raw no-break space", "https://example.com/a\u00a0client.json"],
+        ["an IPv4 address with a leading zero", "https://01.2.3.4/client.json"],
+        ["a % that starts no escape", "https://example.com/%zzclient.json"],
+        ["an encoded slash", "https://example.com/a%2F..%2Fclient.json"],
+        ["an underscore in the host", "https://my_app.example.com/client.json"],
+        ["a < in the host", "https://a<b.example.com/client.json"],
+        ["an escape in the host", "https://ex%41mple.com/client.json"],
+        ["a punycode label", "https://xn--bcher-kva.example/client.json"],
+        ["a numeric last label", "https://example.123/client.json"],
+        ["a hexadecimal last label", "https://example.0x1f/client.json"],
+      ];
+      for (const [what, id] of cases) {
+        const r = await browser.request(oauth.authorizeURL(P, authorizeAs(id, LOOPBACK)), { headers: oauth.CROSS_SITE_NAVIGATION });
+        assertPage(r, 400, what);
+        assert.match(r.text, /Unknown app/, `${what}: "Unknown app": ${r}`);
+      }
+    });
+
+    test("the token and revocation endpoints know it as a client (nothing is fetched)", async () => {
+      const id = unlisted();
+      const garbage = "byrt_eyJnIjoiMDAiLCJuIjoxfQ.AAAA";
+      // Client authentication passes; the token names no grant of it.
+      const t1 = await oauth.refresh(P, { clientId: id, refreshToken: garbage });
+      oauth.assertOAuthError(t1, 400, "invalid_grant", "a refresh with an unknown token");
+      oauth.assertNoStore(t1, "a refresh with an unknown token");
+      const v1 = await oauth.revoke(P, { clientId: id, token: garbage });
+      assert.equal(v1.status, 200, `revoke: ${v1}`);
+      assert.equal(v1.body.length, 0, "revoke: an empty body");
+      for (const [what, bad] of [
+        ["the root path", "https://example.com/"],
+        ["a query", "https://example.com/client.json?v=1"],
+        ["an IP literal host", "https://203.0.113.7/client.json"],
+      ]) {
+        for (const [endpoint, r] of [
+          ["token", await oauth.refresh(P, { clientId: bad, refreshToken: garbage })],
+          ["revoke", await oauth.revoke(P, { clientId: bad, token: garbage })],
+        ]) {
+          oauth.assertOAuthError(r, 401, "invalid_client", `${endpoint}: ${what}`);
+          assert.equal(r.header("www-authenticate"), null, `${endpoint}: ${what}: no challenge without an Authorization header`);
+          assertMachine(r, `${endpoint}: ${what}`);
+        }
+      }
+    });
+
+    test("with a loopback redirect URI: consent, code, tokens, an MCP call, refresh and the grant", async (t) => {
+      if (signInSkip) return t.skip(signInSkip);
+      const id = unlisted();
+      const browser = person(0);
+      const redirectURI = "http://127.0.0.1:53682/callback";
+      const { verifier, challenge } = oauth.pkce();
+      const state = oauth.newState();
+      const params = oauth.authorizeParams({ client: id, redirectURI, challenge, state, resource: R });
+      const { page, form } = await oauth.openConsent(browser, P, params);
+      assert.equal(page.status, 200, `the consent page, without fetching ${id}: ${page}`);
+      assert.ok(page.text.includes(id), "the page names the app by the address it sent");
+      assert.match(page.text, /not verified/i, "marked as not verified");
+      assert.doesNotMatch(page.text, /verified by/i, "no verified host");
+      assert.match(page.text, /this computer/i, "the loopback warning");
+      assert.ok(page.text.includes("http://127.0.0.1:53682"), "the redirect origin");
+      assert.equal(form.client_id, id);
+      assert.equal(form.redirect_uri, redirectURI);
+      // The consent POST checks the client again: an https redirect URI is refused.
+      assertNotLocal(await oauth.submitConsent(browser, P, { ...form, redirect_uri: "https://claude.ai/api/mcp/auth_callback" }), id, "the POST with an https redirect URI");
+
+      const r = await oauth.submitConsent(browser, P, form);
+      assert.equal(r.status, 303, `Allow: ${r}`);
+      const q = oauth.redirectParams(r.header("location"), redirectURI, "Allow");
+      assert.match(q.code ?? "", /^byac_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/, `code: ${r.header("location")}`);
+      assert.equal(q.state, state);
+      assert.equal(q.iss, P);
+      const other = unlisted();
+      const stolen = await oauth.exchangeCode(P, { clientId: other, code: q.code, verifier, redirectURI });
+      oauth.assertOAuthError(stolen, 400, "invalid_grant", "the code with another unlisted client_id");
+      const tok = oauth.assertTokens(await oauth.exchangeCode(P, { clientId: id, code: q.code, verifier, redirectURI }), {
+        scope: "mcp offline_access",
+        what: "the code exchange (client_id = the URL, no secret)",
+      });
+
+      const who = await new MCPClient({ endpoint: R, token: tok.access_token }).callJSON("backyard_whoami", {});
+      assert.equal(who.connection.client, id, "the connection is named by the address");
+      oauth.assertOAuthError(await oauth.refresh(P, { clientId: other, refreshToken: tok.refresh_token }), 400, "invalid_grant", "a refresh as another client");
+      const t2 = oauth.assertTokens(await oauth.refresh(P, { clientId: id, refreshToken: tok.refresh_token }), { scope: "mcp offline_access", what: "refresh" });
+      assert.notEqual(t2.refresh_token, tok.refresh_token, "a new refresh token");
+      const mcp = new MCPClient({ endpoint: R, token: t2.access_token });
+      assert.deepEqual(await mcp.rpc("ping"), {}, "the refreshed access token works");
+
+      const list = await browser.request(`${P}/__backyard/api/mcp/grants`);
+      assert.equal(list.status, 200, `GET grants: ${list}`);
+      const g = list.json.grants.find((x) => x.client_name === id);
+      assert.ok(g, `the connection is listed under its address: ${JSON.stringify(list.json.grants).slice(0, 400)}`);
+      assert.equal(g.client_kind, "unlisted_metadata_document");
+      assert.equal(g.client_host, "", "no verified host");
+      assert.ok(["127.0.0.1", "127.0.0.1:53682"].includes(g.redirect_host), `redirect_host ${g.redirect_host}`);
+      assert.equal(g.scope, "mcp offline_access");
+
+      const v = await oauth.revoke(P, { clientId: id, token: t2.refresh_token });
+      assert.equal(v.status, 200, `revoke: ${v}`);
+      assertInvalidToken(await mcp.post(mcp.request("ping")), "token revoked", "the access token after RFC 7009 revocation");
+    });
+
+    test("any loopback redirect URI is its own: every loopback host, port, path and query", async (t) => {
+      if (signInSkip) return t.skip(signInSkip);
+      const id = unlisted();
+      const browser = person(0);
+      for (const redirectURI of ["http://localhost:41000/callback", "http://127.0.0.1/cb?x=1", "http://[::1]:41001/oauth/callback", "http://localhost/"]) {
+        const { page, form, stoppedAt } = await oauth.openConsent(browser, P, authorizeAs(id, redirectURI));
+        assert.equal(page.status, 200, `${redirectURI}: the consent page: ${page}`);
+        assert.equal(stoppedAt, null, `${redirectURI}: never approved without the page`);
+        assert.equal(form.redirect_uri, redirectURI);
+        assert.equal(form.client_id, id);
+      }
     });
   });
 

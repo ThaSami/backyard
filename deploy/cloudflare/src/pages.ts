@@ -225,9 +225,12 @@ export interface ConsentForm {
   guest: boolean;
   /** "Not you? Sign out" target ("" where there is no logout). */
   signOutURL: string;
+  /** The display name (SPEC §8.4.3): unlisted metadata documents are named by their client_id. */
   clientName: string;
   /** A client metadata document vouches for the name (CIMD); else the app named itself. */
   verified: boolean;
+  /** An unlisted metadata document: the name is the address the app sent, not verified. */
+  unlisted: boolean;
   /** Host of the client metadata URL (verified clients). */
   clientHost: string;
   /** Origin the approval is sent to (the redirect URI's). */
@@ -265,7 +268,9 @@ export function consentPage(f: ConsentForm): Response {
   const signOut = f.signOutURL ? ` <a href="${e(f.signOutURL)}">Not you? Sign out</a>` : "";
   const app = f.verified
     ? `<strong>${e(f.clientName)}</strong> — verified by <strong>${e(f.clientHost)}</strong> wants to use Backyard as you.`
-    : `<strong>"${e(f.clientName)}"</strong> (name provided by the app, not verified) wants to use Backyard as you.`;
+    : f.unlisted
+      ? `<strong>${e(f.clientName)}</strong> (address provided by the app, not verified) wants to use Backyard as you.`
+      : `<strong>"${e(f.clientName)}"</strong> (name provided by the app, not verified) wants to use Backyard as you.`;
   const back = f.loopback
     ? `Backyard will send the approval to <strong>an app on this computer (${e(f.origin)})</strong>. Only continue if you just started the sign-in from an app on this computer.`
     : `Backyard will send the approval to <strong>${e(f.origin)}</strong>.`;

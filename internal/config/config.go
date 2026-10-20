@@ -476,9 +476,11 @@ type MCPConfig struct {
 	// Enabled serves the connector endpoint and Backyard's OAuth endpoints
 	// (default false: every connector path answers 404).
 	Enabled bool `yaml:"enabled"`
-	// Clients are the Client ID Metadata Document URLs that may connect
-	// (only these are fetched). Unset: DefaultMCPClients; [] turns CIMD off,
-	// so clients register automatically (stateless DCR).
+	// Clients are the Client ID Metadata Document URLs that are fetched and
+	// shown as verified, and that may connect from anywhere. Unset:
+	// DefaultMCPClients; [] stops advertising CIMD, so clients register
+	// automatically (stateless DCR). Another valid client metadata URL is
+	// accepted, never fetched, only with an http loopback redirect address.
 	Clients []string `yaml:"clients"`
 	// RedirectURIs are the exact https addresses that may receive sign-in
 	// codes (unset: DefaultMCPRedirectURIs). http loopback addresses are
@@ -1278,7 +1280,7 @@ func (c *Config) validateMCP() []error {
 	add := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
 	m := c.MCP
 	for _, e := range m.Clients {
-		if !validMCPClientURL(e) {
+		if !ValidMCPClientURL(e) {
 			add("mcp.clients: %q is not a client metadata URL (an https URL with a path, without query, fragment or user info, at most 512 bytes)", e)
 		}
 	}
@@ -1322,10 +1324,13 @@ func (c *Config) validateMCP() []error {
 // maxMCPURLBytes bounds the entries of mcp.clients and mcp.redirect_uris.
 const maxMCPURLBytes = 512
 
-// validMCPClientURL reports whether e may be listed in mcp.clients: an https
-// URL whose host is a name (not an IP literal), with a path other than "/"
-// and without dot segments, query, fragment or user info.
-func validMCPClientURL(e string) bool {
+// ValidMCPClientURL reports whether e is a client metadata URL (rule 1 of
+// SPEC §12): an https URL of at most 512 bytes whose host is a name (not an
+// IP literal), with a path other than "/" and without dot segments, query,
+// fragment or user info. It decides what mcp.clients may list; an https
+// client_id outside the list must pass it too (the connector adds a stricter
+// form, SPEC §8.4.3).
+func ValidMCPClientURL(e string) bool {
 	if e == "" || len(e) > maxMCPURLBytes || strings.ContainsAny(e, "?#\\ ") {
 		return false
 	}

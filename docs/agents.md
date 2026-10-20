@@ -14,7 +14,7 @@ channel below, so they never drift apart.
 | Claude Code plugin | Claude Code | `/plugin marketplace add thasami/backyard`, `/plugin install backyard@backyard` |
 | Claude skill | Claude Code, Claude apps | `backyard skill install`, or added to every project by `backyard init` |
 | MCP server | any MCP client (Claude Code, Claude Desktop, Cursor, VS Code, Codex…) | `backyard mcp` |
-| Claude connector | Claude on the web, Desktop, mobile and Cowork, Claude Code — no CLI needed | `https://<hub>/__backyard/mcp`, once an admin turns it on |
+| Claude connector | Claude on the web, Desktop, mobile and Cowork, Claude Code, ChatGPT and other MCP apps (opencode, Codex CLI…) — no CLI needed | `https://<hub>/__backyard/mcp`, once an admin turns it on |
 | Project instructions | Claude, Codex and other `AGENTS.md` readers, Cursor, Copilot | `backyard init --agents …` |
 | `/llms.txt`, `/llms-full.txt`, `/docs` | any LLM or person with a browser | served by every hub |
 
@@ -109,11 +109,13 @@ the project and away from credentials:
 
 ## Claude connector (remote MCP)
 
-The hub itself can be an MCP server for Claude: an admin turns the connector on (`mcp.enabled`,
-or `MCP_ENABLED` on the Cloudflare edition), adds `https://<hub>/__backyard/mcp` as a custom
-connector in Claude, and everyone connects with the company sign-in. Claude then publishes and
-edits sites as the signed-in person, without the CLI. Setup, the sign-in and consent flow,
-proxies, limits and disconnecting: [Claude connector](claude-connector.md).
+The hub itself can be an MCP server for Claude, ChatGPT and other MCP apps: an admin turns the
+connector on (`mcp.enabled`, or `MCP_ENABLED` on the Cloudflare edition), people add
+`https://<hub>/__backyard/mcp` as a custom connector in Claude or ChatGPT, or as a remote MCP
+server in an app on their computer (opencode, Codex CLI, Hermes Agent, Gemini CLI…), and
+everyone connects with the company sign-in. The app then publishes and edits sites as the
+signed-in person, without the CLI. Setup, the sign-in and consent flow, proxies, limits and
+disconnecting: [Claude connector](claude-connector.md).
 
 | Tool | Input | Does |
 |---|---|---|

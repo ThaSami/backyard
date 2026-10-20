@@ -15,13 +15,15 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/thasami/backyard/internal/config"
 	"github.com/thasami/backyard/internal/keys"
 )
 
-// Client identification (SPEC §8.4): a client_id is either an allowlisted
-// Client ID Metadata Document URL (CIMD) or a stateless, HMAC-signed id from
-// dynamic registration (DCR). Codes only ever go to an exact entry of
-// mcp.redirect_uris or to an http loopback URI.
+// Client identification (SPEC §8.4): a client_id is an allowlisted Client ID
+// Metadata Document URL (CIMD), another valid client metadata URL (an
+// unlisted metadata document: never fetched, loopback redirects only), or a
+// stateless, HMAC-signed id from dynamic registration (DCR). Codes only ever
+// go to an exact entry of mcp.redirect_uris or to an http loopback URI.
 
 // CIMD fetch limits.
 const (
@@ -38,10 +40,10 @@ var errCIMDRedirect = errors.New("redirects are not followed")
 // mcpClient is a resolved client_id.
 type mcpClient struct {
 	id        string
-	kind      string // clientKindCIMD | clientKindDCR
-	name      string // sanitized display name
-	host      string // CIMD: the client_id URL's host; DCR: ""
-	redirects []string
+	kind      string   // clientKindCIMD | clientKindUnlisted | clientKindDCR
+	name      string   // sanitized display name; unlisted: the client_id
+	host      string   // CIMD: the client_id URL's host; else ""
+	redirects []string // unlisted: none (any loopback URI, clientRedirect)
 }
 
 // clientError is a client_id that cannot be used; page names the error page
@@ -60,22 +62,47 @@ func errUnknownApp() *clientError {
 		msg: "This sign-in link names an app that Backyard does not know. Go back to the app and connect again."}
 }
 
+// errAppNotLocal refuses an unlisted metadata document whose redirect URI
+// is not a loopback URI (SPEC §8.4.4).
+func errAppNotLocal(id string) *clientError {
+	return &clientError{status: http.StatusBadRequest, title: "App not allowed",
+		msg: "The app " + id + " may connect to this Backyard only from this computer (a sign-in that returns to localhost).",
+		detail: "An administrator can allow it from anywhere by adding its client metadata URL to mcp.clients " +
+			"and its redirect address to mcp.redirect_uris."}
+}
+
+// The details of "Could not verify the app": the document could not be
+// loaded, or it was loaded and breaks the rules of SPEC §8.4.3.
+const (
+	cimdFetchDetail = "Backyard needs outbound HTTPS to that address. Without it, an administrator can set mcp.clients: [] " +
+		"and the app can be added with \"Register automatically\" instead."
+	cimdRulesDetail = "The app's client metadata document does not meet Backyard's rules. If the reason is its redirect_uris, " +
+		"an administrator can add the app's redirect address to mcp.redirect_uris; otherwise the app can be added with " +
+		"\"Register automatically\" once its URL is removed from mcp.clients."
+)
+
 // resolveClient resolves a client_id for the authorize endpoint (it may
-// fetch a client metadata document).
+// fetch an allowlisted client metadata document).
 func (m *MCP) resolveClient(ctx context.Context, id string) (*mcpClient, *clientError) {
 	switch {
 	case strings.HasPrefix(id, "https://"):
 		if !m.clientSet[id] {
-			return nil, &clientError{status: http.StatusBadRequest, title: "App not allowed",
-				msg:    "The app " + id + " is not allowed to connect to this Backyard.",
-				detail: "An administrator can allow it by adding its client metadata URL to mcp.clients."}
+			if !unlistedClientURL(id) {
+				return nil, errUnknownApp()
+			}
+			// Never fetched: its name is its address, and parseAuthorize
+			// admits it with a loopback redirect URI only.
+			return &mcpClient{id: id, kind: clientKindUnlisted, name: id}, nil
 		}
 		doc, err := m.cimdDocument(ctx, id)
 		if err != nil {
+			detail := cimdFetchDetail
+			if errors.As(err, new(*cimdRulesError)) {
+				detail = cimdRulesDetail
+			}
 			return nil, &clientError{status: http.StatusBadGateway, title: "Could not verify the app",
-				msg: "Backyard could not load the app's client metadata document " + id + ": " + err.Error() + ".",
-				detail: "Backyard needs outbound HTTPS to that address. Without it, an administrator can set mcp.clients: [] " +
-					"and the app can be added with \"Register automatically\" instead."}
+				msg:    "Backyard could not load the app's client metadata document " + id + ": " + err.Error() + ".",
+				detail: detail}
 		}
 		return doc, nil
 	case strings.HasPrefix(id, prefixDCRClient):
@@ -88,20 +115,75 @@ func (m *MCP) resolveClient(ctx context.Context, id string) (*mcpClient, *client
 	return nil, errUnknownApp()
 }
 
-// knownClient reports whether id is an allowlisted CIMD URL or a DCR id with
-// a valid MAC (token and revocation endpoints; never fetches).
+// knownClient reports whether id is an allowlisted CIMD URL, another valid
+// client metadata URL (unlisted) or a DCR id with a valid MAC (token and
+// revocation endpoints; never fetches).
 func (m *MCP) knownClient(id string) bool {
 	if strings.HasPrefix(id, "https://") {
-		return m.clientSet[id]
+		return m.clientSet[id] || unlistedClientURL(id)
 	}
 	_, ok := m.verifyDCRClient(id)
 	return ok
 }
 
-// clientHost is the host shown for a client_id: the URL host of a CIMD
-// client, "" for a registered one.
-func clientHost(id string) string {
-	if !strings.HasPrefix(id, "https://") {
+// unlistedClientURL reports whether id may name an unlisted metadata
+// document (SPEC §8.4.3): a client metadata URL (rule 1 of SPEC §12) of a
+// strict form, as people are shown it as the app's name. After "https://"
+// comes a host of ASCII letters, digits and "-" in labels separated by
+// single dots (none starting with "xn--", the last neither all digits nor
+// "0x" and hex digits, which URL parsers read as an IPv4 address) without
+// a port, then a path of printable ASCII without "\" in which every "%"
+// starts a two-hex-digit escape other than %2F: no white space, control,
+// bidi or other non-ASCII character, and both editions read it alike.
+func unlistedClientURL(id string) bool {
+	rest, ok := strings.CutPrefix(id, "https://")
+	if !ok || !config.ValidMCPClientURL(id) {
+		return false
+	}
+	host, path, ok := strings.Cut(rest, "/")
+	if !ok {
+		return false
+	}
+	const labelChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+	labels := strings.Split(host, ".")
+	for _, l := range labels {
+		if l == "" || strings.Trim(l, labelChars) != "" || strings.HasPrefix(strings.ToLower(l), "xn--") {
+			return false
+		}
+	}
+	last := labels[len(labels)-1]
+	if strings.Trim(last, "0123456789") == "" ||
+		len(last) >= 2 && strings.EqualFold(last[:2], "0x") && strings.Trim(last[2:], "0123456789abcdefABCDEF") == "" {
+		return false
+	}
+	for i := 0; i < len(path); i++ {
+		switch c := path[i]; {
+		case c < '!' || c > '~' || c == '\\':
+			return false
+		case c == '%':
+			if i+2 >= len(path) || !isHex(path[i+1]) || !isHex(path[i+2]) || path[i+1] == '2' && (path[i+2] == 'f' || path[i+2] == 'F') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isHex reports whether c is an ASCII hex digit.
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+// notAllowlisted reports whether id is an https client_id outside the
+// allowlist: one whose redirect URI must be a loopback URI.
+func (m *MCP) notAllowlisted(id string) bool {
+	return strings.HasPrefix(id, "https://") && !m.clientSet[id]
+}
+
+// clientHost is the host shown for a client: the URL host of an
+// allowlisted metadata document (verified), "" for any other kind.
+func clientHost(kind, id string) string {
+	if kind != clientKindCIMD || !strings.HasPrefix(id, "https://") {
 		return ""
 	}
 	u, err := url.Parse(id)
@@ -332,10 +414,15 @@ func redirectMatches(registered, requested string) bool {
 }
 
 // clientRedirect returns the requested redirect_uri when it matches one of
-// the client's registered URIs and passes the current redirect policy.
+// the client's registered URIs and passes the current redirect policy. An
+// unlisted metadata document has none: any loopback URI is its own.
 func (m *MCP) clientRedirect(c *mcpClient, requested string) bool {
 	if requested == "" || !m.redirectAllowed(requested) {
 		return false
+	}
+	if c.kind == clientKindUnlisted {
+		_, ok := parseLoopbackURI(requested)
+		return ok
 	}
 	for _, reg := range c.redirects {
 		if redirectMatches(reg, requested) {
@@ -343,6 +430,21 @@ func (m *MCP) clientRedirect(c *mcpClient, requested string) bool {
 		}
 	}
 	return false
+}
+
+// grantRedirectAllowed applies the redirect policy to a grant at the token
+// endpoint: its redirect URI must still be allowed, and be a loopback URI
+// when its client_id is a metadata document URL outside the allowlist
+// (unlisted, or removed from mcp.clients since).
+func (m *MCP) grantRedirectAllowed(g *grantRecord) bool {
+	if !m.redirectAllowed(g.RedirectURI) {
+		return false
+	}
+	if m.notAllowlisted(g.ClientID) {
+		_, ok := parseLoopbackURI(g.RedirectURI)
+		return ok
+	}
+	return true
 }
 
 // canonicalResource canonicalizes a resource parameter (SPEC §8.4.1): an absolute
@@ -499,22 +601,32 @@ func (m *MCP) fetchCIMD(ctx context.Context, id string) (*mcpClient, time.Durati
 	return c, cimdCacheTTL(resp.Header.Values("Cache-Control")), nil
 }
 
-// parseCIMD validates a client metadata document (SPEC §8.4.3).
+// cimdRulesError is a client metadata document that was loaded but breaks
+// the rules of SPEC §8.4.3 (any other error of fetchCIMD is its fetch).
+type cimdRulesError struct{ reason string }
+
+func (e *cimdRulesError) Error() string { return e.reason }
+
+// errCIMDRules returns a cimdRulesError.
+func errCIMDRules(reason string) error { return &cimdRulesError{reason} }
+
+// parseCIMD validates a client metadata document (SPEC §8.4.3). Its errors
+// are cimdRulesErrors.
 func (m *MCP) parseCIMD(id string, body []byte) (*mcpClient, error) {
 	if !utf8.Valid(body) {
-		return nil, errors.New("it is not UTF-8 JSON")
+		return nil, errCIMDRules("it is not UTF-8 JSON")
 	}
 	var doc map[string]json.RawMessage
 	if err := decodeOne(body, &doc); err != nil || doc == nil {
-		return nil, errors.New("it is not a JSON object")
+		return nil, errCIMDRules("it is not a JSON object")
 	}
 	var cid string
 	if json.Unmarshal(doc["client_id"], &cid) != nil || cid != id {
-		return nil, errors.New("its client_id is not its own URL")
+		return nil, errCIMDRules("its client_id is not its own URL")
 	}
-	var uris []string
-	if raw, ok := doc["redirect_uris"]; !ok || json.Unmarshal(raw, &uris) != nil || len(uris) == 0 || len(uris) > 10 {
-		return nil, errors.New("redirect_uris must be an array of 1 to 10 URIs")
+	uris, ok := stringArray(doc["redirect_uris"])
+	if !ok || len(uris) == 0 || len(uris) > 10 {
+		return nil, errCIMDRules("redirect_uris must be an array of 1 to 10 URIs")
 	}
 	var allowed []string
 	for _, u := range uris {
@@ -523,22 +635,22 @@ func (m *MCP) parseCIMD(id string, body []byte) (*mcpClient, error) {
 		}
 	}
 	if len(allowed) == 0 {
-		return nil, errors.New("none of its redirect_uris is allowed on this server (mcp.redirect_uris and http loopback URIs)")
+		return nil, errCIMDRules("none of its redirect_uris is allowed on this server (mcp.redirect_uris and http loopback URIs)")
 	}
 	if err := cimdAuthMethodOK(doc); err != nil {
 		return nil, err
 	}
 	for _, k := range []string{"client_secret", "client_secret_expires_at"} {
 		if _, ok := doc[k]; ok {
-			return nil, errors.New("it contains a client secret")
+			return nil, errCIMDRules("it contains a client secret")
 		}
 	}
-	host := clientHost(id)
+	host := clientHost(clientKindCIMD, id)
 	name := host
 	if raw, ok := doc["client_name"]; ok && string(raw) != "null" {
 		var n string
 		if json.Unmarshal(raw, &n) != nil {
-			return nil, errors.New("client_name is not a string")
+			return nil, errCIMDRules("client_name is not a string")
 		}
 		if n = cleanClientName(n); n != "" {
 			name = n
@@ -555,11 +667,11 @@ func (m *MCP) parseCIMD(id string, body []byte) (*mcpClient, error) {
 // private_key_jwt and lists none). Without it, the singular member must be
 // absent or "none".
 func cimdAuthMethodOK(doc map[string]json.RawMessage) error {
-	refused := errors.New("it asks for client authentication (token_endpoint_auth_method), which Backyard does not support")
+	refused := errCIMDRules("it asks for client authentication (token_endpoint_auth_method), which Backyard does not support")
 	if raw, ok := doc["token_endpoint_auth_methods_supported"]; ok {
-		var methods []string
-		if json.Unmarshal(raw, &methods) != nil || methods == nil {
-			return errors.New("token_endpoint_auth_methods_supported is not an array of strings")
+		methods, ok := stringArray(raw)
+		if !ok {
+			return errCIMDRules("token_endpoint_auth_methods_supported is not an array of strings")
 		}
 		if !containsString(methods, "none") {
 			return refused
@@ -573,6 +685,24 @@ func cimdAuthMethodOK(doc map[string]json.RawMessage) error {
 		}
 	}
 	return nil
+}
+
+// stringArray decodes a JSON array of strings; null, another type or an
+// array with a member that is not a string (null included) is not one.
+func stringArray(raw json.RawMessage) ([]string, bool) {
+	var list []any
+	if json.Unmarshal(raw, &list) != nil || list == nil {
+		return nil, false
+	}
+	out := make([]string, len(list))
+	for i, v := range list {
+		s, ok := v.(string)
+		if !ok {
+			return nil, false
+		}
+		out[i] = s
+	}
+	return out, true
 }
 
 // cimdCacheTTL returns how long a document may be cached according to its

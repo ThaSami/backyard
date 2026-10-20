@@ -89,10 +89,12 @@
     // Claude connector (remote MCP, SPEC §8.4): "true" serves <hub>/__backyard/mcp and
     // Backyard's own OAuth endpoints (off when unset; with Access, run
     // `backyard cloudflare access enable` once first). MCP_CLIENTS: client metadata
-    // URLs that may connect (default Claude's two and ChatGPT's; set but empty: apps
-    // register themselves). MCP_REDIRECT_URIS: exact https callbacks (default Claude's
-    // two and ChatGPT's). Both are comma or whitespace separated; an invalid entry
-    // turns the connector off and is reported by /__backyard/readyz.
+    // URLs that are fetched, shown as verified and may connect from anywhere (default
+    // Claude's two and ChatGPT's; set but empty: apps register themselves; any other
+    // client metadata URL connects unverified, from this computer only).
+    // MCP_REDIRECT_URIS: exact https callbacks (default Claude's two and ChatGPT's).
+    // Both are comma or whitespace separated; an invalid entry turns the connector
+    // off and is reported by /__backyard/readyz.
     // "MCP_ENABLED": "true",
     // "MCP_CLIENTS": "https://claude.ai/oauth/mcp-oauth-client-metadata,https://claude.ai/oauth/claude-code-client-metadata,https://chatgpt.com/oauth/client.json",
     // "MCP_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback,https://chatgpt.com/connector_platform_oauth_redirect",

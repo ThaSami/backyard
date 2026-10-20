@@ -47,7 +47,9 @@ type accessPayload struct {
 var verifierRe = regexp.MustCompile(`^[A-Za-z0-9._~-]{43,128}$`)
 
 // errRedirectGone: the redirect policy (SPEC §8.4.4) applies at token time too, so
-// removing an address from mcp.redirect_uris ends its connections.
+// removing an address from mcp.redirect_uris ends its connections, and removing a
+// metadata URL from mcp.clients ends those of its connections that do not return
+// to a loopback address.
 const errRedirectGone = "the app's redirect address is no longer allowed on this server"
 
 // signToken returns prefix + keys.Sign(key, compact JSON of v).
@@ -253,7 +255,7 @@ func (m *MCP) exchangeCode(w http.ResponseWriter, r *http.Request, form url.Valu
 	if !chargeUser(w, g.User.ID, g.User.Anonymous) {
 		return
 	}
-	if !m.redirectAllowed(g.RedirectURI) {
+	if !m.grantRedirectAllowed(g) {
 		invalid(errRedirectGone)
 		return
 	}
@@ -324,7 +326,7 @@ func (m *MCP) refreshToken(w http.ResponseWriter, r *http.Request, form url.Valu
 	if !chargeUser(w, g.User.ID, g.User.Anonymous) {
 		return
 	}
-	if !m.redirectAllowed(g.RedirectURI) {
+	if !m.grantRedirectAllowed(g) {
 		invalid(errRedirectGone)
 		return
 	}

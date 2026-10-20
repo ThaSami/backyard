@@ -1,7 +1,7 @@
 /*
  * Backyard hub UI: site directory (with the previews sites ship), drag-and-drop
  * deploys, and the collapsible side cards: CLI and agent setup and the "Use
- * Backyard in Claude" card of the Claude connector.
+ * Backyard in Claude or ChatGPT" card of the Claude connector.
  * No frameworks, no dependencies. Works with the Go server and the Cloudflare
  * Worker edition (same /__backyard/api endpoints, SPEC §2, §7).
  *
@@ -1254,8 +1254,10 @@
   /**
    * How a connection (a Grant of GET /__backyard/api/mcp/grants) is shown:
    * { id, app, verified, trust ("verified by <host>" or "unverified"),
-   * returnsTo, created, expires }. Only a client identified by its metadata
-   * document (CIMD) is verified; a self-registered app names itself.
+   * returnsTo, created, expires }. Only a client identified by an allowlisted
+   * metadata document (CIMD) is verified; a self-registered app names itself,
+   * an unlisted one (unlisted_metadata_document) is named by its client_id URL,
+   * and any other kind counts as unverified (SPEC §8.4.7).
    */
   function grantSummary(g, opts) {
     const str = (v) => (typeof v === "string" ? v.trim() : "");
@@ -2152,7 +2154,7 @@
       input.focus();
       return;
     }
-    if (!confirm(`Disconnect every Claude connection of ${user}? Their apps lose access to Backyard at once.`)) return;
+    if (!confirm(`Disconnect every app connection of ${user}? Their apps lose access to Backyard at once.`)) return;
     submit.disabled = true;
     setStatus(status, "");
     try {

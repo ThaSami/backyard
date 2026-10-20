@@ -423,6 +423,46 @@ func TestExampleMCPSection(t *testing.T) {
 	}
 }
 
+// ValidMCPClientURL is rule 1 of SPEC §12: what mcp.clients may list, and
+// which unlisted https client_ids the connector accepts (SPEC §8.4.3).
+func TestValidMCPClientURL(t *testing.T) {
+	long := "https://apps.example.com/" + strings.Repeat("a", 512-len("https://apps.example.com/"))
+	for e, want := range map[string]bool{
+		"https://claude.ai/oauth/mcp-oauth-client-metadata":                           true,
+		"https://chatgpt.com/oauth/client.json":                                       true,
+		"https://opencode.ai/oauth/opencode/client.json":                              true,
+		"https://chatgpt.com/oauth/codex/client.json":                                 true,
+		"https://nousresearch.github.io/hermes-agent/docs/oauth/client-metadata.json": true,
+		"https://pi.dev/oauth/client.json":                                            true,
+		"https://apps.example.com:8443/client":                                        true,
+		"https://localhost/client":                                                    true,
+		long:                                                                          true,
+		long + "a":                                                                    false,
+		"":                                                                            false,
+		"http://claude.ai/x":                                                          false,
+		"https://claude.ai":                                                           false,
+		"https://claude.ai/":                                                          false,
+		"https://claude.ai/x?a=1":                                                     false,
+		"https://claude.ai/x?":                                                        false,
+		"https://claude.ai/x#f":                                                       false,
+		"https://u@claude.ai/x":                                                       false,
+		"https://203.0.113.5/x":                                                       false,
+		"https://[2001:db8::1]/x":                                                     false,
+		"https://claude.ai/a/../x":                                                    false,
+		"https://claude.ai/./x":                                                       false,
+		"https://claude.ai/a/%2e%2e/x":                                                false,
+		"https://claude.ai/a b":                                                       false,
+		"https://claude.ai/a\\b":                                                      false,
+		"https://claude.ai/a\x01b":                                                    false,
+		"https://claude.ai/%zz":                                                       false,
+		"https:///x":                                                                  false,
+	} {
+		if got := ValidMCPClientURL(e); got != want {
+			t.Errorf("ValidMCPClientURL(%q) = %v, want %v", e, got, want)
+		}
+	}
+}
+
 func TestLoopbackHost(t *testing.T) {
 	for h, want := range map[string]bool{
 		"localhost": true, "LOCALHOST": true, "hub.localhost": true, "127.0.0.1": true, "127.9.8.7": true,

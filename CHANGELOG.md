@@ -17,6 +17,29 @@ All notable changes to Backyard are documented here. The format follows
   [Adding it in ChatGPT](docs/claude-connector.md#adding-it-in-chatgpt).
 - The hub card is now **Use Backyard in Claude or ChatGPT**, with steps for ChatGPT and other
   MCP apps.
+- **MCP apps on your computer with their own client metadata document connect** (both
+  editions): opencode 2.x (`https://opencode.ai/oauth/opencode/client.json`), Codex CLI
+  (`https://chatgpt.com/oauth/codex/client.json`), Hermes Agent and pi in its document mode.
+  Before, they got `400` "App not allowed", because their document URL is not in `mcp.clients`
+  / `MCP_CLIENTS`. An `https://` client id outside the list is now accepted when, and only
+  when, the sign-in returns to a loopback address (`http://127.0.0.1:<port>/…`,
+  `http://localhost:<port>/…`): its document is never fetched, the consent page shows the URL
+  "(address provided by the app, not verified)", and the grants API and the audit events report
+  `client_kind` `unlisted_metadata_document` with an empty `client_host`.
+  This admits nothing that dynamic registration does not. With an https redirect address such
+  an app still gets "App not allowed" (the page now says it may connect only from the user's
+  computer, or once an admin lists it), and an `https://` client id that is not a valid client
+  metadata URL gets "Unknown app". The apps that register themselves (opencode 1.x, pi,
+  pi-mcp-adapter, DeepSeek-TUI/Codewhale, DeepChat, Gemini CLI) already connected; none of
+  them needs any setting. Guide: [Other MCP apps](docs/claude-connector.md#other-mcp-apps).
+
+### Changed
+
+- "Could not verify the app" (`502`) gives different advice for a client metadata document
+  that could not be fetched (outbound HTTPS, or `mcp.clients: []` and "Register automatically")
+  and for one that breaks Backyard's rules (add the app's callback to `mcp.redirect_uris` if the
+  reason is its `redirect_uris`, else remove its URL from `mcp.clients` and use "Register
+  automatically"). The Cloudflare edition names `MCP_CLIENTS` and `MCP_REDIRECT_URIS`.
 
 ### Fixed
 
@@ -24,15 +47,32 @@ All notable changes to Backyard are documented here. The format follows
   SEP-3149) is accepted whatever its singular `token_endpoint_auth_method` prefers. ChatGPT's
   prefers `private_key_jwt`, so even an allowlisted ChatGPT failed with "Could not verify the
   app" (`502`).
+- The Go server, like the Worker, refuses a client metadata document whose `redirect_uris` or
+  `token_endpoint_auth_methods_supported` has a member that is not a string; it read `null` as
+  an empty string, so `["none", null]` passed.
 
 ### Upgrade
 
-- Deployments that leave `mcp.clients` / `mcp.redirect_uris` (`MCP_CLIENTS` /
-  `MCP_REDIRECT_URIS`) unset now admit ChatGPT too; people still sign in and approve Backyard's
-  consent page for every connection. To keep Claude only, set both lists to Claude's entries
+- **ChatGPT is admitted whenever `mcp.redirect_uris` (`MCP_REDIRECT_URIS`) is left unset.**
+  With ChatGPT's document in `mcp.clients` (`MCP_CLIENTS`; the default) it is verified by
+  chatgpt.com; with `mcp.clients: []`, or a list without ChatGPT's document, it can still
+  register itself (shown as not verified). People still sign in and approve Backyard's consent
+  page for every connection. To keep Claude only, set `mcp.redirect_uris` to Claude's two
+  callbacks, and `mcp.clients` to Claude's two documents unless it is `[]`
   ([clients and redirect addresses](docs/claude-connector.md#clients-and-redirect-addresses)).
-  The Go server also fetches `https://chatgpt.com/oauth/client.json` (outbound HTTPS) when
-  someone connects ChatGPT.
+  While ChatGPT's callback or document is listed, `/__backyard/mcp` also accepts requests with
+  `Origin: https://chatgpt.com`. The Go server fetches `https://chatgpt.com/oauth/client.json`
+  (outbound HTTPS) when someone connects ChatGPT.
+- Deployments that set their own `mcp.redirect_uris` (`MCP_REDIRECT_URIS`) without ChatGPT's
+  callback and leave `mcp.clients` (`MCP_CLIENTS`) unset get "Could not verify the app" (`502`,
+  "none of its redirect_uris is allowed") for ChatGPT until they add
+  `https://chatgpt.com/connector_platform_oauth_redirect` to their list or leave ChatGPT's
+  document out of `mcp.clients`.
+- An `https://` client id outside `mcp.clients` no longer always gets "App not allowed": with a
+  loopback redirect address it connects, unverified and never fetched, whatever the list holds
+  (`[]` included) — what such an app could already do by registering itself. `mcp.clients` now
+  decides which documents are fetched and shown as verified, and which apps identified by a
+  document may connect with an https redirect address.
 
 ## [0.4.0] - 2026-10-19
 

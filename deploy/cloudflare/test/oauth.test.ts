@@ -24,6 +24,7 @@ import {
   parseLoopbackURI,
   redirectMatches,
   resetMcpCaches,
+  unlistedClientURL,
   verifyMcpAccessToken,
   type McpGrantRecord,
 } from "../src/oauth";
@@ -39,6 +40,7 @@ import {
   apiHeaders,
   authorizeQuery,
   call,
+  decodeHTML,
   hiddenInputs,
   mcpConnect,
   openConsent,
@@ -57,6 +59,7 @@ const CIMD_ENV: Partial<Env> = { MCP_CLIENTS: CIMD_URL };
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   vi.useRealTimers();
   resetMcpCaches();
   resetAccessCaches();
@@ -586,6 +589,13 @@ const cimdDoc = (extra: Record<string, unknown> = {}) => ({
 const jsonResponse = (doc: unknown, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(doc), { status: 200, headers: { "Content-Type": "application/json", ...headers } });
 
+/** The details of "Could not verify the app" (SPEC §8.4.5 step 3): the fetch failed, or the document breaks the rules. */
+const CIMD_FETCH_DETAIL =
+  'Backyard needs outbound HTTPS to that address. Without it, an administrator can set MCP_CLIENTS to an empty value and the app can be added with "Register automatically" instead.';
+const CIMD_RULES_DETAIL =
+  "The app's client metadata document does not meet Backyard's rules. If the reason is its redirect_uris, an administrator can add the app's redirect address to MCP_REDIRECT_URIS; " +
+  'otherwise the app can be added with "Register automatically" once its URL is removed from MCP_CLIENTS.';
+
 describe("client metadata documents (SPEC §8.4.3)", () => {
   const authorizeCIMD = async (redirectURI = "http://localhost:53682/callback", identity: Record<string, string> = {}, env: Partial<Env> = {}) => {
     const { challenge } = await pkcePair();
@@ -613,42 +623,62 @@ describe("client metadata documents (SPEC §8.4.3)", () => {
     expect(await expectPage(evil, 400, "a document's refused redirect URI")).toContain("Redirect address not allowed");
   });
 
-  it("refuses documents that break the rules, with the reason", async () => {
-    let doc: () => Response = () => jsonResponse(cimdDoc());
+  it("refuses documents that break the rules, with the reason and the remedy of its cause", async () => {
+    let doc: () => Response | Promise<Response> = () => jsonResponse(cimdDoc());
     stubFetch(() => doc());
     const pad = (n: number) => {
       const base = JSON.stringify(cimdDoc({ pad: "" }));
       return JSON.stringify(cimdDoc({ pad: "x".repeat(n - base.length) }));
     };
-    for (const [what, make, reason] of [
-      ["another client_id", () => jsonResponse(cimdDoc({ client_id: "https://client.example/other" })), "its client_id is not its own URL"],
-      ["a redirect", () => new Response(null, { status: 302, headers: { Location: "https://evil.example/doc" } }), "it answered with a redirect (HTTP 302), which is not followed"],
-      ["HTTP 404", () => new Response("nope", { status: 404 }), "it answered HTTP 404"],
-      ["text/html", () => new Response(JSON.stringify(cimdDoc()), { status: 200, headers: { "Content-Type": "text/html" } }), "it is not JSON"],
-      ["5121 bytes (streamed)", () => new Response(new Blob([pad(5121)]).stream(), { status: 200, headers: { "Content-Type": "application/json" } }), "larger than 5120 bytes"],
-      ["a declared length over 5120", () => new Response(pad(6000), { status: 200, headers: { "Content-Type": "application/json", "Content-Length": "6000" } }), "larger than 5120 bytes"],
-      ["private_key_jwt", () => jsonResponse(cimdDoc({ token_endpoint_auth_method: "private_key_jwt" })), "client authentication"],
+    const methods = "token_endpoint_auth_methods_supported is not an array of strings";
+    const uris = "redirect_uris must be an array of 1 to 10 URIs";
+    // rules: the document was loaded but breaks the rules (else the fetch failed).
+    for (const [what, make, reason, rules] of [
+      ["another client_id", () => jsonResponse(cimdDoc({ client_id: "https://client.example/other" })), "its client_id is not its own URL", true],
+      ["a redirect", () => new Response(null, { status: 302, headers: { Location: "https://evil.example/doc" } }), "it answered with a redirect (HTTP 302), which is not followed", false],
+      ["HTTP 404", () => new Response("nope", { status: 404 }), "it answered HTTP 404", false],
+      ["a network failure", () => Promise.reject(new TypeError("connection refused")), "the request failed (connection refused)", false],
+      ["text/html", () => new Response(JSON.stringify(cimdDoc()), { status: 200, headers: { "Content-Type": "text/html" } }), "it is not JSON", false],
+      ["5121 bytes (streamed)", () => new Response(new Blob([pad(5121)]).stream(), { status: 200, headers: { "Content-Type": "application/json" } }), "larger than 5120 bytes", false],
+      ["a declared length over 5120", () => new Response(pad(6000), { status: 200, headers: { "Content-Type": "application/json", "Content-Length": "6000" } }), "larger than 5120 bytes", false],
+      ["private_key_jwt", () => jsonResponse(cimdDoc({ token_endpoint_auth_method: "private_key_jwt" })), "client authentication", true],
       [
         "a methods list without none",
         () => jsonResponse(cimdDoc({ token_endpoint_auth_method: "none", token_endpoint_auth_methods_supported: ["private_key_jwt"] })),
         "client authentication",
+        true,
       ],
-      ["a methods string", () => jsonResponse(cimdDoc({ token_endpoint_auth_methods_supported: "none" })), "token_endpoint_auth_methods_supported is not an array of strings"],
-      ["a methods null", () => jsonResponse(cimdDoc({ token_endpoint_auth_methods_supported: null })), "token_endpoint_auth_methods_supported is not an array of strings"],
-      ["a client_secret", () => jsonResponse(cimdDoc({ client_secret: "s" })), "client secret"],
-      ["no allowed redirect URI", () => jsonResponse(cimdDoc({ redirect_uris: ["https://evil.example/cb"] })), "none of its redirect_uris is allowed"],
-      ["11 redirect URIs", () => jsonResponse(cimdDoc({ redirect_uris: Array.from({ length: 11 }, (_, i) => `http://localhost/${i}`) })), "redirect_uris must be an array of 1 to 10 URIs"],
-      ["not an object", () => jsonResponse([cimdDoc()]), "it is not a JSON object"],
-      ["invalid JSON", () => new Response("{", { status: 200, headers: { "Content-Type": "application/json" } }), "it is not a JSON object"],
-      ["not UTF-8", () => new Response(new Uint8Array([0x7b, 0xff, 0x7d]), { status: 200, headers: { "Content-Type": "application/json" } }), "it is not UTF-8 JSON"],
-      ["a client_name number", () => jsonResponse(cimdDoc({ client_name: 5 })), "client_name is not a string"],
+      ["a methods string", () => jsonResponse(cimdDoc({ token_endpoint_auth_methods_supported: "none" })), methods, true],
+      ["a methods null", () => jsonResponse(cimdDoc({ token_endpoint_auth_methods_supported: null })), methods, true],
+      // Every member must be a string, as on the Go server (null is not "").
+      ["a methods list with null", () => jsonResponse(cimdDoc({ token_endpoint_auth_methods_supported: ["none", null] })), methods, true],
+      ["a methods list with a number", () => jsonResponse(cimdDoc({ token_endpoint_auth_methods_supported: ["none", 1] })), methods, true],
+      ["a client_secret", () => jsonResponse(cimdDoc({ client_secret: "s" })), "client secret", true],
+      ["no allowed redirect URI", () => jsonResponse(cimdDoc({ redirect_uris: ["https://evil.example/cb"] })), "none of its redirect_uris is allowed", true],
+      ["11 redirect URIs", () => jsonResponse(cimdDoc({ redirect_uris: Array.from({ length: 11 }, (_, i) => `http://localhost/${i}`) })), uris, true],
+      ["redirect_uris with null", () => jsonResponse(cimdDoc({ redirect_uris: ["http://localhost/callback", null] })), uris, true],
+      ["redirect_uris with a number", () => jsonResponse(cimdDoc({ redirect_uris: [1, "http://localhost/callback"] })), uris, true],
+      ["redirect_uris null", () => jsonResponse(cimdDoc({ redirect_uris: null })), uris, true],
+      ["redirect_uris a string", () => jsonResponse(cimdDoc({ redirect_uris: "http://localhost/callback" })), uris, true],
+      ["not an object", () => jsonResponse([cimdDoc()]), "it is not a JSON object", true],
+      ["invalid JSON", () => new Response("{", { status: 200, headers: { "Content-Type": "application/json" } }), "it is not a JSON object", true],
+      ["not UTF-8", () => new Response(new Uint8Array([0x7b, 0xff, 0x7d]), { status: 200, headers: { "Content-Type": "application/json" } }), "it is not UTF-8 JSON", true],
+      ["a client_name number", () => jsonResponse(cimdDoc({ client_name: 5 })), "client_name is not a string", true],
     ] as const) {
       resetMcpCaches();
       doc = make;
-      const html = await expectPage(await authorizeCIMD(), 502, what);
+      const html = decodeHTML(await expectPage(await authorizeCIMD(), 502, what));
       expect(html, what).toContain("Could not verify the app");
+      expect(html, what).toContain(`Backyard could not load the app's client metadata document ${CIMD_URL}: `);
       expect(html, what).toContain(reason);
-      expect(html, what).toContain(CIMD_URL);
+      expect(html, what).toContain("Register automatically");
+      // The detail names the remedy of the cause.
+      const [want, other] = rules ? [CIMD_RULES_DETAIL, CIMD_FETCH_DETAIL] : [CIMD_FETCH_DETAIL, CIMD_RULES_DETAIL];
+      expect(html, what).toContain(want);
+      expect(html, what).not.toContain(other);
+      // Within the failure throttle the same failure, with the same detail.
+      const again = decodeHTML(await expectPage(await authorizeCIMD(), 502, `${what} (throttled)`));
+      expect(again, what).toContain(want);
     }
     // 5120 bytes exactly is fine; a +json type too; unknown members are ignored.
     resetMcpCaches();
@@ -679,10 +709,25 @@ describe("client metadata documents (SPEC §8.4.3)", () => {
   it("never fetches a URL that is not allowlisted", async () => {
     const { calls, other } = stubFetch(() => jsonResponse(cimdDoc()));
     const { challenge } = await pkcePair();
+    const authorizeAs = (id: string, redirectURI?: string) =>
+      call(`/__backyard/auth/authorize?${authorizeQuery({ clientId: id, challenge, state: "s", ...(redirectURI ? { redirectURI } : {}) })}`, {}, { ...MCP_ENV, ...CIMD_ENV });
     for (const id of ["https://example.com/x", CIMD_URL + "/", "https://client.example/oauth/METADATA"]) {
-      const html = await expectPage(await call(`/__backyard/auth/authorize?${authorizeQuery({ clientId: id, challenge, state: "s" })}`, {}, { ...MCP_ENV, ...CIMD_ENV }), 400, id);
+      // A client metadata URL outside the allowlist: an unlisted app on this
+      // computer (a loopback redirect URI), unverified …
+      const local = await authorizeAs(id);
+      const page = await local.text();
+      expect(local.status, `${id}: ${page.slice(0, 300)}`).toBe(200);
+      expect(page, id).toContain(`<strong>${id}</strong> (address provided by the app, not verified)`);
+      expect(page, id).not.toContain("verified by");
+      // … and not allowed with an https one.
+      const html = await expectPage(await authorizeAs(id, "https://claude.ai/api/mcp/auth_callback"), 400, id);
       expect(html).toContain("App not allowed");
       expect(html).toContain("MCP_CLIENTS");
+      expect(html).toContain("MCP_REDIRECT_URIS");
+    }
+    // Any other https client_id is unknown.
+    for (const id of ["https://example.com/", "https://203.0.113.7/client.json", CIMD_URL + "?x=1"]) {
+      expect(await expectPage(await authorizeAs(id), 400, id), id).toContain("Unknown app");
     }
     expect(calls).toHaveLength(0);
     expect(other).toHaveLength(0);
@@ -752,9 +797,271 @@ describe("client metadata documents (SPEC §8.4.3)", () => {
     expect(v.ok && v.grant).toMatchObject({ client_id: CIMD_URL, client_name: "Example App", client_kind: "metadata_document", client_host: "client.example", redirect_uri: "http://localhost:53682/callback" });
     const list = await call("/__backyard/api/mcp/grants", { headers: c.identity }, { ...MCP_ENV, ...CIMD_ENV });
     expect(((await list.json()) as { grants: Record<string, unknown>[] }).grants[0]).toMatchObject({ client_kind: "metadata_document", client_host: "client.example", redirect_host: "localhost:53682" });
-    // Taking the URL off the allowlist ends the connection's refreshes.
-    await expectOAuthError(await refresh(CIMD_URL, c.refresh_token, {}, { MCP_CLIENTS: "" }), 401, "invalid_client", "a CIMD client no longer allowlisted");
+    // Taking the URL off the allowlist keeps a connection that returns to
+    // this computer (the client is then unlisted; see the delisting test).
+    expect((await refresh(CIMD_URL, c.refresh_token, {}, { MCP_CLIENTS: "" })).status).toBe(200);
     expect((await refresh(CIMD_URL, c.refresh_token, {}, CIMD_ENV)).status).toBe(200);
+  });
+});
+
+/** Client metadata URLs of apps on the user's computer that name themselves by their own document, which no deployment lists. */
+const OPENCODE = "https://opencode.ai/oauth/opencode/client.json";
+const PI = "https://pi.dev/oauth/client.json";
+
+describe("unlisted client metadata documents (SPEC §8.4.3, §8.4.4)", () => {
+  const LOCAL = "http://127.0.0.1:53682/callback";
+  const CLAUDE_CB = "https://claude.ai/api/mcp/auth_callback";
+
+  /** GET authorize for id (redirectURI null: without one). */
+  const authorizeAs = async (id: string, redirectURI: string | null, env: Partial<Env> = {}) => {
+    const { challenge } = await pkcePair();
+    const q = new URLSearchParams(authorizeQuery({ clientId: id, challenge, state: "s", ...(redirectURI !== null ? { redirectURI } : {}) }));
+    if (redirectURI === null) q.delete("redirect_uri");
+    return call(`/__backyard/auth/authorize?${q}`, { headers: { "Sec-Fetch-Site": "cross-site" } }, { ...MCP_ENV, ...env });
+  };
+
+  /** Asserts the "App not allowed" page of an unlisted app whose sign-in does not return to this computer. */
+  const expectNotLocal = async (r: Response, id: string, what: string) => {
+    const html = decodeHTML(await expectPage(r, 400, what));
+    expect(html, what).toContain("<h1>App not allowed</h1>");
+    expect(html, what).toContain(
+      `The app ${id} may connect to this Backyard only from this computer (a sign-in that returns to localhost). ` +
+        "An administrator can allow it from anywhere by adding its client metadata URL to MCP_CLIENTS and its redirect address to MCP_REDIRECT_URIS.",
+    );
+  };
+
+  /** The rows of mcp_grants of a user (pending ones included). */
+  const grantRows = async (userID: string) => {
+    const e = testEnv({ ...MCP_ENV });
+    return runInDurableObject(e.REGISTRY.get(e.REGISTRY.idFromName("registry")), (_o, st) => st.storage.sql.exec("SELECT id FROM mcp_grants WHERE user_id = ?", userID).toArray());
+  };
+
+  it("names apps by a strict form of a client metadata URL", () => {
+    const long = "https://opencode.ai/" + "a".repeat(512 - "https://opencode.ai/".length);
+    for (const id of [
+      // The documents of opencode 2.x, Codex CLI, Hermes Agent and pi.
+      OPENCODE,
+      "https://chatgpt.com/oauth/codex/client.json",
+      "https://nousresearch.github.io/hermes-agent/docs/oauth/client-metadata.json",
+      PI,
+      long,
+      // Escapes stay as sent.
+      "https://example.com/%E2%80%AEclient.json",
+      "https://Example.COM/a@b/~c!$&'()*+,;=:x.json",
+      "https://my-app.example.co.uk/oauth/client",
+      "https://x/y",
+      "https://1a.example/2",
+      "https://example.com/%252F",
+      "https://foo.0xg/a",
+      "https://0x1f.example/a",
+    ]) {
+      expect(unlistedClientURL(id), id).toBe(true);
+    }
+    for (const id of [
+      "",
+      "http://opencode.ai/oauth/client.json",
+      "HTTPS://opencode.ai/oauth/client.json",
+      "https://opencode.ai/oauth/client.json?x=1",
+      "https://opencode.ai/oauth/client.json?",
+      "https://opencode.ai/oauth/client.json#f",
+      "https://opencode.ai/",
+      "https://opencode.ai",
+      "https://203.0.113.5/client.json",
+      "https://[2001:db8::1]/client.json",
+      "https://127.0.0.1/client.json",
+      "https://opencode.ai/a/../client.json",
+      "https://opencode.ai/./client.json",
+      "https://opencode.ai/a/%2e%2e/client.json",
+      "https://u@opencode.ai/client.json",
+      "https://opencode.ai/a b",
+      "https://opencode.ai/a\\b",
+      "https://opencode.ai/%zz",
+      "https:///client.json",
+      long + "a",
+      // The strict form of an address shown as the app's name.
+      "https://opencode.ai:443/client.json",
+      "https://opencode.ai./client.json",
+      "https://open..code.ai/client.json",
+      "https://open_code.ai/client.json",
+      "https://1.2.3.999/client.json",
+      "https://01.2.3.4/client.json",
+      "https://example.123/client.json",
+      "https://example.0x1f/client.json",
+      "https://foo.0X/a",
+      "https://1.2.3.0x4/a",
+      "https://op\u202eencode.ai/client.json",
+      "https://opencode.ai/\u202eclient.json",
+      "https://opencode.ai/a\u00a0b",
+      "https://opencode.ai/a\u0085b",
+      "https://opencode.ai/a\u007fb",
+      "https://opencode.ai/a\tb",
+      "https://ex\u00e4mple.com/client.json",
+      "https://opencode.ai/cli\u00e9nt.json",
+      "https://opencode.ai/a%2Fb",
+      "https://opencode.ai/a%2fb",
+      "https://opencode.ai/a%2",
+      "https://opencode.ai/a%",
+      "https://ex%41mple.com/client.json",
+      "https://a<b.example.com/client.json",
+      "https://xn--80ak6aa92e.com/client.json",
+      "https://apps.XN--p1ai/client.json",
+    ]) {
+      expect(unlistedClientURL(id), JSON.stringify(id)).toBe(false);
+    }
+  });
+
+  it("connects an app on this computer without a fetch, named by its address and not verified", async () => {
+    const { calls, other } = stubFetch(() => jsonResponse(cimdDoc()));
+    const log = vi.spyOn(console, "log");
+    const r = await authorizeAs(OPENCODE, LOCAL);
+    const page = await r.text();
+    expect(r.status, page.slice(0, 300)).toBe(200);
+    for (const want of [
+      `<p id="consent-app"><strong>${OPENCODE}</strong> (address provided by the app, not verified) wants to use Backyard as you.</p>`,
+      "Backyard will send the approval to <strong>an app on this computer (http://127.0.0.1:53682)</strong>. Only continue if you just started the sign-in from an app on this computer.",
+      `Only allow this if you started connecting ${OPENCODE} to Backyard yourself just now.`,
+      "overflow-wrap:anywhere",
+    ]) {
+      expect(page).toContain(want);
+    }
+    expect(page).not.toContain("verified by");
+    expect(hiddenInputs(page)).toMatchObject({ client_id: OPENCODE, redirect_uri: LOCAL });
+    // There is no document, so no registered list: any loopback URI.
+    for (const uri of ["http://localhost/callback", "http://localhost:27890/callback", "http://[::1]:5/cb?x=1", "http://127.0.0.1:9", "http://localhost/"]) {
+      const o = await openConsent(authorizeQuery({ clientId: OPENCODE, challenge: (await pkcePair()).challenge, redirectURI: uri }));
+      expect(o.page.status, uri).toBe(200);
+      expect(o.form.redirect_uri, uri).toBe(uri);
+    }
+
+    // The whole flow: consent, code exchange, an MCP call, refresh, revocation.
+    const c = await mcpConnect({ clientId: OPENCODE, redirectURI: LOCAL });
+    const v = await verify(c.access_token);
+    expect(v.ok && v.grant).toMatchObject({ client_id: OPENCODE, client_name: OPENCODE, client_kind: "unlisted_metadata_document", client_host: "", redirect_uri: LOCAL });
+    const audit = log.mock.calls.map((x) => String(x[0])).find((x) => x.includes('"action":"mcp.authorize"'));
+    expect(JSON.parse(audit ?? "{}")).toMatchObject({ client_name: OPENCODE, client_kind: "unlisted_metadata_document", client_host: "", redirect_host: "127.0.0.1:53682" });
+    log.mockRestore();
+    const rpc = await call(
+      "/__backyard/mcp",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": "2025-11-25", Authorization: `Bearer ${c.access_token}` },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "backyard_whoami", arguments: {} } }),
+      },
+      MCP_ENV,
+    );
+    expect(rpc.status).toBe(200);
+    const who = JSON.parse(((await rpc.json()) as { result: { content: { text: string }[] } }).result.content[0]!.text) as { connection: { client: string } };
+    expect(who.connection.client, "the connection is named by the address").toBe(OPENCODE);
+    // It adds no origin to the MCP endpoint (SPEC §14.1).
+    expect(mcpAllowedOrigin(ctxFor(), "https://opencode.ai")).toBe(false);
+    const list = await call("/__backyard/api/mcp/grants", { headers: c.identity }, MCP_ENV);
+    expect(((await list.json()) as { grants: Record<string, unknown>[] }).grants).toEqual([
+      expect.objectContaining({ client_name: OPENCODE, client_kind: "unlisted_metadata_document", client_host: "", redirect_host: "127.0.0.1:53682", scope: "mcp offline_access" }),
+    ]);
+    const t2 = await refresh(OPENCODE, c.refresh_token);
+    expect(t2.status).toBe(200);
+    const rt2 = ((await t2.json()) as { refresh_token: string }).refresh_token;
+    // Codes and refresh tokens stay bound to the client_id.
+    await expectOAuthError(await refresh(PI, rt2), 400, "invalid_grant", "a refresh as another unlisted client");
+    const a = await authorize({ clientId: OPENCODE });
+    await expectOAuthError(await exchange({ ...a, clientId: PI }), 400, "invalid_grant", "the code with another unlisted client_id");
+    await expectOAuthError(await exchange(a, { redirect_uri: "http://127.0.0.1:53683/callback" }), 400, "invalid_grant", "another redirect_uri");
+    expect((await exchange(a, { redirect_uri: LOOPBACK })).status, "the code, with its own redirect_uri").toBe(200);
+    // RFC 7009 revocation by the same client.
+    const rv = await tokenRequest({ client_id: OPENCODE, token: rt2 }, { path: "/__backyard/oauth/revoke" });
+    expect(rv.status).toBe(200);
+    expect(await verify(c.access_token)).toEqual({ ok: false, error: "token revoked" });
+
+    // Never fetched (the stub records every URL).
+    expect(calls).toHaveLength(0);
+    expect(other).toHaveLength(0);
+    // With MCP_CLIENTS empty the rule still applies (nothing is fetched anyway).
+    expect((await authorizeAs(OPENCODE, LOCAL, { MCP_CLIENTS: "" })).status).toBe(200);
+    expect(other).toHaveLength(0);
+  });
+
+  it("is not allowed with a sign-in that leaves this computer, also at the consent POST", async () => {
+    const { calls, other } = stubFetch(() => jsonResponse(cimdDoc()));
+    for (const uri of [
+      CLAUDE_CB,
+      "https://chatgpt.com/connector_platform_oauth_redirect",
+      "https://evil.example/cb",
+      "http://opencode.ai/callback",
+      "https://localhost/callback",
+      "https://127.0.0.1:9/callback",
+      "http://127.0.0.2:9/callback",
+      "http://localhost/cb#x",
+      "http://localhost:0/cb",
+      "http://u@localhost/cb",
+      "",
+      null,
+    ]) {
+      await expectNotLocal(await authorizeAs(OPENCODE, uri), OPENCODE, `redirect ${JSON.stringify(uri)}`);
+    }
+    // A consent form whose redirect_uri was changed to Claude's callback.
+    const o = await openConsent(authorizeQuery({ clientId: OPENCODE, challenge: (await pkcePair()).challenge, redirectURI: "http://localhost:4000/cb" }));
+    expect(o.page.status).toBe(200);
+    await expectNotLocal(await submitConsent({ ...o.form, redirect_uri: CLAUDE_CB }, o.identity), OPENCODE, "the consent POST");
+    const me = await whoami(o.identity);
+    expect(await grantRows(me.id)).toEqual([]);
+    expect(calls).toHaveLength(0);
+    expect(other).toHaveLength(0);
+  });
+
+  it("is unknown when the https client_id is no client metadata URL, at every endpoint", async () => {
+    const { other } = stubFetch(() => jsonResponse(cimdDoc()));
+    const garbage = "byrt_eyJnIjoiMDAiLCJuIjoxfQ.AAAA";
+    for (const id of [
+      "https://example.com/",
+      "https://example.com",
+      "https://example.com/client.json?v=1",
+      "https://203.0.113.7/client.json",
+      "https://example.com/a/../client.json",
+      "https://example.com:8443/client.json",
+      "https://example.com/\u202eclient.json",
+      `https://example.com/${"a".repeat(500)}`,
+    ]) {
+      const html = await expectPage(await authorizeAs(id, "http://localhost/callback"), 400, id);
+      expect(html, id).toContain("Unknown app");
+      for (const [endpoint, path, fields] of [
+        ["token", "/__backyard/oauth/token", { grant_type: "refresh_token", refresh_token: garbage }],
+        ["revoke", "/__backyard/oauth/revoke", { token: garbage }],
+      ] as const) {
+        const r = await tokenRequest({ ...fields, client_id: id }, { path });
+        await expectOAuthError(r, 401, "invalid_client", `${endpoint}: ${id}`);
+        expect(r.headers.get("WWW-Authenticate"), `${endpoint}: ${id}`).toBeNull();
+      }
+    }
+    // A valid one is a client there (client authentication passes; the token names no grant of it).
+    await expectOAuthError(await refresh(OPENCODE, garbage), 400, "invalid_grant", "an unlisted client with an unknown token");
+    const rv = await tokenRequest({ client_id: OPENCODE, token: garbage }, { path: "/__backyard/oauth/revoke" });
+    expect(rv.status).toBe(200);
+    expect(other).toHaveLength(0);
+  });
+
+  it("once its URL leaves MCP_CLIENTS, a metadata document client keeps only the connections that return to this computer", async () => {
+    const { calls } = stubFetch(() => jsonResponse(cimdDoc({ redirect_uris: ["http://localhost/callback", CLAUDE_CB] })));
+    const hosted = await mcpConnect({ clientId: CIMD_URL, env: CIMD_ENV, redirectURI: CLAUDE_CB });
+    const local = await mcpConnect({ clientId: CIMD_URL, env: CIMD_ENV, redirectURI: "http://localhost:4444/callback" });
+    // A code to Claude's callback that is not exchanged yet.
+    const { verifier, challenge } = await pkcePair();
+    const o = await openConsent(authorizeQuery({ clientId: CIMD_URL, challenge, redirectURI: CLAUDE_CB }), {}, CIMD_ENV);
+    const pending = { clientId: CIMD_URL, verifier, code: redirectParams(await submitConsent(o.form, o.identity, { env: CIMD_ENV })).code! };
+    expect(calls).toHaveLength(1);
+    // The administrator removes it from MCP_CLIENTS (the default list).
+    const gone = "the app's redirect address is no longer allowed on this server";
+    expect((await expectOAuthError(await refresh(CIMD_URL, hosted.refresh_token), 400, "invalid_grant", "the hosted connection")).error_description).toBe(gone);
+    expect((await expectOAuthError(await exchange(pending), 400, "invalid_grant", "the pending code")).error_description).toBe(gone);
+    expect((await refresh(CIMD_URL, local.refresh_token)).status, "the local connection").toBe(200);
+    // Signing in again: not with Claude's callback; from this computer as an
+    // unlisted app, without a fetch.
+    await expectNotLocal(await authorizeAs(CIMD_URL, CLAUDE_CB), CIMD_URL, "Claude's callback after delisting");
+    const page = await (await authorizeAs(CIMD_URL, "http://localhost:4444/callback")).text();
+    expect(page).toContain(`<strong>${CIMD_URL}</strong> (address provided by the app, not verified)`);
+    expect(calls).toHaveLength(1);
+    // Listed again, the hosted connection and the code work again (nothing was revoked).
+    expect((await refresh(CIMD_URL, hosted.refresh_token, {}, CIMD_ENV)).status).toBe(200);
+    expect((await exchange(pending, {}, CIMD_ENV)).status).toBe(200);
   });
 });
 
@@ -775,7 +1082,25 @@ describe("authorization requests (SPEC §8.4.5)", () => {
       ["a ; separator", variant((q) => q.set("prompt", "x")).replace("prompt=x", "prompt=a;b"), 400, "Invalid authorization request"],
       ["no client_id", variant((q) => q.delete("client_id")), 400, "Unknown app"],
       ["an unknown kind of client_id", variant((q) => q.set("client_id", "hello")), 400, "Unknown app"],
-      ["a CIMD URL not allowlisted", variant((q) => q.set("client_id", "https://example.com/x")), 400, "App not allowed"],
+      ["an https client_id that is no client metadata URL", variant((q) => q.set("client_id", "https://example.com/")), 400, "Unknown app"],
+      [
+        "an unlisted client metadata URL with an https redirect URI",
+        variant((q) => {
+          q.set("client_id", "https://example.com/x");
+          q.set("redirect_uri", "https://claude.ai/api/mcp/auth_callback");
+        }),
+        400,
+        "App not allowed",
+      ],
+      [
+        "an unlisted client metadata URL without a redirect URI",
+        variant((q) => {
+          q.set("client_id", "https://example.com/x");
+          q.delete("redirect_uri");
+        }),
+        400,
+        "App not allowed",
+      ],
       ["an unregistered redirect URI", variant((q) => q.set("redirect_uri", "http://127.0.0.1:9/other")), 400, "Redirect address not allowed"],
       ["a foreign redirect URI", variant((q) => q.set("redirect_uri", "https://evil.example/cb")), 400, "Redirect address not allowed"],
       ["another loopback host", variant((q) => q.set("redirect_uri", "http://localhost:9/callback")), 400, "Redirect address not allowed"],
@@ -1152,7 +1477,10 @@ describe("the token endpoint (SPEC §8.4.6)", () => {
       ["a Bearer Authorization", tokenRequest(base, { headers: { Authorization: "Bearer x" } }), 401, "invalid_client"],
       ["Basic naming another client", tokenRequest(base, { headers: { Authorization: "Basic " + btoa(other.client_id + ":") } }), 400, "invalid_request"],
       ["a tampered client_id", tokenRequest({ ...base, client_id: tamper(a.clientId) }), 401, "invalid_client"],
-      ["a CIMD URL that is not allowlisted", tokenRequest({ ...base, client_id: "https://example.com/x" }), 401, "invalid_client"],
+      ["an https client_id that is no client metadata URL", tokenRequest({ ...base, client_id: "https://example.com/" }), 401, "invalid_client"],
+      ["an https client_id with a query (no client metadata URL)", tokenRequest({ ...base, client_id: "https://example.com/x?y=1" }), 401, "invalid_client"],
+      // A valid client metadata URL is a client (unlisted, SPEC §8.4.3), but not this code's.
+      ["an unlisted client metadata URL", tokenRequest({ ...base, client_id: "https://example.com/x" }), 400, "invalid_grant"],
       ["no client_id", tokenRequest({ grant_type: "authorization_code", code: a.code, code_verifier: a.verifier }), 401, "invalid_client"],
       ["another client's code", tokenRequest({ ...base, client_id: other.client_id }), 400, "invalid_grant"],
       ["no code_verifier", tokenRequest({ grant_type: "authorization_code", client_id: a.clientId, code: a.code }), 400, "invalid_request"],
@@ -1170,7 +1498,7 @@ describe("the token endpoint (SPEC §8.4.6)", () => {
       const r = await pending;
       await expectOAuthError(r, status, error, what);
       if (status === 401 && /Basic|Bearer|client_secret/.test(what)) expect(r.headers.get("WWW-Authenticate"), what).toBe('Basic realm="Backyard"');
-      if (status === 401 && /tampered|not allowlisted|no client_id/.test(what)) expect(r.headers.get("WWW-Authenticate"), what).toBeNull();
+      if (status === 401 && /tampered|no client metadata URL|no client_id/.test(what)) expect(r.headers.get("WWW-Authenticate"), what).toBeNull();
     }
     // None of these used the code up.
     expect((await tokenRequest(base)).status).toBe(200);

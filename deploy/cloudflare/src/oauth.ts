@@ -7,7 +7,9 @@
  * - Discovery: the protected resource and authorization server metadata.
  * - Clients: allowlisted Client ID Metadata Documents (CIMD, fetched with
  *   redirect:"manual", a size cap, a per-isolate cache, a failure throttle
- *   and single-flight) and stateless, HMAC-signed dynamic registration.
+ *   and single-flight), other valid client metadata URLs (unlisted: never
+ *   fetched, loopback redirects only) and stateless, HMAC-signed dynamic
+ *   registration.
  * - Codes only ever go to an exact entry of MCP_REDIRECT_URIS or to an http
  *   loopback URI; consent is shown on every authorization.
  * - Tokens are opaque values signed with signValue under five HKDF labels;
@@ -19,7 +21,7 @@
  * mcpResourceMetadataURL).
  */
 import { authenticate, isCookieConflict, secretMissing } from "./auth";
-import { isAdminIdentity, isLoopbackHost, type Config } from "./config";
+import { isAdminIdentity, isLoopbackHost, validMCPClientURL, type Config } from "./config";
 import { KeyLabel, b64url, b64urlDecode, deriveKey, randomHex, signValue, verifyValue } from "./crypto";
 import { HttpError, errorResponse, forbidden, isPlainObject, json, notFound, readBody, requestID, truncate, unwrap } from "./http";
 import type { User } from "./identity";
@@ -77,8 +79,13 @@ const PREFIX_CODE = "byac_";
 const PREFIX_REFRESH = "byrt_";
 const PREFIX_ACCESS = "byat_";
 
+// Client kinds of a grant (SPEC §8.4.3): an allowlisted client metadata
+// document, a valid client metadata URL that is not allowlisted (never
+// fetched; loopback redirects only), a dynamic registration.
 const KIND_CIMD = "metadata_document";
+const KIND_UNLISTED = "unlisted_metadata_document";
 const KIND_DCR = "registered";
+type ClientKind = typeof KIND_CIMD | typeof KIND_UNLISTED | typeof KIND_DCR;
 const SCOPE_MCP = "mcp";
 const SCOPE_OFFLINE = "offline_access";
 
@@ -89,7 +96,11 @@ const CHALLENGE_RE = /^[A-Za-z0-9_-]{43}$/;
 const VERIFIER_RE = /^[A-Za-z0-9._~-]{43,128}$/;
 const GID_RE = /^[0-9a-f]{32}$/;
 
-/** At token time the redirect policy applies too: removing an address ends its connections. */
+/**
+ * At token time the redirect policy applies too: removing an address ends its
+ * connections, and removing a metadata URL from MCP_CLIENTS ends those of its
+ * connections that do not return to a loopback address.
+ */
 const REDIRECT_GONE = "the app's redirect address is no longer allowed on this server";
 
 /** One connection: the consent of a user to one MCP client (SPEC §8.4.8). */
@@ -100,8 +111,9 @@ export interface McpGrant {
   user: { id: string; email?: string; name: string; groups?: string[]; anonymous: boolean };
   client_id: string;
   client_name: string;
-  client_kind: "metadata_document" | "registered";
-  /** Host of a client metadata URL; "" for registered clients. */
+  /** Readers treat every kind but metadata_document as not verified. */
+  client_kind: ClientKind;
+  /** Host of an allowlisted client metadata URL (verified); "" for the other kinds. */
   client_host: string;
   redirect_uri: string;
   scope: string;
@@ -497,7 +509,7 @@ async function exchangeCode(ctx: RequestContext, form: URLSearchParams, clientID
   // PKCE has verified (rotate detects it).
   if (!g || g.code_exp < now) return invalid("the authorization code is invalid or expired");
   if (g.client_id !== clientID) return invalid("the authorization code was issued to another client");
-  if (!redirectAllowed(ctx.cfg, g.redirect_uri)) return invalid(REDIRECT_GONE);
+  if (!grantRedirectAllowed(ctx.cfg, g)) return invalid(REDIRECT_GONE);
   if (form.has("redirect_uri") && form.get("redirect_uri") !== g.redirect_uri) return invalid("redirect_uri does not match the authorization request");
   if (!VERIFIER_RE.test(verifier) || !(await pkceMatches(verifier, g.code_challenge))) return invalid("PKCE verification failed");
   const familyExp = g.created_at + ctx.cfg.tokenTTLSeconds;
@@ -529,7 +541,7 @@ async function refreshToken(ctx: RequestContext, form: URLSearchParams, clientID
   const g = unwrap(await registry(ctx.env).mcpGrantGet(p.g));
   if (!g || !live(g, now)) return invalid("the connection was revoked or has expired");
   if (g.client_id !== clientID) return invalid("the refresh token was issued to another client");
-  if (!redirectAllowed(ctx.cfg, g.redirect_uri)) return invalid(REDIRECT_GONE);
+  if (!grantRedirectAllowed(ctx.cfg, g)) return invalid(REDIRECT_GONE);
   let scope = g.scope;
   const asked = (form.get("scope") ?? "").split(/\s+/).filter(Boolean);
   if (asked.length > 0) {
@@ -587,11 +599,12 @@ async function serveRevoke(ctx: RequestContext): Promise<Response> {
 /** A resolved client_id. */
 interface McpClient {
   id: string;
-  kind: "metadata_document" | "registered";
-  /** Sanitized display name. */
+  kind: ClientKind;
+  /** Sanitized display name; unlisted: the client_id. */
   name: string;
-  /** CIMD: the client_id URL's host; DCR: "". */
+  /** CIMD: the client_id URL's host; else "". */
   host: string;
+  /** Unlisted: none (any loopback URI, clientRedirect). */
   redirects: string[];
 }
 
@@ -609,16 +622,31 @@ const UNKNOWN_APP: ClientError = {
   message: "This sign-in link names an app that Backyard does not know. Go back to the app and connect again.",
 };
 
-/** Resolves a client_id for the authorize endpoint (it may fetch a client metadata document). */
+/** Refuses an unlisted metadata document whose redirect URI is not a loopback URI (SPEC §8.4.4). */
+function appNotLocal(id: string): ClientError {
+  return {
+    status: 400,
+    title: "App not allowed",
+    message: `The app ${id} may connect to this Backyard only from this computer (a sign-in that returns to localhost).`,
+    detail: "An administrator can allow it from anywhere by adding its client metadata URL to MCP_CLIENTS and its redirect address to MCP_REDIRECT_URIS.",
+  };
+}
+
+// The details of "Could not verify the app": the document could not be
+// loaded, or it was loaded and breaks the rules of SPEC §8.4.3.
+const CIMD_FETCH_DETAIL =
+  'Backyard needs outbound HTTPS to that address. Without it, an administrator can set MCP_CLIENTS to an empty value and the app can be added with "Register automatically" instead.';
+const CIMD_RULES_DETAIL =
+  "The app's client metadata document does not meet Backyard's rules. If the reason is its redirect_uris, an administrator can add the app's redirect address to MCP_REDIRECT_URIS; " +
+  'otherwise the app can be added with "Register automatically" once its URL is removed from MCP_CLIENTS.';
+
+/** Resolves a client_id for the authorize endpoint (it may fetch an allowlisted client metadata document). */
 async function resolveClient(ctx: RequestContext, id: string): Promise<McpClient | ClientError> {
   if (id.startsWith("https://")) {
     if (!ctx.cfg.mcp.clients.includes(id)) {
-      return {
-        status: 400,
-        title: "App not allowed",
-        message: `The app ${id} is not allowed to connect to this Backyard.`,
-        detail: "An administrator can allow it by adding its client metadata URL to MCP_CLIENTS.",
-      };
+      // Never fetched: its name is its address, and parseAuthorize admits
+      // it with a loopback redirect URI only.
+      return unlistedClientURL(id) ? { id, kind: KIND_UNLISTED, name: id, host: "", redirects: [] } : UNKNOWN_APP;
     }
     try {
       return await cimdDocument(ctx.cfg, id);
@@ -627,7 +655,7 @@ async function resolveClient(ctx: RequestContext, id: string): Promise<McpClient
         status: 502,
         title: "Could not verify the app",
         message: `Backyard could not load the app's client metadata document ${id}: ${(e as Error).message}.`,
-        detail: 'Backyard needs outbound HTTPS to that address. Without it, an administrator can set MCP_CLIENTS to an empty value and the app can be added with "Register automatically" instead.',
+        detail: e instanceof CimdError && e.rules ? CIMD_RULES_DETAIL : CIMD_FETCH_DETAIL,
       };
     }
   }
@@ -635,10 +663,49 @@ async function resolveClient(ctx: RequestContext, id: string): Promise<McpClient
   return UNKNOWN_APP;
 }
 
-/** Whether id is an allowlisted CIMD URL or a DCR id with a valid MAC (token and revocation endpoints; never fetches). */
+/**
+ * Whether id is an allowlisted CIMD URL, another valid client metadata URL
+ * (unlisted) or a DCR id with a valid MAC (token and revocation endpoints;
+ * never fetches).
+ */
 async function knownClient(ctx: RequestContext, id: string): Promise<boolean> {
-  if (id.startsWith("https://")) return ctx.cfg.mcp.clients.includes(id);
+  if (id.startsWith("https://")) return ctx.cfg.mcp.clients.includes(id) || unlistedClientURL(id);
   return (await verifyDCRClient(ctx, id)) !== null;
+}
+
+/** A host label: ASCII letters, digits and "-". */
+const HOST_LABEL_RE = /^[A-Za-z0-9-]+$/;
+
+/**
+ * Whether id may name an unlisted metadata document (SPEC §8.4.3): a client
+ * metadata URL (rule 1 of SPEC §12, validMCPClientURL) of a strict form, as
+ * people are shown it as the app's name. After "https://" comes a host of
+ * ASCII letters, digits and "-" in labels separated by single dots (none
+ * starting with "xn--", the last neither all digits nor "0x" and hex digits,
+ * which URL parsers read as an IPv4 address) without a port, then a path of
+ * printable ASCII without "\" in which every "%" starts a two-hex-digit
+ * escape other than %2F: no white space, control, bidi or other non-ASCII
+ * character, and both editions read it alike.
+ */
+export function unlistedClientURL(id: string): boolean {
+  if (!id.startsWith("https://") || !validMCPClientURL(id)) return false;
+  const rest = id.slice("https://".length);
+  const slash = rest.indexOf("/");
+  if (slash < 0) return false;
+  const labels = rest.slice(0, slash).split(".");
+  if (labels.some((l) => !HOST_LABEL_RE.test(l) || /^xn--/i.test(l)) || /^(\d+|0x[0-9a-f]*)$/i.test(labels[labels.length - 1]!)) return false;
+  const path = rest.slice(slash + 1);
+  for (let i = 0; i < path.length; i++) {
+    const c = path[i]!;
+    if (c < "!" || c > "~" || c === "\\") return false;
+    if (c === "%" && !/^(?!2f)[0-9a-f]{2}$/i.test(path.slice(i + 1, i + 3))) return false;
+  }
+  return true;
+}
+
+/** Whether id is an https client_id outside MCP_CLIENTS: one whose redirect URI must be a loopback URI. */
+function notAllowlisted(cfg: Config, id: string): boolean {
+  return id.startsWith("https://") && !cfg.mcp.clients.includes(id);
 }
 
 /** Checks a DCR client_id and returns its client. */
@@ -751,10 +818,26 @@ export function redirectMatches(registered: string, requested: string): boolean 
   return registered === requested;
 }
 
-/** Whether requested matches one of the client's URIs and passes the current redirect policy. */
+/**
+ * Whether requested matches one of the client's URIs and passes the current
+ * redirect policy. An unlisted metadata document has none: any loopback URI
+ * is its own.
+ */
 function clientRedirect(cfg: Config, c: McpClient, requested: string): boolean {
   if (requested === "" || !redirectAllowed(cfg, requested)) return false;
+  if (c.kind === KIND_UNLISTED) return parseLoopbackURI(requested) !== null;
   return c.redirects.some((reg) => redirectMatches(reg, requested));
+}
+
+/**
+ * The redirect policy applied to a grant at the token endpoint: its redirect
+ * URI must still be allowed, and be a loopback URI when its client_id is a
+ * metadata document URL outside MCP_CLIENTS (unlisted, or removed from it
+ * since).
+ */
+function grantRedirectAllowed(cfg: Config, g: McpGrant): boolean {
+  if (!redirectAllowed(cfg, g.redirect_uri)) return false;
+  return !notAllowlisted(cfg, g.client_id) || parseLoopbackURI(g.redirect_uri) !== null;
 }
 
 /**
@@ -789,8 +872,22 @@ function resourceOK(ctx: RequestContext, v: string): boolean {
 
 // --- client metadata documents (SPEC §8.4.3) ----------------------------------------
 
-/** The result of one fetch: a client and how long it may be cached (s; 0 = not at all), or why it failed. */
-type CimdFetch = { doc: McpClient; ttl: number } | { err: string };
+/**
+ * The result of one fetch: a client and how long it may be cached (s; 0 = not
+ * at all), or why it failed (rules: the document was loaded but breaks the
+ * rules of SPEC §8.4.3; else the fetch failed).
+ */
+type CimdFetch = { doc: McpClient; ttl: number } | { err: string; rules?: boolean };
+
+/** Why a client metadata document cannot be used (rules: as in CimdFetch). */
+class CimdError extends Error {
+  readonly rules: boolean;
+  constructor(message: string, rules: boolean) {
+    super(message);
+    this.name = "CimdError";
+    this.rules = rules;
+  }
+}
 
 /** Cache state of one allowlisted client metadata URL (per isolate). */
 interface CimdEntry {
@@ -798,6 +895,7 @@ interface CimdEntry {
   /** ms */
   expires: number;
   failErr?: string;
+  failRules?: boolean;
   /** ms: no new fetch before this after a failure. */
   failUntil: number;
   /** The in-flight fetch shared by concurrent requests. */
@@ -813,7 +911,7 @@ export function resetMcpCaches(): void {
 
 /**
  * The client of an allowlisted metadata URL from the cache or a fetch;
- * throws an Error whose message is the reason it cannot be used. Concurrent
+ * throws a CimdError whose message is the reason it cannot be used. Concurrent
  * requests share one fetch; a failure is not cached, but the URL is not
  * fetched again for 10 s (requests in that window get the same failure).
  */
@@ -825,7 +923,7 @@ async function cimdDocument(cfg: Config, id: string): Promise<McpClient> {
   }
   const now = Date.now();
   if (e.doc && now < e.expires) return e.doc;
-  if (e.failErr && now < e.failUntil) throw new Error(e.failErr);
+  if (e.failErr && now < e.failUntil) throw new CimdError(e.failErr, !!e.failRules);
   let pending = e.inflight;
   if (!pending) {
     const entry = e;
@@ -836,6 +934,7 @@ async function cimdDocument(cfg: Config, id: string): Promise<McpClient> {
         if ("err" in r) {
           entry.doc = undefined;
           entry.failErr = r.err;
+          entry.failRules = r.rules;
           entry.failUntil = Date.now() + CIMD_FAIL_THROTTLE_MS;
           console.warn(`backyard: mcp: the client metadata document ${id} could not be loaded: ${r.err}`);
         } else if (r.ttl > 0) {
@@ -851,7 +950,7 @@ async function cimdDocument(cfg: Config, id: string): Promise<McpClient> {
       });
   }
   const r = await pending;
-  if ("err" in r) throw new Error(r.err);
+  if ("err" in r) throw new CimdError(r.err, !!r.rules);
   return r.doc;
 }
 
@@ -919,7 +1018,7 @@ async function fetchCIMD(cfg: Config, id: string): Promise<CimdFetch> {
   }
   if (!body) return { err: `it is larger than ${CIMD_MAX_BYTES} bytes` };
   const doc = parseCIMD(cfg, id, body);
-  if (typeof doc === "string") return { err: doc };
+  if (typeof doc === "string") return { err: doc, rules: true };
   return { doc, ttl: cimdCacheTTL(res.headers.get("Cache-Control") ?? "") };
 }
 
@@ -1275,9 +1374,11 @@ async function parseAuthorize(ctx: RequestContext, q: URLSearchParams, redirectS
   for (const k of AUTHORIZE_PARAMS) {
     if (q.getAll(k).length > 1) return badAuthorizeRequest(`The parameter ${k} appears more than once.`);
   }
-  const client = await resolveClient(ctx, q.get("client_id") ?? "");
-  if ("status" in client) return authErrorPage(client.status, client.title, client.message, client.detail ? { detail: client.detail } : {});
+  let client = await resolveClient(ctx, q.get("client_id") ?? "");
   const redirectURI = q.get("redirect_uri") ?? "";
+  // An app on this computer, or not allowed at all (SPEC §8.4.4).
+  if (!("status" in client) && client.kind === KIND_UNLISTED && parseLoopbackURI(redirectURI) === null) client = appNotLocal(client.id);
+  if ("status" in client) return authErrorPage(client.status, client.title, client.message, client.detail ? { detail: client.detail } : {});
   if (!clientRedirect(ctx.cfg, client, redirectURI)) {
     return authErrorPage(
       400,
@@ -1394,6 +1495,7 @@ async function renderConsent(ctx: RequestContext, u: User, req: AuthzRequest): P
     signOutURL: "/__backyard/auth/logout",
     clientName: req.client.name,
     verified: req.client.kind === KIND_CIMD,
+    unlisted: req.client.kind === KIND_UNLISTED,
     clientHost: req.client.host,
     origin: `${target.protocol}//${target.host}`.toLowerCase(),
     loopback: parseLoopbackURI(req.redirectURI) !== null,

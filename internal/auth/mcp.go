@@ -73,10 +73,13 @@ const (
 	prefixAccess    = "byat_"
 )
 
-// Client kinds of a grant.
+// Client kinds of a grant (SPEC §8.4.3): an allowlisted client metadata
+// document, a valid client metadata URL that is not allowlisted (never
+// fetched; loopback redirects only), a dynamic registration.
 const (
-	clientKindCIMD = "metadata_document"
-	clientKindDCR  = "registered"
+	clientKindCIMD     = "metadata_document"
+	clientKindUnlisted = "unlisted_metadata_document"
+	clientKindDCR      = "registered"
 )
 
 // Scopes: one capability set; offline_access is only advertised.

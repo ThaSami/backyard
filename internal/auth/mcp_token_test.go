@@ -217,8 +217,17 @@ func TestMCPTokenRequestRules(t *testing.T) {
 	oauthErr(t, e.do(oauthPost(OAuthTokenPath, v)), http.StatusUnauthorized, "invalid_client")
 	v.Set("client_id", "bydc_forged")
 	oauthErr(t, e.do(oauthPost(OAuthTokenPath, v)), http.StatusUnauthorized, "invalid_client")
+	// An https client_id must be a client metadata URL (rule 1 of SPEC §12).
+	for _, bad := range []string{"https://evil.example/", "https://203.0.113.5/client", "https://evil.example/client?x=1"} {
+		v.Set("client_id", bad)
+		oauthErr(t, e.do(oauthPost(OAuthTokenPath, v)), http.StatusUnauthorized, "invalid_client")
+	}
+	// One that is (unlisted) is known, but the code is not its own.
 	v.Set("client_id", "https://evil.example/client")
-	oauthErr(t, e.do(oauthPost(OAuthTokenPath, v)), http.StatusUnauthorized, "invalid_client")
+	if m := oauthErr(t, e.do(oauthPost(OAuthTokenPath, v)), http.StatusBadRequest, "invalid_grant"); m["error_description"] !=
+		"the authorization code was issued to another client" {
+		t.Errorf("unlisted client_id: %v", m)
+	}
 	// Basic and body disagree.
 	other := e.register("Other", loopbackCB)
 	r = oauthPost(OAuthTokenPath, base())

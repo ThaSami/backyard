@@ -583,8 +583,12 @@ With the [Terraform module](#with-terraform-optional-infrastructure-as-code), se
 - **Connections** last `TOKEN_TTL_HOURS` (720 by default) from the consent. People disconnect on
   the hub card; admins can disconnect a person there. Rotating `BACKYARD_SECRET` ends every
   connection.
-- **Which apps.** `MCP_CLIENTS` and `MCP_REDIRECT_URIS` default to Claude's exact addresses; see
-  the [configuration reference](#configuration-reference).
+- **Which apps.** `MCP_CLIENTS` and `MCP_REDIRECT_URIS` default to Claude's and ChatGPT's exact
+  addresses; see the [configuration reference](#configuration-reference). Apps on the user's
+  computer need no entry: they register themselves, or name their own client metadata document
+  (opencode 2.x, Codex CLI, Hermes Agent), which the Worker accepts with a loopback redirect
+  address only, never fetches and shows as not verified
+  ([other MCP apps](../../docs/claude-connector.md#other-mcp-apps)).
 
 Adding the connector in Claude, the consent page, the tools and troubleshooting:
 [docs/claude-connector.md](../../docs/claude-connector.md).
@@ -943,7 +947,7 @@ guard. Secrets go through
 | `AI_ENABLED` | `true` | Anything but `true`, `1`, `yes`, `on` or empty (e.g. `false`) turns AI off: every `/__backyard/api/ai/*` endpoint answers `501 unsupported`, like the Go server with `ai.enabled: false`. `setup --no-ai` sets it and drops the Workers AI binding; see [Turning AI off](#turning-ai-off). |
 | `AI_*`, `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL` | — | See [AI](#ai). |
 | `MCP_ENABLED` | `false` | `true` serves the [Claude connector](#use-backyard-in-claude) at `<hub>/__backyard/mcp` (needs an https hub URL). Unset or false: every connector path answers `404`. |
-| `MCP_CLIENTS` | Claude's two client metadata URLs and ChatGPT's (`https://chatgpt.com/oauth/client.json`) | Client ID Metadata Document URLs that may connect (comma-separated, compared exactly; only these are fetched). Set but empty (`--var MCP_CLIENTS:,`) turns this off, so apps register automatically; `--var MCP_CLIENTS:` drops the override. |
+| `MCP_CLIENTS` | Claude's two client metadata URLs and ChatGPT's (`https://chatgpt.com/oauth/client.json`) | Client ID Metadata Document URLs that the Worker fetches and shows as verified, and the only ones that may connect from anywhere (comma-separated, compared exactly). Another document URL connects only with a loopback redirect address (an app on the user's computer), never fetched and shown as not verified. Set but empty (`--var MCP_CLIENTS:,`) stops advertising and fetching documents, so apps register automatically; `--var MCP_CLIENTS:` drops the override. |
 | `MCP_REDIRECT_URIS` | `https://claude.ai/api/mcp/auth_callback`, `https://claude.com/api/mcp/auth_callback`, `https://chatgpt.com/connector_platform_oauth_redirect` | Exact https addresses that may receive sign-in codes (comma-separated). http loopback addresses are always allowed. A value replaces the default: list every address you still want. |
 | `WAREHOUSE_URL` | — | Optional: proxy `/warehouse/*` to a Backyard Go server's site API (secret `WAREHOUSE_TOKEN`). Its query errors (400/403/404/429/501) pass through; other failures answer `502`/`504 upstream_error` with a generic message naming the request id (details in the Worker log). |
 

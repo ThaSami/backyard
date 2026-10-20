@@ -140,7 +140,9 @@ Tests detect capabilities instead of checking the edition:
   `Browser` is a new guest) and in `oidc` with `BACKYARD_CONFORMANCE_IDP`; with a proxy in
   front (`iap`, `alb`, `header`, Access) only discovery, registration and the authorization
   request checks run. The tool catalog is compared with `internal/mcpremote/tools.json` of this
-  checkout.
+  checkout. No test needs outbound HTTPS: the clients register themselves, and the unlisted
+  client metadata document tests use a `client_id` on an `.example` host that Backyard must
+  accept with a loopback redirect URI without fetching it (SPEC §8.4.3).
 * **Site listing** — `tests/listing.test.mjs` follows `site_listing` in `/info`. With `all` a
   site one person deployed must be listed to another person and to a guest (in mode `none`).
   With `owners` the suite deploys sites as its people (one shared through the owners endpoint by

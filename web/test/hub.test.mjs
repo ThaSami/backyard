@@ -980,6 +980,14 @@ test("grantSummary: verified only for metadata-document clients; loopback return
     assert.equal(hub.grantSummary({ ...dcr, redirect_host: host }).returnsTo, "an app on this computer", host);
   }
   assert.equal(hub.grantSummary({ ...dcr, redirect_host: "localhost.example" }).returnsTo, "localhost.example");
+  // An unlisted metadata document (never fetched) is named by its client_id URL and never "verified";
+  // so is any kind this hub does not know yet (SPEC §8.4.7).
+  const unlisted = { ...cimd, client_name: "https://opencode.ai/oauth/opencode/client.json", client_kind: "unlisted_metadata_document", client_host: "", redirect_host: "127.0.0.1:53682" };
+  const u = hub.grantSummary(unlisted, opts);
+  assert.deepEqual([u.app, u.verified, u.trust, u.returnsTo], ["https://opencode.ai/oauth/opencode/client.json", false, "unverified", "an app on this computer"]);
+  for (const kind of ["unlisted_metadata_document", "some_future_kind", undefined]) {
+    assert.equal(hub.grantSummary({ ...unlisted, client_kind: kind, client_host: "opencode.ai" }, opts).trust, "unverified", String(kind));
+  }
   // Missing or malformed fields degrade to neutral text.
   assert.deepEqual(plain(hub.grantSummary(null)), { id: "", app: "An app", verified: false, trust: "unverified", returnsTo: "", created: "", expires: "" });
   assert.equal(hub.grantSummary({ client_name: 7, created_at: "soon" }).created, "");

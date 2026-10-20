@@ -234,9 +234,10 @@ A site is written by whoever deployed it, so its files are untrusted on your mac
 
 Backyard fetches remote content in two places. The [Claude connector](#the-claude-connector)
 fetches client metadata documents, but only the exact URLs an admin listed in `mcp.clients`
-(by default Claude's two documents and ChatGPT's), never a URL a request names: https only, no redirects, 5 s,
-at most 5 KiB (on the Go server through the same public-address guard as below), with failures
-throttled per URL.
+(by default Claude's two documents and ChatGPT's), never a URL a request names (an app that
+names another document URL is accepted only for a loopback redirect, without a fetch): https
+only, no redirects, 5 s, at most 5 KiB (on the Go server through the same public-address guard
+as below), with failures throttled per URL.
 The other is on behalf of users: image URLs in AI chat
 messages, for providers that need bytes. That fetcher only allows http(s), refuses loopback,
 private, link-local, multicast and other non-public addresses **on the dialled IP** (so DNS
@@ -265,10 +266,18 @@ What it defends against, and how:
   hub or the redirect origin, and the approval must be a same-origin top-level navigation with a
   CSRF token bound to the user and, with `oidc`, to the session. This is a residual risk of
   every hosted OAuth client: the mitigations make it visible, not impossible.
-- **Who may connect.** Apps identified by a metadata document (CIMD) are accepted only from the
-  exact URLs of `mcp.clients`; nothing else is fetched, so there is no SSRF surface and no
-  probing oracle. Self-registration (DCR) is stateless — the client id is HMAC-signed with
-  `backyard/mcp-client/v1` and nothing is stored — and its name is shown as unverified.
+- **Who may connect.** Apps identified by a metadata document (CIMD) are verified only for the
+  exact URLs of `mcp.clients`: only these documents are fetched, so there is no SSRF surface and
+  no probing oracle. Self-registration (DCR) is stateless — the client id is HMAC-signed with
+  `backyard/mcp-client/v1` and nothing is stored — and its name is shown as unverified. Any
+  other valid client metadata URL (an app on the user's computer that names its own document,
+  such as opencode or Codex CLI) is accepted only with a loopback redirect address, is never
+  fetched, and is shown by its URL as not verified; with an https redirect address it is refused
+  ("App not allowed"). This is equivalent to the open registration: anyone may already
+  register an app with any loopback redirect address, and a code for a loopback address only
+  ever reaches the person's own computer, so the rule admits nothing that registration does not
+  and adds no fetch. `mcp.clients` still decides which documents are fetched and shown as
+  verified, and which apps identified by a document may connect from anywhere.
 - **Where codes go.** Only to an exact `mcp.redirect_uris` entry (default: Claude's two callback
   URLs and ChatGPT's, never a whole host) or an http loopback address of the user's own machine; anything else
   fails before a redirect happens, and redirect addresses on the hub or a site are rejected by
@@ -307,10 +316,11 @@ What it defends against, and how:
 Deliberate deviations from the standards (the full list is in SPEC §8.4.11): a plain-http
 issuer only on loopback hosts; the loopback redirect port is ignored for `localhost` too; a
 missing `MCP-Protocol-Version` means `2025-06-18`; the 60 s refresh grace; revocation answers
-`200` even for other clients' tokens (no oracle); CIMD only for allowlisted URLs; unknown scopes
-are ignored; the upstream login happens before the consent page (it creates only Backyard's own
-session, never a grant); `redirect_uri` is optional at the token endpoint (OAuth 2.1); a
-missing `code_challenge_method` is refused.
+`200` even for other clients' tokens (no oracle); CIMD only for allowlisted URLs (other URL
+client ids only with a loopback redirect, unfetched); unknown scopes are ignored; the upstream
+login happens before the consent page (it creates only Backyard's own session, never a grant);
+`redirect_uri` is optional at the token endpoint (OAuth 2.1); a missing `code_challenge_method`
+is refused.
 
 ## Error messages
 

@@ -977,9 +977,9 @@ request can be refused with `401`. Several valid cookies of the same user are fi
 
 ### 8.4 Remote MCP connector: OAuth 2.1 authorization server
 
-Claude (claude.ai, Desktop, mobile, Cowork, and Claude Code) can use Backyard as a remote MCP
-server, a "custom connector" (§14.1). The connector signs people in with the company sign-in
-Backyard already uses; Claude never talks to the company IdP.
+Claude (claude.ai, Desktop, mobile, Cowork, and Claude Code), ChatGPT and other MCP apps can use
+Backyard as a remote MCP server, a "custom connector" (§14.1). The connector signs people in with
+the company sign-in Backyard already uses; the app never talks to the company IdP.
 
 #### 8.4.1 Roles, URLs and enablement
 
@@ -1078,47 +1078,85 @@ The authorization server metadata, with the keys in this order:
 ```
 
 `client_id_metadata_document_supported` is present only while the effective client allowlist
-(`mcp.clients` / `MCP_CLIENTS`) is non-empty; without it clients fall back to registration.
+(`mcp.clients` / `MCP_CLIENTS`) is non-empty; without it clients fall back to registration. It
+only governs what is advertised: an unlisted metadata document URL with a loopback redirect URI
+(§8.4.3) is accepted either way.
 `offline_access` appears only in the AS metadata. The root
 `/.well-known/oauth-protected-resource` and `/.well-known/openid-configuration` are not served
 (every `401` names M, and there are no ID tokens).
 
 #### 8.4.3 Client identification
 
-There are no pre-registered clients and no client secrets. A `client_id` is resolved like this:
+There are no pre-registered clients and no client secrets. A `client_id` is resolved like this
+(the first rule that applies decides):
 
-* **`https://…` — a Client ID Metadata Document (CIMD).** It must be byte-equal to an entry of
-  the effective `mcp.clients` / `MCP_CLIENTS` (default
+* **`https://…`, allowlisted — a Client ID Metadata Document (CIMD).** It is byte-equal to an
+  entry of the effective `mcp.clients` / `MCP_CLIENTS` (default
   `https://claude.ai/oauth/mcp-oauth-client-metadata`,
   `https://claude.ai/oauth/claude-code-client-metadata` and ChatGPT's
-  `https://chatgpt.com/oauth/client.json`); otherwise it is refused ("App not
-  allowed") and nothing is fetched. `client_kind` is `metadata_document`, the display name is
-  the document's sanitized `client_name` (else the URL host), and the verified host is the URL
-  host.
+  `https://chatgpt.com/oauth/client.json`). Its document is fetched (below); `client_kind` is
+  `metadata_document`, the display name is the document's sanitized `client_name` (else the URL
+  host), and the verified host is the URL host.
+* **`https://…`, not allowlisted — an unlisted metadata document.** A **valid client metadata
+  URL**: it passes the `mcp.clients` entry rule of §12 (https, a host that is not an IP literal,
+  a path other than `/` and empty, no `.`/`..` segments, no query, fragment or userinfo, at most
+  512 bytes) and, because people are shown it as the app's name and both editions must read it
+  alike, has this strict form: `https://`, a host of ASCII letters, digits and `-` in labels
+  separated by single dots (no label starting with `xn--` in any case; the last label neither
+  all digits nor `0x`/`0X` followed by zero or more hex digits, which URL parsers read as an
+  IPv4 address), no port, then a path of printable ASCII (`!`–`~`) without `\`, in which every `%`
+  starts a two-hex-digit escape and none is `%2F` (any case) — so it contains no white space,
+  control, bidi or other non-ASCII character. Its document is **never fetched** (nor cached, nor
+  counted by the fetch throttle) and nothing about it is verified: `client_kind` is
+  `unlisted_metadata_document`, the display name is the `client_id` exactly as sent, and there
+  is no verified host. It may only use a loopback redirect URI (§8.4.4 (b)) — any one, as there
+  is no document to list them; any other `redirect_uri`, an entry of `mcp.redirect_uris` and an
+  absent one included, is refused ("App not allowed"). This admits nothing that registration
+  does not (anyone may register any loopback redirect URI), and a code for a loopback URI only
+  ever reaches the person's own computer: local apps that identify themselves by their own
+  document (opencode, Codex CLI, Hermes Agent, pi) connect this way without the server
+  fetching anything. The rule applies whatever the allowlist holds, `mcp.clients: []` / an
+  empty `MCP_CLIENTS` included. The allowlist thus decides which documents are fetched and
+  shown as verified, and which URL client ids may use an https redirect URI.
+* **Any other `https://…`** (not a valid client metadata URL) → "Unknown app".
 * **`bydc_…` — a registered client.** Its MAC must verify (`backyard/mcp-client/v1`), else
   "Unknown app". `client_kind` is `registered`; name and redirect URIs come from the signed
   payload.
 * **Anything else** → "Unknown app".
 
-**CIMD fetch** (only allowlisted URLs; the token and revoke endpoints never fetch): a `GET` with
-`Accept: application/json`, no cookies or credentials, no redirects (any `3xx` is an error),
-5 s in total, only `200`, a `Content-Type` of `application/json` or ending in `+json`
-(parameters allowed), at most 5120 bytes, UTF-8 JSON that is an object. The Go server dials
-through its SSRF guard (public addresses only, also through an `HTTPS_PROXY`). The document
-must have `client_id` equal to the URL; `redirect_uris` an array of 1–10 strings of which at
-least one passes the redirect policy (§8.4.4; the others are ignored);
-`token_endpoint_auth_methods_supported` (MCP SEP-3149), when present, an array of strings that
-contains `"none"` — the client then uses `none`, the only method of the AS metadata, whatever
-the singular `token_endpoint_auth_method` prefers (ChatGPT's document prefers
-`private_key_jwt`) — and without that list `token_endpoint_auth_method` absent or `"none"`;
-no `client_secret` or
+| `client_id` (not allowlisted) | Resolves to |
+|---|---|
+| `https://opencode.ai/oauth/opencode/client.json` | unlisted metadata document |
+| `https://example.com/` | "Unknown app" (root path) |
+| `https://example.com/client.json?v=1` | "Unknown app" (query) |
+| `https://example.com:8443/client.json` | "Unknown app" (port) |
+| `https://203.0.113.7/client.json` | "Unknown app" (IP literal) |
+| `https://example.0x1f/client.json` | "Unknown app" (a last label read as a number) |
+| `https://example.com/a/../client.json` | "Unknown app" (dot segment) |
+| `https://example.com/%E2%80%AEclient.json` | unlisted metadata document (escapes stay as sent) |
+| `https://example.com/` + a raw U+202E + `client.json` | "Unknown app" (not ASCII) |
+| `http://example.com/client.json` | "Unknown app" (not https) |
+
+**CIMD fetch** (only allowlisted URLs, never an unlisted one; the token and revoke endpoints
+never fetch): a `GET` with `Accept: application/json`, no cookies or credentials, no redirects
+(any `3xx` is an error), 5 s in total, only `200`, a `Content-Type` of `application/json` or
+ending in `+json` (parameters allowed), at most 5120 bytes, UTF-8 JSON that is an object. The Go
+server dials through its SSRF guard (public addresses only, also through an `HTTPS_PROXY`). The
+document must have `client_id` equal to the URL; `redirect_uris` an array of 1–10 members, every
+one a string (`null` is not), of which at least one passes the redirect policy (§8.4.4; the
+others are ignored); `token_endpoint_auth_methods_supported` (MCP SEP-3149), when present, an
+array whose every member is a string (`null` is not) and that contains `"none"` — the client
+then uses `none`, the only method of the AS metadata, whatever the singular
+`token_endpoint_auth_method` prefers (ChatGPT's document prefers `private_key_jwt`) — and
+without that list `token_endpoint_auth_method` absent or `"none"`; no `client_secret` or
 `client_secret_expires_at`; `client_name` optional (sanitized as below; not a string → failure;
-empty after sanitizing → the URL host). Other members,
-`grant_types` included, are ignored. Any failure renders "Could not verify the app" with the
-reason. A success is cached for `max-age` clamped to 60–3600 s (300 s without one; `no-store` or
-`no-cache`: this request only); failures are never cached, but the URL is not fetched again for
-10 s and requests in that window get the same failure; concurrent requests for one URL share
-one fetch. The cache is per process (Go) or per isolate (Worker).
+empty after sanitizing → the URL host). Other members, `grant_types` included, are ignored.
+Any failure renders "Could not verify the app" with the reason (a fetch failure and a document
+that breaks these rules get different advice, §8.4.5). A success is cached for `max-age`
+clamped to 60–3600 s (300 s without one; `no-store` or `no-cache`: this request only); failures
+are never cached, but the URL is not fetched again for 10 s and requests in that window get the
+same failure; concurrent requests for one URL share one fetch. The cache is per process (Go) or
+per isolate (Worker).
 
 **`POST /__backyard/oauth/register`** (RFC 7591, stateless; no authentication, no
 `X-Backyard`). The body is one UTF-8 JSON object (`Content-Type: application/json`, parameters
@@ -1158,6 +1196,17 @@ no fragment,
 any path and query — but no backslash, ASCII control character or Unicode white space (Go's
 `unicode.IsSpace`; U+FEFF is not one) anywhere, and no `%` before the query that does not start
 a two-hex-digit escape. Nothing else, ever.
+
+The client's own URIs narrow this further: a CIMD client's are its document's `redirect_uris`, a
+registered client's those of its registration. An **unlisted metadata document** client
+(§8.4.3) has no list: any loopback URI (b) is allowed for it, and no https URI ever is, an entry
+of `mcp.redirect_uris` included. The code exchange and refresh match it as for every client: the
+token request's `redirect_uri`, when present, must equal the authorization's byte for byte
+(§8.4.6). There a grant's redirect URI is checked again against the current policy, else
+`invalid_grant` "the app's redirect address is no longer allowed on this server" — which, for a
+URL `client_id` that is not (or no longer) allowlisted, admits a loopback URI only: once a URL
+is removed from `mcp.clients`, its grants to https redirect URIs can no longer exchange a code
+or refresh.
 
 A requested `redirect_uri` matches a registered one when both are https and byte-equal, or both
 are loopback URIs with equal scheme, host string, path and query, the port being ignored on
@@ -1206,12 +1255,23 @@ decides:
    `;` separator or a malformed `%`-escape), or one of `response_type`, `client_id`,
    `redirect_uri`, `code_challenge`, `code_challenge_method`, `resource`, `scope`, `state`,
    `response_mode` is repeated → `400` page "Invalid authorization request".
-3. `client_id` (§8.4.3): missing or unknown → `400` page "Unknown app"; not allowlisted → `400`
-   page "App not allowed" naming `mcp.clients` (Worker: `MCP_CLIENTS`); CIMD failure → `502`
-   page "Could not verify the app" naming the URL and the reason and suggesting outbound HTTPS
-   or "Register automatically".
+3. `client_id` (§8.4.3): missing or unknown → `400` page "Unknown app"; an unlisted metadata
+   document URL whose `redirect_uri` is not a loopback URI (§8.4.4 (b); absent included) → `400`
+   page "App not allowed" that names the `client_id`, says that the app may connect to this
+   Backyard only from this computer (a sign-in that returns to localhost) and that an
+   administrator can allow it from anywhere by adding its client metadata URL to `mcp.clients`
+   and its redirect address to `mcp.redirect_uris` (Worker: `MCP_CLIENTS`, `MCP_REDIRECT_URIS`);
+   CIMD failure → `502` page "Could not verify the app" naming the URL and the reason, whose
+   advice depends on the cause — a failed fetch (network, timeout, a redirect, not `200`, not
+   JSON, too large): Backyard needs outbound HTTPS to that address, else an administrator can set
+   `mcp.clients: []` (Worker: an empty `MCP_CLIENTS`) and the app can be added with "Register
+   automatically"; a document that breaks the rules: an administrator can add the app's
+   redirect address to `mcp.redirect_uris` (`MCP_REDIRECT_URIS`) if the reason is its
+   `redirect_uris`, otherwise the app can be added with "Register automatically" once its URL
+   is removed from `mcp.clients` (`MCP_CLIENTS`). Both name "Register automatically".
 4. `redirect_uri` is required; it must match one of the client's URIs and pass the current
-   redirect policy (§8.4.4), else `400` page "Redirect address not allowed".
+   redirect policy (§8.4.4; an unlisted metadata document client: any loopback URI), else `400`
+   page "Redirect address not allowed".
 5. Steps 1–4 never redirect. From here on every error is a **`302`** to the redirect URI with
    `error`, `error_description`, `state` (when one was sent and is ≤ 512 bytes) and `iss=<P>`,
    URL-encoded, appended with `?` (or `&` when the URI already has a query), with
@@ -1256,7 +1316,8 @@ differ between editions, but every element is required:
    "**Guest <first 4 hex>**. This Backyard has no sign-in; the app will act as this browser's
    guest"; a "Not you? Sign out" link to `/__backyard/auth/logout` where a logout exists (Go
    `oidc`, the Worker);
-3. the app: CIMD "**<client_name>** — verified by **<client_id host>**"; registered
+3. the app: CIMD "**<client_name>** — verified by **<client_id host>**"; unlisted metadata
+   document "**<client_id>** (address provided by the app, not verified)"; registered
    "**"<client_name>"** (name provided by the app, not verified)";
 4. where the approval goes: https "Backyard will send the approval to **<redirect origin>**";
    loopback "Backyard will send the approval to **an app on this computer (<redirect
@@ -1265,8 +1326,10 @@ differ between editions, but every element is required:
    as you. Published sites are visible to everyone who can sign in to this Backyard.";
 6. the lifetime: "This connection lasts until <YYYY-MM-DD (UTC) of consent + family lifetime>
    unless you disconnect it on the Backyard hub.";
-7. the forwarding warning: "Only allow this if you started connecting <client_name> to Backyard
-   yourself just now. Anyone who sent you this link would get this access.";
+7. the forwarding warning: "Only allow this if you started connecting <display name> to
+   Backyard yourself just now. Anyone who sent you this link would get this access." (the
+   display name of §8.4.3: the `client_name` of item 3, or the `client_id` of an unlisted
+   metadata document);
 8. `<form id="consent" method="post" action="/__backyard/auth/authorize">` with the hidden inputs
    `response_type` (`code`), `client_id`, `redirect_uri`, `state` (omitted when absent),
    `code_challenge`, `code_challenge_method` (`S256`), `scope` (the granted scope), `resource`
@@ -1334,8 +1397,11 @@ when both are given they must be equal (else `invalid_request`). Any other `Auth
 header (an unpadded value or more than one space included), a non-empty Basic
 password or a non-empty `client_secret` → `401 invalid_client` with
 `WWW-Authenticate: Basic realm="Backyard"` (so do two `Authorization` headers). A missing
-`client_id`, or one that is not an allowlisted CIMD URL or a `bydc_` id with a valid MAC
-(nothing is fetched here) → `401 invalid_client` without a challenge. A present `resource` is
+`client_id`, or one that is neither an allowlisted CIMD URL, a valid client metadata URL (an
+unlisted metadata document, §8.4.3) nor a `bydc_` id with a valid MAC → `401 invalid_client`
+without a challenge. Nothing is fetched here; codes and refresh tokens are bound to the
+`client_id` they were issued to (step 3 of both grant types below), so another client cannot
+redeem them. A present `resource` is
 checked (`invalid_target`) before `grant_type`; a missing `grant_type` → `invalid_request`.
 
 **`grant_type=authorization_code`.** `code` and `code_verifier` are required. `redirect_uri` is
@@ -1397,7 +1463,11 @@ not accepted there, and it answers `404` while the connector is disabled.
 * `GET /__backyard/api/mcp/grants[?user=<id>]` → `200 {"grants":[Grant…]}`: without `user` the
   caller's own grants, with `user` any person's (admins only, else `403 forbidden`); live grants
   only (redeemed, not expired), newest first, at most 200. A `Grant` is
-  `{"id":"<gid>","user":{"id":"…","email":"…","name":"…"},"client_name":"…","client_kind":"metadata_document"|"registered","client_host":"<client_id host or \"\">","redirect_host":"<host of redirect_uri>","scope":"mcp …","created_at":"<RFC3339>","expires_at":"<RFC3339>"}`.
+  `{"id":"<gid>","user":{"id":"…","email":"…","name":"…"},"client_name":"…","client_kind":"metadata_document"|"unlisted_metadata_document"|"registered","client_host":"<client_id host or \"\">","redirect_host":"<host of redirect_uri>","scope":"mcp …","created_at":"<RFC3339>","expires_at":"<RFC3339>"}`.
+  `client_name` is the display name at consent (§8.4.3; for `unlisted_metadata_document` the
+  `client_id` exactly as sent) and `client_host` the verified host: the `client_id` URL's host
+  for `metadata_document`, `""` for the other kinds. Readers treat every kind other than
+  `metadata_document` as not verified (more kinds may be added).
 * `DELETE /__backyard/api/mcp/grants/{id}` → `204`, for the grant's user or an admin; someone
   else's grant or an unknown id → `404`. Audit `mcp.revoke` (`via=hub`).
 * `DELETE /__backyard/api/mcp/grants[?user=<id>]` → `200 {"revoked":<n>}`: the caller's own
@@ -1431,7 +1501,8 @@ error messages never contain these values.
 
 **The grant record** — one per consent — is the single source of truth: `id` (gid), `user_id`,
 `user` (the snapshot `{id, email, name, groups, anonymous}` taken at consent), `client_id`,
-`client_name`, `client_kind` (`metadata_document` or `registered`), `redirect_uri` (exactly as
+`client_name` (the display name at consent, §8.4.3), `client_kind` (`metadata_document`,
+`unlisted_metadata_document` or `registered`), `redirect_uri` (exactly as
 authorized), `code_challenge`, `scope` (`mcp` or `mcp offline_access`), `resource` (R at
 consent), `created_at` (unix s), `code_exp` (`created_at` + 300), `redeemed_at` (set at
 redemption), `exp` (pending: `code_exp` + 600; after redemption: `created_at` + the family
@@ -1525,8 +1596,12 @@ Cloudflare edition's Access bypass list is in §16.
    section 4.3.1, requires revocation on reuse).
 5. **Revocation answers.** RFC 7009 revocation answers `200` for tokens of other clients instead
    of an error, so the endpoint is not an oracle.
-6. **CIMD scope.** CIMD is supported only for allowlisted `client_id` URLs (a domain trust
-   policy, which MCP permits); other URL client ids are refused without a fetch.
+6. **CIMD scope.** Client metadata documents are fetched only for allowlisted `client_id` URLs
+   (a domain trust policy, which MCP permits). Another valid URL client id is accepted without
+   its document, and so without checking the redirect URI against the document's
+   `redirect_uris`, but only with a loopback redirect URI (§8.4.3): such a client is no more
+   trusted than one that registered a loopback URI, and is shown as not verified. Other URL
+   client ids are refused without a fetch.
 7. **Scopes.** Unknown requested scopes are ignored and the granted scope is returned.
 8. **Login before consent.** The upstream login (Okta via Backyard's OIDC client, or a proxy)
    happens before the consent page. It creates only Backyard's own browser session, never an
@@ -1642,10 +1717,13 @@ without `auth.mode: none`, and `sites.listing: owners` with `sites.ownership: no
 `sites.listing` must be `all` (the default) or `owners`.
 
 The Claude connector (§8.4) is configured in the `mcp` section: `mcp.enabled` (default
-`false`), `mcp.clients` (the allowlisted client metadata document URLs; default the two Claude
-documents of §8.4.3; an explicit `[]` turns CIMD off, so clients register automatically),
-`mcp.redirect_uris` (the exact https addresses that may receive codes; default the two Claude
-callbacks of §8.4.4; loopback addresses are always allowed and never listed) and
+`false`), `mcp.clients` (the allowlisted client metadata document URLs: the documents Backyard
+fetches and shows as verified, and the only URL client ids that may use an https redirect URI;
+default Claude's two documents and ChatGPT's, §8.4.3; an explicit `[]` stops advertising and
+fetching CIMD, so clients register automatically — an unlisted URL with a loopback redirect is
+accepted either way), `mcp.redirect_uris` (the exact https addresses that may receive codes;
+default Claude's two callbacks and ChatGPT's, §8.4.4; loopback addresses are always allowed and
+never listed) and
 `mcp.max_publish_bytes` (decoded file bytes per `backyard_publish` call, default 4194304).
 Entries are trimmed but their case is kept, as they are compared byte for byte. Validation
 rejects, whether or not the connector is enabled: a `mcp.clients` entry that is not an https URL
@@ -1795,7 +1873,8 @@ the §5 envelope unless noted:
 3. **Origin.** Absent is fine. Present, it must equal (case-insensitively) the hub origin, the
    request's own origin, the origin of an https entry of the effective `mcp.redirect_uris` /
    `MCP_REDIRECT_URIS`, or the origin of an entry of `mcp.clients` / `MCP_CLIENTS` (by default
-   `https://claude.ai`, `https://claude.com` and `https://chatgpt.com`); otherwise
+   `https://claude.ai`, `https://claude.com` and `https://chatgpt.com`; an unlisted metadata
+   document client, §8.4.3, adds no origin); otherwise
    `403 {"error":{"code":"forbidden","message":"requests from this origin are not accepted"}}`.
 4. **Credentials.** More than one `Authorization` header — also one value that joins several
    `<scheme> <credentials>` parts with commas, as proxies and the Workers runtime merge repeated
@@ -1995,8 +2074,10 @@ of the read tools are `Internal error (request <id>)`. The limits are in §11.
 token issuance, deploy create/commit, refresh, site deletion, owner changes) are logged with
 `"audit": true`; the server also stores API token issuance records in `_system/_audit` (best
 effort). The Claude connector (§8.4) adds these audit events, each with the fields `user`,
-`client_name`, `client_kind`, `client_host`, `redirect_host`, `grant` (the first 8 hex
-characters of the grant id) and `ip` where available, and never a token:
+`client_name`, `client_kind` (`metadata_document`, `unlisted_metadata_document` or
+`registered`), `client_host` (as in the grants API, §8.4.7: `""` unless `metadata_document`),
+`redirect_host`, `grant` (the first 8 hex characters of the grant id) and `ip` where available,
+and never a token:
 
 | Event | When | Go | Worker |
 |---|---|---|---|
@@ -2110,7 +2191,8 @@ storage are available on free); R2 and paid features are optional.
   the main Access application.
 * **Claude connector** (§8.4, §14.1), off unless `MCP_ENABLED` is true (`true/1/yes/on`).
   `MCP_CLIENTS` (default the two Claude client metadata documents and ChatGPT's; set but empty:
-  no CIMD, so clients register) and `MCP_REDIRECT_URIS` (default the two Claude callbacks and
+  no CIMD is advertised or fetched, so clients register — an unlisted URL with a loopback
+  redirect still connects, §8.4.3) and `MCP_REDIRECT_URIS` (default the two Claude callbacks and
   ChatGPT's; set but empty:
   loopback redirects only) are comma or whitespace separated and follow the entry rules of §12
   (using `BASE_DOMAIN` and the `PUBLIC_URL` host). An invalid entry does not make the Worker

@@ -110,7 +110,11 @@ export interface MCPConfig {
    * loopback) hub origin: see mcpEnabled in oauth.ts.
    */
   enabled: boolean;
-  /** Effective MCP_CLIENTS: allowlisted Client ID Metadata Document URLs (exact). */
+  /**
+   * Effective MCP_CLIENTS: allowlisted Client ID Metadata Document URLs
+   * (exact), the only ones fetched and the only URL client ids that may use
+   * an https redirect URI (SPEC §8.4.3).
+   */
   clients: string[];
   /** Effective MCP_REDIRECT_URIS: exact https redirect URIs (loopback ones are always allowed). */
   redirectURIs: string[];
@@ -568,9 +572,11 @@ export function isLoopbackHost(h: string): boolean {
 }
 
 /**
- * Whether e may be listed in MCP_CLIENTS (rule 1 of SPEC §12): an https URL
- * whose host is a name (not an IP literal), with a path other than "/" and
- * without dot segments, query, fragment or user info, at most 512 bytes.
+ * Whether e is a client metadata URL (rule 1 of SPEC §12): an https URL whose
+ * host is a name (not an IP literal), with a path other than "/" and without
+ * dot segments, query, fragment or user info, at most 512 bytes. It decides
+ * what MCP_CLIENTS may list; an https client_id outside the list must pass it
+ * too (oauth.ts unlistedClientURL adds a stricter form, SPEC §8.4.3).
  */
 export function validMCPClientURL(e: string): boolean {
   // eslint-disable-next-line no-control-regex

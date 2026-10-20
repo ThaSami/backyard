@@ -596,7 +596,7 @@ test("hub: the Claude connector card shows the URL, the setup steps and the conn
     assert.equal(await page.textContent("#connector-cmd"), "claude mcp add --transport http backyard " + url);
     assert.match(
       await page.textContent("#connector .steps"),
-      /Customize → Connectors → Add custom connector[\s\S]*Organization settings[\s\S]*claude mcp add --transport http backyard/,
+      /Customize → Connectors → Add custom connector[\s\S]*Organization settings[\s\S]*claude mcp add --transport http backyard[\s\S]*Add custom MCP server[\s\S]*Other MCP apps[\s\S]*opencode, Codex or Hermes\s+Agent/,
     );
     assert.equal(await page.isHidden("#connector-revoke-user"), true, "the admin form is for admins only");
 
@@ -694,7 +694,7 @@ test("hub: only admins get the form to disconnect a person; it asks first and re
       d.dismiss();
     });
     await page.click("#connector-user-submit");
-    assert.deepEqual(asked, ["confirm: Disconnect every Claude connection of bob@acme.com? Their apps lose access to Backyard at once."]);
+    assert.deepEqual(asked, ["confirm: Disconnect every app connection of bob@acme.com? Their apps lose access to Backyard at once."]);
     assert.equal(deletes().length, 0);
 
     page.once("dialog", (d) => d.accept());
@@ -724,6 +724,61 @@ test("hub: only admins get the form to disconnect a person; it asks first and re
     await page.waitForSelector("#connector-grants-empty:not([hidden])");
     assert.equal(await page.isVisible("#connector"), true);
     assert.equal(await page.isHidden("#connector-revoke-user"), true);
+  } finally {
+    await context.close();
+    await stub.close();
+  }
+});
+
+test("hub: an app on this computer known only by its own metadata URL is listed by that URL as unverified, wraps on a phone and disconnects", async (t) => {
+  if (!browser) return t.skip(skipReason);
+  // client_kind unlisted_metadata_document (SPEC §8.4.3): the client_id URL is the name, nothing is verified.
+  const unlisted = (id, clientID) => grant(id, "alice@acme.com", { client_name: clientID, client_kind: "unlisted_metadata_document", client_host: "", redirect_host: "127.0.0.1:27891" });
+  const hermes = unlisted("a0000000000000000000000000000001", "https://nousresearch.github.io/hermes-agent/docs/oauth/client-metadata.json");
+  const long = unlisted("a0000000000000000000000000000002", "https://tools.example.com/" + "oauth-client-metadata-".repeat(20) + "client.json");
+  const stub = await startStub({ mcp: { grants: [hermes, long] } });
+  const context = await browser.newContext({ viewport: { width: 360, height: 740 } });
+  try {
+    const { page, problems } = await open(context, stub.url + "/");
+    await page.click("#connector summary");
+    await page.waitForSelector("#connector-grants li");
+    const items = await page.$$eval("#connector-grants li", (lis) => lis.map((li) => li.innerText.replace(/\s+/g, " ").trim()));
+    assert.equal(items.length, 2);
+    assert.match(items[0], /^https:\/\/nousresearch\.github\.io\/hermes-agent\/docs\/oauth\/client-metadata\.json unverified Returns to an app on this computer · connected .+2026 · expires .+2026 Disconnect$/);
+    assert.ok(items[1].startsWith(long.client_name + " unverified "), items[1]);
+    assert.deepEqual(await page.$$eval("#connector-grants .grant-trust", (els) => els.map((e) => e.className)), ["grant-trust", "grant-trust"]);
+    assert.deepEqual(
+      await page.$$eval("button.connector-revoke", (bs) => bs.map((b) => b.getAttribute("aria-label"))),
+      ["Disconnect " + hermes.client_name, "Disconnect " + long.client_name],
+    );
+
+    // The URL wraps inside its row; the Disconnect button stays beside it, whole.
+    const rows = await page.$$eval("#connector-grants li", (lis) =>
+      lis.map((li) => {
+        const r = li.getBoundingClientRect();
+        const app = li.querySelector(".grant-app").getBoundingClientRect();
+        const btn = li.querySelector("button").getBoundingClientRect();
+        const lineHeight = parseFloat(getComputedStyle(li.querySelector(".grant-app")).lineHeight);
+        return { overflow: li.scrollWidth - li.clientWidth, lines: app.height / lineHeight, appRight: app.right, btnLeft: btn.left, btnRight: btn.right, right: r.right };
+      }),
+    );
+    for (const row of rows) {
+      assert.ok(row.overflow <= 0, "a row overflows: " + JSON.stringify(row));
+      assert.ok(row.lines >= 2, "the URL wraps: " + JSON.stringify(row));
+      assert.ok(row.appRight <= row.btnLeft && row.btnRight <= row.right && row.right <= 360, "the name and the button fit side by side: " + JSON.stringify(row));
+    }
+    assert.ok(rows[1].lines > rows[0].lines, "the longer URL takes more lines");
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    assert.ok(overflow <= 0, `the card overflows horizontally by ${overflow}px`);
+
+    await page.click(`button.connector-revoke[data-id="${hermes.id}"]`);
+    await page.waitForFunction(() => document.querySelectorAll("#connector-grants li").length === 1);
+    assert.deepEqual(
+      stub.state.requests.filter((q) => q.method === "DELETE").map((q) => [q.path, q.headers["x-backyard"]]),
+      [["/mcp/grants/" + hermes.id, "1"]],
+    );
+    assert.equal(await page.textContent("#connector-status"), `Disconnected ${hermes.client_name}. It needs your approval again to use Backyard.`);
+    assert.deepEqual(problems, []);
   } finally {
     await context.close();
     await stub.close();

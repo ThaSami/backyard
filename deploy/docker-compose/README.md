@@ -134,11 +134,14 @@ and add `https://backyard.acme.com/__backyard/mcp` to Claude as a custom connect
 [Claude connector guide](../../docs/claude-connector.md)). Caddy needs nothing else: it has no
 request body limit. It needs a sign-in (step 4) to publish as a person; with `auth.mode: none`
 the connector is a guest and can publish only with `deploy.allow_anonymous`. Hosted Claude
-reaches the server from `160.79.104.0/21`, so the four machine paths (`/__backyard/mcp`,
-`/__backyard/oauth/*`, `/.well-known/oauth-authorization-server`,
+reaches the server from `160.79.104.0/21` and ChatGPT from the ranges OpenAI publishes in
+[`chatgpt-connectors.json`](https://openai.com/chatgpt-connectors.json), so the four machine
+paths (`/__backyard/mcp`, `/__backyard/oauth/*`, `/.well-known/oauth-authorization-server`,
 `/.well-known/oauth-protected-resource/__backyard/mcp`) must be reachable from there; behind an
 identity-aware proxy, exempt exactly those from its login and keep
-`/__backyard/auth/authorize` behind it.
+`/__backyard/auth/authorize` behind it. Backyard fetches Claude's client metadata from
+`https://claude.ai` and ChatGPT's from `https://chatgpt.com` when someone connects; without
+outbound internet access add `clients: []` to the `mcp` section.
 
 ### Owners-only site listing (optional)
 

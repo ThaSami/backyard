@@ -235,8 +235,10 @@ with their Entra ID or Okta sign-in. Turn it on with
 (Backyard's own OIDC login does), so there are no proxy exemptions to add, and the IdP
 application stays as it is. A WAF policy attached to the Front Door profile must not inspect
 or cap the request body of `/__backyard/mcp` below 10 MiB (publish calls carry up to 9 MiB),
-and must admit Anthropic's `160.79.104.0/21` (IPv4) if it restricts sources. By default
-Backyard fetches Claude's client metadata from `https://claude.ai` at the first connect; without
+and must admit Anthropic's `160.79.104.0/21` (IPv4, for Claude) and the ranges OpenAI publishes
+in [`chatgpt-connectors.json`](https://openai.com/chatgpt-connectors.json) (for ChatGPT; they
+change) if it restricts sources. By default Backyard fetches Claude's client metadata from
+`https://claude.ai` and ChatGPT's from `https://chatgpt.com` when someone connects; without
 outbound internet access add `clients: []` to the `mcp` section.
 
 ## Storage

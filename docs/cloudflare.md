@@ -111,13 +111,15 @@ token again, or it names the destinations to add in the dashboard; `backyard clo
 reports them as `access-connector`). The optional
 [Terraform module](../deploy/terraform/cloudflare/README.md) creates the same (`bypass_paths`).
 
-**Use Backyard in Claude.** `backyard cloudflare setup --var MCP_ENABLED:true` (Terraform:
-`mcp_enabled = true`) turns on the [Claude connector](claude-connector.md) at
-`https://<hub>/__backyard/mcp`: people add it to Claude and Claude publishes sites as them. It
-signs people in with Cloudflare Access, so publishing from Claude needs `AUTH_MODE=access` (or
+**Use Backyard in Claude or ChatGPT.** `backyard cloudflare setup --var MCP_ENABLED:true`
+(Terraform: `mcp_enabled = true`) turns on the [Claude connector](claude-connector.md) at
+`https://<hub>/__backyard/mcp`: people add it to Claude, ChatGPT or another MCP app, which then
+publishes sites as them. It signs people in with Cloudflare Access, so publishing from an app
+needs `AUTH_MODE=access` (or
 `ALLOW_ANONYMOUS_DEPLOY`, which lets anyone publish); `DEPLOY_TOKEN` plays no part. One publish
 carries at most 2 MiB of file content (`LIMITS.mcp_publish_bytes`) and tool calls count against
-`LIMITS.mcp_calls_per_day`; `MCP_CLIENTS` and `MCP_REDIRECT_URIS` change which apps may connect.
+`LIMITS.mcp_calls_per_day`; `MCP_CLIENTS` and `MCP_REDIRECT_URIS` change which apps may connect
+from anywhere (apps on the user's computer always can).
 Invalid values turn only the connector off and are listed by `/__backyard/readyz`.
 
 **Turning AI off.** AI is on by default. `backyard cloudflare setup --no-ai` (remembered;

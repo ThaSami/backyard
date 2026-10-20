@@ -36,6 +36,7 @@ type consentForm struct {
 	SignOutURL string // "" where Backyard has no logout
 	ClientName string
 	Verified   bool   // CIMD: the name comes from an allowlisted document
+	Unlisted   bool   // an unlisted metadata document: the name is its client_id
 	ClientHost string // CIMD: host of the client_id URL
 	Origin     string // origin of the redirect URI
 	Loopback   bool   // the redirect URI is an app on this computer
@@ -64,7 +65,7 @@ body { margin:0; min-height:100vh; display:flex; align-items:center; justify-con
   background:var(--bg); color:var(--fg); font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
 main { width:100%; max-width:560px; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:28px; }
 h1 { margin:0 0 8px; font-size:1.35rem; }
-p { margin:8px 0; }
+p { margin:8px 0; overflow-wrap:anywhere; }
 .muted { color:var(--muted); font-size:.92rem; }
 a { color:var(--accent); }
 textarea, pre { width:100%; font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--code);
@@ -112,7 +113,7 @@ document.getElementById("copy").addEventListener("click", function () {
 {{end}}
 {{with .Consent}}
 <p id="consent-user">{{if .Guest}}<strong>{{.Who}}</strong>. This Backyard has no sign-in; the app will act as this browser's guest.{{else}}You are signed in as <strong>{{.Who}}</strong>.{{end}}{{if .SignOutURL}} <a href="{{.SignOutURL}}">Not you? Sign out</a>{{end}}</p>
-<p id="consent-app">{{if .Verified}}<strong>{{.ClientName}}</strong> — verified by <strong>{{.ClientHost}}</strong>{{else}}<strong>"{{.ClientName}}"</strong> (name provided by the app, not verified){{end}} wants to use Backyard as you.</p>
+<p id="consent-app">{{if .Verified}}<strong>{{.ClientName}}</strong> — verified by <strong>{{.ClientHost}}</strong>{{else if .Unlisted}}<strong>{{.ClientName}}</strong> (address provided by the app, not verified){{else}}<strong>"{{.ClientName}}"</strong> (name provided by the app, not verified){{end}} wants to use Backyard as you.</p>
 <p id="consent-return">{{if .Loopback}}Backyard will send the approval to <strong>an app on this computer ({{.Origin}})</strong>. Only continue if you just started the sign-in from an app on this computer.{{else}}Backyard will send the approval to <strong>{{.Origin}}</strong>.{{end}}</p>
 <p>The app can see the sites on {{.Host}} and read their files, and publish or change sites as you. Published sites are visible to everyone who can sign in to this Backyard.</p>
 <p class="muted">This connection lasts until {{.Until}} unless you disconnect it on the Backyard hub.</p>

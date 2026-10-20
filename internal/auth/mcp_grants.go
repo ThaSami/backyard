@@ -163,7 +163,7 @@ func (g *grantRecord) live(now int64) bool { return g.RedeemedAt > 0 && g.Exp > 
 func (g *grantRecord) public() Grant {
 	return Grant{
 		ID: g.ID, ClientID: g.ClientID, ClientName: g.ClientName, ClientKind: g.ClientKind,
-		ClientHost: clientHost(g.ClientID), RedirectURI: g.RedirectURI, Scope: g.Scope, Resource: g.Resource,
+		ClientHost: clientHost(g.ClientKind, g.ClientID), RedirectURI: g.RedirectURI, Scope: g.Scope, Resource: g.Resource,
 		User: identity.User{
 			ID: g.User.ID, Email: g.User.Email, Name: g.User.Name,
 			Groups: append([]string(nil), g.User.Groups...), Anonymous: g.User.Anonymous,
@@ -493,7 +493,7 @@ func (m *MCP) audit(ctx context.Context, r *http.Request, level slog.Level, acti
 	if g != nil {
 		fields["client_name"] = g.ClientName
 		fields["client_kind"] = g.ClientKind
-		fields["client_host"] = clientHost(g.ClientID)
+		fields["client_host"] = clientHost(g.ClientKind, g.ClientID)
 		fields["redirect_host"] = redirectHost(g.RedirectURI)
 		if g.ID != "" {
 			fields["grant"] = shortGID(g.ID)

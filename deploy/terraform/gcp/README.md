@@ -329,11 +329,13 @@ The connector URL is `https://<domain>/__backyard/mcp`.
   without IAP (see [IAP notes](#iap-notes)). The routes exist whether or not the connector is on;
   after upgrading the module, run `terraform apply`.
 - **`auth_mode = "oidc"`**: nothing else to do; the IdP application stays as it is.
-- **Cloud Armor**: hosted Claude calls the hub from `160.79.104.0/21` (IPv4). If
-  `security_policy` restricts source addresses, admit that range for the four machine paths.
-- **Egress**: Backyard fetches Claude's client metadata from `https://claude.ai` at the first
-  connect. Without outbound internet access from Cloud Run, add `clients: []` to the `mcp`
-  section.
+- **Cloud Armor**: hosted Claude calls the hub from `160.79.104.0/21` (IPv4) and ChatGPT from the
+  ranges OpenAI publishes in [`chatgpt-connectors.json`](https://openai.com/chatgpt-connectors.json)
+  (they change). If `security_policy` restricts source addresses, admit them for the four
+  machine paths.
+- **Egress**: Backyard fetches Claude's client metadata from `https://claude.ai` and ChatGPT's
+  from `https://chatgpt.com` when someone connects. Without outbound internet access from Cloud
+  Run, add `clients: []` to the `mcp` section.
 - **Size**: publish calls carry up to 9 MiB, well below Cloud Run's 32 MiB request limit.
 
 ## Costs

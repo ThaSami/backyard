@@ -72,10 +72,10 @@ security review. Backyard removes all of that:
   Pomerium, Azure Easy Auth, Cloudflare Access), or none for labs; API tokens, static CI tokens
   and the OAuth device flow for CLIs.
 - **Claude connector** (opt-in, both editions): add `https://<hub>/__backyard/mcp` to Claude
-  (web, Desktop, mobile, Cowork, Claude Code) as a custom connector; people sign in with the
-  company login, approve Backyard's consent page, and Claude finds, reads and publishes sites as
-  them. Backyard is the OAuth server; your IdP needs no change
-  ([guide](docs/claude-connector.md)).
+  (web, Desktop, mobile, Cowork, Claude Code), ChatGPT or another MCP app (opencode, Codex CLI,
+  Gemini CLI…) as a custom connector or remote MCP server; people sign in with the company
+  login, approve Backyard's consent page, and the app finds, reads and publishes sites as them.
+  Backyard is the OAuth server; your IdP needs no change ([guide](docs/claude-connector.md)).
 - **Deploy any way**: Backyard's diffed upload API (no cloud account needed), `aws s3 sync`,
   `gcloud storage rsync`, `az storage blob sync` or plain `rsync`.
 - **Pluggable everything**: storage (disk, S3, GCS, Azure Blob), database (SQLite, PostgreSQL,

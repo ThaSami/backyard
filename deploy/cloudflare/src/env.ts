@@ -65,15 +65,17 @@ export interface Env {
   /** "true" serves the Claude connector (remote MCP, SPEC §8.4, §14.1); unset = off. */
   MCP_ENABLED?: string;
   /**
-   * Client ID Metadata Document URLs that may connect (comma or whitespace
-   * separated). Unset: Claude's two documents; set but empty: none, so
-   * clients register themselves.
+   * Client ID Metadata Document URLs that are fetched and shown as verified,
+   * and that may connect from anywhere (comma or whitespace separated).
+   * Unset: Claude's two documents and ChatGPT's; set but empty: none, so
+   * clients register themselves. Another valid client metadata URL connects
+   * without a fetch, unverified, with a loopback redirect address only.
    */
   MCP_CLIENTS?: string;
   /**
    * Exact https addresses that may receive sign-in codes (comma or whitespace
-   * separated). Unset: Claude's two callbacks; set but empty: http loopback
-   * addresses only (always allowed).
+   * separated). Unset: Claude's two callbacks and ChatGPT's; set but empty:
+   * http loopback addresses only (always allowed).
    */
   MCP_REDIRECT_URIS?: string;
 

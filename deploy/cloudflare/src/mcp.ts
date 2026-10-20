@@ -74,7 +74,8 @@ export async function serveMcp(ctx: RequestContext): Promise<Response> {
   // 1. Enabled, on the canonical hub host (hub.ts checks it too).
   const off = mcpPathGate(ctx);
   if (off) return off;
-  // 3. Origin: absent, or the hub's, the request's own, or Claude's.
+  // 3. Origin: absent, or the hub's, the request's own, or an allowed app's
+  // (MCP_REDIRECT_URIS, MCP_CLIENTS; Claude's and ChatGPT's by default).
   const origin = req.headers.get("Origin") ?? "";
   if (origin !== "" && !(plainOrigin(origin) && mcpAllowedOrigin(ctx, origin))) {
     return gateError(403, "forbidden", "requests from this origin are not accepted");

@@ -195,10 +195,13 @@ The connector URL is `https://<domain>/__backyard/mcp` (see the
 and the nginx example's `client_max_body_size 100m` is above the 10 MiB a publish call may need;
 a smaller limit must stay at `10m` or more. Publishing as a person needs single sign-on
 (`auth.mode: oidc`, or `header` behind a proxy); hosted Claude reaches the server from
-`160.79.104.0/21`. Behind an identity-aware proxy, exempt the four machine paths
-(`/__backyard/mcp`, `/__backyard/oauth/*`, `/.well-known/oauth-authorization-server`,
-`/.well-known/oauth-protected-resource/__backyard/mcp`) from its login and keep
-`/__backyard/auth/authorize` behind it.
+`160.79.104.0/21` and ChatGPT from the ranges OpenAI publishes in
+[`chatgpt-connectors.json`](https://openai.com/chatgpt-connectors.json). Behind an
+identity-aware proxy, exempt the four machine paths (`/__backyard/mcp`, `/__backyard/oauth/*`,
+`/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/__backyard/mcp`)
+from its login and keep `/__backyard/auth/authorize` behind it. Backyard fetches Claude's
+client metadata from `https://claude.ai` and ChatGPT's from `https://chatgpt.com` when someone
+connects; without outbound internet access add `clients: []` to the `mcp` section.
 
 ## Owners-only site listing
 

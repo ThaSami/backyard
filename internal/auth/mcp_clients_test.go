@@ -1,8 +1,12 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"html"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,6 +17,7 @@ import (
 	"time"
 
 	"github.com/thasami/backyard/internal/config"
+	"github.com/thasami/backyard/internal/docstore"
 )
 
 func TestMCPRegister(t *testing.T) {
@@ -360,12 +365,17 @@ func TestMCPCIMD(t *testing.T) {
 		t.Errorf("unlisted redirect: %d", res.StatusCode)
 	}
 
-	// Not allowlisted: never fetched, never redirected.
+	// Not allowlisted: never fetched, never redirected. A client metadata
+	// URL is not allowed with a redirect that leaves this computer; anything
+	// else (here an IP literal host, a query) is unknown.
 	before := s.count()
-	for _, other := range []string{s.URL + "/other", "https://example.com/x", id + "/", id + "?x=1"} {
+	for other, title := range map[string]string{
+		"https://example.com/x": "App not allowed", "https://localhost/client": "App not allowed",
+		s.URL + "/other": "Unknown app", id + "/": "Unknown app", id + "?x=1": "Unknown app",
+	} {
 		res := e.authorize(newBrowser(), authzParams(other, claudeCB, ch, "s"))
-		if res.StatusCode != http.StatusBadRequest || res.Header.Get("Location") != "" || !strings.Contains(body(t, res), "App not allowed") {
-			t.Errorf("non-allowlisted %s: %d", other, res.StatusCode)
+		if res.StatusCode != http.StatusBadRequest || res.Header.Get("Location") != "" || !strings.Contains(body(t, res), title) {
+			t.Errorf("non-allowlisted %s: %d, want %s", other, res.StatusCode, title)
 		}
 	}
 	// Only "https://" (exactly) names a metadata document.
@@ -383,61 +393,58 @@ func TestMCPCIMD(t *testing.T) {
 
 func TestMCPCIMDFailures(t *testing.T) {
 	_, ch := pkce()
+	doc := func(members string) func(s *cimdServer) {
+		return func(s *cimdServer) {
+			s.body = func(id string) string { return `{"client_id":"` + id + `",` + members + `}` }
+		}
+	}
 	cases := []struct {
 		name   string
 		setup  func(s *cimdServer)
 		path   string
 		reason string
+		rules  bool // loaded, but it breaks the document rules (else: the fetch failed)
 	}{
 		{"client_id mismatch", func(s *cimdServer) {
 			s.body = func(string) string { return `{"client_id":"https://claude.ai/x","redirect_uris":["` + claudeCB + `"]}` }
-		}, "/client", "client_id"},
-		{"redirect", nil, "/redirect", "redirect"},
-		{"non-200", func(s *cimdServer) { s.status = http.StatusNotFound }, "/client", "HTTP 404"},
-		{"wrong content type", func(s *cimdServer) { s.ctype = "text/html" }, "/client", "not JSON"},
+		}, "/client", "client_id", true},
+		{"redirect", nil, "/redirect", "redirect", false},
+		{"non-200", func(s *cimdServer) { s.status = http.StatusNotFound }, "/client", "HTTP 404", false},
+		{"wrong content type", func(s *cimdServer) { s.ctype = "text/html" }, "/client", "not JSON", false},
 		{"too large", func(s *cimdServer) {
 			s.body = func(id string) string {
 				doc := `{"client_id":"` + id + `","redirect_uris":["` + claudeCB + `"],"pad":"`
 				return doc + strings.Repeat("x", 5121-len(doc)-2) + `"}`
 			}
-		}, "/client", "5120 bytes"},
-		{"private_key_jwt", func(s *cimdServer) {
-			s.body = func(id string) string {
-				return `{"client_id":"` + id + `","redirect_uris":["` + claudeCB + `"],"token_endpoint_auth_method":"private_key_jwt"}`
-			}
-		}, "/client", "client authentication"},
-		{"methods without none", func(s *cimdServer) {
-			s.body = func(id string) string {
-				return `{"client_id":"` + id + `","redirect_uris":["` + claudeCB + `"],"token_endpoint_auth_method":"none",` +
-					`"token_endpoint_auth_methods_supported":["private_key_jwt"]}`
-			}
-		}, "/client", "client authentication"},
-		{"methods not strings", func(s *cimdServer) {
-			s.body = func(id string) string {
-				return `{"client_id":"` + id + `","redirect_uris":["` + claudeCB + `"],"token_endpoint_auth_methods_supported":"none"}`
-			}
-		}, "/client", "token_endpoint_auth_methods_supported"},
-		{"methods null", func(s *cimdServer) {
-			s.body = func(id string) string {
-				return `{"client_id":"` + id + `","redirect_uris":["` + claudeCB + `"],"token_endpoint_auth_methods_supported":null}`
-			}
-		}, "/client", "token_endpoint_auth_methods_supported"},
-		{"client secret", func(s *cimdServer) {
-			s.body = func(id string) string {
-				return `{"client_id":"` + id + `","redirect_uris":["` + claudeCB + `"],"client_secret":"s3cret"}`
-			}
-		}, "/client", "client secret"},
-		{"no allowed redirect", func(s *cimdServer) {
-			s.body = func(id string) string {
-				return `{"client_id":"` + id + `","redirect_uris":["https://evil.example/cb"]}`
-			}
-		}, "/client", "redirect_uris"},
-		{"eleven redirects", func(s *cimdServer) {
-			s.body = func(id string) string {
-				return `{"client_id":"` + id + `","redirect_uris":[` + strings.Repeat(`"`+claudeCB+`",`, 10) + `"` + claudeCB + `"]}`
-			}
-		}, "/client", "redirect_uris"},
-		{"not an object", func(s *cimdServer) { s.body = func(string) string { return `[1]` } }, "/client", "JSON object"},
+		}, "/client", "5120 bytes", false},
+		{"private_key_jwt", doc(`"redirect_uris":["` + claudeCB + `"],"token_endpoint_auth_method":"private_key_jwt"`),
+			"/client", "client authentication", true},
+		{"methods without none", doc(`"redirect_uris":["` + claudeCB + `"],"token_endpoint_auth_method":"none",` +
+			`"token_endpoint_auth_methods_supported":["private_key_jwt"]`), "/client", "client authentication", true},
+		{"methods not strings", doc(`"redirect_uris":["` + claudeCB + `"],"token_endpoint_auth_methods_supported":"none"`),
+			"/client", "token_endpoint_auth_methods_supported is not an array of strings", true},
+		{"methods null", doc(`"redirect_uris":["` + claudeCB + `"],"token_endpoint_auth_methods_supported":null`),
+			"/client", "token_endpoint_auth_methods_supported is not an array of strings", true},
+		// Every member must be a string, as on the Worker (null is not "").
+		{"methods with null", doc(`"redirect_uris":["` + claudeCB + `"],"token_endpoint_auth_methods_supported":["none",null]`),
+			"/client", "token_endpoint_auth_methods_supported is not an array of strings", true},
+		{"methods with a number", doc(`"redirect_uris":["` + claudeCB + `"],"token_endpoint_auth_methods_supported":["none",1]`),
+			"/client", "token_endpoint_auth_methods_supported is not an array of strings", true},
+		{"client secret", doc(`"redirect_uris":["` + claudeCB + `"],"client_secret":"s3cret"`), "/client", "client secret", true},
+		{"no allowed redirect", doc(`"redirect_uris":["https://evil.example/cb"]`), "/client", "redirect_uris", true},
+		{"eleven redirects", doc(`"redirect_uris":[` + strings.Repeat(`"`+claudeCB+`",`, 10) + `"` + claudeCB + `"]`),
+			"/client", "redirect_uris", true},
+		{"redirect_uris with null", doc(`"redirect_uris":["` + claudeCB + `",null]`),
+			"/client", "redirect_uris must be an array of 1 to 10 URIs", true},
+		{"redirect_uris with a number", doc(`"redirect_uris":[1,"` + claudeCB + `"]`),
+			"/client", "redirect_uris must be an array of 1 to 10 URIs", true},
+		{"redirect_uris null", doc(`"redirect_uris":null`), "/client", "redirect_uris must be an array of 1 to 10 URIs", true},
+		{"redirect_uris a string", doc(`"redirect_uris":"` + claudeCB + `"`), "/client", "redirect_uris must be an array of 1 to 10 URIs", true},
+		{"client_name not a string", doc(`"redirect_uris":["` + claudeCB + `"],"client_name":7`), "/client", "client_name", true},
+		{"not an object", func(s *cimdServer) { s.body = func(string) string { return `[1]` } }, "/client", "JSON object", true},
+		{"not UTF-8", func(s *cimdServer) {
+			s.body = func(id string) string { return `{"client_id":"` + id + `","client_name":"a` + "\xff" + `"}` }
+		}, "/client", "UTF-8", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -447,10 +454,18 @@ func TestMCPCIMDFailures(t *testing.T) {
 			}
 			e, _ := cimdEnv(t, s)
 			res := e.authorize(newBrowser(), authzParams(s.URL+tc.path, claudeCB, ch, "s"))
-			b := body(t, res)
+			b := html.UnescapeString(body(t, res))
 			if res.StatusCode != http.StatusBadGateway || res.Header.Get("Location") != "" || !strings.Contains(b, "Could not verify the app") ||
 				!strings.Contains(b, tc.reason) || !strings.Contains(b, "Register automatically") || !strings.Contains(b, s.URL+tc.path) {
 				t.Errorf("%d %q:\n%s", res.StatusCode, res.Header.Get("Location"), b)
+			}
+			// The detail names the remedy of the cause.
+			want, other := cimdFetchDetail, cimdRulesDetail
+			if tc.rules {
+				want, other = other, want
+			}
+			if !strings.Contains(b, want) || strings.Contains(b, other) {
+				t.Errorf("detail: want %q in\n%s", want, b)
 			}
 		})
 	}
@@ -672,4 +687,258 @@ func TestMCPRegisterNotUTF8(t *testing.T) {
 	if m := jsonBody(t, res); res.StatusCode != http.StatusBadRequest || m["error"] != "invalid_client_metadata" {
 		t.Errorf("a body that is not UTF-8: %d %v; want 400 invalid_client_metadata", res.StatusCode, m)
 	}
+}
+
+// opencode's client metadata URL: an app on the user's computer that names
+// itself by its own document, which no deployment lists.
+const opencodeCIMD = "https://opencode.ai/oauth/opencode/client.json"
+
+// fetchCounter is an MCP HTTP client transport that counts and fails every
+// request: a client metadata document fetch, of any URL, reaches it.
+type fetchCounter struct{ n atomic.Int32 }
+
+func (c *fetchCounter) RoundTrip(*http.Request) (*http.Response, error) {
+	c.n.Add(1)
+	return nil, errors.New("no network in this test")
+}
+
+// unlistedEnv is a hub with the default mcp.clients whose metadata fetches
+// all reach fc.
+func unlistedEnv(t *testing.T, fc *fetchCounter, mutate func(*config.Config)) *mcpEnv {
+	t.Helper()
+	return newMCPEnv(t, ModeNone, mutate, func(o *Options) { o.MCPHTTPClient = &http.Client{Transport: fc} })
+}
+
+// TestMCPUnlistedCIMD: a client metadata URL outside mcp.clients connects
+// from this computer (a loopback redirect URI), is never fetched, and is
+// shown by its address as not verified (SPEC §8.4.3, §8.4.4).
+func TestMCPUnlistedCIMD(t *testing.T) {
+	fc := &fetchCounter{}
+	e := unlistedEnv(t, fc, nil)
+	ctx := context.Background()
+	const cb = "http://127.0.0.1:53682/callback"
+	_, ch := pkce()
+
+	_, page := consentFields(t, e.authorize(newBrowser(), authzParams(opencodeCIMD, cb, ch, "s")))
+	for _, want := range []string{
+		`<p id="consent-app"><strong>` + opencodeCIMD + `</strong> (address provided by the app, not verified) wants to use Backyard as you.</p>`,
+		"Backyard will send the approval to <strong>an app on this computer (http://127.0.0.1:53682)</strong>. Only continue if you just started the sign-in from an app on this computer.",
+		"Only allow this if you started connecting " + opencodeCIMD + " to Backyard yourself just now.",
+		"overflow-wrap:anywhere",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("consent page lacks %q\n%s", want, page)
+		}
+	}
+	if strings.Contains(page, "verified by") {
+		t.Error("an unlisted metadata document is shown as verified")
+	}
+	// There is no document, so no registered list: any loopback URI.
+	for _, uri := range []string{"http://localhost/callback", "http://localhost:27890/callback", "http://[::1]:5/cb?x=1", "http://127.0.0.1:9"} {
+		consentFields(t, e.authorize(newBrowser(), authzParams(opencodeCIMD, uri, ch, "s")))
+	}
+
+	// The whole flow: consent, code exchange, an MCP access token, refresh.
+	f := newFlow(opencodeCIMD, cb)
+	at, rt := e.tokens(newBrowser(), f)
+	u, g, err := e.m.VerifyAccessToken(ctx, at)
+	if err != nil || !u.Anonymous || g.ClientID != opencodeCIMD || g.ClientKind != "unlisted_metadata_document" ||
+		g.ClientName != opencodeCIMD || g.ClientHost != "" || g.RedirectURI != cb {
+		t.Fatalf("VerifyAccessToken = %+v %+v %v", u, g, err)
+	}
+	gs, err := e.m.Grants(ctx, u.ID)
+	if err != nil || len(gs) != 1 || gs[0].ClientKind != clientKindUnlisted || gs[0].ClientHost != "" || gs[0].ClientName != opencodeCIMD {
+		t.Fatalf("Grants = %+v %v", gs, err)
+	}
+	q := docstore.Query{Limit: 100}
+	_ = q.Normalize(100)
+	audit, _ := e.docs.Query(ctx, docstore.SystemSite, auditCollection, q)
+	if len(audit.Docs) != 1 || audit.Docs[0].Data["client_kind"] != clientKindUnlisted || audit.Docs[0].Data["client_host"] != "" ||
+		audit.Docs[0].Data["client_name"] != opencodeCIMD || audit.Docs[0].Data["redirect_host"] != "127.0.0.1:53682" {
+		t.Errorf("audit = %+v", audit.Docs)
+	}
+	res := e.refresh(f, rt, nil)
+	m := jsonBody(t, res)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("refresh: %d %v", res.StatusCode, m)
+	}
+	// Codes and refresh tokens stay bound to the client_id.
+	other := newFlow("https://pi.dev/oauth/client.json", cb)
+	oauthErr(t, e.refresh(other, m["refresh_token"].(string), nil), http.StatusBadRequest, "invalid_grant")
+	code := e.code(newBrowser(), f)
+	other.verifier = f.verifier
+	oauthErr(t, e.exchange(other, code, nil), http.StatusBadRequest, "invalid_grant")
+	if res := e.exchange(f, code, url.Values{"redirect_uri": {"http://127.0.0.1:53683/callback"}}); res.StatusCode != http.StatusBadRequest {
+		t.Errorf("exchange with another redirect_uri: %d", res.StatusCode)
+	}
+	// RFC 7009 revocation by the same client.
+	if res := e.do(oauthPost(OAuthRevokePath, url.Values{"token": {m["refresh_token"].(string)}, "client_id": {opencodeCIMD}})); res.StatusCode != http.StatusOK {
+		t.Errorf("revoke: %d", res.StatusCode)
+	}
+	if _, _, err := e.m.VerifyAccessToken(ctx, m["access_token"].(string)); !isDesc(err, descRevoked) {
+		t.Errorf("after revocation: %v", err)
+	}
+
+	// Never fetched, never cached.
+	if n := fc.n.Load(); n != 0 {
+		t.Fatalf("an unlisted client metadata URL was fetched %d times", n)
+	}
+	e.m.cimdMu.Lock()
+	cached := len(e.m.cimd)
+	e.m.cimdMu.Unlock()
+	if cached != 0 {
+		t.Errorf("cimd cache entries = %d", cached)
+	}
+	// The counter does see fetches: an allowlisted document is fetched (and
+	// fails with the fetch detail).
+	res = e.authorize(newBrowser(), authzParams(claudeCIMD, claudeCB, ch, "s"))
+	if b := html.UnescapeString(body(t, res)); res.StatusCode != http.StatusBadGateway || !strings.Contains(b, cimdFetchDetail) || fc.n.Load() != 1 {
+		t.Errorf("allowlisted document: %d, fetches %d\n%s", res.StatusCode, fc.n.Load(), b)
+	}
+
+	// With mcp.clients: [] the rule still applies (nothing is fetched anyway).
+	none := unlistedEnv(t, fc, func(c *config.Config) { c.MCP.Clients = []string{} })
+	consentFields(t, none.authorize(newBrowser(), authzParams(opencodeCIMD, cb, ch, "s")))
+	if fc.n.Load() != 1 {
+		t.Error("mcp.clients: [] fetched an unlisted document")
+	}
+}
+
+// TestMCPUnlistedCIMDNotLocal: an unlisted metadata document whose sign-in
+// does not return to this computer is not allowed, also at the consent POST.
+func TestMCPUnlistedCIMDNotLocal(t *testing.T) {
+	fc := &fetchCounter{}
+	e := unlistedEnv(t, fc, nil)
+	_, ch := pkce()
+	for _, uri := range []string{claudeCB, "https://chatgpt.com/connector_platform_oauth_redirect", "https://evil.example/cb",
+		"http://opencode.ai/callback", "https://localhost/callback", "http://localhost/cb#x", "http://localhost:0/cb", "http://u@localhost/cb", ""} {
+		params := authzParams(opencodeCIMD, uri, ch, "s")
+		if uri == "" {
+			params.Del("redirect_uri")
+		}
+		res := e.authorize(newBrowser(), params)
+		b := html.UnescapeString(body(t, res))
+		if res.StatusCode != http.StatusBadRequest || res.Header.Get("Location") != "" || !strings.Contains(b, "<h1>App not allowed</h1>") ||
+			!strings.Contains(b, "The app "+opencodeCIMD+" may connect to this Backyard only from this computer (a sign-in that returns to localhost).") ||
+			!strings.Contains(b, "An administrator can allow it from anywhere by adding its client metadata URL to mcp.clients and its redirect address to mcp.redirect_uris.") {
+			t.Errorf("redirect %q: %d %q\n%s", uri, res.StatusCode, res.Header.Get("Location"), b)
+		}
+	}
+	// A consent form whose redirect_uri was changed to Claude's callback.
+	br := newBrowser()
+	fields, _ := consentFields(t, e.authorize(br, authzParams(opencodeCIMD, "http://localhost:4000/cb", ch, "s")))
+	fields.Set("redirect_uri", claudeCB)
+	res := e.consentPost(br, fields, "allow")
+	if b := body(t, res); res.StatusCode != http.StatusBadRequest || res.Header.Get("Location") != "" || !strings.Contains(b, "App not allowed") {
+		t.Errorf("consent POST: %d %q\n%s", res.StatusCode, res.Header.Get("Location"), b)
+	}
+	if e.grantCount() != 0 || fc.n.Load() != 0 {
+		t.Errorf("grants %d, fetches %d", e.grantCount(), fc.n.Load())
+	}
+}
+
+// TestMCPUnlistedCIMDInvalidURL: an https client_id that is neither
+// allowlisted nor a client metadata URL (rule 1 of SPEC §12) is unknown, at
+// the authorize and the token endpoint.
+func TestMCPUnlistedCIMDInvalidURL(t *testing.T) {
+	fc := &fetchCounter{}
+	e := unlistedEnv(t, fc, nil)
+	_, ch := pkce()
+	long := "https://opencode.ai/" + strings.Repeat("a", 512-len("https://opencode.ai/"))
+	for _, id := range []string{
+		"http://opencode.ai/oauth/client.json", "HTTPS://opencode.ai/oauth/client.json",
+		"https://opencode.ai/oauth/client.json?x=1", "https://opencode.ai/oauth/client.json?",
+		"https://opencode.ai/oauth/client.json#f", "https://opencode.ai/", "https://opencode.ai",
+		"https://203.0.113.5/client.json", "https://[2001:db8::1]/client.json", "https://127.0.0.1/client.json",
+		"https://opencode.ai/a/../client.json", "https://opencode.ai/./client.json", "https://opencode.ai/a/%2e%2e/client.json",
+		"https://u@opencode.ai/client.json", "https://opencode.ai/a b", "https://opencode.ai/a\\b", "https://opencode.ai/%zz",
+		"https:///client.json", long + "a",
+		// The strict form of an address shown as the app's name.
+		"https://opencode.ai:443/client.json", "https://opencode.ai./client.json", "https://open_code.ai/client.json",
+		"https://1.2.3.999/client.json", "https://op\u202eencode.ai/client.json", "https://opencode.ai/\u202eclient.json",
+		"https://opencode.ai/a\u00a0b", "https://opencode.ai/a\u0085b", "https://exämple.com/client.json",
+		"https://opencode.ai/a%2Fb", "https://opencode.ai/a%2fb", "https://opencode.ai/a%2", "https://opencode.ai/a%",
+		"https://xn--80ak6aa92e.com/client.json", "https://apps.XN--p1ai/client.json",
+		"https://example.123/client.json", "https://example.0x1f/client.json", "https://foo.0X/a", "https://1.2.3.0x4/a",
+	} {
+		res := e.authorize(newBrowser(), authzParams(id, "http://localhost/callback", ch, "s"))
+		if b := body(t, res); res.StatusCode != http.StatusBadRequest || res.Header.Get("Location") != "" || !strings.Contains(b, "Unknown app") {
+			t.Errorf("client_id %q: %d\n%s", id, res.StatusCode, b)
+		}
+		if e.m.knownClient(id) {
+			t.Errorf("knownClient(%q)", id)
+		}
+		r := oauthPost(OAuthTokenPath, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"byrt_x"}, "client_id": {id}})
+		oauthErr(t, e.do(r), http.StatusUnauthorized, "invalid_client")
+	}
+	// 512 bytes is a client metadata URL; escapes stay as sent.
+	consentFields(t, e.authorize(newBrowser(), authzParams(long, "http://localhost/callback", ch, "s")))
+	for _, id := range []string{"https://example.com/%E2%80%AEclient.json", "https://Example.COM/a@b/~c!$&'()*+,;=:x.json",
+		"https://my-app.example.co.uk/oauth/client", "https://x/y", "https://1a.example/2", "https://foo.0xg/a", "https://0x1f.example/a"} {
+		if !unlistedClientURL(id) {
+			t.Errorf("unlistedClientURL(%q) = false", id)
+		}
+	}
+	if !e.m.knownClient(long) || !e.m.knownClient(opencodeCIMD) || !e.m.knownClient(claudeCIMD) {
+		t.Error("knownClient refuses a client metadata URL")
+	}
+	if fc.n.Load() != 0 {
+		t.Errorf("fetches = %d", fc.n.Load())
+	}
+}
+
+// TestMCPDelistedCIMD: once its URL leaves mcp.clients, a metadata document
+// client is an unlisted one: it keeps only the connections that return to
+// this computer, and is no longer fetched.
+func TestMCPDelistedCIMD(t *testing.T) {
+	s := newCIMDServer(t)
+	const id = "https://example.com/client" // served by s (namedClient)
+	e := newMCPEnv(t, ModeNone, func(c *config.Config) { c.MCP.Clients = []string{id} },
+		func(o *Options) { o.MCPHTTPClient = s.namedClient() })
+	hosted := newFlow(id, claudeCB)
+	_, hostedRT := e.tokens(newBrowser(), hosted)
+	pending := newFlow(id, claudeCB)
+	pendingCode := e.code(newBrowser(), pending)
+	local := newFlow(id, "http://localhost:4444/callback")
+	_, localRT := e.tokens(newBrowser(), local)
+	if s.count() != 1 {
+		t.Fatalf("fetches = %d", s.count())
+	}
+
+	// The administrator removes it from mcp.clients (same secret and store).
+	e2 := newMCPEnv(t, ModeNone, nil, func(o *Options) { o.Docs = e.docs; o.MCPHTTPClient = s.namedClient() })
+	if m := oauthErr(t, e2.refresh(hosted, hostedRT, nil), http.StatusBadRequest, "invalid_grant"); m["error_description"] != errRedirectGone {
+		t.Errorf("hosted refresh: %v", m)
+	}
+	oauthErr(t, e2.exchange(pending, pendingCode, nil), http.StatusBadRequest, "invalid_grant")
+	if res := e2.refresh(local, localRT, nil); res.StatusCode != http.StatusOK {
+		t.Errorf("local refresh: %d %s", res.StatusCode, body(t, res))
+	}
+	// Signing in again: not with Claude's callback; from this computer as
+	// an unlisted app, without a fetch.
+	_, ch := pkce()
+	if res := e2.authorize(newBrowser(), authzParams(id, claudeCB, ch, "s")); res.StatusCode != http.StatusBadRequest ||
+		!strings.Contains(body(t, res), "App not allowed") {
+		t.Errorf("authorize with Claude's callback: %d", res.StatusCode)
+	}
+	_, page := consentFields(t, e2.authorize(newBrowser(), authzParams(id, "http://localhost:4444/callback", ch, "s")))
+	if !strings.Contains(page, "<strong>"+id+"</strong> (address provided by the app, not verified)") {
+		t.Errorf("consent page:\n%s", page)
+	}
+	if s.count() != 1 {
+		t.Errorf("fetches = %d after delisting", s.count())
+	}
+}
+
+// namedClient is an HTTP client that reaches s for every host name (its
+// certificate is valid for example.com).
+func (s *cimdServer) namedClient() *http.Client {
+	tlsConf := s.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	return &http.Client{Transport: &http.Transport{
+		TLSClientConfig: tlsConf,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, s.Listener.Addr().String())
+		},
+	}}
 }

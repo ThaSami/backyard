@@ -379,14 +379,17 @@ connector.
   `terraform apply`. `/__backyard/auth/authorize` stays behind the ALB login, which is the
   connector's sign-in. On site hosts Backyard answers the machine paths with `404` and still
   demands the ALB's signed header for a site's own `/.well-known` files.
-- **Network**: hosted Claude reaches the hub from `160.79.104.0/21` (IPv4), so an internet-facing
-  ALB whose `allowed_cidrs` restrict sources must include that range (an `internal = true` ALB
-  works only with connectors added locally in Claude Code). By default Backyard fetches Claude's
-  client metadata from `https://claude.ai` at the first connect; the tasks reach it through the
-  NAT gateway. Without egress, add `clients: []` to the `mcp` section.
+- **Network**: hosted Claude reaches the hub from `160.79.104.0/21` (IPv4) and ChatGPT from the
+  ranges OpenAI publishes in [`chatgpt-connectors.json`](https://openai.com/chatgpt-connectors.json)
+  (they change), so an internet-facing ALB whose `allowed_cidrs` restrict sources must include
+  them (an `internal = true` ALB works only with apps on the user's computer, such as a connector
+  added locally in Claude Code). By default Backyard fetches Claude's client metadata from
+  `https://claude.ai` and ChatGPT's from `https://chatgpt.com` when someone connects; the tasks
+  reach them through the NAT gateway. Without egress, add `clients: []` to the `mcp` section.
 - **AWS WAF** (`waf_web_acl_arn`): the managed rule `SizeRestrictions_BODY` (Core rule set)
   blocks large request bodies; exclude `/__backyard/mcp` from it (publish calls carry up to
-  9 MiB), and allow `160.79.104.0/21` if the web ACL restricts sources.
+  9 MiB), and allow `160.79.104.0/21` and OpenAI's published ranges if the web ACL restricts
+  sources.
 
 ## Scaling and pub/sub
 

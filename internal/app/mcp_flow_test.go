@@ -707,6 +707,78 @@ func TestMCPFlowCIMD(t *testing.T) {
 	}
 }
 
+// TestMCPFlowUnlistedCIMD: an app on the user's computer that names itself
+// by a client metadata document no deployment lists (opencode 2.x, Codex
+// CLI, Hermes Agent) connects with the default mcp.clients: its URL is the
+// client_id, the sign-in returns to a loopback address, and the document is
+// never fetched (SPEC §8.4.3).
+func TestMCPFlowUnlistedCIMD(t *testing.T) {
+	const clientURL = "https://opencode.ai/oauth/opencode/client.json"
+	var fetches atomic.Int32
+	cimdClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		fetches.Add(1)
+		return nil, io.ErrUnexpectedEOF
+	})}
+	port := freePort(t)
+	_, base := startApp(t, mcpFlowConfig(t, port, nil), Options{
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		authOptions: func(o *auth.Options) { o.MCPHTTPClient = cimdClient },
+	})
+
+	b := newBrowser(t, base)
+	h, err := sdkauth.NewAuthorizationCodeHandler(&sdkauth.AuthorizationCodeHandlerConfig{
+		ClientIDMetadataDocumentConfig: &sdkauth.ClientIDMetadataDocumentConfig{URL: clientURL},
+		RedirectURL:                    "http://127.0.0.1:53682/callback",
+		AuthorizationCodeFetcher:       b.fetcher,
+		RequestRefreshToken:            true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := connect(t, base, h)
+	page := b.lastPage()
+	if !strings.Contains(page, "<strong>"+clientURL+"</strong> (address provided by the app, not verified)") ||
+		!strings.Contains(page, "an app on this computer (http://127.0.0.1:53682)") || strings.Contains(page, "verified by") {
+		t.Errorf("consent page:\n%s", page)
+	}
+	var who struct {
+		Connection struct {
+			Client string `json:"client"`
+		} `json:"connection"`
+	}
+	if err := json.Unmarshal([]byte(callTool(t, cs, "backyard_whoami", nil)), &who); err != nil || who.Connection.Client != clientURL {
+		t.Fatalf("whoami connection = %+v (%v)", who.Connection, err)
+	}
+
+	code, raw := b.do(http.MethodGet, "/__backyard/api/mcp/grants", nil)
+	var grants struct {
+		Grants []struct {
+			ClientName   string `json:"client_name"`
+			ClientKind   string `json:"client_kind"`
+			ClientHost   string `json:"client_host"`
+			RedirectHost string `json:"redirect_host"`
+		} `json:"grants"`
+	}
+	if code != 200 || json.Unmarshal(raw, &grants) != nil || len(grants.Grants) != 1 {
+		t.Fatalf("grants: %d %s", code, raw)
+	}
+	if g := grants.Grants[0]; g.ClientName != clientURL || g.ClientKind != "unlisted_metadata_document" || g.ClientHost != "" ||
+		g.RedirectHost != "127.0.0.1:53682" {
+		t.Fatalf("grant = %+v (%s)", g, raw)
+	}
+	if !strings.Contains(string(raw), `"client_host":""`) {
+		t.Errorf("client_host is not an empty string: %s", raw)
+	}
+	if n := fetches.Load(); n != 0 {
+		t.Errorf("the unlisted client metadata document was fetched %d times", n)
+	}
+}
+
+// roundTripFunc is an http.RoundTripper.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
 // TestMCPFlowLimits: the connector without the hub's embedded gateway can
 // read but not publish, and the endpoint charges api_per_minute per user.
 func TestMCPFlowLimits(t *testing.T) {

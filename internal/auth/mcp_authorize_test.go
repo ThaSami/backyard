@@ -51,7 +51,15 @@ func TestMCPAuthorizeOrder(t *testing.T) {
 		{"bad query", e, "client_id=%zz", nil, 400, "Invalid authorization request"},
 		{"missing client_id", e, "", with(func(v url.Values) { v.Del("client_id") }), 400, "Unknown app"},
 		{"unknown client_id", e, "", with(func(v url.Values) { v.Set("client_id", "bydc_nope") }), 400, "Unknown app"},
-		{"non-allowlisted cimd", e, "", with(func(v url.Values) { v.Set("client_id", "https://evil.example/client") }), 400, "App not allowed"},
+		{"unlisted cimd, https redirect", e, "", with(func(v url.Values) {
+			v.Set("client_id", "https://evil.example/client")
+			v.Set("redirect_uri", claudeCB)
+		}), 400, "App not allowed"},
+		{"unlisted cimd, no redirect", e, "", with(func(v url.Values) {
+			v.Set("client_id", "https://evil.example/client")
+			v.Del("redirect_uri")
+		}), 400, "App not allowed"},
+		{"https client_id, no metadata URL", e, "", with(func(v url.Values) { v.Set("client_id", "https://evil.example/") }), 400, "Unknown app"},
 		{"missing redirect_uri", e, "", with(func(v url.Values) { v.Del("redirect_uri") }), 400, "Redirect address not allowed"},
 		{"unregistered redirect", e, "", with(func(v url.Values) { v.Set("redirect_uri", "http://127.0.0.1:9/other") }), 400, "Redirect address not allowed"},
 		{"other loopback host", e, "", with(func(v url.Values) { v.Set("redirect_uri", "http://localhost:9/callback") }), 400, "Redirect address not allowed"},

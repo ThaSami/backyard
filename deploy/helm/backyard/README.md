@@ -206,10 +206,13 @@ ingress:
   `/.well-known/oauth-protected-resource/__backyard/mcp`. Keep `/__backyard/auth/authorize`
   behind the proxy: its login is the connector's sign-in. Recipes per proxy:
   [Claude connector](../../../docs/claude-connector.md#machine-paths-and-identity-proxies).
-- **Reachability.** Hosted Claude calls the hub from `160.79.104.0/21` (IPv4), and Backyard
-  fetches Claude's client metadata from `https://claude.ai` (without egress, add
-  `clients: []` to `config.mcp`). An internal-only ingress works only with connectors added
-  locally in Claude Code.
+- **Reachability.** Hosted Claude calls the hub from `160.79.104.0/21` (IPv4) and ChatGPT from
+  the ranges OpenAI publishes in
+  [`chatgpt-connectors.json`](https://openai.com/chatgpt-connectors.json) (they change), and
+  Backyard fetches Claude's client metadata from `https://claude.ai` and ChatGPT's from
+  `https://chatgpt.com` (without egress, add `clients: []` to `config.mcp`). An internal-only
+  ingress works only with apps on the user's computer, such as a connector added locally in
+  Claude Code.
 
 ## Owners-only site listing
 

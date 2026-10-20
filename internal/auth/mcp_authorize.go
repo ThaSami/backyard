@@ -235,11 +235,17 @@ func (m *MCP) parseAuthorize(w http.ResponseWriter, r *http.Request, q url.Value
 		}
 	}
 	client, cerr := m.resolveClient(r.Context(), q.Get("client_id"))
+	redirectURI := q.Get("redirect_uri")
+	if cerr == nil && client.kind == clientKindUnlisted {
+		// An app on this computer, or not allowed at all (SPEC §8.4.4).
+		if _, loopback := parseLoopbackURI(redirectURI); !loopback {
+			cerr = errAppNotLocal(client.id)
+		}
+	}
 	if cerr != nil {
 		renderPage(w, cerr.status, pageData{Title: cerr.title, Message: cerr.msg, Detail: cerr.detail})
 		return nil, false
 	}
-	redirectURI := q.Get("redirect_uri")
 	if !m.clientRedirect(client, redirectURI) {
 		renderPage(w, http.StatusBadRequest, pageData{
 			Title:   "Redirect address not allowed",
@@ -386,6 +392,7 @@ func (m *MCP) renderConsent(w http.ResponseWriter, r *http.Request, u *identity.
 		SignOutURL: m.a.logoutURL(),
 		ClientName: req.client.name,
 		Verified:   req.client.kind == clientKindCIMD,
+		Unlisted:   req.client.kind == clientKindUnlisted,
 		ClientHost: req.client.host,
 		Origin:     strings.ToLower(target.Scheme + "://" + target.Host),
 		Loopback:   loopback,
